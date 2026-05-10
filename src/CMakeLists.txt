@@ -1,0 +1,2 @@
+add_executable(blackwell_llm main.cpp)
+target_link_libraries(blackwell_llm PRIVATE blackwell_kernels)

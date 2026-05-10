@@ -1,0 +1,37 @@
+#include "embedding.cuh"
+#include <cuda_runtime.h>
+
+__global__ void embedding_lookup_kernel(const int* tokens, 
+                                        const float* embed_table, 
+                                        float* output, 
+                                        size_t seq_len, 
+                                        size_t hidden_dim) {
+    // blockIdx.x отвечает за индекс токена в запросе (seq_len)
+    size_t seq_idx = blockIdx.x;
+    if (seq_idx >= seq_len) return;
+
+    int token_id = tokens[seq_idx];
+    const float* src_row = embed_table + (size_t)token_id * hidden_dim;
+    float* dst_row = output + seq_idx * hidden_dim;
+
+    // threadIdx.x итерируется по скрытой размерности (hidden_dim)
+    // Grid-stride цикл на случай, если hidden_dim больше количества потоков в блоке
+    for (size_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
+        dst_row[h] = src_row[h];
+    }
+}
+
+void launch_embedding_kernel(const int* d_tokens, 
+                             const float* d_embed_table, 
+                             float* d_output, 
+                             size_t seq_len, 
+                             size_t hidden_dim) {
+    // Запускаем сетку: количество блоков = количеству токенов
+    dim3 blocks(seq_len);
+    
+    // 512 потоков на блок — оптимально для сатурации кэша L1/L2 на Blackwell
+    unsigned int num_threads = (hidden_dim < 512) ? static_cast<unsigned int>(hidden_dim) : 512;
+    dim3 threads(num_threads);
+
+    embedding_lookup_kernel<<<blocks, threads>>>(d_tokens, d_embed_table, d_output, seq_len, hidden_dim);
+}

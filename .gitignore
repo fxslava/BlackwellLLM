@@ -1,0 +1,27 @@
+# Сборка и кэш CMake
+out/
+build/
+bin/
+lib/
+CMakeUserPresets.json
+
+# Visual Studio
+.vs/
+*.sln.docstates
+*.user
+
+# Артефакты компиляции CUDA / C++
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.exe
+*.exp
+*.pdb
+*.ilk
+*.cubin
+*.ptx
+
+# Зависимости FetchContent
+_deps/
