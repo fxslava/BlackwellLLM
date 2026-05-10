@@ -1,0 +1,48 @@
+#pragma once
+#include <cuda_runtime.h>
+#include <cstddef>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include "safetensors.h"
+
+// Static Memory Orchestrator for 12GB VRAM limit
+class VRAMArena {
+public:
+    VRAMArena(const SafetensorsLoader& loader, size_t max_seq_len = 2048);
+    ~VRAMArena();
+
+    VRAMArena(const VRAMArena&) = delete;
+    VRAMArena& operator=(const VRAMArena&) = delete;
+
+    // Retrieve device pointer for static weights
+    void* get_weight_ptr(const std::string& name) const;
+
+    // Ping-Pong activation buffers (reused across all 32 layers)
+    float* get_activation_buffer_A() const { return d_activation_A; }
+    float* get_activation_buffer_B() const { return d_activation_B; }
+
+    // Global KV-Cache buffers
+    float* get_k_cache() const { return d_k_cache; }
+    float* get_v_cache() const { return d_v_cache; }
+
+private:
+    void allocate_weights_pool(const SafetensorsLoader& loader);
+    void allocate_dynamic_pool(size_t max_seq_len);
+
+    // Contiguous memory blocks
+    void* d_weights_arena = nullptr;
+    size_t total_weights_bytes = 0;
+
+    // Activation buffers (FP32)
+    float* d_activation_A = nullptr;
+    float* d_activation_B = nullptr;
+
+    // KV Cache pool
+    float* d_k_cache = nullptr;
+    float* d_v_cache = nullptr;
+
+    // Offset registry mapping tensor names to their absolute addresses in d_weights_arena
+    std::unordered_map<std::string, void*> weight_pointers;
+};

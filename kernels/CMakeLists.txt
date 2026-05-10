@@ -5,26 +5,29 @@ add_library(blackwell_kernels STATIC ${SOURCES})
 
 # --- Настройки для библиотеки ядер (blackwell_kernels) ---
 
-# 1. Флаги для конфигурации RELEASE (Ориентировано на бенчмарки)
+# --- Настройки для библиотеки ядер ---
+
+# Флаги для конфигурации RELEASE
 target_compile_options(blackwell_kernels PRIVATE 
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:
-        --use_fast_math          # Разрешает быстрые (но менее точные) математические функции
-        -Xptxas=-O3,-v           # Оптимизация PTX-ассемблера + вывод использования регистров
-        -Xcompiler=/O2,/Ot       # Флаги MSVC: Оптимизация по скорости и всему приложению
+        --use_fast_math
+        -Xptxas=-O3,-v
+        # Пробрасываем стандартный препроцессор и отключаем излишние проверки CCCL
+        -Xcompiler=/O2,/Ot,/Zc:preprocessor
+        -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
     >
 )
 
-# 2. Флаги для конфигурации DEBUG (Ориентировано на Nsight Debugger)
+# Флаги для конфигурации DEBUG
 target_compile_options(blackwell_kernels PRIVATE 
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:
-        -g -G                    # -g: символы хоста, -G: символы устройства (DEBUG ЯДЕР)
-        -Xcompiler=/Zi,/Od,/RTC1 # Флаги MSVC: символы, отключение оптимизаций, проверки рантайма
+        -g -G
+        -Xcompiler=/Zi,/Od,/Zc:preprocessor
+        -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
     >
 )
 
-# Для Blackwell/Hopper полезно видеть статистику регистров в Release
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    # Выводит информацию о регистрах и Shared Memory при сборке
     set_target_properties(blackwell_kernels PROPERTIES CUDA_PTX_COMPILATION_FLAGS "-v")
 endif()
 
