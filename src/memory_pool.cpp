@@ -1,4 +1,4 @@
-#include "memory_pool.h"
+﻿#include "memory_pool.h"
 #include "common.h"
 #include <iostream>
 
@@ -83,6 +83,16 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
 
     CUDA_CHECK(cudaMalloc(&d_k_cache, total_cache_bytes));
     CUDA_CHECK(cudaMalloc(&d_v_cache, total_cache_bytes));
+
+    // Выделение KV-кэша
+    CUDA_CHECK(cudaMalloc(&d_k_cache, total_cache_bytes));
+    CUDA_CHECK(cudaMalloc(&d_v_cache, total_cache_bytes));
+
+    // 🚨 ЖЕЛЕЗОБЕТОННАЯ ОЧИСТКА: Зануляем весь кэш и буферы активаций
+    CUDA_CHECK(cudaMemset(d_k_cache, 0, total_cache_bytes));
+    CUDA_CHECK(cudaMemset(d_v_cache, 0, total_cache_bytes));
+    CUDA_CHECK(cudaMemset(d_activation_A, 0, ping_pong_bytes));
+    CUDA_CHECK(cudaMemset(d_activation_B, 0, ping_pong_bytes));
 
     std::cout << "[VRAM Arena] Dynamic pool allocated. Context capacity: " << max_seq_len << " tokens.\n";
     std::cout << "[VRAM Arena] Total dynamic memory consumption: " 

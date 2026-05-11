@@ -7,6 +7,7 @@ target_link_libraries(unit_tests PRIVATE
     GTest::gtest
     GTest::gtest_main
     blackwell_kernels
+    blackwell_core
 )
 
 # Регистрируем бинарник в CTest
