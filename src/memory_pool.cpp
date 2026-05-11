@@ -106,3 +106,12 @@ void* VRAMArena::get_weight_ptr(const std::string& name) const {
     }
     return it->second;
 }
+
+const void* VRAMArena::get_weight_ptr_optional(const std::string& name) const {
+    // Assuming your class internally maps pointers using a hash map like std::unordered_map
+    auto it = weight_pointers.find(name); // Or weight_pointers.find(name) depending on your naming
+    if (it != weight_pointers.end()) {
+        return it->second;
+    }
+    return nullptr;
+}

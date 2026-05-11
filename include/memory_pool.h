@@ -19,6 +19,9 @@ public:
     // Retrieve device pointer for static weights
     void* get_weight_ptr(const std::string& name) const;
 
+    // Safely retrieves a pointer if the weight exists, returns nullptr otherwise
+    const void* get_weight_ptr_optional(const std::string& name) const;
+
     // Ping-Pong activation buffers (reused across all 32 layers)
     float* get_activation_buffer_A() const { return d_activation_A; }
     float* get_activation_buffer_B() const { return d_activation_B; }

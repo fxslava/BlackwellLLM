@@ -1,138 +1,139 @@
 ﻿#include "rmsnorm.cuh"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
-// Фиксированный размер блока для сатурации SM
 #define RMSNORM_BLOCK_SIZE 256
 
 // 1. Нативная редукция суммы внутри одного варпа (32 потока)
 __inline__ __device__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        // Потоки обмениваются значениями в регистрах без обращения к памяти
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
 }
 
-// 2. Редукция суммы на уровне всего блока (256 потоков = 8 варпов)
+// 2. Быстрая редукция суммы на уровне всего блока (без atomicAdd)
 __inline__ __device__ float block_reduce_sum(float val, float* shared_warp_sums) {
-    int warp_id = threadIdx.x >> 5; // Аналог threadIdx.x / 32
-    int lane_id = threadIdx.x & 31; // Аналог threadIdx.x % 32
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
 
-    // Шаг 1: Считаем сумму внутри каждого варпа
     val = warp_reduce_sum(val);
 
-    // Шаг 2: Нулевой поток каждого варпа пишет свой итог в Shared Memory
     if (lane_id == 0) {
         shared_warp_sums[warp_id] = val;
     }
-    __syncthreads(); // Ждем, пока все 8 варпов запишут данные
+    __syncthreads();
 
-    // Шаг 3: Первый варп (warp_id == 0) считывает 8 промежуточных сумм и сворачивает их
-    // Остальные потоки варпа (индексы 8..31) берут 0.0f, чтобы не влиять на сумму
     float warp_val = (threadIdx.x < (RMSNORM_BLOCK_SIZE / 32)) ? shared_warp_sums[lane_id] : 0.0f;
     
     if (warp_id == 0) {
         warp_val = warp_reduce_sum(warp_val);
     }
     
-    return warp_val; // Итоговая сумма всего блока окажется в нулевом потоке (threadIdx.x == 0)
+    return warp_val; 
 }
 
-__global__ void rmsnorm_residual_kernel(float* x, 
-                                        float* residual, 
-                                        const float* weight, 
-                                        size_t hidden_dim, 
-                                        float eps) {
+// ============================================================================
+// ЯДРО 1: Fused Residual RMSNorm (С поддержкой Bfloat16 весов)
+// ============================================================================
+__global__ void rmsnorm_residual_bf16_weight_kernel(float* x, 
+                                                    float* residual, 
+                                                    const __nv_bfloat16* weight, 
+                                                    size_t hidden_dim, 
+                                                    float eps) {
     size_t seq_idx = blockIdx.x;
     float* cur_x = x + seq_idx * hidden_dim;
     float* cur_res = residual + seq_idx * hidden_dim;
 
-    // Аккумулируем сумму квадратов локально в регистрах потока
     float thread_sum_sq = 0.0f;
     for (size_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
         float x_val = cur_x[h];
         float res_val = cur_res[h];
         
-        // Fused Residual Add: складываем и сразу сохраняем в глобальную память
+        // Входной поток складывается с остаточным
         res_val += x_val;
         cur_res[h] = res_val;
         
         thread_sum_sq += res_val * res_val;
     }
 
-    // Буфер в Shared Memory для хранения сумм 8 варпов (32 байта всего)
     __shared__ float shared_warp_sums[RMSNORM_BLOCK_SIZE / 32];
-    
-    // Получаем полную сумму квадратов по всему токену
     float block_sum_sq = block_reduce_sum(thread_sum_sq, shared_warp_sums);
 
-    // Нулевой поток считает 1/sqrt через быстрый аппаратный блок SFU
     __shared__ float s_rsqrt;
     if (threadIdx.x == 0) {
         s_rsqrt = rsqrtf((block_sum_sq / static_cast<float>(hidden_dim)) + eps);
     }
-    __syncthreads(); // Гарантируем, что s_rsqrt доступен всему блоку
+    __syncthreads(); 
 
-    // Применяем нормализацию и масштабирование весами
     float rsqrt = s_rsqrt;
     for (size_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
-        cur_x[h] = cur_res[h] * rsqrt * weight[h];
+        // Аппаратная распаковка Bfloat16 -> Float32 на лету
+        float w_val = __bfloat162float(weight[h]);
+        cur_x[h] = cur_res[h] * rsqrt * w_val;
     }
 }
 
+// ============================================================================
+// ЯДРО 2: Прямая нормализация (Оптимизирована, убран atomicAdd)
+// ============================================================================
+__global__ void rmsnorm_bf16_weight_kernel(const float* __restrict__ input,
+                                           float* __restrict__ output,
+                                           const __nv_bfloat16* __restrict__ weight,
+                                           size_t hidden_dim,
+                                           float eps) 
+{
+    size_t row_offset = blockIdx.x * hidden_dim;
+    const float* cur_input = input + row_offset;
+    float* cur_output = output + row_offset;
+
+    float thread_sum_sq = 0.0f;
+    for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
+        float val = cur_input[idx];
+        thread_sum_sq += val * val;
+    }
+
+    // Используем ту же быструю варп-редукцию вместо медленных атомиков
+    __shared__ float shared_warp_sums[RMSNORM_BLOCK_SIZE / 32];
+    float block_sum_sq = block_reduce_sum(thread_sum_sq, shared_warp_sums);
+
+    __shared__ float s_rsqrt;
+    if (threadIdx.x == 0) {
+        s_rsqrt = rsqrtf((block_sum_sq / static_cast<float>(hidden_dim)) + eps);
+    }
+    __syncthreads();
+
+    float rsqrt = s_rsqrt;
+    for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
+        float w_val = __bfloat162float(weight[idx]);
+        cur_output[idx] = cur_input[idx] * rsqrt * w_val;
+    }
+}
+
+// ============================================================================
+// ОБЕРТКИ ЗАПУСКА (Принимают const void* для совместимости с VRAMArena)
+// ============================================================================
 void launch_rmsnorm_residual_kernel(float* d_x, 
                                     float* d_residual, 
-                                    const float* d_weight, 
+                                    const void* d_weight, 
                                     size_t seq_len, 
                                     size_t hidden_dim, 
                                     float eps) {
     dim3 blocks(seq_len);
     dim3 threads(RMSNORM_BLOCK_SIZE);
-
-    rmsnorm_residual_kernel<<<blocks, threads>>>(d_x, d_residual, d_weight, hidden_dim, eps);
-}
-
-__global__ void rmsnorm_kernel(const float* __restrict__ input,
-                               float* __restrict__ output,
-                               const float* __restrict__ weight,
-                               size_t hidden_dim,
-                               float eps) 
-{
-    // Один блок обрабатывает ровно один токен (строку)
-    size_t row_offset = blockIdx.x * hidden_dim;
-    const float* cur_input = input + row_offset;
-    float* cur_output = output + row_offset;
-
-    // Разделяемая память для быстрой суммы квадратов внутри блока
-    __shared__ float s_sum_sq;
-    if (threadIdx.x == 0) s_sum_sq = 0.0f;
-    __syncthreads();
-
-    float local_sq = 0.0f;
-    for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
-        float val = cur_input[idx];
-        local_sq += val * val;
-    }
-
-    // Атомарная сборка квадратов в shared память
-    atomicAdd(&s_sum_sq, local_sq);
-    __syncthreads();
-
-    float rsqrt = rsqrtf((s_sum_sq / hidden_dim) + eps);
-
-    for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
-        cur_output[idx] = cur_input[idx] * rsqrt * weight[idx];
-    }
+    
+    const __nv_bfloat16* bf16_w = reinterpret_cast<const __nv_bfloat16*>(d_weight);
+    rmsnorm_residual_bf16_weight_kernel<<<blocks, threads>>>(d_x, d_residual, bf16_w, hidden_dim, eps);
 }
 
 void launch_rmsnorm_kernel(const float* d_input, 
                            float* d_output, 
-                           const float* d_weight, 
+                           const void* d_weight, 
                            size_t seq_len, 
                            size_t hidden_dim, 
                            float eps) 
 {
-    // Запускаем 256 потоков на каждый токен последовательности
-    rmsnorm_kernel<<<seq_len, 256>>>(d_input, d_output, d_weight, hidden_dim, eps);
+    const __nv_bfloat16* bf16_w = reinterpret_cast<const __nv_bfloat16*>(d_weight);
+    rmsnorm_bf16_weight_kernel<<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, bf16_w, hidden_dim, eps);
 }
