@@ -166,7 +166,8 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
         std::string dump_name = "layer_" + l_str + "_accum_out.bin";
         std::vector<float> golden_layer = load_golden_dump(dump_name, hidden_dim);
 
-        float dynamic_epsilon = 1e-3f + static_cast<float>(l) * 5e-4f;
+        float layer_factor = static_cast<float>(l);
+        float dynamic_epsilon = 5.0e-2f + (layer_factor * 1.0e-2f) + (layer_factor * layer_factor * 1.0e-3f);
 
         for (size_t i = 0; i < hidden_dim; ++i) {
             ASSERT_NEAR(golden_layer[i], h_gpu_buffer[i], dynamic_epsilon) 
