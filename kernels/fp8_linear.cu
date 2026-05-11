@@ -1,5 +1,6 @@
 #include "fp8_linear.cuh"
 #include <cuda_runtime.h>
+#include <cmath>
 
 #define GEMV_BLOCK_SIZE 128
 
@@ -121,4 +122,64 @@ void launch_fp8_gemv_kernel(const uint8_t* d_W_fp8,
     dim3 threads(GEMV_BLOCK_SIZE);
 
     fp8_gemv_kernel<<<blocks, threads>>>(d_W_fp8, d_X, d_scales, d_Y, K);
+}
+
+// Детерминированная инлайн-распаковка FP8 (E4M3) во float
+__device__ __inline__ float unpack_fp8_e4m3(uint8_t byte_val) {
+    if ((byte_val & 0x7F) == 0) return 0.0f;
+    int sign = (byte_val & 0x80) ? -1 : 1;
+    int exp  = (byte_val & 0x78) >> 3;
+    int mant = byte_val & 0x07;
+    
+    if (exp == 0) {
+        return sign * ldexpf(static_cast<float>(mant) / 8.0f, -6);
+    }
+    return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
+}
+
+__global__ void fp8_gemv_residual_warp_kernel(const uint8_t* __restrict__ W_fp8,
+                                              const float* __restrict__ X,
+                                              const float* __restrict__ scales,
+                                              float* __restrict__ Y_accum,
+                                              size_t M,
+                                              size_t K)
+{
+    // 1 варп (32 потока) полностью обрабатывает 1 строку матрицы
+    size_t row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane   = threadIdx.x % 32;
+
+    if (row >= M) return;
+
+    const uint8_t* cur_W_row = W_fp8 + row * K;
+    float row_scale = scales[row];
+
+    float dot = 0.0f;
+    for (size_t col = lane; col < K; col += 32) {
+        float w_val = unpack_fp8_e4m3(cur_W_row[col]);
+        dot += w_val * X[col];
+    }
+
+    // Быстрая редукция суммы внутри варпа
+    for (int offset = 16; offset > 0; offset /= 2) {
+        dot += __shfl_down_sync(0xffffffff, dot, offset);
+    }
+
+    // Нулевой поток варпа прибавляет результат к главному накопителю
+    if (lane == 0) {
+        Y_accum[row] += dot * row_scale;
+    }
+}
+
+void launch_fp8_gemv_residual_kernel(const uint8_t* d_W_fp8,
+                                     const float* d_X,
+                                     const float* d_scales,
+                                     float* d_Y_accum,
+                                     size_t M,
+                                     size_t K)
+{
+    int threads = 256;
+    size_t total_threads = M * 32; // По 32 потока на каждую из M строк
+    size_t blocks = (total_threads + threads - 1) / threads;
+
+    fp8_gemv_residual_warp_kernel<<<blocks, threads>>>(d_W_fp8, d_X, d_scales, d_Y_accum, M, K);
 }

@@ -16,45 +16,29 @@ protected:
 };
 
 TEST_F(SamplingTests, ArgmaxGreedyCorrectness) {
-    const size_t vocab_size = 128256; // Реальный размер словаря Llama 3
-    const int target_max_idx = 84042; // Секретный индекс, куда мы спрячем максимум
+    const size_t vocab_size = 128256; 
+    const int target_max_idx = 84042; 
 
-    // 1. Подготовка данных на Host
     std::vector<float> h_logits(vocab_size);
     for (size_t i = 0; i < vocab_size; ++i) {
-        // Заполняем фоновыми вероятностями
         h_logits[i] = static_cast<float>(i % 100) * 0.01f - 5.0f; 
     }
-    
-    // Внедряем гарантированный максимум
     h_logits[target_max_idx] = 500.0f;
 
     int cpu_token_id = -1;
-    int gpu_token_id = -2;
-
-    // 2. Вычисление Golden Reference на CPU
     cpu_argmax(h_logits.data(), &cpu_token_id, vocab_size);
 
-    // 3. Выделение памяти на GPU
-    float* d_logits;
-    int* d_out_token_id;
-    CUDA_CHECK(cudaMalloc(&d_logits, vocab_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out_token_id, sizeof(int)));
+    CudaVector<float> d_logits(vocab_size); d_logits.upload(h_logits);
+    CudaVector<int>   d_out_token_id(1);
 
-    CUDA_CHECK(cudaMemcpy(d_logits, h_logits.data(), vocab_size * sizeof(float), cudaMemcpyHostToDevice));
-
-    // 4. Запуск ядра
     launch_argmax_kernel(d_logits, d_out_token_id, vocab_size);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 5. Проверка результата
-    CUDA_CHECK(cudaMemcpy(&gpu_token_id, d_out_token_id, sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<int> h_gpu_token(1);
+    d_out_token_id.download(h_gpu_token);
+    int gpu_token_id = h_gpu_token[0];
 
     ASSERT_EQ(cpu_token_id, target_max_idx) << "Сбой в логике CPU эталона!";
     ASSERT_EQ(gpu_token_id, cpu_token_id)   << "GPU Argmax выбрал неверный токен!";
-
-    // 6. Очистка
-    cudaFree(d_logits);
-    cudaFree(d_out_token_id);
 }

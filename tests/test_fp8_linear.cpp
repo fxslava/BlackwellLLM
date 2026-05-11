@@ -9,74 +9,86 @@ class Fp8LinearTests : public ::testing::Test {
 protected:
     void TearDown() override {
         cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            std::cerr << "\n[ОШИБКА CUDA]: " << cudaGetErrorString(err) << "\n";
-        }
+        if (err != cudaSuccess) std::cerr << "\n[ОШИБКА CUDA]: " << cudaGetErrorString(err) << "\n";
     }
 };
 
 TEST_F(Fp8LinearTests, GemvDecodingCorrectness) {
-    // K обязано быть кратно 16 для нашей векторизованной оптимизации uint4
-    const size_t M = 64;   // Количество выходных признаков (строк)
-    const size_t K = 4096; // Входная скрытая размерность (столбцов)
+    const size_t M = 64;   
+    const size_t K = 4096; 
 
-    // 1. Подготовка данных на Host
     std::vector<uint8_t> h_W_fp8(M * K);
     std::vector<float> h_X(K);
     std::vector<float> h_scales(M);
     std::vector<float> h_cpu_Y(M, 0.0f);
 
-    // Заполняем веса безопасными паттернами FP8 (избегаем NaN/Inf, которые в E4M3 равны 0x7F/0xFF)
-    for (size_t i = 0; i < h_W_fp8.size(); ++i) {
-        // Генерируем разнообразные нормальные и субнормальные мантиссы/экспоненты
-        uint8_t raw = static_cast<uint8_t>(i % 120 + 1); 
-        h_W_fp8[i] = raw;
-    }
+    for (size_t i = 0; i < h_W_fp8.size(); ++i) h_W_fp8[i] = static_cast<uint8_t>(i % 120 + 1); 
+    for (size_t i = 0; i < K; ++i)              h_X[i] = static_cast<float>(i % 5) * 0.1f - 0.2f;
+    for (size_t i = 0; i < M; ++i)              h_scales[i] = 0.5f + static_cast<float>(i % 4) * 0.25f;
 
-    for (size_t i = 0; i < K; ++i) {
-        h_X[i] = static_cast<float>(i % 5) * 0.1f - 0.2f; // Вектор активаций от -0.2 до 0.2
-    }
-
-    for (size_t i = 0; i < M; ++i) {
-        h_scales[i] = 0.5f + static_cast<float>(i % 4) * 0.25f; // Скейлинг-факторы
-    }
-
-    // 2. Вычисление Golden Reference на CPU
     cpu_fp8_gemv(h_W_fp8.data(), h_X.data(), h_scales.data(), h_cpu_Y.data(), M, K);
 
-    // 3. Выделение памяти на GPU
-    uint8_t* d_W_fp8;
-    float *d_X, *d_scales, *d_Y;
+    // 🚨 Элегантное выделение памяти через обертку
+    CudaVector<uint8_t> d_W_fp8(M * K); d_W_fp8.upload(h_W_fp8);
+    CudaVector<float>   d_X(K);         d_X.upload(h_X);
+    CudaVector<float>   d_scales(M);    d_scales.upload(h_scales);
+    CudaVector<float>   d_Y(M);
 
-    CUDA_CHECK(cudaMalloc(&d_W_fp8, M * K * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_X, K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_scales, M * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_Y, M * sizeof(float)));
-
-    CUDA_CHECK(cudaMemcpy(d_W_fp8, h_W_fp8.data(), M * K * sizeof(uint8_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_X, h_X.data(), K * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_scales, h_scales.data(), M * sizeof(float), cudaMemcpyHostToDevice));
-
-    // 4. Запуск тестируемого ядра
     launch_fp8_gemv_kernel(d_W_fp8, d_X, d_scales, d_Y, M, K);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 5. Верификация результатов
     std::vector<float> h_gpu_Y(M);
-    CUDA_CHECK(cudaMemcpy(h_gpu_Y.data(), d_Y, M * sizeof(float), cudaMemcpyDeviceToHost));
+    d_Y.download(h_gpu_Y);
 
-    // Сравниваем выходные векторы
     for (size_t i = 0; i < M; ++i) {
-        // Используем чуть более мягкий эпсилон из-за разницы в порядке 
-        // суммации чисел (дерево редукции GPU против линейного цикла CPU)
-        ASSERT_NEAR(h_cpu_Y[i], h_gpu_Y[i], 5e-3f) 
-            << "Расхождение в Linear GEMV по строке " << i;
+        ASSERT_NEAR(h_cpu_Y[i], h_gpu_Y[i], 5e-3f) << "Расхождение в Linear GEMV по строке " << i;
+    }
+}
+
+TEST_F(Fp8LinearTests, Fp8GemvResidualCorrectness) {
+    const size_t M = 128;  
+    const size_t K = 4096; 
+
+    std::vector<uint8_t> h_W_fp8(M * K);
+    std::vector<float> h_X(K);
+    std::vector<float> h_scales(M);
+    std::vector<float> h_Y_cpu(M); 
+
+    for (size_t i = 0; i < M; ++i) {
+        h_Y_cpu[i] = static_cast<float>(i) * 0.5f; 
+        h_scales[i] = 0.02f; 
+    }
+    for (size_t j = 0; j < K; ++j)     h_X[j] = static_cast<float>(j % 50) * 0.05f - 1.0f;
+    for (size_t i = 0; i < M * K; ++i) h_W_fp8[i] = static_cast<uint8_t>((i % 120) + 1);
+
+    // Эталонный расчет на CPU: Y_accum += (W * X) * scale
+    for (size_t i = 0; i < M; ++i) {
+        double dot = 0.0;
+        for (size_t j = 0; j < K; ++j) {
+            dot += cpu_unpack_fp8_e4m3(h_W_fp8[i * K + j]) * h_X[j];
+        }
+        h_Y_cpu[i] += static_cast<float>(dot) * h_scales[i]; 
     }
 
-    // 6. Очистка
-    cudaFree(d_W_fp8);
-    cudaFree(d_X);
-    cudaFree(d_scales);
-    cudaFree(d_Y);
+    CudaVector<uint8_t> d_W_fp8(M * K); d_W_fp8.upload(h_W_fp8);
+    CudaVector<float>   d_X(K);         d_X.upload(h_X);
+    CudaVector<float>   d_scales(M);    d_scales.upload(h_scales);
+    CudaVector<float>   d_Y_accum(M);   
+    
+    // Загружаем начальное состояние накопителя
+    std::vector<float> h_Y_initial(M);
+    for (size_t i = 0; i < M; ++i) h_Y_initial[i] = static_cast<float>(i) * 0.5f;
+    d_Y_accum.upload(h_Y_initial);
+
+    launch_fp8_gemv_residual_kernel(d_W_fp8, d_X, d_scales, d_Y_accum, M, K);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_gpu_output(M);
+    d_Y_accum.download(h_gpu_output);
+
+    for (size_t i = 0; i < M; ++i) {
+        ASSERT_NEAR(h_Y_cpu[i], h_gpu_output[i], 5e-3f) << "Ошибка Residual GEMV на строке " << i;
+    }
 }

@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 
+
 // Таблица эмбеддингов — это матрица [vocab_size, hidden_dim].
 // Мы берем ID токена и копируем соответствующую строку в выходной буфер.
 inline void cpu_embedding_lookup(const int* tokens, 
@@ -53,6 +54,30 @@ inline void cpu_rmsnorm_residual(float* x_out,
         // 3. Применение весов нормализации
         for (size_t h = 0; h < hidden_dim; ++h) {
             cur_x[h] = cur_res[h] * rsqrt * weight[h];
+        }
+    }
+}
+
+inline void cpu_rmsnorm_direct(const float* input, 
+                               float* output, 
+                               const float* weight, 
+                               size_t seq_len, 
+                               size_t hidden_dim, 
+                               float eps = 1e-5f) 
+{
+    for (size_t s = 0; s < seq_len; ++s) {
+        const float* cur_input = input + s * hidden_dim;
+        float* cur_output = output + s * hidden_dim;
+
+        float sum_sq = 0.0f;
+        for (size_t h = 0; h < hidden_dim; ++h) {
+            sum_sq += cur_input[h] * cur_input[h];
+        }
+
+        float rsqrt = 1.0f / std::sqrt((sum_sq / hidden_dim) + eps);
+
+        for (size_t h = 0; h < hidden_dim; ++h) {
+            cur_output[h] = cur_input[h] * rsqrt * weight[h];
         }
     }
 }

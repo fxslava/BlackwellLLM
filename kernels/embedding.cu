@@ -1,5 +1,6 @@
 #include "embedding.cuh"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 __global__ void embedding_lookup_kernel(const int* tokens, 
                                         const float* embed_table, 
@@ -34,4 +35,49 @@ void launch_embedding_kernel(const int* d_tokens,
     dim3 threads(num_threads);
 
     embedding_lookup_kernel<<<blocks, threads>>>(d_tokens, d_embed_table, d_output, seq_len, hidden_dim);
+}
+
+__global__ void bf16_embedding_kernel(
+    const int* __restrict__ tokens,
+    const __nv_bfloat16* __restrict__ embed_table,
+    float* __restrict__ output,
+    size_t seq_len,
+    size_t hidden_dim)
+{
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_elements = seq_len * hidden_dim;
+
+    if (idx >= total_elements) return;
+
+    // Определяем, какой токен и какую размерность обрабатывает поток
+    size_t token_idx = idx / hidden_dim;
+    size_t dim_idx   = idx % hidden_dim;
+
+    int token_id = tokens[token_idx];
+
+    // Коалесцированное чтение 2-байтового BF16
+    __nv_bfloat16 bf16_val = embed_table[token_id * hidden_dim + dim_idx];
+    
+    // Аппаратная распаковка в 4-байтовый FP32 и запись в буфер активаций
+    output[idx] = __bfloat162float(bf16_val);
+}
+
+void launch_bf16_embedding_kernel(
+    const int* d_tokens,
+    const void* d_embed_table,
+    float* d_output,
+    size_t seq_len,
+    size_t hidden_dim)
+{
+    size_t total_elements = seq_len * hidden_dim;
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+
+    bf16_embedding_kernel<<<blocks, threads>>>(
+        d_tokens,
+        reinterpret_cast<const __nv_bfloat16*>(d_embed_table),
+        d_output,
+        seq_len,
+        hidden_dim
+    );
 }

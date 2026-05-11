@@ -9,9 +9,7 @@ class RmsnormTests : public ::testing::Test {
 protected:
     void TearDown() override {
         cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            std::cerr << "\n[ОШИБКА CUDA]: " << cudaGetErrorString(err) << "\n";
-        }
+        if (err != cudaSuccess) std::cerr << "\n[ОШИБКА CUDA]: " << cudaGetErrorString(err) << "\n";
     }
 };
 
@@ -20,61 +18,72 @@ TEST_F(RmsnormTests, FusedRmsnormResidualCorrectness) {
     const size_t hidden_dim = 4096;
     const float eps = 1e-5f;
 
-    // 1. Подготовка данных на Host
     std::vector<float> h_x(seq_len * hidden_dim);
     std::vector<float> h_residual(seq_len * hidden_dim);
     std::vector<float> h_weight(hidden_dim);
 
-    // Заполняем псевдослучайными, но детерминированными числами
     for (size_t i = 0; i < h_x.size(); ++i) {
         h_x[i] = static_cast<float>(i % 13) * 0.1f - 0.6f;
         h_residual[i] = static_cast<float>(i % 7) * 0.2f + 0.1f;
     }
-    for (size_t i = 0; i < hidden_dim; ++i) {
-        h_weight[i] = 1.0f + static_cast<float>(i % 5) * 0.01f; // Веса близки к 1.0
-    }
+    for (size_t i = 0; i < hidden_dim; ++i) h_weight[i] = 1.0f + static_cast<float>(i % 5) * 0.01f;
 
-    // Создаем копии для CPU расчетов
     std::vector<float> h_cpu_x = h_x;
     std::vector<float> h_cpu_residual = h_residual;
-
-    // 2. Вычисление Golden Reference на CPU
     cpu_rmsnorm_residual(h_cpu_x.data(), h_cpu_residual.data(), h_weight.data(), seq_len, hidden_dim, eps);
 
-    // 3. Выделение памяти на GPU
-    float *d_x, *d_residual, *d_weight;
-    CUDA_CHECK(cudaMalloc(&d_x, seq_len * hidden_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_residual, seq_len * hidden_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_weight, hidden_dim * sizeof(float)));
+    // 🚨 МАГИЯ RAII: Выделение и загрузка в 3 строчки вместо 12
+    CudaVector<float> d_x(h_x.size());           d_x.upload(h_x);
+    CudaVector<float> d_residual(h_residual.size()); d_residual.upload(h_residual);
+    CudaVector<float> d_weight(h_weight.size());     d_weight.upload(h_weight);
 
-    CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), seq_len * hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_residual, h_residual.data(), seq_len * hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_weight, h_weight.data(), hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
-
-    // 4. Запуск ядра
     launch_rmsnorm_residual_kernel(d_x, d_residual, d_weight, seq_len, hidden_dim, eps);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 5. Проверка результатов
-    std::vector<float> h_gpu_x(seq_len * hidden_dim);
-    std::vector<float> h_gpu_residual(seq_len * hidden_dim);
-    
-    CUDA_CHECK(cudaMemcpy(h_gpu_x.data(), d_x, seq_len * hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_gpu_residual.data(), d_residual, seq_len * hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    std::vector<float> h_gpu_x(h_x.size());           d_x.download(h_gpu_x);
+    std::vector<float> h_gpu_residual(h_residual.size()); d_residual.download(h_gpu_residual);
 
-    // Сравниваем Residual буфер
     for (size_t i = 0; i < h_gpu_residual.size(); ++i) {
         ASSERT_NEAR(h_cpu_residual[i], h_gpu_residual[i], 1e-4f) << "Ошибка в Residual по индексу " << i;
+        ASSERT_NEAR(h_cpu_x[i], h_gpu_x[i], 1e-4f)               << "Ошибка в X_norm по индексу " << i;
+    }
+    // cudaFree вызывается автоматически деструкторами d_x, d_residual и d_weight!
+}
+
+TEST_F(RmsnormTests, DirectRmsnormCorrectness) {
+    const size_t hidden_dim = 4096;
+    const size_t seq_len = 1;
+    const float eps = 1e-5f;
+
+    std::vector<float> h_input(hidden_dim);
+    std::vector<float> h_weight(hidden_dim);
+    std::vector<float> h_cpu_output(hidden_dim, 0.0f);
+
+    for (size_t i = 0; i < hidden_dim; ++i) {
+        h_input[i] = static_cast<float>(i % 100) * 0.01f - 0.5f;
+        h_weight[i] = 1.0f + static_cast<float>(i % 10) * 0.05f;
     }
 
-    // Сравниваем нормализованный X
-    for (size_t i = 0; i < h_gpu_x.size(); ++i) {
-        ASSERT_NEAR(h_cpu_x[i], h_gpu_x[i], 1e-4f) << "Ошибка в X_norm по индексу " << i;
+    // Используем вынесенный эталон
+    cpu_rmsnorm_direct(h_input.data(), h_cpu_output.data(), h_weight.data(), seq_len, hidden_dim, eps);
+
+    CudaVector<float> d_input(hidden_dim);  d_input.upload(h_input);
+    CudaVector<float> d_weight(hidden_dim); d_weight.upload(h_weight);
+    CudaVector<float> d_output(hidden_dim); // Инициализируется нулями внутри конструктора
+
+    launch_rmsnorm_kernel(d_input, d_output, d_weight, seq_len, hidden_dim, eps);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_gpu_output(hidden_dim);
+    d_output.download(h_gpu_output);
+
+    for (size_t i = 0; i < hidden_dim; ++i) {
+        ASSERT_NEAR(h_cpu_output[i], h_gpu_output[i], 1e-5f) << "Сбой RMSNorm по индексу " << i;
     }
 
-    // 6. Очистка
-    cudaFree(d_x);
-    cudaFree(d_residual);
-    cudaFree(d_weight);
+    std::vector<float> h_input_check(hidden_dim);
+    d_input.download(h_input_check);
+    ASSERT_EQ(h_input, h_input_check) << "Критическая ошибка: ядро перезаписало входной буфер!";
 }

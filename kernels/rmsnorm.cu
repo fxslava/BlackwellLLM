@@ -92,3 +92,47 @@ void launch_rmsnorm_residual_kernel(float* d_x,
 
     rmsnorm_residual_kernel<<<blocks, threads>>>(d_x, d_residual, d_weight, hidden_dim, eps);
 }
+
+__global__ void rmsnorm_kernel(const float* __restrict__ input,
+                               float* __restrict__ output,
+                               const float* __restrict__ weight,
+                               size_t hidden_dim,
+                               float eps) 
+{
+    // Один блок обрабатывает ровно один токен (строку)
+    size_t row_offset = blockIdx.x * hidden_dim;
+    const float* cur_input = input + row_offset;
+    float* cur_output = output + row_offset;
+
+    // Разделяемая память для быстрой суммы квадратов внутри блока
+    __shared__ float s_sum_sq;
+    if (threadIdx.x == 0) s_sum_sq = 0.0f;
+    __syncthreads();
+
+    float local_sq = 0.0f;
+    for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
+        float val = cur_input[idx];
+        local_sq += val * val;
+    }
+
+    // Атомарная сборка квадратов в shared память
+    atomicAdd(&s_sum_sq, local_sq);
+    __syncthreads();
+
+    float rsqrt = rsqrtf((s_sum_sq / hidden_dim) + eps);
+
+    for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
+        cur_output[idx] = cur_input[idx] * rsqrt * weight[idx];
+    }
+}
+
+void launch_rmsnorm_kernel(const float* d_input, 
+                           float* d_output, 
+                           const float* d_weight, 
+                           size_t seq_len, 
+                           size_t hidden_dim, 
+                           float eps) 
+{
+    // Запускаем 256 потоков на каждый токен последовательности
+    rmsnorm_kernel<<<seq_len, 256>>>(d_input, d_output, d_weight, hidden_dim, eps);
+}
