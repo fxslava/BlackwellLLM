@@ -15,19 +15,25 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
 
     const __nv_bfloat16* cur_W_row = W_bf16 + row * K;
 
-    float dot = 0.0f;
+    // 🎯 Используем double для поглощения произведений каналов-выбросов без потери точности
+    double dot = 0.0;
     for (size_t col = lane; col < K; col += 32) {
-        float w_val = __bfloat162float(cur_W_row[col]);
-        // Входной буфер X уже идеально согласован с сеткой Bfloat16 на этапе нормализации
-        dot += w_val * X[col];
+        double w_val = static_cast<double>(__bfloat162float(cur_W_row[col]));
+        double x_val = static_cast<double>(X[col]);
+        dot += w_val * x_val;
     }
 
+    // Каскадная редукция варпа поддерживается аппаратно для double
+    #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         dot += __shfl_down_sync(0xffffffff, dot, offset);
     }
 
     if (lane == 0) {
-        Y[row] = dot;
+        // 🎯 Золотая семантика: выход линейного слоя BF16 в PyTorch является тензором Bfloat16.
+        // Защелкиваем итоговый логит в дискретную сетку
+        float final_logit = static_cast<float>(dot);
+        Y[row] = __bfloat162float(__float2bfloat16(final_logit));
     }
 }
 

@@ -44,7 +44,7 @@ private:
     // Вспомогательные буферы для вычислений внутри слоев
     float *d_Q, *d_K, *d_V, *d_Attn_out;
     float *d_Gate, *d_Up, *d_Swiglu_out;
-    float *d_logits;
+    float *d_logits, *d_token_scale;
     int *d_next_token;
 
     // Параметры модели (Llama 3 8B)
