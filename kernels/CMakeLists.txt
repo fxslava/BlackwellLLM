@@ -3,10 +3,9 @@ file(GLOB SOURCES "*.cu")
 # Создаем статическую библиотеку с ядрами
 add_library(blackwell_kernels STATIC ${SOURCES})
 
-# 🎯 Находим установленный CUDA Toolkit и его компоненты
-find_package(CUDAToolkit REQUIRED)
-
 # --- Настройки для библиотеки ядер (blackwell_kernels) ---
+
+# --- Настройки для библиотеки ядер ---
 
 # Флаги для конфигурации RELEASE
 target_compile_options(blackwell_kernels PRIVATE 
@@ -34,9 +33,3 @@ endif()
 
 # Разрешаем включать заголовочные файлы из этой директории
 target_include_directories(blackwell_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
-# 🎯 Линкуем библиотеки cuBLAS и cuBLASLt к нашим ядрам
-target_link_libraries(blackwell_kernels PUBLIC 
-    CUDA::cublasLt
-    CUDA::cublas
-)
