@@ -5,11 +5,6 @@
 
 #define GEMV_BLOCK_SIZE 128
 
-// ============================================================================
-// ВНУТРЕННИЕ ФУНКЦИИ РЕДУКЦИИ И КВАНТОВАНИЯ
-// ============================================================================
-
-// Нативная редукция максимума внутри варпа
 __inline__ __device__ float gemv_warp_reduce_max(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -18,26 +13,20 @@ __inline__ __device__ float gemv_warp_reduce_max(float val) {
     return val;
 }
 
-// Редукция максимума по всему блоку (128 потоков)
 __inline__ __device__ float gemv_block_reduce_max(float val, float* shared_warp_maxes) {
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
 
     val = gemv_warp_reduce_max(val);
 
-    if (lane_id == 0) {
-        shared_warp_maxes[warp_id] = val;
-    }
+    if (lane_id == 0) shared_warp_maxes[warp_id] = val;
     __syncthreads();
 
     float warp_val = (threadIdx.x < (GEMV_BLOCK_SIZE / 32)) ? shared_warp_maxes[lane_id] : 0.0f;
-    if (warp_id == 0) {
-        warp_val = gemv_warp_reduce_max(warp_val);
-    }
+    if (warp_id == 0) warp_val = gemv_warp_reduce_max(warp_val);
     return warp_val;
 }
 
-// Нативная редукция суммы внутри варпа
 __inline__ __device__ float gemv_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -46,26 +35,20 @@ __inline__ __device__ float gemv_warp_reduce_sum(float val) {
     return val;
 }
 
-// Нативная редукция суммы по всему блоку
 __inline__ __device__ float gemv_block_reduce_sum(float val, float* shared_warp_sums) {
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
 
     val = gemv_warp_reduce_sum(val);
 
-    if (lane_id == 0) {
-        shared_warp_sums[warp_id] = val;
-    }
+    if (lane_id == 0) shared_warp_sums[warp_id] = val;
     __syncthreads();
 
     float warp_val = (threadIdx.x < (GEMV_BLOCK_SIZE / 32)) ? shared_warp_sums[lane_id] : 0.0f;
-    if (warp_id == 0) {
-        warp_val = gemv_warp_reduce_sum(warp_val);
-    }
+    if (warp_id == 0) warp_val = gemv_warp_reduce_sum(warp_val);
     return warp_val;
 }
 
-// Аппаратный декодер FP8 E4M3
 __inline__ __device__ float device_unpack_fp8_e4m3(uint8_t byte_val) {
     if ((byte_val & 0x7F) == 0) return 0.0f;
     int sign = (byte_val & 0x80) ? -1 : 1;
@@ -76,28 +59,16 @@ __inline__ __device__ float device_unpack_fp8_e4m3(uint8_t byte_val) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
-// Математически точное динамическое квантование/деквантование E4M3
 __inline__ __device__ float dynamic_quantize_e4m3(float x, float scale, float inv_scale) {
     float scaled = x * scale;
     if (fabsf(scaled) < 1e-4f) return 0.0f;
 
-    // Ограничиваем диапазон максимальным числом E4M3
     scaled = fminf(fmaxf(scaled, -448.0f), 448.0f);
-
     int exp;
-    // frexpf возвращает мантиссу в диапазоне [0.5, 1.0)
     float mantissa = frexpf(scaled, &exp);
-    
-    // Округляем мантиссу до 3 бит (шаг 1/16 на отрезке [0.5, 1.0))
     mantissa = roundf(mantissa * 16.0f) / 16.0f;
-
-    // Собираем деквантованное число обратно
     return ldexpf(mantissa, exp) * inv_scale;
 }
-
-// ============================================================================
-// ГЛОБАЛЬНЫЕ ЯДРА С ДИНАМИЧЕСКИМ КВАНТОВАНИЕМ АКТИВАЦИЙ
-// ============================================================================
 
 __global__ void fp8_gemv_kernel(const uint8_t* __restrict__ W_fp8,
                                 const float* __restrict__ X,
@@ -110,29 +81,22 @@ __global__ void fp8_gemv_kernel(const uint8_t* __restrict__ W_fp8,
     size_t row_idx = blockIdx.x;
     const uint8_t* cur_W_row = W_fp8 + row_idx * K;
     
-    // Буферы Shared Memory для редукций
     __shared__ float shared_warp_acc[GEMV_BLOCK_SIZE / 32];
     __shared__ float s_dyn_scale;
     __shared__ float s_dyn_inv_scale;
 
-    // ------------------------------------------------------------------------
-    // ШАГ 1: Динамический поиск абсолютного максимума вектора X
-    // ------------------------------------------------------------------------
     float thread_max = 0.0f;
     for (size_t col = threadIdx.x; col < K; col += blockDim.x) {
         thread_max = fmaxf(thread_max, fabsf(X[col]));
     }
-
     float block_max = gemv_block_reduce_max(thread_max, shared_warp_acc);
 
     if (threadIdx.x == 0) {
-        // Если input_scale отсутствует, рассчитываем динамический скейл E4M3
         if (input_scale == nullptr) {
             float max_val = fmaxf(block_max, 1e-5f);
             s_dyn_scale = 448.0f / max_val;
             s_dyn_inv_scale = max_val / 448.0f;
         } else {
-            // Если скейл передан статически, квантование пропускается (коэффициенты нейтральны)
             s_dyn_scale = 1.0f;
             s_dyn_inv_scale = 1.0f;
         }
@@ -143,9 +107,6 @@ __global__ void fp8_gemv_kernel(const uint8_t* __restrict__ W_fp8,
     float d_inv_scale = s_dyn_inv_scale;
     bool apply_quant = (input_scale == nullptr);
 
-    // ------------------------------------------------------------------------
-    // ШАГ 2: Векторизованное скалярное произведение с квантованием на лету
-    // ------------------------------------------------------------------------
     float thread_acc = 0.0f;
     size_t num_vec_elems = K / 16;
     const uint4* W_vec = reinterpret_cast<const uint4*>(cur_W_row);
@@ -191,7 +152,9 @@ __global__ void fp8_gemv_kernel(const uint8_t* __restrict__ W_fp8,
     if (threadIdx.x == 0) {
         float w_scale = __bfloat162float(weight_scales[row_idx * scale_stride]);
         float i_scale = (input_scale != nullptr) ? __bfloat162float(*input_scale) : 1.0f;
-        Y[row_idx] = row_sum * w_scale * i_scale;
+        float res_val = row_sum * w_scale * i_scale;
+        // 🎯 Эмулируем прохождение активации через тензор Bfloat16
+        Y[row_idx] = __bfloat162float(__float2bfloat16(res_val));
     }
 }
 
@@ -205,17 +168,12 @@ void launch_fp8_gemv_kernel(const void* d_W_fp8,
                             int scale_stride) {
     dim3 blocks(M);
     dim3 threads(GEMV_BLOCK_SIZE);
-
     const uint8_t* w_ptr = reinterpret_cast<const uint8_t*>(d_W_fp8);
     const __nv_bfloat16* ws_ptr = reinterpret_cast<const __nv_bfloat16*>(d_weight_scales);
     const __nv_bfloat16* is_ptr = reinterpret_cast<const __nv_bfloat16*>(d_input_scale);
-
     fp8_gemv_kernel<<<blocks, threads>>>(w_ptr, d_X, ws_ptr, is_ptr, d_Y, K, scale_stride);
 }
 
-// ----------------------------------------------------------------------------
-// Остаточное ядро (Residual GEMV) с динамическим сжатием
-// ----------------------------------------------------------------------------
 __global__ void fp8_gemv_residual_warp_kernel(const uint8_t* __restrict__ W_fp8,
                                               const float* __restrict__ X,
                                               const __nv_bfloat16* __restrict__ weight_scales,
@@ -227,10 +185,8 @@ __global__ void fp8_gemv_residual_warp_kernel(const uint8_t* __restrict__ W_fp8,
 {
     size_t row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane   = threadIdx.x % 32;
-
     if (row >= M) return;
 
-    // В варп-ядре каждый варп независимо находит максимум (быстрое чтение из L1/L2)
     float warp_max = 0.0f;
     for (size_t col = lane; col < K; col += 32) {
         warp_max = fmaxf(warp_max, fabsf(X[col]));
@@ -263,7 +219,10 @@ __global__ void fp8_gemv_residual_warp_kernel(const uint8_t* __restrict__ W_fp8,
     if (lane == 0) {
         float w_scale = __bfloat162float(weight_scales[row * scale_stride]);
         float i_scale = (input_scale != nullptr) ? __bfloat162float(*input_scale) : 1.0f;
-        Y_accum[row] += dot * w_scale * i_scale;
+        
+        // 🎯 Считываем текущий аккумулятор, прибавляем инкремент и жестко округляем до Bfloat16
+        float new_acc = Y_accum[row] + (dot * w_scale * i_scale);
+        Y_accum[row] = __bfloat162float(__float2bfloat16(new_acc));
     }
 }
 
@@ -279,10 +238,8 @@ void launch_fp8_gemv_residual_kernel(const void* d_W_fp8,
     int threads = 256;
     size_t total_threads = M * 32;
     size_t blocks = (total_threads + threads - 1) / threads;
-
     const uint8_t* w_ptr = reinterpret_cast<const uint8_t*>(d_W_fp8);
     const __nv_bfloat16* ws_ptr = reinterpret_cast<const __nv_bfloat16*>(d_weight_scales);
     const __nv_bfloat16* is_ptr = reinterpret_cast<const __nv_bfloat16*>(d_input_scale);
-
     fp8_gemv_residual_warp_kernel<<<blocks, threads>>>(w_ptr, d_X, ws_ptr, is_ptr, d_Y_accum, M, K, scale_stride);
 }

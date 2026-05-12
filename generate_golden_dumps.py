@@ -26,13 +26,9 @@ def main():
     # Универсальная фабрика перехватчиков (хуков)
     def create_dump_hook(filename):
         def hook(module, input_tensor, output_tensor):
-            # Если модуль возвращает кортеж (характерно для self_attn и полных слоев), берем первый тензор
             tensor_data = output_tensor[0] if isinstance(output_tensor, tuple) else output_tensor
-            
-            # Приводим к float32, переносим в RAM и сохраняем как плоский бинарный массив
             filepath = os.path.join(dumps_dir, f"{filename}.bin")
             tensor_data.detach().cpu().float().numpy().tofile(filepath)
-            
         return hook
 
     print("[System] Registering forward hooks across all 32 transformer layers...")
@@ -42,24 +38,23 @@ def main():
 
     # 2. Послойные дампы (Внимание, MLP и полный остаточный поток)
     for i, layer in enumerate(model.model.layers):
-        # 🚨 НОВЫЕ ДАМПЫ: Входная нормализация (RMSNorm)
+        # Нормализация
         layer.input_layernorm.register_forward_hook(create_dump_hook(f"layer_{i}_input_norm"))
         layer.post_attention_layernorm.register_forward_hook(create_dump_hook(f"layer_{i}_post_attn_norm"))
 
-        # Существующие дампы...
+        # Стандартные выходы блоков
         layer.self_attn.register_forward_hook(create_dump_hook(f"layer_{i}_attn_out"))
         layer.mlp.register_forward_hook(create_dump_hook(f"layer_{i}_mlp_out"))
         layer.register_forward_hook(create_dump_hook(f"layer_{i}_accum_out"))
 
-        # 🚨 НОВЫЕ ГРАНУЛЯРНЫЕ ДАМПЫ (Внутренности Attention)
+        # Гранулярные проекции Attention
         layer.self_attn.q_proj.register_forward_hook(create_dump_hook(f"layer_{i}_q_proj"))
         layer.self_attn.k_proj.register_forward_hook(create_dump_hook(f"layer_{i}_k_proj"))
         layer.self_attn.v_proj.register_forward_hook(create_dump_hook(f"layer_{i}_v_proj"))
 
-        # 2. 🚨 НОВЫЙ PRE-HOOK: Захватываем чистую математику внимания (ДО o_proj)
+        # Pre-hook: захват чистой математики внимания (ДО o_proj)
         def create_pre_dump_hook(filename):
             def pre_hook(module, input_tuple):
-                # input_tuple[0] содержит тензор активаций, идущий прямо из формулы внимания
                 tensor_data = input_tuple[0]
                 filepath = os.path.join(dumps_dir, f"{filename}.bin")
                 tensor_data.detach().cpu().float().numpy().tofile(filepath)
@@ -67,7 +62,13 @@ def main():
 
         layer.self_attn.o_proj.register_forward_pre_hook(create_pre_dump_hook(f"layer_{i}_attn_math"))
 
-        # 🚨 НОВЫЕ ГРАНУЛЯРНЫЕ ДАМПЫ (Внутренности MLP)
+        # 🚨 НОВОЕ: Точечный дамп остаточного потока сразу после Attention для Layer 31
+        if i == 31:
+            # Поскольку o_proj возвращает проекцию внимания, мы можем перехватить её выход 
+            # (это эквивалентно выходу self_attn, который прибавляется к остаточному потоку)
+            layer.self_attn.o_proj.register_forward_hook(create_dump_hook("layer_31_post_attn"))
+
+        # Гранулярные проекции MLP
         layer.mlp.gate_proj.register_forward_hook(create_dump_hook(f"layer_{i}_gate_proj"))
         layer.mlp.up_proj.register_forward_hook(create_dump_hook(f"layer_{i}_up_proj"))
 
@@ -77,7 +78,7 @@ def main():
     # 4. Финальные логиты словаря (lm_head)
     model.lm_head.register_forward_hook(create_dump_hook("logits_out"))
 
-    # Запускаем прогон ровно на одном тестовом токене (ID = 42)
+    # Запуск прогона
     test_token_id = 128000
     print(f"\n[Engine] Executing Forward Pass for token_id: {test_token_id}...")
     
@@ -86,7 +87,6 @@ def main():
     with torch.no_grad():
         output = model(dummy_input)
 
-    # Получаем итоговый предсказанный токен для сверки
     next_token_id = output.logits[0, -1, :].argmax().item()
 
     print("--------------------------------------------------")

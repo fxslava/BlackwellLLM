@@ -4,7 +4,6 @@
 
 #define RMSNORM_BLOCK_SIZE 256
 
-// 1. Нативная редукция суммы внутри одного варпа (32 потока)
 __inline__ __device__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -13,7 +12,6 @@ __inline__ __device__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// 2. Быстрая редукция суммы на уровне всего блока (без atomicAdd)
 __inline__ __device__ float block_reduce_sum(float val, float* shared_warp_sums) {
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
@@ -26,17 +24,12 @@ __inline__ __device__ float block_reduce_sum(float val, float* shared_warp_sums)
     __syncthreads();
 
     float warp_val = (threadIdx.x < (RMSNORM_BLOCK_SIZE / 32)) ? shared_warp_sums[lane_id] : 0.0f;
-    
     if (warp_id == 0) {
         warp_val = warp_reduce_sum(warp_val);
     }
-    
     return warp_val; 
 }
 
-// ============================================================================
-// ЯДРО 1: Fused Residual RMSNorm (С поддержкой Bfloat16 весов)
-// ============================================================================
 __global__ void rmsnorm_residual_bf16_weight_kernel(float* x, 
                                                     float* residual, 
                                                     const __nv_bfloat16* weight, 
@@ -51,10 +44,11 @@ __global__ void rmsnorm_residual_bf16_weight_kernel(float* x,
         float x_val = cur_x[h];
         float res_val = cur_res[h];
         
-        // Входной поток складывается с остаточным
+        // 🎯 Сложение остаточного потока с принудительной упаковкой в сетку Bfloat16
         res_val += x_val;
-        cur_res[h] = res_val;
+        res_val = __bfloat162float(__float2bfloat16(res_val));
         
+        cur_res[h] = res_val;
         thread_sum_sq += res_val * res_val;
     }
 
@@ -69,15 +63,13 @@ __global__ void rmsnorm_residual_bf16_weight_kernel(float* x,
 
     float rsqrt = s_rsqrt;
     for (size_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
-        // Аппаратная распаковка Bfloat16 -> Float32 на лету
         float w_val = __bfloat162float(weight[h]);
-        cur_x[h] = cur_res[h] * rsqrt * w_val;
+        float out_val = cur_res[h] * rsqrt * w_val;
+        // 🎯 Выход нормализации также сохраняет семантику Bfloat16 буфера
+        cur_x[h] = __bfloat162float(__float2bfloat16(out_val));
     }
 }
 
-// ============================================================================
-// ЯДРО 2: Прямая нормализация (Оптимизирована, убран atomicAdd)
-// ============================================================================
 __global__ void rmsnorm_bf16_weight_kernel(const float* __restrict__ input,
                                            float* __restrict__ output,
                                            const __nv_bfloat16* __restrict__ weight,
@@ -94,7 +86,6 @@ __global__ void rmsnorm_bf16_weight_kernel(const float* __restrict__ input,
         thread_sum_sq += val * val;
     }
 
-    // Используем ту же быструю варп-редукцию вместо медленных атомиков
     __shared__ float shared_warp_sums[RMSNORM_BLOCK_SIZE / 32];
     float block_sum_sq = block_reduce_sum(thread_sum_sq, shared_warp_sums);
 
@@ -107,13 +98,12 @@ __global__ void rmsnorm_bf16_weight_kernel(const float* __restrict__ input,
     float rsqrt = s_rsqrt;
     for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
         float w_val = __bfloat162float(weight[idx]);
-        cur_output[idx] = cur_input[idx] * rsqrt * w_val;
+        float out_val = cur_input[idx] * rsqrt * w_val;
+        // 🎯 Гарантируем, что на вход lm_head пойдут строго усеченные значения
+        cur_output[idx] = __bfloat162float(__float2bfloat16(out_val));
     }
 }
 
-// ============================================================================
-// ОБЕРТКИ ЗАПУСКА (Принимают const void* для совместимости с VRAMArena)
-// ============================================================================
 void launch_rmsnorm_residual_kernel(float* d_x, 
                                     float* d_residual, 
                                     const void* d_weight, 
@@ -122,7 +112,6 @@ void launch_rmsnorm_residual_kernel(float* d_x,
                                     float eps) {
     dim3 blocks(seq_len);
     dim3 threads(RMSNORM_BLOCK_SIZE);
-    
     const __nv_bfloat16* bf16_w = reinterpret_cast<const __nv_bfloat16*>(d_weight);
     rmsnorm_residual_bf16_weight_kernel<<<blocks, threads>>>(d_x, d_residual, bf16_w, hidden_dim, eps);
 }

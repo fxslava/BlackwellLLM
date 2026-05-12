@@ -176,6 +176,15 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
 
         // --- 3. Выходная проекция Внимания и нормализация перед MLP ---
         engine.step_attention_out(l);
+
+        if (l == 31) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(h_gpu_buffer.data(), engine.d_X_accum, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+            std::vector<float> g_attn_out = load_golden_dump("layer_31_post_attn.bin", hidden_dim); // если есть такой дамп
+            TelemetryMetrics m = compute_vector_telemetry(g_attn_out, h_gpu_buffer);
+            std::cout << "  [Debug L31] Post-Attention RMSE: " << m.rmse << "\n";
+        }
+
         engine.step_mlp_norm(l);
 
         // --- 4. Проекции MLP (Gate & Up) ---

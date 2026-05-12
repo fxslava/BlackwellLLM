@@ -8,7 +8,6 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
                                       size_t M,
                                       size_t K)
 {
-    // 1 варп (32 потока) вычисляет логит для 1 токена словаря
     size_t row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane   = threadIdx.x % 32;
 
@@ -18,17 +17,15 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
 
     float dot = 0.0f;
     for (size_t col = lane; col < K; col += 32) {
-        // Аппаратная конвертация BF16 -> FP32 за один такт
         float w_val = __bfloat162float(cur_W_row[col]);
+        // Входной буфер X уже идеально согласован с сеткой Bfloat16 на этапе нормализации
         dot += w_val * X[col];
     }
 
-    // Редукция варпом
     for (int offset = 16; offset > 0; offset /= 2) {
         dot += __shfl_down_sync(0xffffffff, dot, offset);
     }
 
-    // Прямая запись итогового вероятностного логита
     if (lane == 0) {
         Y[row] = dot;
     }
