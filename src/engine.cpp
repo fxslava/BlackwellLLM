@@ -32,6 +32,9 @@ BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_l
     
     // 🎯 Выделяем память под буфер динамического скейла токена (scale и inv_scale)
     CUDA_CHECK(cudaMalloc(&d_token_scale, 2 * sizeof(float)));
+
+    CUDA_CHECK(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
+    CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
 }
 
 BlackwellEngine::~BlackwellEngine() {
@@ -84,8 +87,16 @@ void BlackwellEngine::step_attention_qkv_projections(int layer_idx) {
 }
 
 void BlackwellEngine::step_attention_math(int layer_idx, int pos) {
-    launch_fused_rope_kv_kernel(d_Q, d_K, d_V, arena.get_k_cache(), arena.get_v_cache(), pos, 32, 8, 128, 2048);
-    launch_attention_decoding_kernel(d_Q, arena.get_k_cache(), arena.get_v_cache(), d_Attn_out, pos, 32, 8, 128, 2048);
+    // Шаг смещения для одного слоя = (число_kv_голов * max_seq_len * head_dim) элементов.
+    // Для архитектуры Llama 3 8B: 8 голов * max_seq_len * 128
+    size_t layer_cache_offset = layer_idx * (8 * arena.get_max_seq_len() * 128);
+
+    float* d_layer_k_cache = arena.get_k_cache() + layer_cache_offset;
+    float* d_layer_v_cache = arena.get_v_cache() + layer_cache_offset;
+
+    // Передаем смещенные указатели целевого слоя
+    launch_fused_rope_kv_kernel(d_Q, d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos, 32, 8, 128, arena.get_max_seq_len(), 500000.0f);
+    launch_attention_decoding_kernel(d_Q, d_layer_k_cache, d_layer_v_cache, d_Attn_out, pos, 32, 8, 128, arena.get_max_seq_len());
 }
 
 void BlackwellEngine::step_attention_out(int layer_idx) {

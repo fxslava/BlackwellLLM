@@ -1,38 +1,40 @@
 #include "rope.cuh"
 #include <cuda_runtime.h>
 
-// Ядро обработки Query голов
+// ============================================================================
+// 1. ВРАЩЕНИЕ QUERY ГОЛОВ (Стандарт Hugging Face / rotate_half)
+// ============================================================================
 __global__ void rope_q_kernel(float* __restrict__ Q, 
                               int pos, 
                               size_t head_dim, 
                               float rope_theta) 
 {
-    // blockIdx.x - индекс головы Q
-    // threadIdx.x - индекс пары элементов внутри головы
     size_t head_idx = blockIdx.x;
-    size_t pair_idx = threadIdx.x;
-    size_t i = pair_idx * 2;
+    size_t k = threadIdx.x; // Индекс канала от 0 до (head_dim / 2 - 1)
 
-    if (i >= head_dim) return;
+    if (k >= head_dim / 2) return;
 
     float* cur_q = Q + head_idx * head_dim;
 
-    // Быстрый расчет частоты
-    float freq = __fdividef(1.0f, powf(rope_theta, __fdividef((float)i, (float)head_dim)));
+    // Базовая частота для пары k (эквивалентно исходному шагу 2 * k)
+    float freq = __fdividef(1.0f, powf(rope_theta, __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
     float angle = pos * freq;
 
     float sin_val, cos_val;
-    // sincosf - аппаратная инструкция SFU (быстрее, чем отдельные sin и cos)
     sincosf(angle, &sin_val, &cos_val);
 
-    float q0 = cur_q[i];
-    float q1 = cur_q[i + 1];
+    // 🎯 Золотой стандарт HF: считываем каналы из первой и второй половины размерности
+    float q0 = cur_q[k];
+    float q1 = cur_q[k + head_dim / 2];
 
-    cur_q[i]     = q0 * cos_val - q1 * sin_val;
-    cur_q[i + 1] = q0 * sin_val + q1 * cos_val;
+    // Применяем вращение rotate_half
+    cur_q[k]                = q0 * cos_val - q1 * sin_val;
+    cur_q[k + head_dim / 2] = q0 * sin_val + q1 * cos_val;
 }
 
-// Ядро обработки KV голов + кэширование
+// ============================================================================
+// 2. ВРАЩЕНИЕ И КЭШИРОВАННАЯ ЗАПИСЬ KV ГОЛОВ (Стандарт Hugging Face)
+// ============================================================================
 __global__ void rope_kv_append_kernel(float* __restrict__ K,
                                       const float* __restrict__ V,
                                       float* __restrict__ K_cache,
@@ -43,39 +45,39 @@ __global__ void rope_kv_append_kernel(float* __restrict__ K,
                                       float rope_theta)
 {
     size_t head_idx = blockIdx.x;
-    size_t pair_idx = threadIdx.x;
-    size_t i = pair_idx * 2;
+    size_t k = threadIdx.x;
 
-    if (i >= head_dim) return;
+    if (k >= head_dim / 2) return;
 
     float* cur_k = K + head_idx * head_dim;
     const float* cur_v = V + head_idx * head_dim;
 
-    // Смещения для глобального кэша
+    // Линейные смещения для слотов глобального кэша
     float* k_slot = K_cache + (head_idx * max_seq_len + pos) * head_dim;
     float* v_slot = V_cache + (head_idx * max_seq_len + pos) * head_dim;
 
-    float freq = __fdividef(1.0f, powf(rope_theta, __fdividef((float)i, (float)head_dim)));
+    float freq = __fdividef(1.0f, powf(rope_theta, __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
     float angle = pos * freq;
 
     float sin_val, cos_val;
     sincosf(angle, &sin_val, &cos_val);
 
-    float k0 = cur_k[i];
-    float k1 = cur_k[i + 1];
+    float k0 = cur_k[k];
+    float k1 = cur_k[k + head_dim / 2];
 
     float k0_rot = k0 * cos_val - k1 * sin_val;
     float k1_rot = k0 * sin_val + k1 * cos_val;
 
-    // Запись обновленных значений
-    cur_k[i]     = k0_rot;
-    cur_k[i + 1] = k1_rot;
+    // Записываем результат обратно в буфер операнда
+    cur_k[k]                = k0_rot;
+    cur_k[k + head_dim / 2] = k1_rot;
 
-    k_slot[i]     = k0_rot;
-    k_slot[i + 1] = k1_rot;
+    // Дублируем в линейный слот KV-кэша
+    k_slot[k]                = k0_rot;
+    k_slot[k + head_dim / 2] = k1_rot;
 
-    v_slot[i]     = cur_v[i];
-    v_slot[i + 1] = cur_v[i + 1];
+    v_slot[k]                = cur_v[k];
+    v_slot[k + head_dim / 2] = cur_v[k + head_dim / 2];
 }
 
 void launch_fused_rope_kv_kernel(
@@ -91,8 +93,6 @@ void launch_fused_rope_kv_kernel(
     size_t max_seq_len,
     float rope_theta)
 {
-    // Запускаем два параллельных ядра в одном дефолтном стриме
-    // Количество потоков = количеству пар (head_dim / 2)
     dim3 threads(head_dim / 2);
 
     rope_q_kernel<<<q_heads, threads>>>(d_Q, pos, head_dim, rope_theta);

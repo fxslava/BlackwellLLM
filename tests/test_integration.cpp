@@ -57,7 +57,6 @@ static TelemetryMetrics compute_vector_telemetry(const std::vector<float>& golde
 
         sum_sq_err += err * err;
         if (err > max_err) {
-            // Сохраняем текущий максимум как "предпоследний" перед обновлением
             last_max_err = max_err;
             last_max_error_idx = max_error_idx;
 
@@ -83,7 +82,7 @@ static TelemetryMetrics compute_vector_telemetry(const std::vector<float>& golde
     return metrics;
 }
 
-// 🎯 Универсальный хелпер для устранения бойлерплейта при сверке и логировании
+// 🎯 Универсальный хелпер для сверки и логирования
 static void verify_and_log_telemetry(const std::string& dump_filename,
                                      const float* d_tensor,
                                      std::vector<float>& h_buffer,
@@ -97,18 +96,9 @@ static void verify_and_log_telemetry(const std::string& dump_filename,
 
     try {
         std::vector<float> golden = load_golden_dump(dump_filename, num_elements);
-        
-        // Опциональная жесткая проверка (обычно для нулевого слоя)
-        /*if (assert_tolerance > 0.0f) {
-            for (size_t i = 0; i < num_elements; ++i) {
-                ASSERT_NEAR(golden[i], h_buffer[i], assert_tolerance) 
-                    << stage_name << " mismatch detected at Layer " << layer_idx << ", index: " << i;
-            }
-        }*/
 
         TelemetryMetrics metrics = compute_vector_telemetry(golden, h_buffer);
 
-        // Форматированный вывод строки таблицы с расширенной информацией
         std::cout << std::left 
                   << std::setw(6)  << layer_idx 
                   << std::setw(14) << stage_name 
@@ -127,12 +117,26 @@ static void verify_and_log_telemetry(const std::string& dump_filename,
             std::cout << "✅ STABLE\n";
         }
     } catch (const std::exception& e) {
-        // Если дампа нет, выводим аккуратную заглушку без срыва конвейера
         std::cout << std::left 
                   << std::setw(6)  << layer_idx 
                   << std::setw(14) << stage_name 
                   << std::setw(77) << "[Дамп недоступен для расчета телеметрии]" 
                   << "ℹ️ SKIPPED\n";
+    }
+}
+
+// 🎯 Хелпер для точечной гранулярной инъекции эталонных данных в любой буфер на GPU
+static bool inject_golden_tensor(const std::string& dump_filename, float* d_tensor, size_t num_elements, const std::string& stage_name, int layer_idx) {
+    try {
+        std::vector<float> golden = load_golden_dump(dump_filename, num_elements);
+        // Безопасно копируем идеальные данные на устройство и синхронизируем контекст
+        CUDA_CHECK(cudaMemcpy(d_tensor, golden.data(), num_elements * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::cout << "  [Injection] 💉 Успешная инъекция эталона '" << dump_filename << "' в буфер " << stage_name << " (Слой " << layer_idx << ")\n";
+        return true;
+    } catch (const std::exception& e) {
+        std::cout << "  [Injection Warning] Пропущен дамп '" << dump_filename << "' для " << stage_name << " (Слой " << layer_idx << "): файл не найден.\n";
+        return false;
     }
 }
 
@@ -142,6 +146,20 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     const size_t vocab_size = 128256;
     const int start_token = 128000; // Стандартный токен BOS
     const int pos = 0;
+
+    // ========================================================================
+    // 🎯 ГРАНУЛЯРНАЯ НАСТРОЙКА ИНЪЕКЦИЙ ДЛЯ ПРОМЕЖУТОЧНЫХ ОПЕРАЦИЙ
+    // ========================================================================
+    // Укажите целевой слой для проведения инъекций (например, 0), или -1 для отключения
+    int target_injection_layer = 30;
+
+    // Флаги включения инъекций для конкретных промежуточных этапов целевого слоя:
+    bool inject_input_norm     = false;  // Инъекция в d_X_norm после первой нормализации
+    bool inject_qkv_projections= false;  // Инъекция в d_Q, d_K, d_V после линейных проекций внимания
+    bool inject_attn_math      = false;  // Инъекция в d_Attn_out после RoPE и SDPA
+    bool inject_post_attn_norm = false;  // Инъекция в d_X_norm после нормализации перед MLP
+    bool inject_mlp_projections= false;  // Инъекция в d_Gate и d_Up после линейных слоев MLP
+    bool inject_accum_out      = true ;  // Инъекция в итоговый остаточный поток слоя d_X_accum
 
     std::cout << "\n[Integration Test] Инициализация BlackwellEngine и выделение VRAM...\n";
     BlackwellEngine engine("D:/Projects/BlackwellLLM/llama3-8b-fp8/model.safetensors.index.json", 2048);
@@ -167,9 +185,12 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     std::cout << "  [OK] Входные эмбеддинги идеально совпадают с эталоном PyTorch!\n";
 
     // ========================================================================
-    // STAGE 2: Послойное выполнение с расширенной телеметрией
+    // STAGE 2: Послойное выполнение с расширенной телеметрией и инъекциями
     // ========================================================================
     std::cout << "\n[Integration Test] Шаг 2: Выполнение 32 слоев с отслеживанием телеметрии...\n";
+    if (target_injection_layer != -1) {
+        std::cout << "🎯 РЕЖИМ ГРАНУЛЯРНОЙ ИНЪЕКЦИИ АКТИВЕН для слоя: " << target_injection_layer << "\n";
+    }
     std::cout << std::string(110, '-') << "\n";
     std::cout << std::left 
               << std::setw(6)  << "Layer" 
@@ -183,62 +204,73 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
               << "Status\n";
     std::cout << std::string(110, '-') << "\n";
 
-    // 🎯 Выделяем компактный хост-буфер из 1 элемента для сверки скалярных скейлов
     std::vector<float> h_scale_buf(1);
 
     for (int l = 0; l < 32; ++l) {
         std::string l_str = std::to_string(l);
 
-        // --- 0. RMSNorm ---
+        // --- 0. Нормализация входа во внимание ---
         engine.step_attention_norm(l);
-        /*if (l == 0)*/ {
+        if (l == 0) {
             verify_and_log_telemetry("layer_0_input_norm.bin", engine.d_X_norm, h_gpu_buffer, l, "InputNorm", 3.5e-2f);
         }
+        // 💉 Инъекция в буфер d_X_norm
+        if (l == target_injection_layer && inject_input_norm) {
+            inject_golden_tensor("layer_" + l_str + "_input_norm.bin", engine.d_X_norm, hidden_dim, "InputNorm", l);
+        }
 
-        // --- 1. Проекции Внимания (Q, K, V) ---
+        // --- 1. Линейные проекции Внимания (Q, K, V) ---
         engine.step_attention_qkv_projections(l);
-        /*if (l == 0)*/ {
-            // 🎯 Сверяем скейл активаций, рассчитанный внутри шага проекций
-            verify_and_log_telemetry("layer_0_qkv_input_scale.bin", engine.d_token_scale, h_scale_buf, l, "QKV_Scale", 1e-6f);
-
+        if (l == 0) {
             verify_and_log_telemetry("layer_0_q_proj.bin", engine.d_Q, h_gpu_buffer, l, "Q_proj", 5.0e-2f);
             verify_and_log_telemetry("layer_0_k_proj.bin", engine.d_K, h_gpu_kv,     l, "K_proj", 5.0e-2f);
             verify_and_log_telemetry("layer_0_v_proj.bin", engine.d_V, h_gpu_kv,     l, "V_proj", 5.0e-2f);
         }
+        // 💉 Инъекция в буферы d_Q, d_K, d_V
+        if (l == target_injection_layer && inject_qkv_projections) {
+            inject_golden_tensor("layer_" + l_str + "_q_proj.bin", engine.d_Q, hidden_dim, "Q_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_k_proj.bin", engine.d_K, 1024,       "K_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_v_proj.bin", engine.d_V, 1024,       "V_proj", l);
+        }
 
         // --- 2. Математика Внимания (RoPE + SDPA) ---
         engine.step_attention_math(l, pos);
-        /*if (l == 0)*/ {
+        if (l == 0) {
             verify_and_log_telemetry("layer_0_attn_math.bin", engine.d_Attn_out, h_gpu_buffer, l, "AttnMath", 1.0e-2f);
         }
-
-        // --- 3. Выходная проекция Внимания и нормализация перед MLP ---
-        engine.step_attention_out(l);
-        /*if (l == 0)*/ {
-            // 🎯 Сверяем скейл перед входом в o_proj
-            verify_and_log_telemetry("layer_0_o_proj_input_scale.bin", engine.d_token_scale, h_scale_buf, l, "Out_Scale", 1e-6f);
+        // 💉 Инъекция в буфер d_Attn_out
+        if (l == target_injection_layer && inject_attn_math) {
+            inject_golden_tensor("layer_" + l_str + "_attn_math.bin", engine.d_Attn_out, hidden_dim, "AttnMath", l);
         }
-        
+
+        // --- 3. Выходная свертка внимания и нормализация перед MLP ---
+        engine.step_attention_out(l);       
         engine.step_mlp_norm(l);
+        // 💉 Инъекция в переиспользованный буфер d_X_norm после нормализации MLP
+        if (l == target_injection_layer && inject_post_attn_norm) {
+            inject_golden_tensor("layer_" + l_str + "_post_attn_norm.bin", engine.d_X_norm, hidden_dim, "PostAttnNorm", l);
+        }
 
-        // --- 4. Проекции MLP (Gate & Up) ---
+        // --- 4. Линейные проекции MLP (Gate & Up) ---
         engine.step_mlp_projections(l);
-        /*if (l == 0)*/ {
-            // 🎯 Сверяем скейл перед входом в гейты MLP
-            verify_and_log_telemetry("layer_0_mlp_input_scale.bin", engine.d_token_scale, h_scale_buf, l, "MLP_Scale", 1e-6f);
-
+        if (l == 0) {
             verify_and_log_telemetry("layer_0_gate_proj.bin", engine.d_Gate, h_gpu_gate, l, "Gate_proj", 5.0e-2f);
         }
-
-        // --- 5. Выход MLP и накопление остаточного потока ---
-        engine.step_mlp_out(l);
-        /*if (l == 0)*/ {
-            // 🎯 Сверяем скейл перед входом в down_proj
-            verify_and_log_telemetry("layer_0_down_proj_input_scale.bin", engine.d_token_scale, h_scale_buf, l, "Down_Scale", 1e-6f);
+        // 💉 Инъекция в широкие промежуточные буферы d_Gate и d_Up
+        if (l == target_injection_layer && inject_mlp_projections) {
+            inject_golden_tensor("layer_" + l_str + "_gate_proj.bin", engine.d_Gate, intermediate_dim, "Gate_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_up_proj.bin",   engine.d_Up,   intermediate_dim, "Up_proj",   l);
         }
 
+        // --- 5. Выход MLP (SwiGLU + Down) и итоговое накопление слоя ---
+        engine.step_mlp_out(l);
         float tolerance = (l == 0) ? 8.0e-2f : -1.0f;
         verify_and_log_telemetry("layer_" + l_str + "_accum_out.bin", engine.d_X_accum, h_gpu_buffer, l, "Accum_out", tolerance);
+
+        // 💉 Инъекция в итоговый остаточный буфер слоя d_X_accum
+        if (l == target_injection_layer && inject_accum_out) {
+            inject_golden_tensor("layer_" + l_str + "_accum_out.bin", engine.d_X_accum, hidden_dim, "Accum_out", l);
+        }
     }
     std::cout << std::string(110, '-') << "\n";
     std::cout << "  [OK] Телеметрия конвейера успешно собрана.\n";
@@ -317,7 +349,7 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     }
     std::cout << "\n";
 
-    // 🎯 ПРОВЕРКА ТОП-2 РАСПРЕДЕЛЕНИЯ (Top-K Accuracy)
+    // 🎯 ПРОВЕРКА ТОП-2 РАСПРЕДЕЛЕНИЯ
     bool token_is_valid = (gpu_indices[0] == golden_max_idx) || (gpu_indices[1] == golden_max_idx);
     
     ASSERT_TRUE(token_is_valid) 

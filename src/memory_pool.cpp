@@ -2,7 +2,9 @@
 #include "common.h"
 #include <iostream>
 
-VRAMArena::VRAMArena(const SafetensorsLoader& loader, size_t max_seq_len) {
+VRAMArena::VRAMArena(const SafetensorsLoader& loader, size_t max_seq_len) 
+    : m_max_seq_len(max_seq_len) // Инициализируем длину контекста
+{
     std::cout << "[VRAM Arena] Initializing static memory pools...\n";
     allocate_weights_pool(loader);
     allocate_dynamic_pool(max_seq_len);
@@ -73,6 +75,7 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
 
     // Ping-Pong buffers (FP32 accumulation) allocated for the maximum possible intermediate dimension
     size_t ping_pong_bytes = intermediate_dim * sizeof(float);
+    m_activation_bytes = ping_pong_bytes; // 🎯 Сохраняем размер буферов активации
     
     CUDA_CHECK(cudaMalloc(&d_activation_A, ping_pong_bytes));
     CUDA_CHECK(cudaMalloc(&d_activation_B, ping_pong_bytes));
@@ -80,11 +83,9 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
     // Global KV-Cache calculation: [num_layers, kv_heads, max_seq_len, head_dim]
     size_t single_layer_kv_bytes = kv_heads * max_seq_len * head_dim * sizeof(float);
     size_t total_cache_bytes = num_layers * single_layer_kv_bytes;
+    m_total_cache_bytes = total_cache_bytes; // 🎯 Сохраняем размер в байтах одного пула кэша
 
-    CUDA_CHECK(cudaMalloc(&d_k_cache, total_cache_bytes));
-    CUDA_CHECK(cudaMalloc(&d_v_cache, total_cache_bytes));
-
-    // Выделение KV-кэша
+    // 🎯 ИСПРАВЛЕНО: Удалено дублирование вызовов cudaMalloc
     CUDA_CHECK(cudaMalloc(&d_k_cache, total_cache_bytes));
     CUDA_CHECK(cudaMalloc(&d_v_cache, total_cache_bytes));
 
@@ -108,8 +109,7 @@ void* VRAMArena::get_weight_ptr(const std::string& name) const {
 }
 
 const void* VRAMArena::get_weight_ptr_optional(const std::string& name) const {
-    // Assuming your class internally maps pointers using a hash map like std::unordered_map
-    auto it = weight_pointers.find(name); // Or weight_pointers.find(name) depending on your naming
+    auto it = weight_pointers.find(name);
     if (it != weight_pointers.end()) {
         return it->second;
     }

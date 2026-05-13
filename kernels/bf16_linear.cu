@@ -2,12 +2,16 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
+// ============================================================================
+// ЭТАЛОННОЕ ЯДРО GEMV ДЛЯ BFLOAT16 (Warp-Level Reduction)
+// ============================================================================
 __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
                                       const float* __restrict__ X,
                                       float* __restrict__ Y,
                                       size_t M,
                                       size_t K)
 {
+    // Каждый варп (32 потока) отвечает за одну строку матрицы (один логит)
     size_t row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane   = threadIdx.x % 32;
 
@@ -15,28 +19,36 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
 
     const __nv_bfloat16* cur_W_row = W_bf16 + row * K;
 
-    // 🎯 Используем double для поглощения произведений каналов-выбросов без потери точности
-    double dot = 0.0;
+    // Нативное накопление во float32 (использует аппаратные FMA инструкции CUDA)
+    float dot = 0.0f;
+    
     for (size_t col = lane; col < K; col += 32) {
-        double w_val = static_cast<double>(__bfloat162float(cur_W_row[col]));
-        double x_val = static_cast<double>(X[col]);
+        // Декодируем вес из Bfloat16 во Float32
+        float w_val = __bfloat162float(cur_W_row[col]);
+        
+        // Вектор X поступает из нормализации в полной точности Float32
+        float x_val = X[col];
+        
         dot += w_val * x_val;
     }
 
-    // Каскадная редукция варпа поддерживается аппаратно для double
+    // Быстрая каскадная редукция суммы внутри варпа
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         dot += __shfl_down_sync(0xffffffff, dot, offset);
     }
 
+    // Нулевой поток варпа записывает финальный ответ
     if (lane == 0) {
-        // 🎯 Золотая семантика: выход линейного слоя BF16 в PyTorch является тензором Bfloat16.
-        // Защелкиваем итоговый логит в дискретную сетку
-        float final_logit = static_cast<float>(dot);
-        Y[row] = __bfloat162float(__float2bfloat16(final_logit));
+        // Эталонное аппаратное скругление RNE (Round-to-Nearest-Even)
+        // Эмулирует поведение стандартного каста тензоров PyTorch: .to(torch.bfloat16)
+        Y[row] = __bfloat162float(__float2bfloat16(dot));
     }
 }
 
+// ============================================================================
+// ФУНКЦИЯ ЗАПУСКА
+// ============================================================================
 void launch_bf16_gemv_kernel(const void* d_W_bf16,
                              const float* d_X,
                              float* d_Y,
@@ -44,6 +56,7 @@ void launch_bf16_gemv_kernel(const void* d_W_bf16,
                              size_t K)
 {
     int threads = 256;
+    // Общее количество потоков рассчитывается так, чтобы выделить 32 потока на строку
     size_t total_threads = M * 32; 
     size_t blocks = (total_threads + threads - 1) / threads;
 

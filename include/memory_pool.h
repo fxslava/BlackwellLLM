@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <unordered_map>
@@ -30,6 +30,12 @@ public:
     float* get_k_cache() const { return d_k_cache; }
     float* get_v_cache() const { return d_v_cache; }
 
+    // 🎯 НОВЫЕ МЕТОДЫ: Получение сохраненных размеров и емкостей
+    size_t get_max_seq_len() const { return m_max_seq_len; }
+    size_t get_k_cache_size() const { return m_total_cache_bytes; }
+    size_t get_v_cache_size() const { return m_total_cache_bytes; }
+    size_t get_activation_buffer_size() const { return m_activation_bytes; }
+
 private:
     void allocate_weights_pool(const SafetensorsLoader& loader);
     void allocate_dynamic_pool(size_t max_seq_len);
@@ -45,6 +51,11 @@ private:
     // KV Cache pool
     float* d_k_cache = nullptr;
     float* d_v_cache = nullptr;
+
+    // 🎯 НОВЫЕ ПОЛЯ: Внутреннее хранение габаритов буферов
+    size_t m_max_seq_len = 0;
+    size_t m_total_cache_bytes = 0;
+    size_t m_activation_bytes = 0;
 
     // Offset registry mapping tensor names to their absolute addresses in d_weights_arena
     std::unordered_map<std::string, void*> weight_pointers;
