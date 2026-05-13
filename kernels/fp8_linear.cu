@@ -6,11 +6,11 @@
 #define GEMV_BLOCK_SIZE 256
 #define QUANT_BLOCK_SIZE 1024
 
-// 🎯 Включено для точного совпадения с динамической семантикой compressed-tensors из config.json
+// Включено для точного паритета с динамическим сжатием W8A8
 #define FORCE_ACTIVATION_QUANTIZATION true
 
 // ============================================================================
-// ЗОЛОТАЯ РЕАЛИЗАЦИЯ РАСЧЁТА СКЕЙЛА (Чистый Float32 без потери мантиссы)
+// 1. РАСЧЕТ ДИНАМИЧЕСКОГО СКЕЙЛА ТОКЕНА
 // ============================================================================
 __global__ void quantize_per_token_kernel(const float* __restrict__ X, float* __restrict__ token_scale, size_t K) {
     __shared__ float s_max_vals[32];
@@ -42,7 +42,6 @@ __global__ void quantize_per_token_kernel(const float* __restrict__ X, float* __
         }
 
         if (threadIdx.x == 0) {
-            // 🎯 Нативная логика: сохраняем полную 24-битную мантиссу Float32
             float max_val = fmaxf(block_max, 1e-12f);
             float scale = max_val / 448.0f;
             
@@ -91,6 +90,7 @@ __inline__ __device__ float device_unpack_fp8_e4m3(uint8_t byte_val) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
+// 🎯 ИСПРАВЛЕНО: Теперь возвращает ЧИСТОЕ несжатое значение сетки FP8 (без умножения на scale)
 __inline__ __device__ float golden_rne_quantize_e4m3(float x, float scale) {
     float scaled = x / scale;
     if (fabsf(scaled) < 1e-4f) return 0.0f;
@@ -114,26 +114,17 @@ __inline__ __device__ float golden_rne_quantize_e4m3(float x, float scale) {
     }
     
     uint32_t res_bits = sign | (quantized_bits << 20);
-    return __uint_as_float(res_bits) * scale; 
+    return __uint_as_float(res_bits); 
 }
 
-// 🎯 Возвращаем чистую мантиссу веса FP8 без предварительного умножения на скейл
+// Возвращает чистое значение веса FP8
 __inline__ __device__ double unpack_raw_weight_double(uint8_t byte_val) {
     return static_cast<double>(device_unpack_fp8_e4m3(byte_val));
 }
 
-/// ============================================================================
-// 🎯 НИЗКОУРОВНЕВЫЕ PTX ИНТРИНСИКИ УМНОЖЕНИЯ (Strict IEEE 754 FMA)
 // ============================================================================
-
-// Форсированный аппаратный FMA на 64-битных регистрах (double)
-__inline__ __device__ double ptx_fma_rn_f64(double a, double b, double c) {
-    double res;
-    // asm volatile гарантирует, что компилятор не выбросит и не переставит инструкцию.
-    // fma.rn.f64: d = a*b + c с точным округлением к ближайшему четному.
-    asm volatile("fma.rn.f64 %0, %1, %2, %3;" : "=d"(res) : "d"(a), "d"(b), "d"(c));
-    return res;
-}
+// 2. ЧИСТОЕ ЯДРО УМНОЖЕНИЯ (Pure Unscaled Dot Product + Epilogue)
+// ============================================================================
 
 __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
                                        const float* __restrict__ X,
@@ -152,7 +143,6 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
     bool apply_quant = (input_scale != nullptr) || FORCE_ACTIVATION_QUANTIZATION;
     float d_scale = (input_scale != nullptr) ? __bfloat162float(*input_scale) : token_scale[0];
 
-    // 4 независимых аппаратных регистра под сумматоры
     double acc_tiles[4] = {0.0, 0.0, 0.0, 0.0};
     size_t num_vec_elems = K / 16;
     const uint4* W_vec = reinterpret_cast<const uint4*>(cur_W_row);
@@ -165,6 +155,7 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
         if (apply_quant) {
             #pragma unroll
             for (int i = 0; i < 16; ++i) {
+                // x[i] теперь получает строго несжатую мантиссу
                 x[i] = golden_rne_quantize_e4m3(x_base[i], d_scale);
             }
         } else {
@@ -172,46 +163,65 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
             for (int i = 0; i < 16; ++i) x[i] = x_base[i];
         }
 
-        // 🎯 Заменяем C++ сложение на жесткие вызовы аппаратных PTX интринсиков
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.x        & 0xFF), static_cast<double>(x[0]), acc_tiles[0]);
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.x >>  8) & 0xFF), static_cast<double>(x[1]), acc_tiles[0]);
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.x >> 16) & 0xFF), static_cast<double>(x[2]), acc_tiles[0]);
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.x >> 24) & 0xFF), static_cast<double>(x[3]), acc_tiles[0]);
+        // Накапливаем чистое скалярное произведение операндов
+        acc_tiles[0] += unpack_raw_weight_double( w_chunk.x        & 0xFF) * static_cast<double>(x[0])
+                      + unpack_raw_weight_double((w_chunk.x >>  8) & 0xFF) * static_cast<double>(x[1])
+                      + unpack_raw_weight_double((w_chunk.x >> 16) & 0xFF) * static_cast<double>(x[2])
+                      + unpack_raw_weight_double((w_chunk.x >> 24) & 0xFF) * static_cast<double>(x[3]);
 
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.y        & 0xFF), static_cast<double>(x[4]), acc_tiles[1]);
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.y >>  8) & 0xFF), static_cast<double>(x[5]), acc_tiles[1]);
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.y >> 16) & 0xFF), static_cast<double>(x[6]), acc_tiles[1]);
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.y >> 24) & 0xFF), static_cast<double>(x[7]), acc_tiles[1]);
+        acc_tiles[1] += unpack_raw_weight_double( w_chunk.y        & 0xFF) * static_cast<double>(x[4])
+                      + unpack_raw_weight_double((w_chunk.y >>  8) & 0xFF) * static_cast<double>(x[5])
+                      + unpack_raw_weight_double((w_chunk.y >> 16) & 0xFF) * static_cast<double>(x[6])
+                      + unpack_raw_weight_double((w_chunk.y >> 24) & 0xFF) * static_cast<double>(x[7]);
 
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.z        & 0xFF), static_cast<double>(x[8]), acc_tiles[2]);
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.z >>  8) & 0xFF), static_cast<double>(x[9]), acc_tiles[2]);
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.z >> 16) & 0xFF), static_cast<double>(x[10]), acc_tiles[2]);
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.z >> 24) & 0xFF), static_cast<double>(x[11]), acc_tiles[2]);
+        acc_tiles[2] += unpack_raw_weight_double( w_chunk.z        & 0xFF) * static_cast<double>(x[8])
+                      + unpack_raw_weight_double((w_chunk.z >>  8) & 0xFF) * static_cast<double>(x[9])
+                      + unpack_raw_weight_double((w_chunk.z >> 16) & 0xFF) * static_cast<double>(x[10])
+                      + unpack_raw_weight_double((w_chunk.z >> 24) & 0xFF) * static_cast<double>(x[11]);
 
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.w        & 0xFF), static_cast<double>(x[12]), acc_tiles[3]);
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.w >>  8) & 0xFF), static_cast<double>(x[13]), acc_tiles[3]);
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.w >> 16) & 0xFF), static_cast<double>(x[14]), acc_tiles[3]);
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.w >> 24) & 0xFF), static_cast<double>(x[15]), acc_tiles[3]);
+        acc_tiles[3] += unpack_raw_weight_double( w_chunk.w        & 0xFF) * static_cast<double>(x[12])
+                      + unpack_raw_weight_double((w_chunk.w >>  8) & 0xFF) * static_cast<double>(x[13])
+                      + unpack_raw_weight_double((w_chunk.w >> 16) & 0xFF) * static_cast<double>(x[14])
+                      + unpack_raw_weight_double((w_chunk.w >> 24) & 0xFF) * static_cast<double>(x[15]);
     }
 
     double thread_acc = (acc_tiles[0] + acc_tiles[1]) + (acc_tiles[2] + acc_tiles[3]);
     double row_sum = gemv_block_reduce_sum_double(thread_acc, shared_warp_acc);
 
     if (threadIdx.x == 0) {
-        double scaled_final = row_sum * static_cast<double>(w_scale);
-        Y[row_idx] = __bfloat162float(__float2bfloat16(static_cast<float>(scaled_final)));
+        // 🎯 Золотой эпилог: сворачиваем скейлы и применяем к сырой сумме во float32
+        float combined_scale = w_scale * d_scale;
+        float final_res = static_cast<float>(row_sum) * combined_scale;
+
+        Y[row_idx] = __bfloat162float(__float2bfloat16(final_res));
     }
 }
 
-// 🎯 Применяем нативный PTX FMA и к остаточному ядру
+void launch_fp8_gemv_kernel(const void* d_W_fp8,
+                            const float* d_X,
+                            const void* d_weight_scales,
+                            const void* d_input_scale,
+                            const float* d_token_scale,
+                            float* d_Y,
+                            size_t M, size_t K, int scale_stride) 
+{
+    dim3 blocks(M);
+    dim3 threads(GEMV_BLOCK_SIZE);
+    fp8_gemv_splitk_kernel<<<blocks, threads>>>(
+        (const uint8_t*)d_W_fp8, d_X, (const __nv_bfloat16*)d_weight_scales,
+        (const __nv_bfloat16*)d_input_scale, d_token_scale, d_Y, K, scale_stride);
+}
+
+// ============================================================================
+// 3. ОСТАТОЧНОЕ ЯДРО (С идентичной чистой логикой)
+// ============================================================================
 __global__ void fp8_gemv_splitk_residual_kernel(const uint8_t* __restrict__ W_fp8,
                                                 const float* __restrict__ X,
                                                 const __nv_bfloat16* __restrict__ weight_scales,
                                                 const __nv_bfloat16* __restrict__ input_scale,
                                                 const float* __restrict__ token_scale,
                                                 float* __restrict__ Y_accum,
-                                                size_t K,
-                                                int scale_stride)
+                                                size_t K, int scale_stride)
 {
     size_t row_idx = blockIdx.x;
     const uint8_t* cur_W_row = W_fp8 + row_idx * K;
@@ -240,56 +250,37 @@ __global__ void fp8_gemv_splitk_residual_kernel(const uint8_t* __restrict__ W_fp
             for (int i = 0; i < 16; ++i) x[i] = x_base[i];
         }
 
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.x        & 0xFF), static_cast<double>(x[0]), acc_tiles[0]);
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.x >>  8) & 0xFF), static_cast<double>(x[1]), acc_tiles[0]);
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.x >> 16) & 0xFF), static_cast<double>(x[2]), acc_tiles[0]);
-        acc_tiles[0] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.x >> 24) & 0xFF), static_cast<double>(x[3]), acc_tiles[0]);
+        acc_tiles[0] += unpack_raw_weight_double( w_chunk.x        & 0xFF) * static_cast<double>(x[0])
+                      + unpack_raw_weight_double((w_chunk.x >>  8) & 0xFF) * static_cast<double>(x[1])
+                      + unpack_raw_weight_double((w_chunk.x >> 16) & 0xFF) * static_cast<double>(x[2])
+                      + unpack_raw_weight_double((w_chunk.x >> 24) & 0xFF) * static_cast<double>(x[3]);
 
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.y        & 0xFF), static_cast<double>(x[4]), acc_tiles[1]);
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.y >>  8) & 0xFF), static_cast<double>(x[5]), acc_tiles[1]);
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.y >> 16) & 0xFF), static_cast<double>(x[6]), acc_tiles[1]);
-        acc_tiles[1] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.y >> 24) & 0xFF), static_cast<double>(x[7]), acc_tiles[1]);
+        acc_tiles[1] += unpack_raw_weight_double( w_chunk.y        & 0xFF) * static_cast<double>(x[4])
+                      + unpack_raw_weight_double((w_chunk.y >>  8) & 0xFF) * static_cast<double>(x[5])
+                      + unpack_raw_weight_double((w_chunk.y >> 16) & 0xFF) * static_cast<double>(x[6])
+                      + unpack_raw_weight_double((w_chunk.y >> 24) & 0xFF) * static_cast<double>(x[7]);
 
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.z        & 0xFF), static_cast<double>(x[8]), acc_tiles[2]);
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.z >>  8) & 0xFF), static_cast<double>(x[9]), acc_tiles[2]);
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.z >> 16) & 0xFF), static_cast<double>(x[10]), acc_tiles[2]);
-        acc_tiles[2] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.z >> 24) & 0xFF), static_cast<double>(x[11]), acc_tiles[2]);
+        acc_tiles[2] += unpack_raw_weight_double( w_chunk.z        & 0xFF) * static_cast<double>(x[8])
+                      + unpack_raw_weight_double((w_chunk.z >>  8) & 0xFF) * static_cast<double>(x[9])
+                      + unpack_raw_weight_double((w_chunk.z >> 16) & 0xFF) * static_cast<double>(x[10])
+                      + unpack_raw_weight_double((w_chunk.z >> 24) & 0xFF) * static_cast<double>(x[11]);
 
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double( w_chunk.w        & 0xFF), static_cast<double>(x[12]), acc_tiles[3]);
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.w >>  8) & 0xFF), static_cast<double>(x[13]), acc_tiles[3]);
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.w >> 16) & 0xFF), static_cast<double>(x[14]), acc_tiles[3]);
-        acc_tiles[3] = ptx_fma_rn_f64(unpack_raw_weight_double((w_chunk.w >> 24) & 0xFF), static_cast<double>(x[15]), acc_tiles[3]);
+        acc_tiles[3] += unpack_raw_weight_double( w_chunk.w        & 0xFF) * static_cast<double>(x[12])
+                      + unpack_raw_weight_double((w_chunk.w >>  8) & 0xFF) * static_cast<double>(x[13])
+                      + unpack_raw_weight_double((w_chunk.w >> 16) & 0xFF) * static_cast<double>(x[14])
+                      + unpack_raw_weight_double((w_chunk.w >> 24) & 0xFF) * static_cast<double>(x[15]);
     }
 
     double thread_acc = (acc_tiles[0] + acc_tiles[1]) + (acc_tiles[2] + acc_tiles[3]);
     double row_sum = gemv_block_reduce_sum_double(thread_acc, shared_warp_acc);
 
     if (threadIdx.x == 0) {
-        double res_delta_double = row_sum * static_cast<double>(w_scale);
-        float res_delta_bf16 = __bfloat162float(__float2bfloat16(static_cast<float>(res_delta_double)));
-        
-        double current_accum = static_cast<double>(Y_accum[row_idx]);
-        double merged_accum = current_accum + static_cast<double>(res_delta_bf16);
-        
-        Y_accum[row_idx] = __bfloat162float(__float2bfloat16(static_cast<float>(merged_accum)));
-    }
-}
+        float combined_scale = w_scale * d_scale;
+        float final_res = static_cast<float>(row_sum) * combined_scale;
 
-void launch_fp8_gemv_kernel(const void* d_W_fp8,
-                            const float* d_X,
-                            const void* d_weight_scales,
-                            const void* d_input_scale,
-                            const float* d_token_scale,
-                            float* d_Y,
-                            size_t M,
-                            size_t K,
-                            int scale_stride) {
-    dim3 blocks(M);
-    dim3 threads(GEMV_BLOCK_SIZE);
-    const uint8_t* w_ptr = reinterpret_cast<const uint8_t*>(d_W_fp8);
-    const __nv_bfloat16* ws_ptr = reinterpret_cast<const __nv_bfloat16*>(d_weight_scales);
-    const __nv_bfloat16* is_ptr = reinterpret_cast<const __nv_bfloat16*>(d_input_scale);
-    fp8_gemv_splitk_kernel<<<blocks, threads>>>(w_ptr, d_X, ws_ptr, is_ptr, d_token_scale, d_Y, K, scale_stride);
+        float bf16_delta = __bfloat162float(__float2bfloat16(final_res));
+        Y_accum[row_idx] = __bfloat162float(__float2bfloat16(Y_accum[row_idx] + bf16_delta));
+    }
 }
 
 void launch_fp8_gemv_residual_kernel(const void* d_W_fp8,
@@ -298,14 +289,11 @@ void launch_fp8_gemv_residual_kernel(const void* d_W_fp8,
                                      const void* d_input_scale,
                                      const float* d_token_scale,
                                      float* d_Y_accum,
-                                     size_t M,
-                                     size_t K,
-                                     int scale_stride)
+                                     size_t M, size_t K, int scale_stride)
 {
     dim3 blocks(M);
     dim3 threads(GEMV_BLOCK_SIZE);
-    const uint8_t* w_ptr = reinterpret_cast<const uint8_t*>(d_W_fp8);
-    const __nv_bfloat16* ws_ptr = reinterpret_cast<const __nv_bfloat16*>(d_weight_scales);
-    const __nv_bfloat16* is_ptr = reinterpret_cast<const __nv_bfloat16*>(d_input_scale);
-    fp8_gemv_splitk_residual_kernel<<<blocks, threads>>>(w_ptr, d_X, ws_ptr, is_ptr, d_token_scale, d_Y_accum, K, scale_stride);
+    fp8_gemv_splitk_residual_kernel<<<blocks, threads>>>(
+        (const uint8_t*)d_W_fp8, d_X, (const __nv_bfloat16*)d_weight_scales,
+        (const __nv_bfloat16*)d_input_scale, d_token_scale, d_Y_accum, K, scale_stride);
 }
