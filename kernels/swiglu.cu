@@ -3,26 +3,34 @@
 
 #define SWIGLU_BLOCK_SIZE 256
 
+// 🎯 Принудительное усечение мантиссы (Truncation) для паритета с тензорами PyTorch Bfloat16
+__inline__ __device__ float cast_to_bf16_and_back(float val) {
+    unsigned int bits = __float_as_uint(val);
+    bits &= 0xFFFF0000;
+    return __uint_as_float(bits);
+}
+
 __global__ void fused_swiglu_kernel(const float* __restrict__ gate,
                                     const float* __restrict__ up,
                                     float* __restrict__ output,
                                     size_t num_elements) 
 {
-    // Глобальный индекс потока
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Grid-stride цикл для надежной обработки любых объемов данных
     for (size_t i = idx; i < num_elements; i += gridDim.x * blockDim.x) {
-        float g = gate[i];
-        float u = up[i];
+        // 🎯 Входные буферы gate и up в эталоне уже усечены до BF16
+        float g = cast_to_bf16_and_back(gate[i]);
+        float u = cast_to_bf16_and_back(up[i]);
 
-        // Быстрое вычисление: g / (1.0f + expf(-g))
-        // expf - аппаратная инструкция SFU
-        // __fdividef - быстрое аппаратное деление
+        // Аппаратный расчет SiLU
         float sigmoid = __fdividef(1.0f, 1.0f + expf(-g));
         float swish = g * sigmoid;
 
-        output[i] = swish * u;
+        // 🎯 В PyTorch результат F.silu(gate) приводится к BF16 перед умножением на up
+        float swish_bf16 = cast_to_bf16_and_back(swish);
+
+        // 🎯 Итоговый выход слоя активации также обязан быть в сетке Bfloat16
+        output[i] = cast_to_bf16_and_back(swish_bf16 * u);
     }
 }
 
@@ -31,10 +39,7 @@ void launch_fused_swiglu_kernel(const float* d_gate,
                                 float* d_output, 
                                 size_t num_elements) 
 {
-    // Расчет необходимого количества блоков для покрытия всех элементов
     unsigned int blocks = (num_elements + SWIGLU_BLOCK_SIZE - 1) / SWIGLU_BLOCK_SIZE;
-    
-    // Ограничиваем максимальное количество блоков разумным пределом для сатурации SM
     if (blocks > 1024) blocks = 1024; 
 
     dim3 grid(blocks);

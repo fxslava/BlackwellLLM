@@ -151,15 +151,15 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     // 🎯 ГРАНУЛЯРНАЯ НАСТРОЙКА ИНЪЕКЦИЙ ДЛЯ ПРОМЕЖУТОЧНЫХ ОПЕРАЦИЙ
     // ========================================================================
     // Укажите целевой слой для проведения инъекций (например, 0), или -1 для отключения
-    int target_injection_layer = 30;
+    int target_injection_layer = 31;
 
     // Флаги включения инъекций для конкретных промежуточных этапов целевого слоя:
     bool inject_input_norm     = false;  // Инъекция в d_X_norm после первой нормализации
     bool inject_qkv_projections= false;  // Инъекция в d_Q, d_K, d_V после линейных проекций внимания
     bool inject_attn_math      = false;  // Инъекция в d_Attn_out после RoPE и SDPA
     bool inject_post_attn_norm = false;  // Инъекция в d_X_norm после нормализации перед MLP
-    bool inject_mlp_projections= false;  // Инъекция в d_Gate и d_Up после линейных слоев MLP
-    bool inject_accum_out      = true ;  // Инъекция в итоговый остаточный поток слоя d_X_accum
+    bool inject_mlp_projections= true ;  // Инъекция в d_Gate и d_Up после линейных слоев MLP
+    bool inject_accum_out      = false;  // Инъекция в итоговый остаточный поток слоя d_X_accum
 
     std::cout << "\n[Integration Test] Инициализация BlackwellEngine и выделение VRAM...\n";
     BlackwellEngine engine("D:/Projects/BlackwellLLM/llama3-8b-fp8/model.safetensors.index.json", 2048);
