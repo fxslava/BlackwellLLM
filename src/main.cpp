@@ -4,10 +4,22 @@
 #include <exception>
 #include <chrono>
 #include <algorithm>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "engine.h"
 #include "tokenizer.h"
 
 int main() {
+    // === ХАК ДЛЯ КИРИЛЛИЦЫ В WINDOWS ===
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8); // Заставляем консоль выводить UTF-8
+    SetConsoleCP(CP_UTF8);       // Заставляем консоль читать UTF-8 с клавиатуры
+#endif
+    // ===================================
+
     std::cout << "==================================================\n";
     std::cout << " Blackwell LLM: Full Text-to-Text End-to-End Engine\n";
     std::cout << "==================================================\n\n";
@@ -27,7 +39,31 @@ int main() {
         std::cout << "\n==================================================\n";
         std::cout << "Enter your prompt: ";
         std::string user_prompt;
+#ifdef _WIN32
+        // Читаем сырой UTF-16 прямо из консоли Windows
+        wchar_t wbuf[4096];
+        DWORD read_chars = 0;
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        
+        // Очищаем буфер от мусора
+        FlushConsoleInputBuffer(hStdin); 
+        
+        if (ReadConsoleW(hStdin, wbuf, 4096, &read_chars, NULL)) {
+            // Отрезаем символы переноса строки (\r\n)
+            while (read_chars > 0 && (wbuf[read_chars - 1] == L'\n' || wbuf[read_chars - 1] == L'\r')) {
+                read_chars--;
+            }
+            // Конвертируем UTF-16 в правильный UTF-8 для токенизатора
+            if (read_chars > 0) {
+                int size_needed = WideCharToMultiByte(CP_UTF8, 0, wbuf, read_chars, NULL, 0, NULL, NULL);
+                user_prompt.assign(size_needed, 0);
+                WideCharToMultiByte(CP_UTF8, 0, wbuf, read_chars, &user_prompt[0], size_needed, NULL, NULL);
+            }
+        }
+#else
+        // На Linux/Mac std::cin работает с UTF-8 идеально из коробки
         std::getline(std::cin, user_prompt);
+#endif
         
         if (user_prompt.empty()) {
             user_prompt = "Hello llama!"; // Дефолтный фолбэк
