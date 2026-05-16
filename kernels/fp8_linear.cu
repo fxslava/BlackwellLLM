@@ -1,20 +1,15 @@
 #include "fp8_linear.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cmath>
 
 #define GEMV_BLOCK_SIZE 256
 #define QUANT_BLOCK_SIZE 1024
 
-// Включено для точного паритета с динамическим сжатием W8A8
-#define FORCE_ACTIVATION_QUANTIZATION true
-
-__inline__ __device__ float cast_to_bf16_and_back(float val) {
-    return __bfloat162float(__float2bfloat16(val));
-    /*unsigned int bits = __float_as_uint(val);
-    bits &= 0xFFFF0000;
-    return __uint_as_float(bits);*/
-}
+// 🎯 ОТКЛЮЧАЕМ принудительную квантизацию активаций. 
+// Теперь, если модель позволяет, мы будем умножать чистые FP32 активации на распакованные FP8 веса (Weight-Only режим)!
+#define FORCE_ACTIVATION_QUANTIZATION false
 
 // ============================================================================
 // 1. РАСЧЕТ ДИНАМИЧЕСКОГО СКЕЙЛА ТОКЕНА
@@ -69,28 +64,24 @@ __inline__ __device__ float gemv_block_reduce_sum(float val, float* shared_warp_
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
 
-    // 1. Локальная редукция внутри варпа остается в быстрых регистрах float32
+    // 1. Локальная редукция внутри варпа в чистом float32
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
     }
 
-    // 🎯 ЭМУЛЯЦИЯ cuBLASLt: перед выгрузкой в Shared Memory варп-сумма 
-    // защелкивается в аппаратную сетку Bfloat16
     if (lane_id == 0) {
         shared_warp_sums[warp_id] = val;
     }
     __syncthreads();
 
-    // 2. Нулевой варп считывает усеченные BF16-блоки и дособирает ответ
+    // 2. Нулевой варп дособирает ответ в чистом float32
     float warp_val = (threadIdx.x < (GEMV_BLOCK_SIZE / 32)) ? shared_warp_sums[lane_id] : 0.0f;
     if (warp_id == 0) {
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             warp_val += __shfl_down_sync(0xFFFFFFFF, warp_val, offset);
         }
-        // Итоговую сумму блока перед выходом из редукции также выравниваем
-        //warp_val = cast_to_bf16_and_back(warp_val);
     }
     return warp_val;
 }
@@ -105,23 +96,13 @@ __inline__ __device__ float device_unpack_fp8_e4m3(uint8_t byte_val) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
-#include <cuda_fp8.h>
-
 __inline__ __device__ float golden_hardware_quantize_e4m3(float x, float scale) {
     float scaled = x / scale;
-    
-    // Защита от бесконечности (встроенный интринсик требует предварительного clamp до ±448)
     scaled = fminf(fmaxf(scaled, -448.0f), 448.0f);
-
-    // 1. Аппаратная конвертация float32 -> FP8 (E4M3) с округлением RNE
-    // Под капотом вызывается 1 такт PTX: cvt.rn.satfinite.e4m3x2.f32
     __nv_fp8_e4m3 fp8_val(scaled);
-
-    // 2. Аппаратная деквантизация обратно во float32
     return static_cast<float>(fp8_val);
 }
 
-// Возвращает чистое значение веса FP8 во float
 __inline__ __device__ float unpack_raw_weight(uint8_t byte_val) {
     return device_unpack_fp8_e4m3(byte_val);
 }
@@ -147,6 +128,7 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
     bool apply_quant = (input_scale != nullptr) || FORCE_ACTIVATION_QUANTIZATION;
     float d_scale = (input_scale != nullptr) ? __bfloat162float(*input_scale) : token_scale[0];
 
+    // 🎯 Аккумуляторы работают в полном 32-битном разрешении
     float acc_tiles[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     size_t num_vec_elems = K / 16;
     const uint4* W_vec = reinterpret_cast<const uint4*>(cur_W_row);
@@ -159,15 +141,15 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
         if (apply_quant) {
             #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                // x[i] теперь получает строго несжатую мантиссу
                 x[i] = golden_hardware_quantize_e4m3(x_base[i], d_scale);
             }
         } else {
+            // 🎯 Идеальная точность: читаем FP32 активации напрямую
             #pragma unroll
             for (int i = 0; i < 16; ++i) x[i] = x_base[i];
         }
 
-        // Накапливаем чистое скалярное произведение операндов во float
+        // Fused Multiply-Add (FMA) выполняется аппаратно в FP32
         acc_tiles[0] += unpack_raw_weight( w_chunk.x        & 0xFF) * x[0]
                       + unpack_raw_weight((w_chunk.x >>  8) & 0xFF) * x[1]
                       + unpack_raw_weight((w_chunk.x >> 16) & 0xFF) * x[2]
@@ -189,15 +171,13 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
                       + unpack_raw_weight((w_chunk.w >> 24) & 0xFF) * x[15];
     }
 
-    float thread_acc = (acc_tiles[0] + acc_tiles[1]) + (acc_tiles[2] + acc_tiles[3]);
+    float thread_acc = acc_tiles[0] + acc_tiles[1] + acc_tiles[2] + acc_tiles[3];
     float row_sum = gemv_block_reduce_sum(thread_acc, shared_warp_acc);
 
     if (threadIdx.x == 0) {
-        // 🎯 Золотой эпилог: сворачиваем скейлы и применяем к сырой сумме во float32
-        float combined_scale = w_scale * d_scale;
-        float final_res = row_sum * combined_scale;
-
-        Y[row_idx] = cast_to_bf16_and_back(final_res);
+        float combined_scale = w_scale * (apply_quant ? d_scale : 1.0f);
+        // 🎯 Чистая запись в глобальную память без искажений
+        Y[row_idx] = row_sum * combined_scale;
     }
 }
 
@@ -275,15 +255,16 @@ __global__ void fp8_gemv_splitk_residual_kernel(const uint8_t* __restrict__ W_fp
                       + unpack_raw_weight((w_chunk.w >> 24) & 0xFF) * x[15];
     }
 
-    float thread_acc = cast_to_bf16_and_back(cast_to_bf16_and_back(acc_tiles[0] + acc_tiles[1]) + cast_to_bf16_and_back(acc_tiles[2] + acc_tiles[3]));
+    // 🎯 Чистое сложение без обрезания до BF16
+    float thread_acc = acc_tiles[0] + acc_tiles[1] + acc_tiles[2] + acc_tiles[3];
     float row_sum = gemv_block_reduce_sum(thread_acc, shared_warp_acc);
 
     if (threadIdx.x == 0) {
-        float combined_scale = w_scale * d_scale;
+        float combined_scale = w_scale * (apply_quant ? d_scale : 1.0f);
         float final_res = row_sum * combined_scale;
 
-        float bf16_delta = __bfloat162float(__float2bfloat16(final_res));
-        Y_accum[row_idx] = __bfloat162float(__float2bfloat16(Y_accum[row_idx] + bf16_delta));
+        // 🎯 Прямое накопление остатка (Residual Accumulation) в 32 битах
+        Y_accum[row_idx] += final_res;
     }
 }
 

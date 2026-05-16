@@ -5,67 +5,97 @@
 #include <chrono>
 #include <algorithm>
 #include "engine.h"
-#include "tokenizer.h" // 🎯 Подключаем наш кастомный токенизатор
+#include "tokenizer.h"
 
 int main() {
     std::cout << "==================================================\n";
-    std::cout << " Blackwell LLM: Autoregressive Generation Engine\n";
+    std::cout << " Blackwell LLM: Full Text-to-Text End-to-End Engine\n";
     std::cout << "==================================================\n\n";
 
     try {
         std::string index_path = "llama3-8b-fp8/model.safetensors.index.json";
-        std::string vocab_path = "llama3-8b-fp8/tokenizer.json"; // 🎯 Путь к JSON конфигурации BPE
+        std::string vocab_path = "llama3-8b-fp8/tokenizer.json"; 
         size_t max_context = 2048;
         
-        std::cout << "[System] Loading Llama 3 BPE Vocabulary mappings...\n";
+        std::cout << "[System] Loading Llama 3 BPE Mappings...\n";
         LlamaTokenizer tokenizer(vocab_path);
 
         std::cout << "[System] Initializing BlackwellEngine and static VRAM Arena...\n";
         BlackwellEngine engine(index_path, max_context);
 
-        // Хардкодим промпт. 128000 - это <|begin_of_text|>
-        std::vector<int> prompt_tokens = {128000, 9906, 94776, 0}; 
+        // ЖИВОЙ ВВОД ПРОМПТА ИЗ КОНСОЛИ
+        std::cout << "\n==================================================\n";
+        std::cout << "Enter your prompt: ";
+        std::string user_prompt;
+        std::getline(std::cin, user_prompt);
         
-        // EOS токены Llama 3.1
+        if (user_prompt.empty()) {
+            user_prompt = "Hello llama!"; // Дефолтный фолбэк
+        }
+
+        // --- 1. ТОКЕНИЗАЦИЯ ВХОДНОГО ТЕКСТА ---
+        std::vector<int> prompt_tokens;
+        
+        // 1. Заголовок пользователя
+        prompt_tokens.push_back(128000); // <|begin_of_text|>
+        prompt_tokens.push_back(128006); // <|start_header_id|>
+        prompt_tokens.push_back(882);    // "user"
+        prompt_tokens.push_back(128007); // <|end_header_id|>
+        prompt_tokens.push_back(271);    // "\n\n"
+        
+        // 2. Текст пользователя (без BOS, так как мы его уже добавили)
+        std::vector<int> user_text_ids = tokenizer.encode(user_prompt, false);
+        prompt_tokens.insert(prompt_tokens.end(), user_text_ids.begin(), user_text_ids.end());
+        
+        // 3. Заголовок ассистента (призыв к ответу)
+        prompt_tokens.push_back(128009); // <|eot_id|> (Конец реплики юзера)
+        prompt_tokens.push_back(128006); // <|start_header_id|>
+        prompt_tokens.push_back(78191);  // "assistant"
+        prompt_tokens.push_back(128007); // <|end_header_id|>
+        prompt_tokens.push_back(271);    // "\n\n"
+        
+        std::cout << "\n[Tokenizer] Encoded Prompt IDs: ";
+        for (int id : prompt_tokens) {
+            std::cout << id << " ";
+        }
+        std::cout << "\n";
+        
+        // EOS токены остановки Llama 3
         std::vector<int> eos_tokens = {128001, 128008, 128009};
         
         int current_pos = 0;
         int next_token = -1;
 
-        std::cout << "\n[Engine] Phase 1: Prefill (Processing prompt)...\n";
-        std::cout << "Prompt IDs: ";
+        std::cout << "\n[Engine] Phase 1: Prefill (Processing prompt)... \n";
         
-        // --- 1. PREFILL PHASE ---
+        // --- 2. PREFILL PHASE ---
         for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-            std::cout << prompt_tokens[i] << " " << std::flush;
             next_token = engine.forward(prompt_tokens[i], current_pos);
             current_pos++;
         }
 
-        std::cout << "\n\n[Engine] Phase 2: Decoding (Autoregressive generation)...";
+        std::cout << "\n[Engine] Phase 2: Decoding (Autoregressive generation)...";
         std::cout << "\n--------------------------------------------------\n";
-        std::cout << "[Blackwell LLM Output]: "; // 🎯 Подготавливаем красивый вывод текста
+        std::cout << "[Blackwell LLM]: "; 
         
         std::vector<int> generated_tokens;
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        // --- 2. DECODING PHASE ---
+        // --- 3. DECODING PHASE (Streaming) ---
         while (current_pos < max_context) {
-            // Проверяем, не сгенерировала ли сеть токен конца текста
+            // Проверяем токен конца генерации
             if (std::find(eos_tokens.begin(), eos_tokens.end(), next_token) != eos_tokens.end()) {
-                // 🎯 Наш decode внутри tokenizer.cpp сам выведет красивый тег [EOS], так что здесь просто выходим
-                tokenizer.decode(next_token); 
+                tokenizer.decode(next_token); // Наш декодер красиво напечатает [EOS]
                 break;
             }
 
-            // Сохраняем токен
             generated_tokens.push_back(next_token);
             
-            // 🎯 ДЕКОДИРУЕМ И СТРИМИМ: Превращаем ID в сырые байты, чистим UTF-8 маски и сразу кидаем в stdout
+            // Декодируем текущий токен и мгновенно выводим в консоль
             std::string text_piece = tokenizer.decode(next_token);
             std::cout << text_piece << std::flush;
 
-            // Кормим сгенерированный токен обратно в сеть
+            // Передаём токен обратно на следующий шаг инференса
             next_token = engine.forward(next_token, current_pos);
             current_pos++;
         }
@@ -79,9 +109,9 @@ int main() {
             std::cout << "[System] Reached maximum context length (" << max_context << ").\n";
         }
 
-        // Выводим статистику производительности
+        // Выводим статистику скорости
         double tokens_per_sec = generated_tokens.size() / duration.count();
-        std::cout << "[STATISTICS]\n";
+        std::cout << "[PERFORMANCE STATS]\n";
         std::cout << "  Prompt tokens:    " << prompt_tokens.size() << "\n";
         std::cout << "  Generated tokens: " << generated_tokens.size() << "\n";
         std::cout << "  Generation speed: " << tokens_per_sec << " tokens/sec\n";

@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 
 // ============================================================================
-// ЭТАЛОННОЕ ЯДРО GEMV ДЛЯ BFLOAT16 (Warp-Level Reduction)
+// ЭТАЛОННОЕ ЯДРО GEMV ДЛЯ BFLOAT16 (Warp-Level Reduction) - МАКСИМАЛЬНАЯ ТОЧНОСТЬ
 // ============================================================================
 __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
                                       const float* __restrict__ X,
@@ -11,7 +11,7 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
                                       size_t M,
                                       size_t K)
 {
-    // Каждый варп (32 потока) отвечает за одну строку матрицы (один логит)
+    // Каждый варп (32 потока) отвечает за одну строку матрицы
     size_t row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane   = threadIdx.x % 32;
 
@@ -29,6 +29,7 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
         // Вектор X поступает из нормализации в полной точности Float32
         float x_val = X[col];
         
+        // Математика идет без потерь в 32 битах
         dot += w_val * x_val;
     }
 
@@ -40,9 +41,9 @@ __global__ void bf16_gemv_warp_kernel(const __nv_bfloat16* __restrict__ W_bf16,
 
     // Нулевой поток варпа записывает финальный ответ
     if (lane == 0) {
-        // Эталонное аппаратное скругление RNE (Round-to-Nearest-Even)
-        // Эмулирует поведение стандартного каста тензоров PyTorch: .to(torch.bfloat16)
-        Y[row] = __bfloat162float(__float2bfloat16(dot));
+        // 🎯 ИСПРАВЛЕНО: Пишем чистый FP32 без искусственного урезания до BF16!
+        // Теперь Softmax механизма внимания получит идеальные, неискаженные данные.
+        Y[row] = dot;
     }
 }
 
