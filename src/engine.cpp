@@ -160,15 +160,15 @@ void BlackwellEngine::step_final_ops() {
     launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, hidden_dim);
 
     const void* d_head_w = arena.get_weight_ptr("lm_head.weight");
+    // Вычисляем логиты. Результат остается лежать в массиве d_logits на GPU
     launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, vocab_size, hidden_dim);
-    
-    launch_argmax_kernel(d_logits, d_next_token, vocab_size);
 }
 
 // ============================================================================
 // Full Engine Inference
 // ============================================================================
-int BlackwellEngine::forward(int token_id, int pos) {
+// Добавляем параметры сэмплирования прямо в forward (со значениями по умолчанию)
+int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p) {
     step_embedding(token_id);
     
     for (size_t i = 0; i < num_layers; ++i) {
@@ -182,9 +182,12 @@ int BlackwellEngine::forward(int token_id, int pos) {
         step_mlp_out(i);
     }
     
+    // Подготавливаем логиты
     step_final_ops();
 
-    int next_id;
-    CUDA_CHECK(cudaMemcpy(&next_id, d_next_token, sizeof(int), cudaMemcpyDeviceToHost));
+    // 🎯 ЗАПУСКАЕМ НАШ НОВЫЙ CPU/GPU СЭМПЛЕР
+    // Он сам скачает логиты, применит температуру, softmax, отсечение top-p и выберет токен
+    int next_id = sample_top_p(d_logits, vocab_size, temperature, top_p);
+    
     return next_id;
 }

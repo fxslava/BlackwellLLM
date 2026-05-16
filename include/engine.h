@@ -11,7 +11,7 @@ public:
     ~BlackwellEngine();
 
     // Публичный метод для работы в чате
-    int forward(int token_id, int pos);
+    int forward(int token_id, int pos, float temperature = 0.6f, float top_p = 0.9f);
 
 private:
     // Даем тестам доступ к приватным методам и буферам
