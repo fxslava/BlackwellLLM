@@ -9,6 +9,13 @@
 // Включено для точного паритета с динамическим сжатием W8A8
 #define FORCE_ACTIVATION_QUANTIZATION true
 
+__inline__ __device__ float cast_to_bf16_and_back(float val) {
+    return __bfloat162float(__float2bfloat16(val));
+    /*unsigned int bits = __float_as_uint(val);
+    bits &= 0xFFFF0000;
+    return __uint_as_float(bits);*/
+}
+
 // ============================================================================
 // 1. РАСЧЕТ ДИНАМИЧЕСКОГО СКЕЙЛА ТОКЕНА
 // ============================================================================
@@ -58,24 +65,32 @@ void launch_quantize_per_token_kernel(const float* d_X, float* d_token_scale, si
 // ============================================================================
 // ВНУТРЕННИЕ ФУНКЦИИ РЕДУКЦИИ И РАСПАКОВКИ
 // ============================================================================
-__inline__ __device__ double gemv_block_reduce_sum_double(double val, double* shared_warp_sums) {
+__inline__ __device__ float gemv_block_reduce_sum(float val, float* shared_warp_sums) {
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
 
+    // 1. Локальная редукция внутри варпа остается в быстрых регистрах float32
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
     }
 
-    if (lane_id == 0) shared_warp_sums[warp_id] = val;
+    // 🎯 ЭМУЛЯЦИЯ cuBLASLt: перед выгрузкой в Shared Memory варп-сумма 
+    // защелкивается в аппаратную сетку Bfloat16
+    if (lane_id == 0) {
+        shared_warp_sums[warp_id] = val;
+    }
     __syncthreads();
 
-    double warp_val = (threadIdx.x < (GEMV_BLOCK_SIZE / 32)) ? shared_warp_sums[lane_id] : 0.0;
+    // 2. Нулевой варп считывает усеченные BF16-блоки и дособирает ответ
+    float warp_val = (threadIdx.x < (GEMV_BLOCK_SIZE / 32)) ? shared_warp_sums[lane_id] : 0.0f;
     if (warp_id == 0) {
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             warp_val += __shfl_down_sync(0xFFFFFFFF, warp_val, offset);
         }
+        // Итоговую сумму блока перед выходом из редукции также выравниваем
+        //warp_val = cast_to_bf16_and_back(warp_val);
     }
     return warp_val;
 }
@@ -90,36 +105,25 @@ __inline__ __device__ float device_unpack_fp8_e4m3(uint8_t byte_val) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
-// 🎯 ИСПРАВЛЕНО: Теперь возвращает ЧИСТОЕ несжатое значение сетки FP8 (без умножения на scale)
-__inline__ __device__ float golden_rne_quantize_e4m3(float x, float scale) {
-    float scaled = x / scale;
-    if (fabsf(scaled) < 1e-4f) return 0.0f;
+#include <cuda_fp8.h>
 
+__inline__ __device__ float golden_hardware_quantize_e4m3(float x, float scale) {
+    float scaled = x / scale;
+    
+    // Защита от бесконечности (встроенный интринсик требует предварительного clamp до ±448)
     scaled = fminf(fmaxf(scaled, -448.0f), 448.0f);
-    
-    uint32_t bits = __float_as_uint(scaled);
-    uint32_t sign = bits & 0x80000000;
-    uint32_t abs_bits = bits & 0x7FFFFFFF;
-    
-    uint32_t round_bit = (abs_bits >> 19) & 1;
-    uint32_t sticky_bits = abs_bits & 0x0007FFFF;
-    uint32_t lsb = (abs_bits >> 20) & 1;
-    
-    uint32_t quantized_bits = abs_bits >> 20;
-    
-    if (round_bit) {
-        if (sticky_bits || lsb) {
-            quantized_bits++;
-        }
-    }
-    
-    uint32_t res_bits = sign | (quantized_bits << 20);
-    return __uint_as_float(res_bits); 
+
+    // 1. Аппаратная конвертация float32 -> FP8 (E4M3) с округлением RNE
+    // Под капотом вызывается 1 такт PTX: cvt.rn.satfinite.e4m3x2.f32
+    __nv_fp8_e4m3 fp8_val(scaled);
+
+    // 2. Аппаратная деквантизация обратно во float32
+    return static_cast<float>(fp8_val);
 }
 
-// Возвращает чистое значение веса FP8
-__inline__ __device__ double unpack_raw_weight_double(uint8_t byte_val) {
-    return static_cast<double>(device_unpack_fp8_e4m3(byte_val));
+// Возвращает чистое значение веса FP8 во float
+__inline__ __device__ float unpack_raw_weight(uint8_t byte_val) {
+    return device_unpack_fp8_e4m3(byte_val);
 }
 
 // ============================================================================
@@ -137,13 +141,13 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
 {
     size_t row_idx = blockIdx.x;
     const uint8_t* cur_W_row = W_fp8 + row_idx * K;
-    __shared__ double shared_warp_acc[GEMV_BLOCK_SIZE / 32];
+    __shared__ float shared_warp_acc[GEMV_BLOCK_SIZE / 32];
 
     float w_scale = __bfloat162float(weight_scales[row_idx * scale_stride]);
     bool apply_quant = (input_scale != nullptr) || FORCE_ACTIVATION_QUANTIZATION;
     float d_scale = (input_scale != nullptr) ? __bfloat162float(*input_scale) : token_scale[0];
 
-    double acc_tiles[4] = {0.0, 0.0, 0.0, 0.0};
+    float acc_tiles[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     size_t num_vec_elems = K / 16;
     const uint4* W_vec = reinterpret_cast<const uint4*>(cur_W_row);
 
@@ -156,44 +160,44 @@ __global__ void fp8_gemv_splitk_kernel(const uint8_t* __restrict__ W_fp8,
             #pragma unroll
             for (int i = 0; i < 16; ++i) {
                 // x[i] теперь получает строго несжатую мантиссу
-                x[i] = golden_rne_quantize_e4m3(x_base[i], d_scale);
+                x[i] = golden_hardware_quantize_e4m3(x_base[i], d_scale);
             }
         } else {
             #pragma unroll
             for (int i = 0; i < 16; ++i) x[i] = x_base[i];
         }
 
-        // Накапливаем чистое скалярное произведение операндов
-        acc_tiles[0] += unpack_raw_weight_double( w_chunk.x        & 0xFF) * static_cast<double>(x[0])
-                      + unpack_raw_weight_double((w_chunk.x >>  8) & 0xFF) * static_cast<double>(x[1])
-                      + unpack_raw_weight_double((w_chunk.x >> 16) & 0xFF) * static_cast<double>(x[2])
-                      + unpack_raw_weight_double((w_chunk.x >> 24) & 0xFF) * static_cast<double>(x[3]);
+        // Накапливаем чистое скалярное произведение операндов во float
+        acc_tiles[0] += unpack_raw_weight( w_chunk.x        & 0xFF) * x[0]
+                      + unpack_raw_weight((w_chunk.x >>  8) & 0xFF) * x[1]
+                      + unpack_raw_weight((w_chunk.x >> 16) & 0xFF) * x[2]
+                      + unpack_raw_weight((w_chunk.x >> 24) & 0xFF) * x[3];
 
-        acc_tiles[1] += unpack_raw_weight_double( w_chunk.y        & 0xFF) * static_cast<double>(x[4])
-                      + unpack_raw_weight_double((w_chunk.y >>  8) & 0xFF) * static_cast<double>(x[5])
-                      + unpack_raw_weight_double((w_chunk.y >> 16) & 0xFF) * static_cast<double>(x[6])
-                      + unpack_raw_weight_double((w_chunk.y >> 24) & 0xFF) * static_cast<double>(x[7]);
+        acc_tiles[1] += unpack_raw_weight( w_chunk.y        & 0xFF) * x[4]
+                      + unpack_raw_weight((w_chunk.y >>  8) & 0xFF) * x[5]
+                      + unpack_raw_weight((w_chunk.y >> 16) & 0xFF) * x[6]
+                      + unpack_raw_weight((w_chunk.y >> 24) & 0xFF) * x[7];
 
-        acc_tiles[2] += unpack_raw_weight_double( w_chunk.z        & 0xFF) * static_cast<double>(x[8])
-                      + unpack_raw_weight_double((w_chunk.z >>  8) & 0xFF) * static_cast<double>(x[9])
-                      + unpack_raw_weight_double((w_chunk.z >> 16) & 0xFF) * static_cast<double>(x[10])
-                      + unpack_raw_weight_double((w_chunk.z >> 24) & 0xFF) * static_cast<double>(x[11]);
+        acc_tiles[2] += unpack_raw_weight( w_chunk.z        & 0xFF) * x[8]
+                      + unpack_raw_weight((w_chunk.z >>  8) & 0xFF) * x[9]
+                      + unpack_raw_weight((w_chunk.z >> 16) & 0xFF) * x[10]
+                      + unpack_raw_weight((w_chunk.z >> 24) & 0xFF) * x[11];
 
-        acc_tiles[3] += unpack_raw_weight_double( w_chunk.w        & 0xFF) * static_cast<double>(x[12])
-                      + unpack_raw_weight_double((w_chunk.w >>  8) & 0xFF) * static_cast<double>(x[13])
-                      + unpack_raw_weight_double((w_chunk.w >> 16) & 0xFF) * static_cast<double>(x[14])
-                      + unpack_raw_weight_double((w_chunk.w >> 24) & 0xFF) * static_cast<double>(x[15]);
+        acc_tiles[3] += unpack_raw_weight( w_chunk.w        & 0xFF) * x[12]
+                      + unpack_raw_weight((w_chunk.w >>  8) & 0xFF) * x[13]
+                      + unpack_raw_weight((w_chunk.w >> 16) & 0xFF) * x[14]
+                      + unpack_raw_weight((w_chunk.w >> 24) & 0xFF) * x[15];
     }
 
-    double thread_acc = (acc_tiles[0] + acc_tiles[1]) + (acc_tiles[2] + acc_tiles[3]);
-    double row_sum = gemv_block_reduce_sum_double(thread_acc, shared_warp_acc);
+    float thread_acc = (acc_tiles[0] + acc_tiles[1]) + (acc_tiles[2] + acc_tiles[3]);
+    float row_sum = gemv_block_reduce_sum(thread_acc, shared_warp_acc);
 
     if (threadIdx.x == 0) {
         // 🎯 Золотой эпилог: сворачиваем скейлы и применяем к сырой сумме во float32
         float combined_scale = w_scale * d_scale;
-        float final_res = static_cast<float>(row_sum) * combined_scale;
+        float final_res = row_sum * combined_scale;
 
-        Y[row_idx] = __bfloat162float(__float2bfloat16(final_res));
+        Y[row_idx] = cast_to_bf16_and_back(final_res);
     }
 }
 
@@ -213,7 +217,7 @@ void launch_fp8_gemv_kernel(const void* d_W_fp8,
 }
 
 // ============================================================================
-// 3. ОСТАТОЧНОЕ ЯДРО (С идентичной чистой логикой)
+// 3. ОСТАТОЧНОЕ ЯДРО (С идентичной чистой логикой на float)
 // ============================================================================
 __global__ void fp8_gemv_splitk_residual_kernel(const uint8_t* __restrict__ W_fp8,
                                                 const float* __restrict__ X,
@@ -225,13 +229,13 @@ __global__ void fp8_gemv_splitk_residual_kernel(const uint8_t* __restrict__ W_fp
 {
     size_t row_idx = blockIdx.x;
     const uint8_t* cur_W_row = W_fp8 + row_idx * K;
-    __shared__ double shared_warp_acc[GEMV_BLOCK_SIZE / 32];
+    __shared__ float shared_warp_acc[GEMV_BLOCK_SIZE / 32];
 
     float w_scale = __bfloat162float(weight_scales[row_idx * scale_stride]);
     bool apply_quant = (input_scale != nullptr) || FORCE_ACTIVATION_QUANTIZATION;
     float d_scale = (input_scale != nullptr) ? __bfloat162float(*input_scale) : token_scale[0];
 
-    double acc_tiles[4] = {0.0, 0.0, 0.0, 0.0};
+    float acc_tiles[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     size_t num_vec_elems = K / 16;
     const uint4* W_vec = reinterpret_cast<const uint4*>(cur_W_row);
 
@@ -243,40 +247,40 @@ __global__ void fp8_gemv_splitk_residual_kernel(const uint8_t* __restrict__ W_fp
         if (apply_quant) {
             #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                x[i] = golden_rne_quantize_e4m3(x_base[i], d_scale);
+                x[i] = golden_hardware_quantize_e4m3(x_base[i], d_scale);
             }
         } else {
             #pragma unroll
             for (int i = 0; i < 16; ++i) x[i] = x_base[i];
         }
 
-        acc_tiles[0] += unpack_raw_weight_double( w_chunk.x        & 0xFF) * static_cast<double>(x[0])
-                      + unpack_raw_weight_double((w_chunk.x >>  8) & 0xFF) * static_cast<double>(x[1])
-                      + unpack_raw_weight_double((w_chunk.x >> 16) & 0xFF) * static_cast<double>(x[2])
-                      + unpack_raw_weight_double((w_chunk.x >> 24) & 0xFF) * static_cast<double>(x[3]);
+        acc_tiles[0] += unpack_raw_weight( w_chunk.x        & 0xFF) * x[0]
+                      + unpack_raw_weight((w_chunk.x >>  8) & 0xFF) * x[1]
+                      + unpack_raw_weight((w_chunk.x >> 16) & 0xFF) * x[2]
+                      + unpack_raw_weight((w_chunk.x >> 24) & 0xFF) * x[3];
 
-        acc_tiles[1] += unpack_raw_weight_double( w_chunk.y        & 0xFF) * static_cast<double>(x[4])
-                      + unpack_raw_weight_double((w_chunk.y >>  8) & 0xFF) * static_cast<double>(x[5])
-                      + unpack_raw_weight_double((w_chunk.y >> 16) & 0xFF) * static_cast<double>(x[6])
-                      + unpack_raw_weight_double((w_chunk.y >> 24) & 0xFF) * static_cast<double>(x[7]);
+        acc_tiles[1] += unpack_raw_weight( w_chunk.y        & 0xFF) * x[4]
+                      + unpack_raw_weight((w_chunk.y >>  8) & 0xFF) * x[5]
+                      + unpack_raw_weight((w_chunk.y >> 16) & 0xFF) * x[6]
+                      + unpack_raw_weight((w_chunk.y >> 24) & 0xFF) * x[7];
 
-        acc_tiles[2] += unpack_raw_weight_double( w_chunk.z        & 0xFF) * static_cast<double>(x[8])
-                      + unpack_raw_weight_double((w_chunk.z >>  8) & 0xFF) * static_cast<double>(x[9])
-                      + unpack_raw_weight_double((w_chunk.z >> 16) & 0xFF) * static_cast<double>(x[10])
-                      + unpack_raw_weight_double((w_chunk.z >> 24) & 0xFF) * static_cast<double>(x[11]);
+        acc_tiles[2] += unpack_raw_weight( w_chunk.z        & 0xFF) * x[8]
+                      + unpack_raw_weight((w_chunk.z >>  8) & 0xFF) * x[9]
+                      + unpack_raw_weight((w_chunk.z >> 16) & 0xFF) * x[10]
+                      + unpack_raw_weight((w_chunk.z >> 24) & 0xFF) * x[11];
 
-        acc_tiles[3] += unpack_raw_weight_double( w_chunk.w        & 0xFF) * static_cast<double>(x[12])
-                      + unpack_raw_weight_double((w_chunk.w >>  8) & 0xFF) * static_cast<double>(x[13])
-                      + unpack_raw_weight_double((w_chunk.w >> 16) & 0xFF) * static_cast<double>(x[14])
-                      + unpack_raw_weight_double((w_chunk.w >> 24) & 0xFF) * static_cast<double>(x[15]);
+        acc_tiles[3] += unpack_raw_weight( w_chunk.w        & 0xFF) * x[12]
+                      + unpack_raw_weight((w_chunk.w >>  8) & 0xFF) * x[13]
+                      + unpack_raw_weight((w_chunk.w >> 16) & 0xFF) * x[14]
+                      + unpack_raw_weight((w_chunk.w >> 24) & 0xFF) * x[15];
     }
 
-    double thread_acc = (acc_tiles[0] + acc_tiles[1]) + (acc_tiles[2] + acc_tiles[3]);
-    double row_sum = gemv_block_reduce_sum_double(thread_acc, shared_warp_acc);
+    float thread_acc = cast_to_bf16_and_back(cast_to_bf16_and_back(acc_tiles[0] + acc_tiles[1]) + cast_to_bf16_and_back(acc_tiles[2] + acc_tiles[3]));
+    float row_sum = gemv_block_reduce_sum(thread_acc, shared_warp_acc);
 
     if (threadIdx.x == 0) {
         float combined_scale = w_scale * d_scale;
-        float final_res = static_cast<float>(row_sum) * combined_scale;
+        float final_res = row_sum * combined_scale;
 
         float bf16_delta = __bfloat162float(__float2bfloat16(final_res));
         Y_accum[row_idx] = __bfloat162float(__float2bfloat16(Y_accum[row_idx] + bf16_delta));

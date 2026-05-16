@@ -35,7 +35,7 @@ SafetensorsLoader::~SafetensorsLoader() {
 void SafetensorsLoader::load_single_file(const std::string& file_path) {
 #ifdef _WIN32
     MappedFile mf;
-    mf.h_file = CreateFileA(file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    mf.h_file = CreateFileA(file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (mf.h_file == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("Failed to open file: " + file_path);
     }

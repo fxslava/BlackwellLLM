@@ -78,7 +78,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map="cuda:0",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
 

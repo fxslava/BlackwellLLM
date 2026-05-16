@@ -1,14 +1,16 @@
 ﻿#include "attention.cuh"
 #include <cuda_runtime.h>
 #include <math_constants.h>
+#include <cuda_bf16.h>
 
 #define ATTN_BLOCK_SIZE 128
 
 // 🎯 Принудительное усечение мантиссы (Truncation) для паритета с PyTorch Bfloat16
 __inline__ __device__ float cast_to_bf16_and_back(float val) {
-    unsigned int bits = __float_as_uint(val);
+    return __bfloat162float(__float2bfloat16(val));
+    /*unsigned int bits = __float_as_uint(val);
     bits &= 0xFFFF0000;
-    return __uint_as_float(bits);
+    return __uint_as_float(bits);*/
 }
 
 // Нативная редукция суммы внутри варпа

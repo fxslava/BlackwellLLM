@@ -1,13 +1,15 @@
 ﻿#include "swiglu.cuh"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #define SWIGLU_BLOCK_SIZE 256
 
 // 🎯 Принудительное усечение мантиссы (Truncation) для паритета с тензорами PyTorch Bfloat16
 __inline__ __device__ float cast_to_bf16_and_back(float val) {
-    unsigned int bits = __float_as_uint(val);
+    return __bfloat162float(__float2bfloat16(val));
+    /*unsigned int bits = __float_as_uint(val);
     bits &= 0xFFFF0000;
-    return __uint_as_float(bits);
+    return __uint_as_float(bits);*/
 }
 
 __global__ void fused_swiglu_kernel(const float* __restrict__ gate,
