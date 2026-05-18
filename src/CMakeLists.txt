@@ -107,7 +107,10 @@ endif()
 # ==============================================================================
 
 # Создаем таргет
-add_executable(blackwell_compress compress_experiment.cu)
+add_executable(blackwell_compress 
+    compress_experiment.cu
+    nvcomp_baseline.cu
+)
 
 # 🎯 1. Руками указываем папку с заголовками (include)
 target_include_directories(blackwell_compress PRIVATE 
