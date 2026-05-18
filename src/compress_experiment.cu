@@ -16,41 +16,26 @@ struct SweepResult {
     std::string tensor_name;
     size_t original_bytes;
     float r_raster;
-    float r_morton;
-    float r_hilbert;
+    float r_custom_swizzle;
+    float r_cluster8;
     float r_ideal;
 };
 
-// --- ФРАКТАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-// Генератор Z-кривой (Morton Code) для 2D координат
-inline static unsigned int morton_encode(unsigned int x, unsigned int y) {
-    unsigned int answer = 0;
-    for (unsigned int i = 0; i < 4; ++i) { // Для сетки 16х16 достаточно 4 бит
-        answer |= ((x & (1 << i)) << i) | ((y & (1 << i)) << (i + 1));
-    }
-    return answer;
-}
-
-// Генератор кривой Гильберта (Hilbert Curve) для 2D координат
-static void hilbert_d2xy(int n, int d, int *x, int *y) {
-    int rx, ry, s, t = d;
-    *x = *y = 0;
-    for (s = 1; s < n; s *= 2) {
-        rx = 1 & (t / 2);
-        ry = 1 & (t ^ rx);
-        // Поворот системы координат
-        if (ry == 0) {
-            if (rx == 1) {
-                *x = s - 1 - *x;
-                *y = s - 1 - *y;
-            }
-            int tmp = *x; *x = *y; *y = tmp;
-        }
-        *x += s * rx;
-        *y += s * ry;
-        t /= 4;
-    }
+// 🎯 Твой кастомный swizzle бит адресации (мапинг 2D координат в 1D индекс)
+// Группирует биты как Y3 Y2 X3 X2 Y1 Y0 X1 X0 (Локальные макро/микро тайлы 4х4)
+inline static unsigned int custom_swizzle_encode(unsigned int x, unsigned int y) {
+    unsigned int y3 = (y & 8) >> 3;
+    unsigned int y2 = (y & 4) >> 2;
+    unsigned int y1 = (y & 2) >> 1;
+    unsigned int y0 = (y & 1);
+    
+    unsigned int x3 = (x & 8) >> 3;
+    unsigned int x2 = (x & 4) >> 2;
+    unsigned int x1 = (x & 2) >> 1;
+    unsigned int x0 = (x & 1);
+    
+    return (y3 << 7) | (y2 << 6) | (x3 << 5) | (x2 << 4) | 
+           (y1 << 3) | (y0 << 2) | (x1 << 1) | x0;
 }
 
 struct HuffmanNode {
@@ -92,16 +77,15 @@ std::vector<int> get_huffman_lengths(const std::vector<uint64_t>& histogram) {
     return bit_lengths;
 }
 
-// Вспомогательный метод оценки размера по гистограмме дельт + оверхед базовых байт
 size_t evaluate_delta_stream_bytes(const std::vector<uint64_t>& delta_hist, size_t num_tiles) {
     std::vector<int> lengths = get_huffman_lengths(delta_hist);
     size_t bits = 0;
     for (int i = 0; i < 256; ++i) bits += delta_hist[i] * lengths[i];
-    return ((bits + 7) / 8) + (num_tiles * 1); // Дельты + 1 базовый байт на тайл
+    return ((bits + 7) / 8) + (num_tiles * 1);
 }
 
 int main(int argc, char** argv) {
-    std::cout << "🔬 Launching Space-Filling Curves vs Ideal Sort 16x16 Tile Experiment...\n";
+    std::cout << "🔬 Launching Cluster-8 Factoradic Sort & Custom Address Swizzle Experiment...\n";
     std::string model_path = (argc > 1) ? argv[1] : "F:/AI/llama3-8b-fp8/model.safetensors.index.json";
     
     try {
@@ -110,24 +94,16 @@ int main(int argc, char** argv) {
         auto all_tensors = metadata_loader.list_tensors();
         std::vector<SweepResult> sweep_results;
 
-        // Построение карт индексов для Мортона и Гильберта внутри тайла 16х16 один раз
-        std::vector<int> morton_order(256);
-        std::vector<std::pair<int, int>> morton_coords(256);
+        // Построение LUT-таблицы для твоего кастомного swizzle обхода внутри тайла 16х16
+        std::vector<int> custom_order(256);
         for(int r=0; r<16; ++r) {
             for(int c=0; c<16; ++c) {
-                unsigned int code = morton_encode(c, r);
-                morton_order[code] = r * 16 + c;
+                unsigned int code = custom_swizzle_encode(c, r);
+                custom_order[code] = r * 16 + c;
             }
         }
 
-        std::vector<int> hilbert_order(256);
-        for(int d=0; d<256; ++d) {
-            int x, y;
-            hilbert_d2xy(16, d, &x, &y);
-            hilbert_order[d] = y * 16 + x;
-        }
-
-        size_t total_orig = 0, total_raster = 0, total_morton = 0, total_hilbert = 0, total_ideal = 0;
+        size_t total_orig = 0, total_raster = 0, total_custom = 0, total_c8 = 0, total_ideal = 0;
 
         for (const auto& tensor_name : all_tensors) {
             const void* d_weight_ptr = arena.get_weight_ptr_optional(tensor_name);
@@ -143,7 +119,7 @@ int main(int argc, char** argv) {
             size_t rows = shape[0], cols = shape[1];
             size_t num_tiles = (rows / 16) * (cols / 16);
 
-            std::vector<uint64_t> hist_raster(256, 0), hist_morton(256, 0), hist_hilbert(256, 0), hist_ideal(256, 0);
+            std::vector<uint64_t> hist_raster(256, 0), hist_custom(256, 0), hist_cluster8(256, 0), hist_ideal(256, 0);
 
             for (size_t r = 0; r < rows; r += 16) {
                 for (size_t c = 0; c < cols; c += 16) {
@@ -154,61 +130,75 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // 1. Линейный Raster дельта-обход
+                    // 1. Обычный Raster
                     for(size_t i=0; i<255; ++i) hist_raster[static_cast<uint8_t>(tile[i+1] - tile[i])]++;
 
-                    // 2. Мортон (Z-кривая) дельта-обход
+                    // 2. Твой кастомный Блочный Swizzle XXXXYYYY
                     for(size_t i=0; i<255; ++i) {
-                        uint8_t v1 = tile[morton_order[i]];
-                        uint8_t v2 = tile[morton_order[i+1]];
-                        hist_morton[static_cast<uint8_t>(v2 - v1)]++;
+                        uint8_t v1 = tile[custom_order[i]];
+                        uint8_t v2 = tile[custom_order[i+1]];
+                        hist_custom[static_cast<uint8_t>(v2 - v1)]++;
                     }
 
-                    // 3. Гильберт дельта-обход
-                    for(size_t i=0; i<255; ++i) {
-                        uint8_t v1 = tile[hilbert_order[i]];
-                        uint8_t v2 = tile[hilbert_order[i+1]];
-                        hist_hilbert[static_cast<uint8_t>(v2 - v1)]++;
+                    // 3. Твоя Факториальная Сортировка по N=8 элементам
+                    for (size_t block = 0; block < 32; ++block) {
+                        std::vector<uint8_t> sub_block(8);
+                        for(int i=0; i<8; ++i) sub_block[i] = tile[block * 8 + i];
+                        
+                        // Сортируем мини-блок из 8 элементов
+                        std::sort(sub_block.begin(), sub_block.end());
+                        
+                        // Считаем 7 дельт внутри отсортированного мини-блока
+                        for(size_t i=0; i<7; ++i) {
+                            hist_cluster8[static_cast<uint8_t>(sub_block[i+1] - sub_block[i])]++;
+                        }
                     }
 
-                    // 4. Идеальный отсортированный дельта-обход
+                    // 4. Идеал (Сортировка всего тайла 256 элементов)
                     std::sort(tile.begin(), tile.end());
-                    for(size_t i=0; i<255; ++i) hist_ideal[static_cast<uint8_t>(tile[i+1] - tile[i])]++;
+                    for(size_t i=0; i<255; ++i) {
+                        hist_ideal[static_cast<uint8_t>(tile[i+1] - tile[i])]++;
+                    }
                 }
             }
 
-            size_t b_raster  = evaluate_delta_stream_bytes(hist_raster, num_tiles);
-            size_t b_morton  = evaluate_delta_stream_bytes(hist_morton, num_tiles);
-            size_t b_hilbert = evaluate_delta_stream_bytes(hist_hilbert, num_tiles);
-            size_t b_ideal   = evaluate_delta_stream_bytes(hist_ideal, num_tiles);
+            size_t b_raster = evaluate_delta_stream_bytes(hist_raster, num_tiles);
+            size_t b_custom = evaluate_delta_stream_bytes(hist_custom, num_tiles);
+            size_t b_ideal  = evaluate_delta_stream_bytes(hist_ideal, num_tiles);
+
+            // Чистый подсчет для Cluster-8 с учетом жесткого налога на метаданные (96 байт на тайл)
+            std::vector<int> c8_lengths = get_huffman_lengths(hist_cluster8);
+            size_t c8_bits = 0;
+            for(int i=0; i<256; ++i) c8_bits += hist_cluster8[i] * c8_lengths[i];
+            size_t b_cluster8 = ((c8_bits + 7) / 8) + (num_tiles * 96);
 
             sweep_results.push_back({
                 tensor_name, tensor_size, 
-                static_cast<float>(tensor_size)/b_raster, static_cast<float>(tensor_size)/b_morton,
-                static_cast<float>(tensor_size)/b_hilbert, static_cast<float>(tensor_size)/b_ideal
+                static_cast<float>(tensor_size)/b_raster, static_cast<float>(tensor_size)/b_custom,
+                static_cast<float>(tensor_size)/b_cluster8, static_cast<float>(tensor_size)/b_ideal
             });
 
-            total_orig += tensor_size; total_raster += b_raster; total_morton += b_morton; total_hilbert += b_hilbert; total_ideal += b_ideal;
+            total_orig += tensor_size; total_raster += b_raster; total_custom += b_custom; total_c8 += b_cluster8; total_ideal += b_ideal;
         }
 
-        std::cout << "\n=================================== 2D GEOMETRY TRAVERSAL COMPARISON REPORT ===================================\n";
-        std::cout << std::left << std::setw(38) << "Tensor Name" << std::setw(12) << "Orig(MB)" << std::setw(14) << "Raster Delta" << std::setw(14) << "Morton Delta" << std::setw(15) << "Hilbert Delta" << std::setw(14) << "Ideal Sorted" << "\n";
-        std::cout << "----------------------------------------------------------------------------------------------------------------\n";
+        std::cout << "\n=================================== ADVANCED TRAVERSAL & CLUSTER REPORT ===================================\n";
+        std::cout << std::left << std::setw(38) << "Tensor Name" << std::setw(12) << "Orig(MB)" << std::setw(15) << "Raster Delta" << std::setw(15) << "Custom Swizzle" << std::setw(16) << "Cluster-8 Sort" << std::setw(14) << "Ideal Sorted" << "\n";
+        std::cout << "----------------------------------------------------------------------------------------------------------------------------\n";
         for (const auto& r : sweep_results) {
             std::cout << std::left << std::setw(38) << (r.tensor_name.length() > 35 ? r.tensor_name.substr(0, 32) + "..." : r.tensor_name)
                       << std::setw(12) << std::fixed << std::setprecision(1) << (r.original_bytes / 1024.0 / 1024.0)
-                      << std::setw(14) << (std::to_string(r.r_raster).substr(0,4) + "x")
-                      << std::setw(14) << (std::to_string(r.r_morton).substr(0,4) + "x")
-                      << std::setw(15) << (std::to_string(r.r_hilbert).substr(0,4) + "x")
+                      << std::setw(15) << (std::to_string(r.r_raster).substr(0,4) + "x")
+                      << std::setw(15) << (std::to_string(r.r_custom_swizzle).substr(0,4) + "x")
+                      << std::setw(16) << (std::to_string(r.r_cluster8).substr(0,4) + "x")
                       << std::setw(14) << (std::to_string(r.r_ideal).substr(0,4) + "x") << "\n";
         }
-        std::cout << "----------------------------------------------------------------------------------------------------------------\n";
+        std::cout << "----------------------------------------------------------------------------------------------------------------------------\n";
         std::cout << std::left << std::setw(38) << "TOTAL MODEL SUMMARY" << std::setw(12) << std::fixed << std::setprecision(1) << (total_orig / 1024.0 / 1024.0)
-                  << std::setw(14) << (std::to_string(static_cast<float>(total_orig)/total_raster).substr(0,4) + "x")
-                  << std::setw(14) << (std::to_string(static_cast<float>(total_orig)/total_morton).substr(0,4) + "x")
-                  << std::setw(15) << (std::to_string(static_cast<float>(total_orig)/total_hilbert).substr(0,4) + "x")
+                  << std::setw(15) << (std::to_string(static_cast<float>(total_orig)/total_raster).substr(0,4) + "x")
+                  << std::setw(15) << (std::to_string(static_cast<float>(total_orig)/total_custom).substr(0,4) + "x")
+                  << std::setw(16) << (std::to_string(static_cast<float>(total_orig)/total_c8).substr(0,4) + "x")
                   << std::setw(14) << (std::to_string(static_cast<float>(total_orig)/total_ideal).substr(0,4) + "x") << "\n";
-        std::cout << "================================================================================================================\n\n";
+        std::cout << "============================================================================================================================\n\n";
 
     } catch (const std::exception& e) { std::cerr << "\n[CRITICAL ERROR] " << e.what() << "\n"; return 1; }
     return 0;
