@@ -23,8 +23,8 @@ int main() {
     std::cout << "==================================================\n\n";
 
     try {
-        std::string index_path = "llama3-8b-fp8/model.safetensors.index.json";
-        std::string vocab_path = "llama3-8b-fp8/tokenizer.json"; 
+        std::string index_path = "F:/AI/llama3-8b-fp8/model.safetensors.index.json";
+        std::string vocab_path = "F:/AI/llama3-8b-fp8/tokenizer.json"; 
         size_t max_context = 16384;
         
         LlamaTokenizer tokenizer(vocab_path);

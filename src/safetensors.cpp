@@ -33,36 +33,20 @@ SafetensorsLoader::~SafetensorsLoader() {
 }
 
 void SafetensorsLoader::load_single_file(const std::string& file_path) {
-#ifdef _WIN32
-    MappedFile mf;
-    mf.h_file = CreateFileA(file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (mf.h_file == INVALID_HANDLE_VALUE) {
-        throw std::runtime_error("Failed to open file: " + file_path);
-    }
+    std::ifstream f(file_path, std::ios::binary);
+    if (!f.is_open()) throw std::runtime_error("Failed to open: " + file_path);
 
-    LARGE_INTEGER size;
-    if (!GetFileSizeEx(mf.h_file, &size)) {
-        throw std::runtime_error("Failed to get file size for: " + file_path);
-    }
-    mf.file_size = static_cast<size_t>(size.QuadPart);
+    // 1. Читаем размер шапки (8 байт)
+    uint64_t header_size = 0;
+    f.read(reinterpret_cast<char*>(&header_size), 8);
 
-    mf.h_map = CreateFileMappingA(mf.h_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (!mf.h_map || mf.h_map == INVALID_HANDLE_VALUE) {
-        throw std::runtime_error("Failed to create File Mapping for: " + file_path);
-    }
-
-    mf.mapped_data = reinterpret_cast<const uint8_t*>(MapViewOfFile(mf.h_map, FILE_MAP_READ, 0, 0, 0));
-    if (!mf.mapped_data) {
-        throw std::runtime_error("Failed to execute MapViewOfFile for: " + file_path);
-    }
-
-    // Parse the 8-byte header size
-    uint64_t header_size = *reinterpret_cast<const uint64_t*>(mf.mapped_data);
-    size_t header_bytes = static_cast<size_t>(header_size);
-
-    std::string json_str(reinterpret_cast<const char*>(mf.mapped_data + 8), header_bytes);
+    // 2. Выкачиваем JSON-строку
+    std::string json_str(header_size, '\0');
+    f.read(&json_str[0], header_size);
     json header = json::parse(json_str);
-    const uint8_t* base_data_ptr = mf.mapped_data + 8 + header_bytes;
+
+    // Точка на диске, где начинается бинарный блок текущего файла
+    size_t binary_start_pos = 8 + header_size;
 
     for (auto& [key, value] : header.items()) {
         if (key == "__metadata__") continue;
@@ -70,6 +54,8 @@ void SafetensorsLoader::load_single_file(const std::string& file_path) {
         TensorEntry entry;
         entry.name = key;
         entry.dtype = value["dtype"].get<std::string>();
+        entry.file_path = file_path; // 🎯 Запоминаем конкретный шард
+        
         for (auto& dim : value["shape"]) entry.shape.push_back(dim.get<size_t>());
 
         auto offsets = value["data_offsets"];
@@ -77,17 +63,12 @@ void SafetensorsLoader::load_single_file(const std::string& file_path) {
         size_t end_offset   = offsets[1].get<size_t>();
 
         entry.byte_size = end_offset - start_offset;
-        entry.host_data_ptr = base_data_ptr + start_offset;
+        // 🎯 Считаем абсолютную позицию байт в файле
+        entry.file_offset = binary_start_pos + start_offset; 
 
         registry[key] = entry;
     }
-
-    mapped_files.push_back(mf);
-    std::cout << "[Safetensors] Mapped slice: " << fs::path(file_path).filename().string() 
-              << " (" << (mf.file_size / (1024 * 1024)) << " MB)\n";
-#else
-    throw std::runtime_error("Only Win32 API is currently supported.");
-#endif
+    std::cout << "[Safetensors] Registered metadata for slice: " << fs::path(file_path).filename().string() << "\n";
 }
 
 void SafetensorsLoader::load_index_file(const std::string& index_path) {

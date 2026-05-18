@@ -1,12 +1,13 @@
 ﻿#include "memory_pool.h"
+#include "weight_loader.h"
 #include "common.h"
 #include <iostream>
 
-VRAMArena::VRAMArena(const SafetensorsLoader& loader, size_t max_seq_len) 
-    : m_max_seq_len(max_seq_len) // Инициализируем длину контекста
+VRAMArena::VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, size_t max_seq_len) 
+    : m_max_seq_len(max_seq_len) 
 {
     std::cout << "[VRAM Arena] Initializing static memory pools...\n";
-    allocate_weights_pool(loader);
+    allocate_weights_pool(safetensors_path, metadata_loader);
     allocate_dynamic_pool(max_seq_len);
 }
 
@@ -19,8 +20,8 @@ VRAMArena::~VRAMArena() {
     std::cout << "[VRAM Arena] All static device pools successfully released.\n";
 }
 
-void VRAMArena::allocate_weights_pool(const SafetensorsLoader& loader) {
-    auto tensor_names = loader.list_tensors();
+void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader) {
+    auto tensor_names = metadata_loader.list_tensors();
     
     // 1. Calculate absolute byte footprint with strict 16-byte alignment per tensor
     size_t current_offset = 0;
@@ -28,10 +29,9 @@ void VRAMArena::allocate_weights_pool(const SafetensorsLoader& loader) {
     aligned_offsets.reserve(tensor_names.size());
 
     for (const auto& name : tensor_names) {
-        const auto& entry = loader.get_tensor(name);
+        const auto& entry = metadata_loader.get_tensor(name);
         aligned_offsets.push_back({name, current_offset});
         
-        // Align offsets to 16 bytes (128-bit boundary required by CUDA memory accesses)
         size_t size = entry.byte_size;
         current_offset += (size + 15) & ~15; 
     }
@@ -43,24 +43,21 @@ void VRAMArena::allocate_weights_pool(const SafetensorsLoader& loader) {
     // 2. Allocate one massive unified arena for all weights
     CUDA_CHECK(cudaMalloc(&d_weights_arena, total_weights_bytes));
 
-    // 3. Populate device memory asynchronously via direct copies from OS file cache
+    // 🎯 3. Создаем наш полиморфный загрузчик
+    auto io_loader = IWeightLoader::create();
+
     uint8_t* d_base = reinterpret_cast<uint8_t*>(d_weights_arena);
     
-    for (const auto& [name, offset] : aligned_offsets) {
-        const auto& entry = loader.get_tensor(name);
-        void* d_dest = d_base + offset;
+    for (const auto& [name, vram_offset] : aligned_offsets) {
+        const auto& entry = metadata_loader.get_tensor(name);
+        void* d_dest = d_base + vram_offset;
         
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_dest, 
-            entry.host_data_ptr, 
-            entry.byte_size, 
-            cudaMemcpyHostToDevice
-        ));
+        // 🚀 ИДЕАЛЬНЫЙ LSP: Передаем путь к конкретному шарду и смещение
+        io_loader->load_to_vram(entry.file_path, entry.file_offset, entry.byte_size, d_dest);
         
         weight_pointers[name] = d_dest;
     }
 
-    // Synchronize to ensure all 8.46 GB are safely residing in VRAM
     CUDA_CHECK(cudaDeviceSynchronize());
     std::cout << "[VRAM Arena] Weights successfully transferred to device arena.\n";
 }

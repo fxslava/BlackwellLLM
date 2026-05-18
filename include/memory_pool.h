@@ -10,7 +10,7 @@
 // Static Memory Orchestrator for 12GB VRAM limit
 class VRAMArena {
 public:
-    VRAMArena(const SafetensorsLoader& loader, size_t max_seq_len = 2048);
+    VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, size_t max_seq_len = 2048);
     ~VRAMArena();
 
     VRAMArena(const VRAMArena&) = delete;
@@ -37,7 +37,7 @@ public:
     size_t get_activation_buffer_size() const { return m_activation_bytes; }
 
 private:
-    void allocate_weights_pool(const SafetensorsLoader& loader);
+    void allocate_weights_pool(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader);
     void allocate_dynamic_pool(size_t max_seq_len);
 
     // Contiguous memory blocks

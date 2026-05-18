@@ -10,7 +10,8 @@ struct TensorEntry {
     std::string dtype;
     std::vector<size_t> shape;
     size_t byte_size;
-    const uint8_t* host_data_ptr; // Прямой Zero-Copy указатель
+    std::string file_path; // 🎯 Путь к файлу-шарду
+    size_t file_offset;    // 🎯 Абсолютное смещение на диске
 };
 
 class SafetensorsLoader {

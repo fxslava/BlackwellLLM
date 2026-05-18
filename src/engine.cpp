@@ -11,7 +11,7 @@
 #include <iomanip>
 
 BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len) 
-    : loader(index_path), arena(loader, max_seq_len) 
+    : loader(index_path), arena(index_path, loader, max_seq_len)
 {
     // 1. Bind core activation buffers from the arena
     d_X_accum = arena.get_activation_buffer_A();
