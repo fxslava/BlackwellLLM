@@ -115,7 +115,7 @@ int main() {
 
                 std::cout << tokenizer.decode(next_token) << std::flush;
 
-                next_token = engine.forward(next_token, current_pos, 0.6f, 0.9f);
+                next_token = engine.forward(next_token, current_pos, 0.1f, 0.9f);
                 current_pos++;
             }
         }
