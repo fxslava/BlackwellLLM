@@ -191,3 +191,26 @@ int BlackwellEngine::forward(int token_id, int pos, float temperature, float top
     
     return next_id;
 }
+
+// ============================================================================
+// Evaluation Inference (Для расчета Перплексии)
+// ============================================================================
+float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id) {
+    step_embedding(token_id);
+    
+    for (size_t i = 0; i < num_layers; ++i) {
+        step_attention_norm(i);
+        step_attention_qkv_projections(i);
+        step_attention_math(i, pos);
+        step_attention_out(i);
+        
+        step_mlp_norm(i);
+        step_mlp_projections(i);
+        step_mlp_out(i);
+    }
+    
+    step_final_ops(); // Готовим массив d_logits
+
+    // Возвращаем логарифм вероятности целевого токена!
+    return compute_log_prob(d_logits, vocab_size, target_token_id);
+}

@@ -148,3 +148,27 @@ int sample_top_p(const float* d_logits, size_t vocab_size, float temperature, fl
     // Fallback
     return probs[last_idx].index;
 }
+
+// Вычисляет логарифм вероятности конкретного токена после Softmax
+float compute_log_prob(const float* d_logits, size_t vocab_size, int target_token_id) {
+    // 1. Копируем логиты в оперативную память
+    std::vector<float> h_logits(vocab_size);
+    cudaMemcpy(h_logits.data(), d_logits, vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // 2. Ищем максимум (нужно для математической стабильности экспоненты)
+    float max_val = -INFINITY;
+    for (size_t i = 0; i < vocab_size; i++) {
+        if (h_logits[i] > max_val) max_val = h_logits[i];
+    }
+
+    // 3. Считаем сумму экспонент (знаменатель Softmax)
+    float sum_exp = 0.0f;
+    for (size_t i = 0; i < vocab_size; i++) {
+        sum_exp += std::exp(h_logits[i] - max_val);
+    }
+
+    // 4. log( P(x) ) = log( exp(logit - max) / sum_exp ) = (logit - max) - log(sum_exp)
+    float log_prob = (h_logits[target_token_id] - max_val) - std::log(sum_exp);
+    
+    return log_prob;
+}

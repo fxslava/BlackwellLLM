@@ -13,6 +13,8 @@ public:
     // Публичный метод для работы в чате
     int forward(int token_id, int pos, float temperature = 0.6f, float top_p = 0.9f);
 
+    float forward_eval(int token_id, int pos, int target_token_id);
+
 private:
     // Даем тестам доступ к приватным методам и буферам
     FRIEND_TEST(EngineVerificationTest, LayerByLayerComparison);

@@ -26,3 +26,6 @@ target_include_directories(blackwell_core PUBLIC
 # ==============================================================================
 add_executable(blackwell_llm main.cpp)
 target_link_libraries(blackwell_llm PRIVATE blackwell_core)
+
+add_executable(blackwell_bench benchmark.cpp)
+target_link_libraries(blackwell_bench PRIVATE blackwell_core)

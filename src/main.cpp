@@ -2,7 +2,6 @@
 #include <string>
 #include <vector>
 #include <exception>
-#include <chrono>
 #include <algorithm>
 
 #ifdef _WIN32
@@ -13,148 +12,116 @@
 #include "tokenizer.h"
 
 int main() {
-    // === ХАК ДЛЯ КИРИЛЛИЦЫ В WINDOWS ===
 #ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8); // Заставляем консоль выводить UTF-8
-    SetConsoleCP(CP_UTF8);       // Заставляем консоль читать UTF-8 с клавиатуры
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
 #endif
-    // ===================================
 
     std::cout << "==================================================\n";
-    std::cout << " Blackwell LLM: Full Text-to-Text End-to-End Engine\n";
+    std::cout << " Blackwell LLM: Interactive Chat Mode\n";
+    std::cout << " (Type 'exit' or 'quit' to close)\n";
     std::cout << "==================================================\n\n";
 
     try {
         std::string index_path = "llama3-8b-fp8/model.safetensors.index.json";
         std::string vocab_path = "llama3-8b-fp8/tokenizer.json"; 
-        size_t max_context = 2048;
+        size_t max_context = 16384;
         
-        std::cout << "[System] Loading Llama 3 BPE Mappings...\n";
         LlamaTokenizer tokenizer(vocab_path);
-
-        std::cout << "[System] Initializing BlackwellEngine and static VRAM Arena...\n";
         BlackwellEngine engine(index_path, max_context);
 
-        // ЖИВОЙ ВВОД ПРОМПТА ИЗ КОНСОЛИ
-        std::cout << "\n==================================================\n";
-        std::cout << "Enter your prompt: ";
-        std::string user_prompt;
-#ifdef _WIN32
-        // Читаем сырой UTF-16 прямо из консоли Windows
-        wchar_t wbuf[4096];
-        DWORD read_chars = 0;
-        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-        
-        // Очищаем буфер от мусора
-        FlushConsoleInputBuffer(hStdin); 
-        
-        if (ReadConsoleW(hStdin, wbuf, 4096, &read_chars, NULL)) {
-            // Отрезаем символы переноса строки (\r\n)
-            while (read_chars > 0 && (wbuf[read_chars - 1] == L'\n' || wbuf[read_chars - 1] == L'\r')) {
-                read_chars--;
-            }
-            // Конвертируем UTF-16 в правильный UTF-8 для токенизатора
-            if (read_chars > 0) {
-                int size_needed = WideCharToMultiByte(CP_UTF8, 0, wbuf, read_chars, NULL, 0, NULL, NULL);
-                user_prompt.assign(size_needed, 0);
-                WideCharToMultiByte(CP_UTF8, 0, wbuf, read_chars, &user_prompt[0], size_needed, NULL, NULL);
-            }
-        }
-#else
-        // На Linux/Mac std::cin работает с UTF-8 идеально из коробки
-        std::getline(std::cin, user_prompt);
-#endif
-        
-        if (user_prompt.empty()) {
-            user_prompt = "Hello llama!"; // Дефолтный фолбэк
-        }
-
-        // --- 1. ТОКЕНИЗАЦИЯ ВХОДНОГО ТЕКСТА ---
-        std::vector<int> prompt_tokens;
-        
-        // 1. Заголовок пользователя
-        prompt_tokens.push_back(128000); // <|begin_of_text|>
-        prompt_tokens.push_back(128006); // <|start_header_id|>
-        prompt_tokens.push_back(882);    // "user"
-        prompt_tokens.push_back(128007); // <|end_header_id|>
-        prompt_tokens.push_back(271);    // "\n\n"
-        
-        // 2. Текст пользователя (без BOS, так как мы его уже добавили)
-        std::vector<int> user_text_ids = tokenizer.encode(user_prompt, false);
-        prompt_tokens.insert(prompt_tokens.end(), user_text_ids.begin(), user_text_ids.end());
-        
-        // 3. Заголовок ассистента (призыв к ответу)
-        prompt_tokens.push_back(128009); // <|eot_id|> (Конец реплики юзера)
-        prompt_tokens.push_back(128006); // <|start_header_id|>
-        prompt_tokens.push_back(78191);  // "assistant"
-        prompt_tokens.push_back(128007); // <|end_header_id|>
-        prompt_tokens.push_back(271);    // "\n\n"
-        
-        std::cout << "\n[Tokenizer] Encoded Prompt IDs: ";
-        for (int id : prompt_tokens) {
-            std::cout << id << " ";
-        }
-        std::cout << "\n";
-        
-        // EOS токены остановки Llama 3
-        std::vector<int> eos_tokens = {128001, 128008, 128009};
-        
         int current_pos = 0;
-        int next_token = -1;
-
-        std::cout << "\n[Engine] Phase 1: Prefill (Processing prompt)... \n";
         
-        // --- 2. PREFILL PHASE ---
-        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-            next_token = engine.forward(prompt_tokens[i], current_pos);
+        // 🎯 ФИКС 1: Собираем системный промпт через правильные ID
+        std::vector<int> history_tokens;
+        history_tokens.push_back(128000); // <|begin_of_text|>
+        history_tokens.push_back(128006); // <|start_header_id|>
+        history_tokens.push_back(9125);   // "system"
+        history_tokens.push_back(128007); // <|end_header_id|>
+        history_tokens.push_back(271);    // "\n\n"
+        
+        std::vector<int> sys_text = tokenizer.encode("You are a helpful, smart, and concise AI assistant.", false);
+        history_tokens.insert(history_tokens.end(), sys_text.begin(), sys_text.end());
+        history_tokens.push_back(128009); // <|eot_id|>
+
+        std::cout << "[System] Initializing context...\n";
+        int next_token = -1;
+        for (int token : history_tokens) {
+            next_token = engine.forward(token, current_pos, 0.0f, 1.0f);
             current_pos++;
         }
 
-        std::cout << "\n[Engine] Phase 2: Decoding (Autoregressive generation)...";
-        std::cout << "\n--------------------------------------------------\n";
-        std::cout << "[Blackwell LLM]: "; 
-        
-        std::vector<int> generated_tokens;
-        auto start_time = std::chrono::high_resolution_clock::now();
+        std::vector<int> eos_tokens = {128001, 128008, 128009};
 
-        // --- 3. DECODING PHASE (Streaming) ---
-        while (current_pos < max_context) {
-            // Проверяем токен конца генерации
-            if (std::find(eos_tokens.begin(), eos_tokens.end(), next_token) != eos_tokens.end()) {
-                tokenizer.decode(next_token); // Наш декодер красиво напечатает [EOS]
+        while (true) {
+            std::cout << "\n\nUser > ";
+            std::string user_prompt;
+            
+#ifdef _WIN32
+            wchar_t wbuf[4096];
+            DWORD read_chars = 0;
+            HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+            FlushConsoleInputBuffer(hStdin); 
+            if (ReadConsoleW(hStdin, wbuf, 4096, &read_chars, NULL)) {
+                while (read_chars > 0 && (wbuf[read_chars - 1] == L'\n' || wbuf[read_chars - 1] == L'\r')) read_chars--;
+                if (read_chars > 0) {
+                    int size = WideCharToMultiByte(CP_UTF8, 0, wbuf, read_chars, NULL, 0, NULL, NULL);
+                    user_prompt.assign(size, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, wbuf, read_chars, &user_prompt[0], size, NULL, NULL);
+                }
+            }
+#else
+            std::getline(std::cin, user_prompt);
+#endif
+
+            if (user_prompt == "exit" || user_prompt == "quit") break;
+            if (user_prompt.empty()) continue;
+
+            // 🎯 ФИКС 2: Собираем реплику юзера и вызов ассистента через правильные ID
+            std::vector<int> user_tokens;
+            user_tokens.push_back(128006); // <|start_header_id|>
+            user_tokens.push_back(882);    // "user"
+            user_tokens.push_back(128007); // <|end_header_id|>
+            user_tokens.push_back(271);    // "\n\n"
+            
+            std::vector<int> text_ids = tokenizer.encode(user_prompt, false);
+            user_tokens.insert(user_tokens.end(), text_ids.begin(), text_ids.end());
+            
+            user_tokens.push_back(128009); // <|eot_id|> (Остановка юзера)
+            user_tokens.push_back(128006); // <|start_header_id|>
+            user_tokens.push_back(78191);  // "assistant"
+            user_tokens.push_back(128007); // <|end_header_id|>
+            user_tokens.push_back(271);    // "\n\n"
+
+            if (current_pos + user_tokens.size() >= max_context) {
+                std::cout << "\n[System Warning] Context limit reached!\n";
                 break;
             }
 
-            generated_tokens.push_back(next_token);
-            
-            // Декодируем текущий токен и мгновенно выводим в консоль
-            std::string text_piece = tokenizer.decode(next_token);
-            std::cout << text_piece << std::flush;
+            for (int token : user_tokens) {
+                next_token = engine.forward(token, current_pos, 0.0f, 1.0f);
+                current_pos++;
+            }
 
-            // Передаём токен обратно на следующий шаг инференса
-            next_token = engine.forward(next_token, current_pos);
-            current_pos++;
+            std::cout << "Llama > ";
+
+            while (current_pos < max_context) {
+                if (std::find(eos_tokens.begin(), eos_tokens.end(), next_token) != eos_tokens.end()) {
+                    // Загоняем токен остановки в кэш, чтобы модель поняла, что она закончила!
+                    engine.forward(next_token, current_pos, 0.0f, 1.0f);
+                    current_pos++;
+                    break;
+                }
+
+                std::cout << tokenizer.decode(next_token) << std::flush;
+
+                next_token = engine.forward(next_token, current_pos, 0.6f, 0.9f);
+                current_pos++;
+            }
         }
-
-        auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> duration = end_time - start_time;
-
-        std::cout << "\n--------------------------------------------------\n\n";
-
-        if (current_pos >= max_context) {
-            std::cout << "[System] Reached maximum context length (" << max_context << ").\n";
-        }
-
-        // Выводим статистику скорости
-        double tokens_per_sec = generated_tokens.size() / duration.count();
-        std::cout << "[PERFORMANCE STATS]\n";
-        std::cout << "  Prompt tokens:    " << prompt_tokens.size() << "\n";
-        std::cout << "  Generated tokens: " << generated_tokens.size() << "\n";
-        std::cout << "  Generation speed: " << tokens_per_sec << " tokens/sec\n";
-        std::cout << "--------------------------------------------------\n\n";
 
     } catch (const std::exception& e) {
-        std::cerr << "\n[CRITICAL ENGINE ERROR]: " << e.what() << "\n";
+        std::cerr << "\n[CRITICAL ERROR]: " << e.what() << "\n";
         return 1;
     }
 
