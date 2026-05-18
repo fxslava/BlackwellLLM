@@ -162,7 +162,7 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     bool inject_accum_out      = false;  // Инъекция в итоговый остаточный поток слоя d_X_accum
 
     std::cout << "\n[Integration Test] Инициализация BlackwellEngine и выделение VRAM...\n";
-    BlackwellEngine engine("D:/Projects/BlackwellLLM/llama3-8b-fp8/model.safetensors.index.json", 2048);
+    BlackwellEngine engine("F:/AI/llama3-8b-fp8//model.safetensors.index.json", 2048);
 
     std::vector<float> h_gpu_buffer(hidden_dim);
     std::vector<float> h_gpu_gate(intermediate_dim);

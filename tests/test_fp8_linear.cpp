@@ -44,7 +44,7 @@ TEST_F(Fp8LinearTests, GemvDecodingCorrectness) {
     CudaVector<__nv_bfloat16> d_scales(M);    d_scales.upload(h_scales_bf16);
     CudaVector<float>         d_Y(M);
 
-    launch_fp8_gemv_kernel(d_W_fp8, d_X, d_scales, nullptr, d_Y, M, K, 1);
+    launch_fp8_gemv_kernel(d_W_fp8, d_X, d_scales, nullptr, nullptr, d_Y, M, K, 1);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -92,7 +92,7 @@ TEST_F(Fp8LinearTests, Fp8GemvResidualCorrectness) {
     for (size_t i = 0; i < M; ++i) h_Y_initial[i] = static_cast<float>(i) * 0.5f;
     d_Y_accum.upload(h_Y_initial);
 
-    launch_fp8_gemv_residual_kernel(d_W_fp8, d_X, d_scales, nullptr, d_Y_accum, M, K, 1);
+    launch_fp8_gemv_residual_kernel(d_W_fp8, d_X, d_scales, nullptr, nullptr, d_Y_accum, M, K, 1);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
