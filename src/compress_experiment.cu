@@ -1,118 +1,90 @@
 ﻿#include <iostream>
 #include <vector>
 #include <string>
-#include <set>
+#include <fstream>
 #include <iomanip>
-#include <algorithm>
 #include <cuda_runtime.h>
 
 #include "safetensors.h"
 #include "memory_pool.h"
 #include "cpu_models.h"
-#include "nvcomp_baseline.h"
 
-struct PaletteResult {
-    std::string tensor_name;
-    size_t original_bytes;
-    float avg_unique_values;
-    float theoretical_palette_ratio;
-};
+void export_matrix_to_excel_grid(const void* d_weight_ptr, size_t rows, size_t cols, const std::string& csv_filename) {
+    std::cout << "📂 Exporting 2D weight matrix to Excel grid format...\n";
+    std::cout << "📐 Matrix dimensions: " << rows << " rows x " << cols << " columns\n";
+
+    if (cols > 16384) {
+        std::cout << "⚠️ WARNING: Column count (" << cols << ") exceeds Excel's maximum limit of 16,384!\n";
+        std::cout << "   Excel will truncate columns beyond this limit when opening the file.\n";
+    }
+
+    // 1. Скачиваем веса из VRAM на Хост
+    size_t total_elements = rows * cols;
+    std::vector<uint8_t> h_weights(total_elements);
+    cudaError_t err = cudaMemcpy(h_weights.data(), d_weight_ptr, total_elements, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA Memcpy failed: " + std::string(cudaGetErrorString(err)));
+    }
+
+    // 2. Открываем файл на запись
+    std::ofstream csv_file(csv_filename);
+    if (!csv_file.is_open()) {
+        throw std::runtime_error("Failed to create file: " + csv_filename);
+    }
+
+    // Выставляем точность для красивого вывода чисел с плавающей точкой
+    csv_file << std::fixed << std::setprecision(5);
+
+    // 3. Записываем сетку данных
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < cols; ++c) {
+            // Извлекаем сырой байт и распаковываем его в честный float
+            uint8_t raw_byte = h_weights[r * cols + c];
+            float fp_value = cpu_unpack_fp8_e4m3(raw_byte);
+
+            csv_file << fp_value;
+            
+            // Ставим разделитель-запятую везде, кроме последнего элемента в строке
+            if (c < cols - 1) {
+                csv_file << ",";
+            }
+        }
+        // Перенос строки для Excel — переход к следующему ряду матрицы
+        csv_file << "\n";
+    }
+
+    csv_file.close();
+    std::cout << "✅ Matrix successfully saved as 2D grid to: " << csv_filename << "\n";
+}
 
 int main(int argc, char** argv) {
-    std::cout << "🔬 Launching 16x16 Tile Palette Cardinality Analysis...\n";
+    std::cout << "🔬 Launching Blackwell Matrix Visualizer...\n";
     std::string model_path = (argc > 1) ? argv[1] : "F:/AI/llama3-8b-fp8/model.safetensors.index.json";
     
     try {
         SafetensorsLoader metadata_loader(model_path);
         VRAMArena arena(model_path, metadata_loader, 2048);
-        auto all_tensors = metadata_loader.list_tensors();
-        std::vector<PaletteResult> sweep_results;
-
-        size_t total_orig_bytes = 0;
-        size_t total_palette_compressed_bytes = 0;
-
-        for (const auto& tensor_name : all_tensors) {
-            const void* d_weight_ptr = arena.get_weight_ptr_optional(tensor_name);
-            if (!d_weight_ptr) continue;
-            
-            auto tensor_meta = metadata_loader.get_tensor(tensor_name);
-            size_t tensor_size = tensor_meta.byte_size;
-            auto shape = tensor_meta.shape;
-            if (shape.size() != 2 || shape[0] % 16 != 0 || shape[1] % 16 != 0) continue;
-
-            std::vector<uint8_t> h_weights(tensor_size);
-            cudaMemcpy(h_weights.data(), d_weight_ptr, tensor_size, cudaMemcpyDeviceToHost);
-            
-            size_t rows = shape[0], cols = shape[1];
-            size_t num_tiles = (rows / 16) * (cols / 16);
-            
-            uint64_t total_unique_across_tensor = 0;
-            size_t tensor_compressed_bytes = 0;
-
-            for (size_t r = 0; r < rows; r += 16) {
-                for (size_t c = 0; c < cols; c += 16) {
-                    
-                    // Собираем уникальные значения внутри тайла через bit-set (быстрее чем std::set)
-                    bool unique_flags[256] = {false};
-                    int unique_count = 0;
-
-                    for (size_t tr = 0; tr < 16; ++tr) {
-                        for (size_t tc = 0; tc < 16; ++tc) {
-                            uint8_t val = h_weights[(r + tr) * cols + (c + tc)];
-                            if (!unique_flags[val]) {
-                                unique_flags[val] = true;
-                                unique_count++;
-                            }
-                        }
-                    }
-
-                    total_unique_across_tensor += unique_count;
-
-                    // Вычисляем, сколько бит нужно на один индекс для этого тайла
-                    int bits_per_index = 0;
-                    if (unique_count <= 2) bits_per_index = 1;
-                    else if (unique_count <= 4) bits_per_index = 2;
-                    else if (unique_count <= 8) bits_per_index = 3;
-                    else if (unique_count <= 16) bits_per_index = 4;
-                    else if (unique_count <= 32) bits_per_index = 5;
-                    else if (unique_count <= 64) bits_per_index = 6;
-                    else if (unique_count <= 128) bits_per_index = 7;
-                    else bits_per_index = 8;
-
-                    // Стоимость тайла = (размер палитры в байтах) + (256 индексов * bits_per_index) / 8
-                    size_t tile_indices_bytes = (256 * bits_per_index) / 8;
-                    size_t tile_palette_bytes = unique_count; // 1 байт на каждый элемент палитры
-
-                    tensor_compressed_bytes += tile_palette_bytes + tile_indices_bytes;
-                }
+        
+        // Выберем для визуализации down_proj слой, он идеально демонстрирует структуру калибровки
+        std::string target_tensor = "model.layers.0.mlp.down_proj.weight";
+        
+        if (!metadata_loader.has_tensor(target_tensor)) {
+            for (const auto& t : metadata_loader.list_tensors()) {
+                if (t.find("down_proj.weight") != std::string::npos) { target_tensor = t; break; }
             }
-
-            float avg_unique = static_cast<float>(total_unique_across_tensor) / num_tiles;
-            float ratio = static_cast<float>(tensor_size) / tensor_compressed_bytes;
-
-            sweep_results.push_back({tensor_name, tensor_size, avg_unique, ratio});
-
-            total_orig_bytes += tensor_size;
-            total_palette_compressed_bytes += tensor_compressed_bytes;
         }
-
-        std::cout << "\n=================================== 16x16 TILE PALETTE POTENTIAL REPORT ===================================\n";
-        std::cout << std::left << std::setw(45) << "Tensor Name (2D Matrices)" << std::setw(15) << "Orig (MB)" << std::setw(22) << "Avg Unique Vals/Tile" << std::setw(15) << "Palette Ratio" << "\n";
-        std::cout << "------------------------------------------------------------------------------------------------------------\n";
-        for (const auto& r : sweep_results) {
-            std::cout << std::left << std::setw(45) << (r.tensor_name.length() > 42 ? r.tensor_name.substr(0, 39) + "..." : r.tensor_name)
-                      << std::setw(15) << std::fixed << std::setprecision(1) << (r.original_bytes / 1024.0 / 1024.0)
-                      << std::setw(22) << std::fixed << std::setprecision(2) << r.avg_unique_values
-                      << std::setw(15) << (std::to_string(r.theoretical_palette_ratio).substr(0,4) + "x") << "\n";
-        }
-        std::cout << "------------------------------------------------------------------------------------------------------------\n";
-        float final_ratio = static_cast<float>(total_orig_bytes) / total_palette_compressed_bytes;
-        std::cout << std::left << std::setw(45) << "TOTAL MODEL SUMMARY" 
-                  << std::setw(15) << std::fixed << std::setprecision(1) << (total_orig_bytes / 1024.0 / 1024.0)
-                  << std::setw(22) << "---"
-                  << std::setw(15) << (std::to_string(final_ratio).substr(0,4) + "x") << "\n";
-        std::cout << "============================================================================================================\n\n";
-
-    } catch (const std::exception& e) { std::cerr << "\n[CRITICAL ERROR] " << e.what() << "\n"; return 1; }
+        
+        const void* d_weight_ptr = arena.get_weight_ptr_optional(target_tensor);
+        if (!d_weight_ptr) throw std::runtime_error("Tensor not found in VRAMArena!");
+        
+        auto meta = metadata_loader.get_tensor(target_tensor);
+        
+        // Передаем указатель, количество строк (shape[0]) и столбцов (shape[1])
+        export_matrix_to_excel_grid(d_weight_ptr, meta.shape[0], meta.shape[1], "matrix_surface.csv");
+        
+    } catch (const std::exception& e) {
+        std::cerr << "\n[CRITICAL ERROR] " << e.what() << "\n";
+        return 1;
+    }
     return 0;
 }
