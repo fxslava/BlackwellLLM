@@ -11,6 +11,7 @@
 
 #include "common.h"
 #include "engine.h"
+#include "../src/engine_impl.h"
 
 // Вспомогательная функция загрузки эталонных бинарных дампов PyTorch
 static std::vector<float> load_golden_dump(const std::string& filename, size_t num_elements) {
@@ -163,6 +164,7 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
 
     std::cout << "\n[Integration Test] Инициализация BlackwellEngine и выделение VRAM...\n";
     BlackwellEngine engine("F:/AI/llama3-8b-fp8//model.safetensors.index.json", 2048);
+    auto* core = engine.get_impl();
 
     std::vector<float> h_gpu_buffer(hidden_dim);
     std::vector<float> h_gpu_gate(intermediate_dim);
@@ -172,10 +174,10 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     // STAGE 1: Верификация таблицы Embedding
     // ========================================================================
     std::cout << "[Integration Test] Шаг 1: Проверка таблицы Embedding...\n";
-    engine.step_embedding(start_token);
+    core->step_embedding(start_token);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(h_gpu_buffer.data(), engine.d_X_accum, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gpu_buffer.data(), core->d_X_accum, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
     
     std::vector<float> golden_embed = load_golden_dump("embed_out.bin", hidden_dim);
     for (size_t i = 0; i < hidden_dim; ++i) {
@@ -210,66 +212,66 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
         std::string l_str = std::to_string(l);
 
         // --- 0. Нормализация входа во внимание ---
-        engine.step_attention_norm(l);
+        core->step_attention_norm(l);
         if (l == 0) {
-            verify_and_log_telemetry("layer_0_input_norm.bin", engine.d_X_norm, h_gpu_buffer, l, "InputNorm", 3.5e-2f);
+            verify_and_log_telemetry("layer_0_input_norm.bin", core->d_X_norm, h_gpu_buffer, l, "InputNorm", 3.5e-2f);
         }
         // 💉 Инъекция в буфер d_X_norm
         if (l == target_injection_layer && inject_input_norm) {
-            inject_golden_tensor("layer_" + l_str + "_input_norm.bin", engine.d_X_norm, hidden_dim, "InputNorm", l);
+            inject_golden_tensor("layer_" + l_str + "_input_norm.bin", core->d_X_norm, hidden_dim, "InputNorm", l);
         }
 
         // --- 1. Линейные проекции Внимания (Q, K, V) ---
-        engine.step_attention_qkv_projections(l);
+        core->step_attention_qkv_projections(l);
         if (l == 0) {
-            verify_and_log_telemetry("layer_0_q_proj.bin", engine.d_Q, h_gpu_buffer, l, "Q_proj", 5.0e-2f);
-            verify_and_log_telemetry("layer_0_k_proj.bin", engine.d_K, h_gpu_kv,     l, "K_proj", 5.0e-2f);
-            verify_and_log_telemetry("layer_0_v_proj.bin", engine.d_V, h_gpu_kv,     l, "V_proj", 5.0e-2f);
+            verify_and_log_telemetry("layer_0_q_proj.bin", core->d_Q, h_gpu_buffer, l, "Q_proj", 5.0e-2f);
+            verify_and_log_telemetry("layer_0_k_proj.bin", core->d_K, h_gpu_kv,     l, "K_proj", 5.0e-2f);
+            verify_and_log_telemetry("layer_0_v_proj.bin", core->d_V, h_gpu_kv,     l, "V_proj", 5.0e-2f);
         }
         // 💉 Инъекция в буферы d_Q, d_K, d_V
         if (l == target_injection_layer && inject_qkv_projections) {
-            inject_golden_tensor("layer_" + l_str + "_q_proj.bin", engine.d_Q, hidden_dim, "Q_proj", l);
-            inject_golden_tensor("layer_" + l_str + "_k_proj.bin", engine.d_K, 1024,       "K_proj", l);
-            inject_golden_tensor("layer_" + l_str + "_v_proj.bin", engine.d_V, 1024,       "V_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_q_proj.bin", core->d_Q, hidden_dim, "Q_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_k_proj.bin", core->d_K, 1024,       "K_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_v_proj.bin", core->d_V, 1024,       "V_proj", l);
         }
 
         // --- 2. Математика Внимания (RoPE + SDPA) ---
-        engine.step_attention_math(l, pos);
+        core->step_attention_math(l, pos);
         if (l == 0) {
-            verify_and_log_telemetry("layer_0_attn_math.bin", engine.d_Attn_out, h_gpu_buffer, l, "AttnMath", 1.0e-2f);
+            verify_and_log_telemetry("layer_0_attn_math.bin", core->d_Attn_out, h_gpu_buffer, l, "AttnMath", 1.0e-2f);
         }
         // 💉 Инъекция в буфер d_Attn_out
         if (l == target_injection_layer && inject_attn_math) {
-            inject_golden_tensor("layer_" + l_str + "_attn_math.bin", engine.d_Attn_out, hidden_dim, "AttnMath", l);
+            inject_golden_tensor("layer_" + l_str + "_attn_math.bin", core->d_Attn_out, hidden_dim, "AttnMath", l);
         }
 
         // --- 3. Выходная свертка внимания и нормализация перед MLP ---
-        engine.step_attention_out(l);       
-        engine.step_mlp_norm(l);
+        core->step_attention_out(l);       
+        core->step_mlp_norm(l);
         // 💉 Инъекция в переиспользованный буфер d_X_norm после нормализации MLP
         if (l == target_injection_layer && inject_post_attn_norm) {
-            inject_golden_tensor("layer_" + l_str + "_post_attn_norm.bin", engine.d_X_norm, hidden_dim, "PostAttnNorm", l);
+            inject_golden_tensor("layer_" + l_str + "_post_attn_norm.bin", core->d_X_norm, hidden_dim, "PostAttnNorm", l);
         }
 
         // --- 4. Линейные проекции MLP (Gate & Up) ---
-        engine.step_mlp_projections(l);
+        core->step_mlp_projections(l);
         if (l == 0) {
-            verify_and_log_telemetry("layer_0_gate_proj.bin", engine.d_Gate, h_gpu_gate, l, "Gate_proj", 5.0e-2f);
+            verify_and_log_telemetry("layer_0_gate_proj.bin", core->d_Gate, h_gpu_gate, l, "Gate_proj", 5.0e-2f);
         }
         // 💉 Инъекция в широкие промежуточные буферы d_Gate и d_Up
         if (l == target_injection_layer && inject_mlp_projections) {
-            inject_golden_tensor("layer_" + l_str + "_gate_proj.bin", engine.d_Gate, intermediate_dim, "Gate_proj", l);
-            inject_golden_tensor("layer_" + l_str + "_up_proj.bin",   engine.d_Up,   intermediate_dim, "Up_proj",   l);
+            inject_golden_tensor("layer_" + l_str + "_gate_proj.bin", core->d_Gate, intermediate_dim, "Gate_proj", l);
+            inject_golden_tensor("layer_" + l_str + "_up_proj.bin",   core->d_Up,   intermediate_dim, "Up_proj",   l);
         }
 
         // --- 5. Выход MLP (SwiGLU + Down) и итоговое накопление слоя ---
-        engine.step_mlp_out(l);
+        core->step_mlp_out(l);
         float tolerance = (l == 0) ? 8.0e-2f : -1.0f;
-        verify_and_log_telemetry("layer_" + l_str + "_accum_out.bin", engine.d_X_accum, h_gpu_buffer, l, "Accum_out", tolerance);
+        verify_and_log_telemetry("layer_" + l_str + "_accum_out.bin", core->d_X_accum, h_gpu_buffer, l, "Accum_out", tolerance);
 
         // 💉 Инъекция в итоговый остаточный буфер слоя d_X_accum
         if (l == target_injection_layer && inject_accum_out) {
-            inject_golden_tensor("layer_" + l_str + "_accum_out.bin", engine.d_X_accum, hidden_dim, "Accum_out", l);
+            inject_golden_tensor("layer_" + l_str + "_accum_out.bin", core->d_X_accum, hidden_dim, "Accum_out", l);
         }
     }
     std::cout << std::string(110, '-') << "\n";
@@ -279,11 +281,11 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     // STAGE 3: Финальная нормализация, проекция логитов и сэмплирование
     // ========================================================================
     std::cout << "\n[Integration Test] Шаг 3: Проекция словаря и выбор токена...\n";
-    engine.step_final_ops();
+    core->step_final_ops();
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_gpu_logits(vocab_size);
-    CUDA_CHECK(cudaMemcpy(h_gpu_logits.data(), engine.d_logits, vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gpu_logits.data(), core->d_logits, vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     std::vector<float> golden_logits = load_golden_dump("logits_out.bin", vocab_size);
 
@@ -306,7 +308,7 @@ TEST(EngineVerificationTest, LayerByLayerComparison) {
     }
 
     int next_token_id = -1;
-    CUDA_CHECK(cudaMemcpy(&next_token_id, engine.d_next_token, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&next_token_id, core->d_next_token, sizeof(int), cudaMemcpyDeviceToHost));
 
     std::cout << "  [INFO] PyTorch Top-1 Token: " << golden_max_idx << " (Logit: " << std::setprecision(4) << golden_max_val << ")\n";
     std::cout << "  [INFO] Custom GPU Top-1 Token: " << gpu_max_idx << " (Logit: " << gpu_max_val << ")\n";

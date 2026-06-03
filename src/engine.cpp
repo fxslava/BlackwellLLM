@@ -1,4 +1,5 @@
-﻿#include "engine.h"
+﻿#include "engine_impl.h"
+#include "engine.h"
 #include "common.h"
 #include "embedding.cuh"
 #include "rmsnorm.cuh"
@@ -10,7 +11,7 @@
 #include "sampling.cuh"
 #include <iomanip>
 
-BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len) 
+BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len) 
     : loader(index_path), arena(index_path, loader, max_seq_len)
 {
     // 1. Bind core activation buffers from the arena
@@ -37,7 +38,7 @@ BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_l
     CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
 }
 
-BlackwellEngine::~BlackwellEngine() {
+BlackwellEngine::Impl::~Impl() {
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
     cudaFree(d_Attn_out); cudaFree(d_Gate); cudaFree(d_Up); cudaFree(d_Swiglu_out);
     cudaFree(d_logits); cudaFree(d_next_token);
@@ -47,7 +48,7 @@ BlackwellEngine::~BlackwellEngine() {
 // ============================================================================
 // STAGE 1: Embedding
 // ============================================================================
-void BlackwellEngine::step_embedding(int token_id) {
+void BlackwellEngine::Impl::step_embedding(int token_id) {
     CudaVector<int> d_tokens(1);
     std::vector<int> h_tokens = {token_id};
     d_tokens.upload(h_tokens);
@@ -61,13 +62,13 @@ void BlackwellEngine::step_embedding(int token_id) {
 // ============================================================================
 // STAGE 2: Granular Attention
 // ============================================================================
-void BlackwellEngine::step_attention_norm(int layer_idx) {
+void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "input_layernorm.weight");
     launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, hidden_dim);
 }
 
-void BlackwellEngine::step_attention_qkv_projections(int layer_idx) {
+void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     
     // 🎯 Перед проекциями рассчитываем динамический скейл текущего нормализованного потока
@@ -86,7 +87,7 @@ void BlackwellEngine::step_attention_qkv_projections(int layer_idx) {
     proj("v_proj", d_V, 1024);
 }
 
-void BlackwellEngine::step_attention_math(int layer_idx, int pos) {
+void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
     // Шаг смещения для одного слоя = (число_kv_голов * max_seq_len * head_dim) элементов.
     // Для архитектуры Llama 3 8B: 8 голов * max_seq_len * 128
     size_t layer_cache_offset = layer_idx * (8 * arena.get_max_seq_len() * 128);
@@ -99,7 +100,7 @@ void BlackwellEngine::step_attention_math(int layer_idx, int pos) {
     launch_attention_decoding_kernel(d_Q, d_layer_k_cache, d_layer_v_cache, d_Attn_out, pos, 32, 8, 128, arena.get_max_seq_len());
 }
 
-void BlackwellEngine::step_attention_out(int layer_idx) {
+void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     
     // 🎯 Оцениваем скейл для выхода внимания перед сверткой остаточным ядром
@@ -115,13 +116,13 @@ void BlackwellEngine::step_attention_out(int layer_idx) {
 // ============================================================================
 // STAGE 3: Granular MLP
 // ============================================================================
-void BlackwellEngine::step_mlp_norm(int layer_idx) {
+void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "post_attention_layernorm.weight");
     launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, hidden_dim);
 }
 
-void BlackwellEngine::step_mlp_projections(int layer_idx) {
+void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
 
     // 🎯 Оцениваем скейл перед входом в проекции перцептрона
@@ -138,7 +139,7 @@ void BlackwellEngine::step_mlp_projections(int layer_idx) {
     launch_fp8_gemv_kernel(up_w, d_X_norm, up_w_s, up_i_s, d_token_scale, d_Up, intermediate_dim, hidden_dim, 1);
 }
 
-void BlackwellEngine::step_mlp_out(int layer_idx) {
+void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
 
     launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, intermediate_dim);
@@ -155,7 +156,7 @@ void BlackwellEngine::step_mlp_out(int layer_idx) {
 // ============================================================================
 // STAGE 4: Final Operations
 // ============================================================================
-void BlackwellEngine::step_final_ops() {
+void BlackwellEngine::Impl::step_final_ops() {
     const void* d_w = arena.get_weight_ptr("model.norm.weight");
     launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, hidden_dim);
 
@@ -164,30 +165,37 @@ void BlackwellEngine::step_final_ops() {
     launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, vocab_size, hidden_dim);
 }
 
+// Реализация фасада BlackwellEngine
+BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len)
+    : pImpl(std::make_unique<Impl>(index_path, max_seq_len)) {}
+
+BlackwellEngine::~BlackwellEngine() = default;
+
 // ============================================================================
 // Full Engine Inference
 // ============================================================================
 // Добавляем параметры сэмплирования прямо в forward (со значениями по умолчанию)
 int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p) {
-    step_embedding(token_id);
+    auto* impl = pImpl.get();
+    impl->step_embedding(token_id);
     
-    for (size_t i = 0; i < num_layers; ++i) {
-        step_attention_norm(i);
-        step_attention_qkv_projections(i);
-        step_attention_math(i, pos);
-        step_attention_out(i);
+    for (size_t i = 0; i < impl->num_layers; ++i) {
+        impl->step_attention_norm(i);
+        impl->step_attention_qkv_projections(i);
+        impl->step_attention_math(i, pos);
+        impl->step_attention_out(i);
         
-        step_mlp_norm(i);
-        step_mlp_projections(i);
-        step_mlp_out(i);
+        impl->step_mlp_norm(i);
+        impl->step_mlp_projections(i);
+        impl->step_mlp_out(i);
     }
     
     // Подготавливаем логиты
-    step_final_ops();
+    impl->step_final_ops();
 
     // 🎯 ЗАПУСКАЕМ НАШ НОВЫЙ CPU/GPU СЭМПЛЕР
     // Он сам скачает логиты, применит температуру, softmax, отсечение top-p и выберет токен
-    int next_id = sample_top_p(d_logits, vocab_size, temperature, top_p);
+    int next_id = sample_top_p(impl->d_logits, impl->vocab_size, temperature, top_p);
     
     return next_id;
 }
@@ -196,21 +204,22 @@ int BlackwellEngine::forward(int token_id, int pos, float temperature, float top
 // Evaluation Inference (Для расчета Перплексии)
 // ============================================================================
 float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id) {
-    step_embedding(token_id);
+    auto* impl = pImpl.get();
+    impl->step_embedding(token_id);
     
-    for (size_t i = 0; i < num_layers; ++i) {
-        step_attention_norm(i);
-        step_attention_qkv_projections(i);
-        step_attention_math(i, pos);
-        step_attention_out(i);
+    for (size_t i = 0; i < impl->num_layers; ++i) {
+        impl->step_attention_norm(i);
+        impl->step_attention_qkv_projections(i);
+        impl->step_attention_math(i, pos);
+        impl->step_attention_out(i);
         
-        step_mlp_norm(i);
-        step_mlp_projections(i);
-        step_mlp_out(i);
+        impl->step_mlp_norm(i);
+        impl->step_mlp_projections(i);
+        impl->step_mlp_out(i);
     }
     
-    step_final_ops(); // Готовим массив d_logits
+    impl->step_final_ops(); // Готовим массив d_logits
 
     // Возвращаем логарифм вероятности целевого токена!
-    return compute_log_prob(d_logits, vocab_size, target_token_id);
+    return compute_log_prob(impl->d_logits, impl->vocab_size, target_token_id);
 }
