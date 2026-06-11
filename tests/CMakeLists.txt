@@ -1,58 +1,80 @@
-# CONFIGURE_DEPENDS: newly added test files (e.g. test_awq_linear.cpp) are
-# picked up on the next build without a manual CMake re-run.
-file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "*.cpp")
+# Test suite layout:
+#   common/      - shared headers (CUDA fixtures, CPU references, problem
+#                  generators, benchmark harness); no target of its own
+#   validation/  - mathematical correctness vs CPU references on the exact
+#                  Llama-FP8 / Qwen-AWQ target shapes  -> validation_tests
+#   benchmarks/  - stress shapes (split-K extremes, ragged groups, non-aligned
+#                  dims) and CUDA-event performance benchmarks -> benchmark_tests
+#   integration/ - end-to-end engine vs PyTorch golden dumps (skips when the
+#                  local model/dumps are absent)       -> integration_tests
+#   reference/   - compatibility shim only: cpu_models.h is included by
+#                  src/experiments/compress_experiment.cu via a relative path
+#                  and exposed globally by the root CMakeLists.txt
+#
+# Typical invocations:
+#   ctest -L validation     # fast correctness suite
+#   ctest -L benchmark      # stress + performance suite
+#   ctest -L integration    # needs the local checkpoint + golden dumps
 
-add_executable(unit_tests ${TEST_SOURCES})
+include(GoogleTest)
 
-target_include_directories(unit_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-)
+# Defines one GTest executable from every .cpp under source_dir, wires up
+# includes/links/runtime DLLs identically for each suite and registers the
+# discovered tests in CTest under the given label.
+function(blackwell_add_test_suite target source_dir label)
+    # CONFIGURE_DEPENDS: newly added test files are picked up on the next
+    # build without a manual CMake re-run.
+    file(GLOB suite_sources CONFIGURE_DEPENDS "${source_dir}/*.cpp")
 
-# Линкуем GoogleTest, библиотеку ядер и CUDA Runtime
-target_link_libraries(unit_tests PRIVATE
-    GTest::gtest
-    GTest::gtest_main
-    blackwell_kernels
-    blackwell_core
-)
+    add_executable(${target} ${suite_sources})
 
-if(WIN32)
-    # 1. Жесткий путь к nvCOMP
-    set(LOCAL_NVCOMP_DLL "${CMAKE_SOURCE_DIR}/external/nvcomp/bin/nvcomp64_5.dll")
-    
-    add_custom_command(TARGET unit_tests POST_BUILD
-        # Копируем nvCOMP
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${LOCAL_NVCOMP_DLL}"
-        "$<TARGET_FILE_DIR:unit_tests>"
-        COMMENT "Copying nvCOMP DLL to unit_tests directory..."
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}   # common/..., reference/...
+        ${CMAKE_SOURCE_DIR}/src       # common.h, engine_impl.h, kernels/*.cuh
     )
 
-    # 2. Жесткий путь к DirectStorage (он скачивается в папку сборки _deps).
-    # SDK скачивается только при USE_DIRECT_STORAGE=ON — без этой опции
-    # копировать нечего, и безусловная команда ломала сборку unit_tests.
-    if(USE_DIRECT_STORAGE)
-        set(LOCAL_DS_BIN "${CMAKE_BINARY_DIR}/_deps/directstorage_sdk-src/native/bin/x64")
+    target_link_libraries(${target} PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        blackwell_kernels
+        blackwell_core
+    )
 
-        add_custom_command(TARGET unit_tests POST_BUILD
-            # Копируем DirectStorage (основная DLL)
+    if(WIN32)
+        # nvCOMP runtime DLL must sit next to the executable.
+        add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${LOCAL_DS_BIN}/dstorage.dll"
-            "$<TARGET_FILE_DIR:unit_tests>"
-
-            # Копируем DirectStorage (Core DLL)
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${LOCAL_DS_BIN}/dstoragecore.dll"
-            "$<TARGET_FILE_DIR:unit_tests>"
-
-            COMMENT "Copying DirectStorage DLLs to unit_tests directory..."
+                "${CMAKE_SOURCE_DIR}/external/nvcomp/bin/nvcomp64_5.dll"
+                "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Copying nvCOMP DLL next to ${target}..."
         )
-    endif()
-endif()
 
-# Регистрируем бинарник в CTest
-include(GoogleTest)
-gtest_discover_tests(unit_tests)
+        # The DirectStorage SDK is only downloaded (into the build tree's
+        # _deps) when USE_DIRECT_STORAGE=ON; without the option there is
+        # nothing to copy.
+        if(USE_DIRECT_STORAGE)
+            set(ds_bin "${CMAKE_BINARY_DIR}/_deps/directstorage_sdk-src/native/bin/x64")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${ds_bin}/dstorage.dll"
+                    "$<TARGET_FILE_DIR:${target}>"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${ds_bin}/dstoragecore.dll"
+                    "$<TARGET_FILE_DIR:${target}>"
+                COMMENT "Copying DirectStorage DLLs next to ${target}..."
+            )
+        endif()
+    endif()
+
+    gtest_discover_tests(${target}
+        PROPERTIES LABELS "${label}"
+        DISCOVERY_TIMEOUT 120
+    )
+endfunction()
+
+blackwell_add_test_suite(validation_tests  "${CMAKE_CURRENT_SOURCE_DIR}/validation"  validation)
+blackwell_add_test_suite(benchmark_tests   "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"  benchmark)
+blackwell_add_test_suite(integration_tests "${CMAKE_CURRENT_SOURCE_DIR}/integration" integration)
 
 # Standalone experiment binaries (awq_benchmark etc.). src/CMakeLists.txt does
 # not include the experiments subdirectory itself, so it is hooked up here;
