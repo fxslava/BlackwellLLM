@@ -2,6 +2,15 @@
 
 #include <string>
 
+// Strongly-typed representation of the quantization strategy in use.
+// Mapped from raw JSON strings once at load time in ConfigLoader; the rest of the
+// codebase branches on this enum and never inspects raw method strings or bit widths.
+enum class QuantStrategy {
+    NONE,               // Unquantized / BF16 / FP32 weights
+    ROWWISE_FP8,        // Per-row FP8 weight quantization with per-token activation scaling
+    WEIGHT_ONLY_PACKED, // Weight-only packed int4 (AWQ / GPTQ)
+};
+
 struct ModelConfig {
     size_t hidden_dim;
     size_t intermediate_dim;
@@ -15,9 +24,10 @@ struct ModelConfig {
 
     bool has_qkv_bias;
 
+    QuantStrategy quant_strategy; // primary: use this for all control-flow decisions
+    std::string quant_method;     // kept for VRAMArena internal weight-routing logic
     int quant_bits;
     int quant_group_size;
-    std::string quant_method;
 };
 
 class ConfigLoader {
