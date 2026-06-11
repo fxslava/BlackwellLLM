@@ -6,11 +6,12 @@
 #include <vector>
 #include <stdexcept>
 #include "safetensors.h"
+#include "blackwell/config.h"
 
 // Static Memory Orchestrator for 12GB VRAM limit
 class VRAMArena {
 public:
-    VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, size_t max_seq_len = 2048);
+    VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, const ModelConfig& config, size_t max_seq_len = 2048);
     ~VRAMArena();
 
     VRAMArena(const VRAMArena&) = delete;
@@ -52,7 +53,7 @@ private:
     float* d_k_cache = nullptr;
     float* d_v_cache = nullptr;
 
-    // 🎯 НОВЫЕ ПОЛЯ: Внутреннее хранение габаритов буферов
+    ModelConfig m_config;
     size_t m_max_seq_len = 0;
     size_t m_total_cache_bytes = 0;
     size_t m_activation_bytes = 0;

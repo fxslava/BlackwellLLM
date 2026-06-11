@@ -3,8 +3,8 @@
 #include "common.h"
 #include <iostream>
 
-VRAMArena::VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, size_t max_seq_len) 
-    : m_max_seq_len(max_seq_len) 
+VRAMArena::VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, const ModelConfig& config, size_t max_seq_len)
+    : m_config(config), m_max_seq_len(max_seq_len)
 {
     std::cout << "[VRAM Arena] Initializing static memory pools...\n";
     allocate_weights_pool(safetensors_path, metadata_loader);
@@ -63,12 +63,10 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
 }
 
 void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
-    // Llama 3 8B dimensions
-    const size_t hidden_dim = 4096;
-    const size_t intermediate_dim = 14336; // Largest buffer needed for FFN SwiGLU
-    const size_t kv_heads = 8;             // GQA configuration
-    const size_t head_dim = 128;
-    const size_t num_layers = 32;
+    const size_t intermediate_dim = m_config.intermediate_dim;
+    const size_t kv_heads         = m_config.num_key_value_heads;
+    const size_t head_dim         = m_config.head_dim;
+    const size_t num_layers       = m_config.num_layers;
 
     // Ping-Pong buffers (FP32 accumulation) allocated for the maximum possible intermediate dimension
     size_t ping_pong_bytes = intermediate_dim * sizeof(float);

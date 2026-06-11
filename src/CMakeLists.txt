@@ -15,6 +15,7 @@ set(CORE_SOURCES
     memory_pool.cpp
     tokenizer.cpp
     weight_loader.cpp
+    config.cpp
 )
 
 if(USE_DIRECT_STORAGE AND WIN32)
