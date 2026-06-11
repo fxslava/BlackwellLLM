@@ -23,6 +23,7 @@
 #include "common.h"
 #include "blackwell/engine.h"
 #include "engine_impl.h"
+#include "kernels/sampling.cuh"
 
 namespace {
 
@@ -350,6 +351,14 @@ TEST(LlamaEngineIntegration, LayerByLayerComparison) {
         }
     }
 
+    // The granular step_* pipeline stops at the logits, so at this point
+    // d_next_token still holds the *input* token staged by step_embedding
+    // (BOS = 128000 here), not a sampling result. Run the greedy argmax
+    // kernel explicitly — the same kernel the engine's temperature-0
+    // sampling path uses — before reading the result back.
+    launch_argmax_kernel(core->d_logits, core->d_next_token, vocab_size);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
     int next_token_id = -1;
     CUDA_CHECK(cudaMemcpy(&next_token_id, core->d_next_token, sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -358,6 +367,12 @@ TEST(LlamaEngineIntegration, LayerByLayerComparison) {
     std::cout << "  [INFO] Engine top-1 token: " << gpu_max_idx
               << " (logit: " << gpu_max_val << ")\n";
     std::cout << "  [INFO] Hardware argmax result: " << next_token_id << "\n";
+
+    // The hardware argmax must agree with the host-side argmax over the very
+    // same logits buffer; this invariant is pure kernel correctness and does
+    // not depend on how closely the engine tracks the PyTorch golden logits.
+    EXPECT_EQ(next_token_id, gpu_max_idx)
+        << "GPU argmax kernel disagrees with host argmax over identical logits";
 
     // CSV export for offline analysis.
     std::ofstream csv_file("logits_comparison.csv");

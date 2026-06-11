@@ -1,6 +1,8 @@
 #include "ops_dispatcher.h"
 #include "kernels/fp8_linear.cuh"
 #include "kernels/awq_linear.cuh"
+#include "kernels/bf16_linear.cuh"
+#include "kernels/bf16_linear_residual.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -54,10 +56,19 @@ void LinearDispatcher::forward(const std::string& base_name,
         break;
     }
 
-    case QuantStrategy::NONE:
-        // Placeholder for future unquantized BF16/FP32 GEMV path.
-        (void)d_out; (void)d_residual_accum;
-        throw std::runtime_error(
-            "LinearDispatcher: QuantStrategy::NONE (unquantized) GEMV is not yet implemented.");
+    case QuantStrategy::NONE: {
+        // Unquantized BF16 GEMV. The biased q/k/v projections never reach the
+        // dispatcher (engine.cpp routes them to the fused GEMV+bias fast path),
+        // so only the plain and residual-accumulating variants are needed here.
+        const void* w = m_arena.get_weight_ptr(base_name + ".weight");
+
+        if (d_residual_accum == nullptr) {
+            launch_bf16_gemv_kernel(w, d_in, d_out, out_features, in_features);
+        } else {
+            launch_bf16_gemv_residual_kernel(w, d_in, d_residual_accum,
+                                             out_features, in_features);
+        }
+        break;
+    }
     }
 }

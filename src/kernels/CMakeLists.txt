@@ -1,4 +1,20 @@
-file(GLOB SOURCES "*.cu")
+# Явный список вместо file(GLOB): GLOB вычисляется только на этапе configure,
+# поэтому новые ядра (bias.cu, bf16_linear_bias.cu) молча выпадали бы из сборки
+# до ручного переконфигурирования.
+set(SOURCES
+    attention.cu
+    awq_linear.cu
+    bf16_linear.cu
+    bf16_linear_bias.cu
+    bf16_linear_residual.cu
+    bias.cu
+    embedding.cu
+    fp8_linear.cu
+    rmsnorm.cu
+    rope.cu
+    sampling.cu
+    swiglu.cu
+)
 
 # Создаем статическую библиотеку с ядрами
 add_library(blackwell_kernels STATIC ${SOURCES})

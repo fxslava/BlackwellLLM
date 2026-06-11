@@ -21,8 +21,10 @@ struct ModelConfig {
     size_t head_dim;
 
     float rope_theta;
+    float rms_norm_eps;
 
     bool has_qkv_bias;
+    bool tie_word_embeddings;
 
     QuantStrategy quant_strategy; // primary: use this for all control-flow decisions
     std::string quant_method;     // kept for VRAMArena internal weight-routing logic

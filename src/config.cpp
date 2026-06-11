@@ -1,6 +1,7 @@
 ﻿#include "blackwell/config.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 
 // Map the raw JSON quantization fields to an internal QuantStrategy.
@@ -62,10 +63,35 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
     cfg.num_attention_heads = j.at("num_attention_heads").get<size_t>();
     cfg.num_key_value_heads = j.at("num_key_value_heads").get<size_t>();
     cfg.vocab_size          = j.at("vocab_size").get<size_t>();
-    cfg.head_dim            = cfg.hidden_dim / cfg.num_attention_heads;
+    cfg.head_dim            = j.value("head_dim", cfg.hidden_dim / cfg.num_attention_heads);
 
-    cfg.rope_theta   = j.value("rope_theta", 10000.0f);
-    cfg.has_qkv_bias = j.value("attention_bias", false);
+    cfg.rope_theta          = j.value("rope_theta", 10000.0f);
+    cfg.rms_norm_eps        = j.value("rms_norm_eps", 1e-6f);
+    cfg.tie_word_embeddings = j.value("tie_word_embeddings", false);
+
+    // Qwen2-family checkpoints (incl. Qwen2.5-Coder) hardcode q/k/v bias in the
+    // modeling code and OMIT "attention_bias" from config.json entirely, so for
+    // model_type "qwen2" the key's absence means true, not false.
+    const std::string model_type = j.value("model_type", std::string("unknown"));
+    cfg.has_qkv_bias = j.value("attention_bias", model_type == "qwen2");
+
+    // The RoPE kernel implements vanilla rotate_half only; a rope_scaling block
+    // (llama3 / YaRN / linear) is NOT honored. The angles coincide at pos=0 but
+    // diverge for every later position, so warn loudly instead of failing hard:
+    // the in-repo Llama-3.1-FP8 verification checkpoint carries such a block and
+    // is only ever validated at pos=0 against the golden dumps.
+    if (j.contains("rope_scaling") && !j.at("rope_scaling").is_null()) {
+        const std::string rope_type =
+            j.at("rope_scaling").value("rope_type", j.at("rope_scaling").value("type", "unknown"));
+        std::cerr << "[ConfigLoader] WARNING: config declares rope_scaling (rope_type=\""
+                  << rope_type << "\") but the RoPE kernel applies vanilla rotate_half "
+                  << "frequencies; positional encoding is WRONG for pos >= 1.\n";
+    }
+
+    // The decode attention kernel attends over the full causal prefix.
+    if (j.value("use_sliding_window", false))
+        throw std::runtime_error(
+            "ConfigLoader: use_sliding_window=true is not supported by the attention kernel.");
 
     if (j.contains("quantization_config")) {
         const auto& qc   = j.at("quantization_config");

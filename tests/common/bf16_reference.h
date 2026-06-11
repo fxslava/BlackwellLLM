@@ -8,6 +8,7 @@
 
 #include "common/cuda_test_utils.h"
 #include "kernels/bf16_linear.cuh"
+#include "kernels/bf16_linear_residual.cuh"
 
 namespace test_utils {
 
@@ -39,6 +40,51 @@ inline Bf16Problem make_bf16_problem(size_t M, size_t K, unsigned seed) {
     }
     return p;
 }
+
+// Residual variant (o_proj / down_proj path): the accumulator starts at a
+// non-trivial value and the kernel must add W @ x on top of it (+=), never
+// overwrite it.
+struct Bf16ResidualProblem {
+    Bf16Problem base;                 // base.ref holds the pure W @ x dot
+    std::vector<float> accum_init;    // [M] initial residual stream
+    std::vector<float> ref;           // [M] accum_init + W @ x
+};
+
+inline Bf16ResidualProblem make_bf16_residual_problem(size_t M, size_t K, unsigned seed) {
+    Bf16ResidualProblem p;
+    p.base = make_bf16_problem(M, K, seed);
+    p.accum_init = random_normal(M, seed ^ 0x9E3779B9u);
+    p.ref.resize(M);
+    for (size_t i = 0; i < M; ++i)
+        p.ref[i] = p.accum_init[i] + p.base.ref[i];
+    return p;
+}
+
+struct Bf16ResidualDevice {
+    CudaVector<__nv_bfloat16> weights;
+    CudaVector<float> x;
+    CudaVector<float> y_accum;
+
+    explicit Bf16ResidualDevice(const Bf16ResidualProblem& p)
+        : weights(p.base.weights.size()), x(p.base.x.size()), y_accum(p.base.M) {
+        weights.upload(p.base.weights);
+        x.upload(p.base.x);
+        y_accum.upload(p.accum_init);
+    }
+
+    void launch(const Bf16ResidualProblem& p) {
+        launch_bf16_gemv_residual_kernel(weights, x, y_accum, p.base.M, p.base.K);
+    }
+
+    std::vector<float> run(const Bf16ResidualProblem& p) {
+        launch(p);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> out(p.base.M);
+        y_accum.download(out);
+        return out;
+    }
+};
 
 struct Bf16Device {
     CudaVector<__nv_bfloat16> weights;
