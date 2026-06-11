@@ -5,9 +5,9 @@
 #include <iomanip>
 #include <cuda_runtime.h>
 
-#include "safetensors.h"
-#include "memory_pool.h"
-#include "cpu_models.h"
+#include "../safetensors.h"
+#include "../memory_pool.h"
+#include "../../tests/reference/cpu_models.h"
 
 // --- Функция расчета Шенноновской Энтропии (бит на символ) ---
 double calculate_shannon_entropy(const std::vector<uint64_t>& histogram, uint64_t total_elements) {
