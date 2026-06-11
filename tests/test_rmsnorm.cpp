@@ -2,7 +2,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "common.h"
-#include "rmsnorm.cuh"
+#include "kernels/rmsnorm.cuh"
 #include "cpu_models.h"
 
 class RmsnormTests : public ::testing::Test {

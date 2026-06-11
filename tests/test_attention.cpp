@@ -2,7 +2,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "common.h"
-#include "attention.cuh"
+#include "kernels/attention.cuh"
 #include "cpu_models.h"
 
 class AttentionTests : public ::testing::Test {

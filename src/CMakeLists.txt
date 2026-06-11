@@ -1,5 +1,7 @@
-﻿cmake_minimum_required(VERSION 3.20) 
-project(BlackwellLLM CXX) 
+﻿cmake_minimum_required(VERSION 3.20)
+project(BlackwellLLM CXX)
+
+add_subdirectory(kernels)
 
 # 🎯 Опция для включения DirectStorage (по умолчанию ВЫКЛЮЧЕНА)
 option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
@@ -108,9 +110,9 @@ endif()
 # ==============================================================================
 
 # Создаем таргет
-add_executable(blackwell_compress 
-    compress_experiment.cu
-    nvcomp_baseline.cu
+add_executable(blackwell_compress
+    kernels/compress_experiment.cu
+    kernels/nvcomp_baseline.cu
 )
 
 # 🎯 1. Руками указываем папку с заголовками (include)

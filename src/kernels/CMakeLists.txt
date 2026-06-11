@@ -32,4 +32,4 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 # Разрешаем включать заголовочные файлы из этой директории
-target_include_directories(blackwell_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(blackwell_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

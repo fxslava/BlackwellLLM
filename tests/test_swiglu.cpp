@@ -2,7 +2,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "common.h"
-#include "swiglu.cuh"
+#include "kernels/swiglu.cuh"
 #include "cpu_models.h"
 
 class SwigluTests : public ::testing::Test {

@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "common.h"
-#include "embedding.cuh"
+#include "kernels/embedding.cuh"
 #include "cpu_models.h"
 
 #ifdef _WIN32

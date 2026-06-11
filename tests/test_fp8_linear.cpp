@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "common.h"
-#include "fp8_linear.cuh"
+#include "kernels/fp8_linear.cuh"
 #include "cpu_models.h"
 
 class Fp8LinearTests : public ::testing::Test {

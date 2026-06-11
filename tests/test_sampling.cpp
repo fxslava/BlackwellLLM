@@ -2,7 +2,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "common.h"
-#include "sampling.cuh"
+#include "kernels/sampling.cuh"
 #include "cpu_models.h"
 
 class SamplingTests : public ::testing::Test {

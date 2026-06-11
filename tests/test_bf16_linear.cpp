@@ -6,7 +6,7 @@
 
 #include "common.h"
 #include "cpu_models.h"
-#include "bf16_linear.cuh"
+#include "kernels/bf16_linear.cuh"
 
 class Bf16LinearTests : public ::testing::Test {
 protected:

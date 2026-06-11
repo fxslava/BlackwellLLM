@@ -1,14 +1,14 @@
 ﻿#include "engine_impl.h"
 #include "blackwell/engine.h"
 #include "common.h"
-#include "embedding.cuh"
-#include "rmsnorm.cuh"
-#include "fp8_linear.cuh"
-#include "bf16_linear.cuh"
-#include "rope.cuh"
-#include "attention.cuh"
-#include "swiglu.cuh"
-#include "sampling.cuh"
+#include "kernels/embedding.cuh"
+#include "kernels/rmsnorm.cuh"
+#include "kernels/fp8_linear.cuh"
+#include "kernels/bf16_linear.cuh"
+#include "kernels/rope.cuh"
+#include "kernels/attention.cuh"
+#include "kernels/swiglu.cuh"
+#include "kernels/sampling.cuh"
 #include <iomanip>
 
 BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len) 

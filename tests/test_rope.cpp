@@ -2,7 +2,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "common.h"
-#include "rope.cuh"
+#include "kernels/rope.cuh"
 #include "cpu_models.h"
 
 class RopeTests : public ::testing::Test {
