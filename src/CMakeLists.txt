@@ -11,6 +11,7 @@ option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading 
 # ==============================================================================
 set(CORE_SOURCES
     engine.cpp
+    ops_dispatcher.cpp
     safetensors.cpp
     memory_pool.cpp
     tokenizer.cpp

@@ -3,7 +3,6 @@
 #include "common.h"
 #include "kernels/embedding.cuh"
 #include "kernels/rmsnorm.cuh"
-#include "kernels/fp8_linear.cuh"
 #include "kernels/bf16_linear.cuh"
 #include "kernels/rope.cuh"
 #include "kernels/attention.cuh"
@@ -16,7 +15,8 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len)
     : loader(index_path),
       m_config(ConfigLoader::load_from_json(
           (std::filesystem::path(index_path).parent_path() / "config.json").string())),
-      arena(index_path, loader, m_config, max_seq_len)
+      arena(index_path, loader, m_config, max_seq_len),
+      dispatcher(arena, m_config)
 {
     // 1. Bind core activation buffers from the arena
     d_X_accum = arena.get_activation_buffer_A();
@@ -73,20 +73,16 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
-    
-    // 🎯 Перед проекциями рассчитываем динамический скейл текущего нормализованного потока
+    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".self_attn.";
+
     launch_quantize_per_token_kernel(d_X_norm, d_token_scale, m_config.hidden_dim);
 
-    auto proj = [&](const std::string& name, float* out, size_t M) {
-        const void* w   = arena.get_weight_ptr(prefix + "self_attn." + name + ".weight");
-        const void* w_s = arena.get_weight_ptr(prefix + "self_attn." + name + ".weight_scale");
-        const void* i_s = arena.get_weight_ptr_optional(prefix + "self_attn." + name + ".input_scale");
-        launch_fp8_gemv_kernel(w, d_X_norm, w_s, i_s, d_token_scale, out, M, m_config.hidden_dim, 1);
-    };
-    proj("q_proj", d_Q, m_config.num_attention_heads * m_config.head_dim);
-    proj("k_proj", d_K, m_config.num_key_value_heads * m_config.head_dim);
-    proj("v_proj", d_V, m_config.num_key_value_heads * m_config.head_dim);
+    dispatcher.forward(prefix + "q_proj", d_X_norm, d_Q,
+                       m_config.num_attention_heads * m_config.head_dim, m_config.hidden_dim, d_token_scale);
+    dispatcher.forward(prefix + "k_proj", d_X_norm, d_K,
+                       m_config.num_key_value_heads * m_config.head_dim, m_config.hidden_dim, d_token_scale);
+    dispatcher.forward(prefix + "v_proj", d_X_norm, d_V,
+                       m_config.num_key_value_heads * m_config.head_dim, m_config.hidden_dim, d_token_scale);
 }
 
 void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
@@ -104,16 +100,12 @@ void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
 }
 
 void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
-    
-    // 🎯 Оцениваем скейл для выхода внимания перед сверткой остаточным ядром
+    std::string base = "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
+
     launch_quantize_per_token_kernel(d_Attn_out, d_token_scale, m_config.hidden_dim);
 
-    const void* o_w   = arena.get_weight_ptr(prefix + "self_attn.o_proj.weight");
-    const void* o_w_s = arena.get_weight_ptr(prefix + "self_attn.o_proj.weight_scale");
-    const void* o_i_s = arena.get_weight_ptr_optional(prefix + "self_attn.o_proj.input_scale");
-
-    launch_fp8_gemv_residual_kernel(o_w, d_Attn_out, o_w_s, o_i_s, d_token_scale, d_X_accum, m_config.hidden_dim, m_config.hidden_dim, 1);
+    dispatcher.forward(base, d_Attn_out, nullptr,
+                       m_config.hidden_dim, m_config.hidden_dim, d_token_scale, d_X_accum);
 }
 
 // ============================================================================
@@ -126,33 +118,25 @@ void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
+    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".mlp.";
 
-    // 🎯 Оцениваем скейл перед входом в проекции перцептрона
     launch_quantize_per_token_kernel(d_X_norm, d_token_scale, m_config.hidden_dim);
 
-    const void* gate_w   = arena.get_weight_ptr(prefix + "mlp.gate_proj.weight");
-    const void* gate_w_s = arena.get_weight_ptr(prefix + "mlp.gate_proj.weight_scale");
-    const void* gate_i_s = arena.get_weight_ptr_optional(prefix + "mlp.gate_proj.input_scale");
-    launch_fp8_gemv_kernel(gate_w, d_X_norm, gate_w_s, gate_i_s, d_token_scale, d_Gate, m_config.intermediate_dim, m_config.hidden_dim, 1);
-
-    const void* up_w   = arena.get_weight_ptr(prefix + "mlp.up_proj.weight");
-    const void* up_w_s = arena.get_weight_ptr(prefix + "mlp.up_proj.weight_scale");
-    const void* up_i_s = arena.get_weight_ptr_optional(prefix + "mlp.up_proj.input_scale");
-    launch_fp8_gemv_kernel(up_w, d_X_norm, up_w_s, up_i_s, d_token_scale, d_Up, m_config.intermediate_dim, m_config.hidden_dim, 1);
+    dispatcher.forward(prefix + "gate_proj", d_X_norm, d_Gate,
+                       m_config.intermediate_dim, m_config.hidden_dim, d_token_scale);
+    dispatcher.forward(prefix + "up_proj",   d_X_norm, d_Up,
+                       m_config.intermediate_dim, m_config.hidden_dim, d_token_scale);
 }
 
 void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
+    std::string base = "model.layers." + std::to_string(layer_idx) + ".mlp.down_proj";
 
     launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, m_config.intermediate_dim);
 
     launch_quantize_per_token_kernel(d_Swiglu_out, d_token_scale, m_config.intermediate_dim);
 
-    const void* down_w   = arena.get_weight_ptr(prefix + "mlp.down_proj.weight");
-    const void* down_w_s = arena.get_weight_ptr(prefix + "mlp.down_proj.weight_scale");
-    const void* down_i_s = arena.get_weight_ptr_optional(prefix + "mlp.down_proj.input_scale");
-    launch_fp8_gemv_residual_kernel(down_w, d_Swiglu_out, down_w_s, down_i_s, d_token_scale, d_X_accum, m_config.hidden_dim, m_config.intermediate_dim, 1);
+    dispatcher.forward(base, d_Swiglu_out, nullptr,
+                       m_config.hidden_dim, m_config.intermediate_dim, d_token_scale, d_X_accum);
 }
 
 // ============================================================================

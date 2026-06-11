@@ -3,11 +3,13 @@
 #include "blackwell/config.h"
 #include "safetensors.h"
 #include "memory_pool.h"
+#include "ops_dispatcher.h"
 
 struct BlackwellEngine::Impl {
     ModelConfig m_config;
     SafetensorsLoader loader;
     VRAMArena arena;
+    LinearDispatcher dispatcher;
 
     float *d_X_accum = nullptr;
     float *d_X_norm = nullptr;
