@@ -8,8 +8,8 @@
 #include <windows.h>
 #endif
 
-#include "engine.h"
-#include "tokenizer.h"
+#include "blackwell/engine.h"
+#include "blackwell/tokenizer.h"
 
 int main() {
 #ifdef _WIN32

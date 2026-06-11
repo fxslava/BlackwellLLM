@@ -10,8 +10,8 @@
 #include <algorithm>
 
 #include "common.h"
-#include "engine.h"
-#include "../src/engine_impl.h"
+#include "blackwell/engine.h"
+#include "engine_impl.h"
 
 // Вспомогательная функция загрузки эталонных бинарных дампов PyTorch
 static std::vector<float> load_golden_dump(const std::string& filename, size_t num_elements) {

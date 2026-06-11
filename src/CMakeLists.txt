@@ -27,9 +27,10 @@ target_link_libraries(blackwell_core PRIVATE
     blackwell_kernels
 ) 
 
-target_include_directories(blackwell_core PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include  
-) 
+target_include_directories(blackwell_core
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 # ==============================================================================
 # 2. АВТОМАТИЧЕСКАЯ ЗАГРУЗКА DIRECTSTORAGE SDK С NUGET

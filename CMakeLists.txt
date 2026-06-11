@@ -42,8 +42,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-# Общие заголовки
-include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/reference)
+# Общие заголовки (reference/ needed by tests; include/ exposed via blackwell_core PUBLIC)
+include_directories(${CMAKE_SOURCE_DIR}/reference)
 
 # Подключаем поддиректории
 add_subdirectory(kernels)

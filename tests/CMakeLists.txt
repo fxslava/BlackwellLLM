@@ -2,8 +2,12 @@ file(GLOB TEST_SOURCES "*.cpp")
 
 add_executable(unit_tests ${TEST_SOURCES})
 
+target_include_directories(unit_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
 # Линкуем GoogleTest, библиотеку ядер и CUDA Runtime
-target_link_libraries(unit_tests PRIVATE 
+target_link_libraries(unit_tests PRIVATE
     GTest::gtest
     GTest::gtest_main
     blackwell_kernels

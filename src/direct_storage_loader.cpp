@@ -1,6 +1,6 @@
 ﻿#ifdef USE_DIRECT_STORAGE
 
-#include "weight_loader.h"
+#include "blackwell/weight_loader.h"
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
