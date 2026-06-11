@@ -26,11 +26,13 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
 
     if (j.contains("quantization_config")) {
         const auto& qc   = j.at("quantization_config");
-        cfg.quant_method = qc.value("quant_type", qc.value("quant_method", "none"));
-        cfg.quant_bits   = qc.value("bits", 16);
+        cfg.quant_method     = qc.value("quant_type", qc.value("quant_method", "none"));
+        cfg.quant_bits       = qc.value("bits", 16);
+        cfg.quant_group_size = qc.value("group_size", 128);
     } else {
-        cfg.quant_bits   = 16;
-        cfg.quant_method = "none";
+        cfg.quant_bits       = 16;
+        cfg.quant_group_size = 128;
+        cfg.quant_method     = "none";
     }
 
     return cfg;

@@ -16,6 +16,7 @@ struct ModelConfig {
     bool has_qkv_bias;
 
     int quant_bits;
+    int quant_group_size;
     std::string quant_method;
 };
 
