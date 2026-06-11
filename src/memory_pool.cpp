@@ -25,6 +25,7 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
     
     // 1. Calculate absolute byte footprint with strict 16-byte alignment per tensor
     size_t current_offset = 0;
+    size_t qweight_count = 0;
     std::vector<std::pair<std::string, size_t>> aligned_offsets;
     aligned_offsets.reserve(tensor_names.size());
 
@@ -56,10 +57,13 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
         io_loader->load_to_vram(entry.file_path, entry.file_offset, entry.byte_size, d_dest);
         
         weight_pointers[name] = d_dest;
+        if (name.size() >= 8 && name.compare(name.size() - 8, 8, ".qweight") == 0)
+            ++qweight_count;
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
     std::cout << "[VRAM Arena] Weights successfully transferred to device arena.\n";
+    std::cout << "[VRAM Arena] Loaded " << qweight_count << " quantized AWQ/GPTQ modules.\n";
 }
 
 void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
@@ -109,4 +113,26 @@ const void* VRAMArena::get_weight_ptr_optional(const std::string& name) const {
         return it->second;
     }
     return nullptr;
+}
+
+QuantizedTensorPtrs VRAMArena::get_quantized_pointers(const std::string& base_name) const {
+    const bool is_quant = (m_config.quant_method == "awq" || m_config.quant_method == "gptq");
+
+    auto lookup = [&](const std::string& key) -> const void* {
+        auto it = weight_pointers.find(key);
+        return it != weight_pointers.end() ? it->second : nullptr;
+    };
+
+    const void* qweight = lookup(base_name + ".qweight");
+    const void* scales  = lookup(base_name + ".scales");
+    const void* qzeros  = lookup(base_name + ".qzeros");
+
+    if (is_quant) {
+        if (!qweight)
+            throw std::runtime_error("[VRAMArena] Missing quantized tensor: " + base_name + ".qweight");
+        if (!scales)
+            throw std::runtime_error("[VRAMArena] Missing quantized tensor: " + base_name + ".scales");
+    }
+
+    return {qweight, scales, qzeros};
 }
