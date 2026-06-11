@@ -1,111 +1,71 @@
+// AWQ int4 GEMV kernel tests, split into two categories:
+//   AWQValidation -- mathematical correctness on exact Qwen2.5-Coder-7B
+//                    decode shapes against an FP64 CPU reference.
+//   AWQStress     -- pathological shapes, ragged/malformed parameters,
+//                    non-finite inputs and rapid sequential launches.
 #include <gtest/gtest.h>
-#include <vector>
 #include <cmath>
 #include <cstdint>
-#include <random>
-#include <algorithm>
+#include <vector>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include "common.h"
+#include "test_utils.h"
 #include "kernels/awq_linear.cuh"
 
+using test_utils::AwqProblem;
+using test_utils::make_awq_problem;
+using test_utils::make_awq_constant_problem;
+using test_utils::max_rel_error;
+
 namespace {
-
-// AWQ packs 8 int4 values per uint32 in order {0,2,4,6,1,3,5,7}:
-// logical element j of a packed word lives at bit offset 16*(j&1) + 4*(j>>1).
-constexpr int kAwqOrder[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-
-struct AwqTestCase {
-    std::vector<uint32_t> qweight;  // [in_features][out_features/8]
-    std::vector<uint32_t> qzeros;   // [num_groups][out_features/8]
-    std::vector<half> scales;       // [num_groups][out_features]
-    std::vector<float> x;           // [in_features]
-    std::vector<float> ref;         // [out_features], FP64 reference
-};
-
-AwqTestCase make_case(int in_features, int out_features, int group_size, unsigned seed) {
-    const int gs = group_size > 0 ? group_size : in_features;
-    const int num_groups = (in_features + gs - 1) / gs;
-    const int packed_cols = out_features / 8;
-
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> q4(0, 15);
-    std::normal_distribution<float> nrm(0.0f, 1.0f);
-
-    std::vector<int> w((size_t)in_features * out_features);
-    std::vector<int> z((size_t)num_groups * out_features);
-
-    AwqTestCase tc;
-    tc.scales.resize((size_t)num_groups * out_features);
-    tc.x.resize(in_features);
-    tc.ref.assign(out_features, 0.0f);
-
-    for (auto& v : w) v = q4(rng);
-    for (auto& v : z) v = q4(rng);
-    for (auto& v : tc.scales) v = __float2half(nrm(rng) * 0.05f);
-    for (auto& v : tc.x) v = nrm(rng);
-
-    tc.qweight.assign((size_t)in_features * packed_cols, 0);
-    tc.qzeros.assign((size_t)num_groups * packed_cols, 0);
-    for (int k = 0; k < in_features; ++k)
-        for (int pc = 0; pc < packed_cols; ++pc)
-            for (int n = 0; n < 8; ++n)
-                tc.qweight[(size_t)k * packed_cols + pc] |=
-                    (uint32_t)w[(size_t)k * out_features + pc * 8 + kAwqOrder[n]] << (4 * n);
-    for (int g = 0; g < num_groups; ++g)
-        for (int pc = 0; pc < packed_cols; ++pc)
-            for (int n = 0; n < 8; ++n)
-                tc.qzeros[(size_t)g * packed_cols + pc] |=
-                    (uint32_t)z[(size_t)g * out_features + pc * 8 + kAwqOrder[n]] << (4 * n);
-
-    for (int oc = 0; oc < out_features; ++oc) {
-        double acc = 0.0;
-        for (int k = 0; k < in_features; ++k) {
-            const int g = k / gs;
-            acc += (double)(w[(size_t)k * out_features + oc] - z[(size_t)g * out_features + oc]) *
-                   (double)__half2float(tc.scales[(size_t)g * out_features + oc]) * (double)tc.x[k];
-        }
-        tc.ref[oc] = (float)acc;
-    }
-    return tc;
-}
-
-// Relative error with a small absolute floor in the denominator: outputs that
-// land near zero by cancellation would otherwise blow up the relative metric.
-float max_rel_error(const std::vector<float>& gpu, const std::vector<float>& ref) {
-    float max_rel = 0.0f;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const float a = std::fabs(gpu[i] - ref[i]);
-        max_rel = std::max(max_rel, a / std::max(1e-3f, std::fabs(ref[i])));
-    }
-    return max_rel;
-}
 
 // FP16 scales bound the achievable precision; 4.2e-3 was the worst case
 // observed across shapes, 5e-3 leaves headroom without masking real bugs.
 constexpr float kRelTolerance = 5e-3f;
 
-void run_and_check(int in_features, int out_features, int group_size, unsigned seed) {
-    const AwqTestCase tc = make_case(in_features, out_features, group_size, seed);
+struct AwqDevice {
+    CudaVector<uint32_t> qweight;
+    CudaVector<uint32_t> qzeros;
+    CudaVector<half> scales;
+    CudaVector<float> x;
+    CudaVector<float> y;
 
-    CudaVector<uint32_t> d_qw(tc.qweight.size()); d_qw.upload(tc.qweight);
-    CudaVector<uint32_t> d_qz(tc.qzeros.size());  d_qz.upload(tc.qzeros);
-    CudaVector<half>     d_s(tc.scales.size());   d_s.upload(tc.scales);
-    CudaVector<float>    d_x(tc.x.size());        d_x.upload(tc.x);
-    CudaVector<float>    d_y(out_features);
-    // Poison the output so a kernel that silently writes nothing fails loudly.
-    CUDA_CHECK(cudaMemset(d_y.d_ptr, 0xCC, out_features * sizeof(float)));
+    explicit AwqDevice(const AwqProblem& p)
+        : qweight(p.qweight.size()),
+          qzeros(p.qzeros.size()),
+          scales(p.scales.size()),
+          x(p.x.size()),
+          y(p.out_features) {
+        qweight.upload(p.qweight);
+        qzeros.upload(p.qzeros);
+        scales.upload(p.scales);
+        x.upload(p.x);
+        // Poison the output so a kernel that silently writes nothing fails loudly.
+        CUDA_CHECK(cudaMemset(y.d_ptr, 0xCC, p.out_features * sizeof(float)));
+    }
 
-    launch_awq_gemv_kernel(d_qw, d_s, d_qz, d_x, d_y,
-                           out_features, in_features, group_size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    void launch(const AwqProblem& p) {
+        launch_awq_gemv_kernel(qweight, scales, qzeros, x, y,
+                               p.out_features, p.in_features, p.group_size);
+    }
 
-    std::vector<float> gpu(out_features);
-    d_y.download(gpu);
+    std::vector<float> run(const AwqProblem& p) {
+        launch(p);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> out(p.out_features);
+        y.download(out);
+        return out;
+    }
+};
 
-    const float max_rel = max_rel_error(gpu, tc.ref);
+void expect_awq_matches_reference(int in_features, int out_features,
+                                  int group_size, unsigned seed) {
+    const AwqProblem p = make_awq_problem(in_features, out_features, group_size, seed);
+    AwqDevice dev(p);
+    const float max_rel = max_rel_error(dev.run(p), p.ref);
     EXPECT_LE(max_rel, kRelTolerance)
         << "AWQ GEMV mismatch: IC=" << in_features << " OC=" << out_features
         << " group_size=" << group_size << " max_rel=" << max_rel;
@@ -113,40 +73,112 @@ void run_and_check(int in_features, int out_features, int group_size, unsigned s
 
 }  // namespace
 
-class AWQKernel : public ::testing::Test {
-protected:
-    void TearDown() override {
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            std::cerr << "\n[CUDA ERROR]: " << cudaGetErrorString(err) << "\n";
-        }
+// ============================================================================
+// Category A: Validation (Qwen2.5-Coder-7B: hidden=3584, intermediate=18944,
+// GQA KV dim = 4 heads * 128 = 512, group_size=128)
+// ============================================================================
+
+TEST(AWQValidation, QwenAttentionQProj) {
+    expect_awq_matches_reference(3584, 3584, 128, 11);
+}
+
+// OC=512 -> only 64 packed columns: the launcher distributes the reduction
+// dimension across blocks (split-K), so GQA K/V projections take the
+// atomic-accumulation path.
+TEST(AWQValidation, QwenGqaKvProjSplitK) {
+    expect_awq_matches_reference(3584, 512, 128, 12);
+}
+
+TEST(AWQValidation, QwenMlpGateUpProj) {
+    expect_awq_matches_reference(3584, 18944, 128, 13);
+}
+
+TEST(AWQValidation, QwenMlpDownProj) {
+    expect_awq_matches_reference(18944, 3584, 128, 14);
+}
+
+// ============================================================================
+// Category B: Stress (edge shapes, malformed parameters, hardware limits)
+// ============================================================================
+
+// Minimum legal width: a single packed column, reductions maximally
+// distributed across split-K blocks.
+TEST(AWQStress, ExtremeNarrowOutputOC8) {
+    expect_awq_matches_reference(8192, 8, 128, 21);
+}
+
+TEST(AWQStress, RaggedTailGroup) {
+    expect_awq_matches_reference(200, 64, 64, 22);   // IC % gs = 8
+    expect_awq_matches_reference(1000, 128, 128, 23); // IC % gs = 104
+}
+
+TEST(AWQStress, GroupLargerThanInFeatures) {
+    expect_awq_matches_reference(96, 128, 128, 24);
+}
+
+// group_size <= 0 must fall back to per-channel quantization (one group
+// spanning all of in_features) instead of crashing or dividing by zero.
+TEST(AWQStress, MalformedGroupSizeFallsBackToPerChannel) {
+    expect_awq_matches_reference(4096, 256, -1, 25);
+    expect_awq_matches_reference(512, 128, 0, 26);
+}
+
+// Vocab-sized projection (Qwen lm_head): exercises grid sizing and 64-bit
+// indexing at the largest shape the engine launches. Constant-pattern
+// weights keep the CPU reference O(IC) instead of O(IC*OC).
+TEST(AWQStress, QwenVocabSizedLmHead) {
+    const AwqProblem p = make_awq_constant_problem(3584, 152064, 128, 27);
+    AwqDevice dev(p);
+    const float max_rel = max_rel_error(dev.run(p), p.ref, 1e-2f);
+    EXPECT_LE(max_rel, kRelTolerance) << "lm_head-sized GEMV mismatch, max_rel=" << max_rel;
+}
+
+// A NaN activation must poison every output element (each output is a dot
+// product over all of in_features); no value may pass through untouched.
+TEST(AWQStress, NaNActivationPropagates) {
+    AwqProblem p = make_awq_problem(256, 64, 128, 28);
+    p.x[123] = std::nanf("");
+    AwqDevice dev(p);
+    const std::vector<float> out = dev.run(p);
+    for (size_t i = 0; i < out.size(); ++i)
+        EXPECT_TRUE(std::isnan(out[i])) << "output " << i << " not NaN: " << out[i];
+}
+
+TEST(AWQStress, InfActivationProducesNonFinite) {
+    AwqProblem p = make_awq_problem(256, 64, 128, 29);
+    p.x[7] = INFINITY;
+    AwqDevice dev(p);
+    const std::vector<float> out = dev.run(p);
+    for (size_t i = 0; i < out.size(); ++i)
+        EXPECT_FALSE(std::isfinite(out[i])) << "output " << i << " finite: " << out[i];
+}
+
+// Back-to-back launches without intermediate synchronization. The split-K
+// path interleaves cudaMemsetAsync with atomicAdd kernels on the default
+// stream; any ordering violation or leftover partial sum shows up as a
+// wrong result in one of the rounds.
+TEST(AWQStress, RapidSequentialSplitKLaunches) {
+    const AwqProblem p = make_awq_problem(3584, 512, 128, 30);
+    AwqDevice a(p);
+    AwqDevice b(p);
+
+    for (int i = 0; i < 32; ++i)
+        (i % 2 ? b : a).launch(p);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> out(p.out_features);
+    a.y.download(out);
+    EXPECT_LE(max_rel_error(out, p.ref), kRelTolerance) << "buffer A corrupted";
+    b.y.download(out);
+    EXPECT_LE(max_rel_error(out, p.ref), kRelTolerance) << "buffer B corrupted";
+
+    // Repeated rounds into one buffer: each result must be independently correct.
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < 16; ++i) a.launch(p);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        a.y.download(out);
+        EXPECT_LE(max_rel_error(out, p.ref), kRelTolerance) << "round " << round;
     }
-};
-
-TEST_F(AWQKernel, NumericalCorrectness) {
-    run_and_check(4096, 4096, 128, 1);
-}
-
-TEST_F(AWQKernel, LlamaMlpProjection) {
-    run_and_check(11008, 4096, 128, 2);
-}
-
-// OC=8 -> a single packed column; the launcher must split the reduction
-// dimension across blocks (atomicAdd path) to keep the GPU busy.
-TEST_F(AWQKernel, ExtremeSplitK) {
-    run_and_check(8192, 8, 128, 3);
-}
-
-// group_size <= 0 means per-channel quantization (one group over all of IC).
-TEST_F(AWQKernel, PerChannelQuantization) {
-    run_and_check(4096, 256, -1, 4);
-}
-
-// in_features not divisible by group_size: the last group is ragged.
-TEST_F(AWQKernel, RaggedTailGroup) {
-    run_and_check(200, 64, 64, 5);
-}
-
-TEST_F(AWQKernel, SmallGroupSize) {
-    run_and_check(512, 512, 64, 6);
 }
