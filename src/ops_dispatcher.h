@@ -4,30 +4,36 @@
 #include "memory_pool.h"
 #include "blackwell/config.h"
 
-// Routes linear projections to FP8 or AWQ kernels based on ModelConfig::quant_bits.
+// Routes linear projections to the correct kernel backend based on ModelConfig::quant_method.
+// Owns all quantization-related intermediate state (e.g. per-token FP8 scale buffers)
+// so that callers remain oblivious to the quantization scheme in use.
 class LinearDispatcher {
 public:
-    LinearDispatcher(const VRAMArena& arena, const ModelConfig& config)
-        : m_arena(arena), m_config(config) {}
+    LinearDispatcher(const VRAMArena& arena, const ModelConfig& config);
+    ~LinearDispatcher();
 
-    // Runs a linear projection: d_out = W * d_in, with optional residual accumulation.
+    LinearDispatcher(const LinearDispatcher&) = delete;
+    LinearDispatcher& operator=(const LinearDispatcher&) = delete;
+
+    // Execute one linear projection: d_out = W * d_in.
     //
-    // base_name    - weight tensor prefix (e.g. "model.layers.0.self_attn.q_proj")
-    // d_in         - normalized input vector on device
-    // d_out        - output buffer on device
-    // out_features - output dimension M
-    // in_features  - input dimension K
-    // d_token_scale - per-token quantization scale (FP8 path only)
-    // d_residual_accum - if non-null, result is added into this buffer (residual connection)
+    // base_name       - weight tensor prefix, e.g. "model.layers.0.self_attn.q_proj"
+    // d_in            - raw (unquantized) float input vector on device
+    // d_out           - output buffer on device (ignored when d_residual_accum != nullptr)
+    // out_features    - output dimension M
+    // in_features     - input dimension K (also the quantization domain for FP8)
+    // d_residual_accum - if non-null, result is accumulated into this buffer in-place
     void forward(const std::string& base_name,
                  const float* d_in,
                  float* d_out,
                  size_t out_features,
                  size_t in_features,
-                 const float* d_token_scale,
                  float* d_residual_accum = nullptr);
 
 private:
     const VRAMArena& m_arena;
     const ModelConfig& m_config;
+
+    // Per-token scale buffer [scale, inv_scale]; allocated only for the "fp8" path.
+    float* d_token_scale = nullptr;
 };

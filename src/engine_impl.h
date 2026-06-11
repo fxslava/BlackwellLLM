@@ -15,7 +15,7 @@ struct BlackwellEngine::Impl {
     float *d_X_norm = nullptr;
     float *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_Attn_out = nullptr;
     float *d_Gate = nullptr, *d_Up = nullptr, *d_Swiglu_out = nullptr;
-    float *d_logits = nullptr, *d_token_scale = nullptr;
+    float *d_logits = nullptr;
     int *d_next_token;
 
     Impl(const std::string& index_path, size_t max_seq_len);

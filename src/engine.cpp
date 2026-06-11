@@ -34,9 +34,6 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len)
 
     CUDA_CHECK(cudaMalloc(&d_logits, m_config.vocab_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_next_token, sizeof(int)));
-    
-    // 🎯 Выделяем память под буфер динамического скейла токена (scale и inv_scale)
-    CUDA_CHECK(cudaMalloc(&d_token_scale, 2 * sizeof(float)));
 
     CUDA_CHECK(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
     CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
@@ -46,7 +43,6 @@ BlackwellEngine::Impl::~Impl() {
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
     cudaFree(d_Attn_out); cudaFree(d_Gate); cudaFree(d_Up); cudaFree(d_Swiglu_out);
     cudaFree(d_logits); cudaFree(d_next_token);
-    cudaFree(d_token_scale); // 🎯 Не забываем освобождать память
 }
 
 // ============================================================================
@@ -75,14 +71,12 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
 void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".self_attn.";
 
-    launch_quantize_per_token_kernel(d_X_norm, d_token_scale, m_config.hidden_dim);
-
     dispatcher.forward(prefix + "q_proj", d_X_norm, d_Q,
-                       m_config.num_attention_heads * m_config.head_dim, m_config.hidden_dim, d_token_scale);
+                       m_config.num_attention_heads * m_config.head_dim, m_config.hidden_dim);
     dispatcher.forward(prefix + "k_proj", d_X_norm, d_K,
-                       m_config.num_key_value_heads * m_config.head_dim, m_config.hidden_dim, d_token_scale);
+                       m_config.num_key_value_heads * m_config.head_dim, m_config.hidden_dim);
     dispatcher.forward(prefix + "v_proj", d_X_norm, d_V,
-                       m_config.num_key_value_heads * m_config.head_dim, m_config.hidden_dim, d_token_scale);
+                       m_config.num_key_value_heads * m_config.head_dim, m_config.hidden_dim);
 }
 
 void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
@@ -102,10 +96,8 @@ void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
 void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
     std::string base = "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
 
-    launch_quantize_per_token_kernel(d_Attn_out, d_token_scale, m_config.hidden_dim);
-
     dispatcher.forward(base, d_Attn_out, nullptr,
-                       m_config.hidden_dim, m_config.hidden_dim, d_token_scale, d_X_accum);
+                       m_config.hidden_dim, m_config.hidden_dim, d_X_accum);
 }
 
 // ============================================================================
@@ -120,12 +112,10 @@ void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
 void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".mlp.";
 
-    launch_quantize_per_token_kernel(d_X_norm, d_token_scale, m_config.hidden_dim);
-
     dispatcher.forward(prefix + "gate_proj", d_X_norm, d_Gate,
-                       m_config.intermediate_dim, m_config.hidden_dim, d_token_scale);
+                       m_config.intermediate_dim, m_config.hidden_dim);
     dispatcher.forward(prefix + "up_proj",   d_X_norm, d_Up,
-                       m_config.intermediate_dim, m_config.hidden_dim, d_token_scale);
+                       m_config.intermediate_dim, m_config.hidden_dim);
 }
 
 void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
@@ -133,10 +123,8 @@ void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
 
     launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, m_config.intermediate_dim);
 
-    launch_quantize_per_token_kernel(d_Swiglu_out, d_token_scale, m_config.intermediate_dim);
-
     dispatcher.forward(base, d_Swiglu_out, nullptr,
-                       m_config.hidden_dim, m_config.intermediate_dim, d_token_scale, d_X_accum);
+                       m_config.hidden_dim, m_config.intermediate_dim, d_X_accum);
 }
 
 // ============================================================================
