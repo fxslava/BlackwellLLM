@@ -18,7 +18,7 @@ struct BlackwellEngine::Impl {
     float *d_logits = nullptr;
     int *d_next_token = nullptr;
 
-    Impl(const std::string& index_path, size_t max_seq_len);
+    Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers);
     ~Impl();
 
     void step_embedding(int token_id);

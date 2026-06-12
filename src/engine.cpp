@@ -10,18 +10,33 @@
 #include "kernels/attention.cuh"
 #include "kernels/swiglu.cuh"
 #include "kernels/sampling.cuh"
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <stdexcept>
 
+// SIZE_MAX (= "all resident") may be overridden by BLACKWELL_GPU_LAYERS so the
+// VRAM split is tunable without touching any call site.
+static size_t resolve_num_gpu_layers(size_t requested) {
+    if (requested != static_cast<size_t>(-1)) return requested;
+    if (const char* env = std::getenv("BLACKWELL_GPU_LAYERS")) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(env, &end, 10);
+        if (end != env && *end == '\0') return static_cast<size_t>(v);
+        throw std::invalid_argument(
+            "BLACKWELL_GPU_LAYERS is not a valid non-negative integer: " + std::string(env));
+    }
+    return static_cast<size_t>(-1);
+}
+
 // Initializer list mirrors the declaration order in engine_impl.h: members are
 // constructed in declaration order regardless of the list, and arena consumes
 // both loader and m_config, so the textual order must not suggest otherwise.
-BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len)
+BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers)
     : m_config(ConfigLoader::load_from_json(
           (std::filesystem::path(index_path).parent_path() / "config.json").string())),
       loader(index_path),
-      arena(index_path, loader, m_config, max_seq_len),
+      arena(index_path, loader, m_config, max_seq_len, resolve_num_gpu_layers(num_gpu_layers)),
       dispatcher(arena, m_config)
 {
     // 1. Bind core activation buffers from the arena
@@ -41,8 +56,11 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len)
     CUDA_CHECK(cudaMalloc(&d_logits, m_config.vocab_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_next_token, sizeof(int)));
 
-    CUDA_CHECK(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
-    CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
+    // Resident pool may be empty when every layer is offloaded to host RAM.
+    if (arena.get_k_cache_size() > 0) {
+        CUDA_CHECK(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
+        CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
+    }
 }
 
 BlackwellEngine::Impl::~Impl() {
@@ -81,6 +99,10 @@ void BlackwellEngine::Impl::step_embedding(int token_id) {
 // STAGE 2: Granular Attention
 // ============================================================================
 void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
+    // Offloaded layers: make the compute stream wait until the layer's weight
+    // block is staged in VRAM (no-op for resident layers). Every step repeats
+    // the call so the integration tests, which drive steps directly, stay safe.
+    arena.ensure_layer_ready(layer_idx);
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "input_layernorm.weight");
     if (half_weights_are_fp16(m_config)) {
@@ -91,6 +113,7 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
+    arena.ensure_layer_ready(layer_idx);
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".self_attn.";
 
     const size_t q_dim  = m_config.num_attention_heads * m_config.head_dim;
@@ -139,10 +162,13 @@ void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
-    size_t layer_cache_offset = layer_idx * (m_config.num_key_value_heads * arena.get_max_seq_len() * m_config.head_dim);
+    // For offloaded layers the prefix [0, pos) must sit in the KV staging slot
+    // before the attention kernel scans it (incremental copy, compute-stream
+    // ordered); resident layers resolve straight into the global VRAM pool.
+    arena.prepare_layer_kv(layer_idx, pos);
 
-    float* d_layer_k_cache = arena.get_k_cache() + layer_cache_offset;
-    float* d_layer_v_cache = arena.get_v_cache() + layer_cache_offset;
+    float* d_layer_k_cache = arena.get_layer_k_cache(layer_idx);
+    float* d_layer_v_cache = arena.get_layer_v_cache(layer_idx);
 
     launch_fused_rope_kv_kernel(d_Q, d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos,
         m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
@@ -150,9 +176,14 @@ void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
     launch_attention_decoding_kernel(d_Q, d_layer_k_cache, d_layer_v_cache, d_Attn_out, pos,
         m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
         arena.get_max_seq_len());
+
+    // Spill the freshly written KV column back to the pinned host mirror once
+    // the kernels above complete (event-ordered on the transfer stream).
+    arena.commit_layer_kv(layer_idx, pos);
 }
 
 void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
+    arena.ensure_layer_ready(layer_idx);
     std::string base = "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
 
     dispatcher.forward(base, d_Attn_out, nullptr,
@@ -163,6 +194,7 @@ void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
 // STAGE 3: Granular MLP
 // ============================================================================
 void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
+    arena.ensure_layer_ready(layer_idx);
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "post_attention_layernorm.weight");
     if (half_weights_are_fp16(m_config)) {
@@ -173,6 +205,7 @@ void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
+    arena.ensure_layer_ready(layer_idx);
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".mlp.";
 
     dispatcher.forward(prefix + "gate_proj", d_X_norm, d_Gate,
@@ -182,6 +215,7 @@ void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
+    arena.ensure_layer_ready(layer_idx);
     std::string base = "model.layers." + std::to_string(layer_idx) + ".mlp.down_proj";
 
     launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, m_config.intermediate_dim);
@@ -216,8 +250,8 @@ void BlackwellEngine::Impl::step_final_ops() {
 }
 
 // Реализация фасада BlackwellEngine
-BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len)
-    : pImpl(std::make_unique<Impl>(index_path, max_seq_len)) {}
+BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers)
+    : pImpl(std::make_unique<Impl>(index_path, max_seq_len, num_gpu_layers)) {}
 
 BlackwellEngine::~BlackwellEngine() = default;
 
@@ -237,6 +271,11 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
 
     const int num_layers = static_cast<int>(impl->m_config.num_layers);
     for (int i = 0; i < num_layers; ++i) {
+        // Async pipeline: enqueue layer i+1's weight block and KV prefix on the
+        // transfer stream NOW, so PCIe traffic overlaps layer i's kernels on
+        // the compute stream (no-op when i+1 is VRAM-resident).
+        impl->arena.prefetch_layer(i + 1, pos);
+
         impl->step_attention_norm(i);
         impl->step_attention_qkv_projections(i);
         impl->step_attention_math(i, pos);

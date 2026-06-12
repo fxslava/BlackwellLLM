@@ -1,6 +1,7 @@
-﻿#pragma once
+#pragma once
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <cstdint>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -14,10 +15,48 @@ struct QuantizedTensorPtrs {
     const void* qzeros;
 };
 
-// Static Memory Orchestrator for 12GB VRAM limit
+// Page-locked (pinned) host memory pool. Every host<->device tensor transfer in
+// the offloading path must source/sink cudaHostAlloc'd memory so cudaMemcpyAsync
+// can DMA over PCIe without an internal pageable staging copy; pageable malloc
+// is forbidden for tensor traffic.
+class PinnedHostPool {
+public:
+    PinnedHostPool() = default;
+    explicit PinnedHostPool(size_t bytes) { reserve(bytes); }
+    ~PinnedHostPool();
+
+    PinnedHostPool(const PinnedHostPool&) = delete;
+    PinnedHostPool& operator=(const PinnedHostPool&) = delete;
+
+    // One-shot arena reservation; throws on a second call or cudaHostAlloc failure.
+    void reserve(size_t bytes);
+
+    // Bump allocation, 16-byte aligned; throws std::bad_alloc on exhaustion.
+    void* allocate(size_t bytes);
+
+    void*  base()     const { return m_base; }
+    size_t capacity() const { return m_capacity; }
+    size_t used()     const { return m_used; }
+
+private:
+    void*  m_base = nullptr;
+    size_t m_capacity = 0;
+    size_t m_used = 0;
+};
+
+// Static Memory Orchestrator for 12GB VRAM limit.
+//
+// Layers [0, num_gpu_layers) keep weights and KV cache resident in VRAM exactly
+// as before. Layers [num_gpu_layers, num_layers) live in pinned host RAM and are
+// streamed through two ping-pong device staging slots (slot = layer % 2) on a
+// dedicated non-blocking transfer stream, overlapping PCIe traffic of layer N+1
+// with the legacy-stream compute of layer N. Ordering between the two streams is
+// expressed exclusively through cudaEvents; the math kernels are untouched.
 class VRAMArena {
 public:
-    VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, const ModelConfig& config, size_t max_seq_len = 2048);
+    VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader,
+              const ModelConfig& config, size_t max_seq_len = 2048,
+              size_t num_gpu_layers = static_cast<size_t>(-1));
     ~VRAMArena();
 
     VRAMArena(const VRAMArena&) = delete;
@@ -35,7 +74,7 @@ public:
     float* get_activation_buffer_A() const { return d_activation_A; }
     float* get_activation_buffer_B() const { return d_activation_B; }
 
-    // Global KV-Cache buffers
+    // Global KV-Cache buffers (VRAM-resident layers only)
     float* get_k_cache() const { return d_k_cache; }
     float* get_v_cache() const { return d_v_cache; }
 
@@ -45,12 +84,56 @@ public:
     size_t get_v_cache_size() const { return m_total_cache_bytes; }
     size_t get_activation_buffer_size() const { return m_activation_bytes; }
 
+    // ------------------------------------------------------------------
+    // Layer offloading control plane (all no-ops for VRAM-resident layers)
+    // ------------------------------------------------------------------
+    size_t num_gpu_layers() const { return m_num_gpu_layers; }
+    bool layer_is_offloaded(int layer) const {
+        return static_cast<size_t>(layer) >= m_num_gpu_layers &&
+               static_cast<size_t>(layer) <  m_config.num_layers;
+    }
+
+    // Enqueue layer weights + KV prefix [0, pos) onto the transfer stream.
+    // Never blocks the host or the compute stream: call for layer N+1 while
+    // layer N is executing. Out-of-range / resident layers are ignored.
+    void prefetch_layer(int layer, int pos);
+
+    // Make the compute (legacy) stream wait until the layer's weights are
+    // staged. Cold path stages synchronously-in-order on the transfer stream
+    // first; the host never blocks either way. Must precede any kernel that
+    // reads the layer's weights.
+    void ensure_layer_ready(int layer);
+
+    // Per-layer KV cache routing: resident pool pointer or staging-slot pointer.
+    // For offloaded layers the layer must currently own its staging slot.
+    float* get_layer_k_cache(int layer) const;
+    float* get_layer_v_cache(int layer) const;
+
+    // Guarantee positions [0, pos) of the layer's KV cache are in the staging
+    // slot before the attention kernels run (incremental: only missing tokens
+    // are transferred). Compute-stream-ordered like ensure_layer_ready.
+    void prepare_layer_kv(int layer, int pos);
+
+    // Spill the KV column written at `pos` back to the pinned host mirror once
+    // the attention kernels of this step have finished (event-ordered, async).
+    void commit_layer_kv(int layer, int pos);
+
 private:
     void allocate_weights_pool(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader);
     void allocate_dynamic_pool(size_t max_seq_len);
+    void init_streams();
     // Frees every device pool and nulls the pointers (idempotent). Shared by the
     // destructor and the constructor's failure path.
     void release_pools();
+
+    // Enqueue the full weight block of an offloaded layer into its slot (H2D,
+    // transfer stream). No-op if the slot already holds the layer.
+    void stage_layer_weights(int layer);
+    // Enqueue missing KV prefix tokens [slot.valid_upto, min(pos, host_filled))
+    // into the layer's KV slot. Handles slot eviction of the previous occupant.
+    void stage_layer_kv(int layer, int pos);
+
+    void* resolve_offloaded(const std::string& name) const;
 
     // Contiguous memory blocks
     void* d_weights_arena = nullptr;
@@ -68,7 +151,52 @@ private:
     size_t m_max_seq_len = 0;
     size_t m_total_cache_bytes = 0;
     size_t m_activation_bytes = 0;
+    size_t m_num_gpu_layers = 0;
 
     // Offset registry mapping tensor names to their absolute addresses in d_weights_arena
     std::unordered_map<std::string, void*> weight_pointers;
+
+    // ------------------------------------------------------------------
+    // Offloading state
+    // ------------------------------------------------------------------
+    static constexpr int kNumSlots = 2;
+
+    struct OffloadedTensor {
+        int    layer;
+        size_t offset;   // byte offset inside the layer's packed block
+    };
+
+    struct WeightSlot {
+        uint8_t*    d_base = nullptr;    // device staging buffer
+        int         layer = -1;          // current occupant
+        bool        compute_synced = false; // legacy stream already waits on ev_ready
+        cudaEvent_t ev_ready  = nullptr; // recorded on transfer stream after H2D
+        cudaEvent_t ev_retire = nullptr; // recorded on compute stream before eviction
+    };
+
+    struct KVSlot {
+        float*      d_k = nullptr;       // [kv_heads, max_seq_len, head_dim]
+        float*      d_v = nullptr;
+        int         layer = -1;
+        int         valid_upto = 0;      // tokens of `layer` present in the slot
+        bool        compute_synced = false;
+        cudaEvent_t ev_ready  = nullptr;
+        cudaEvent_t ev_retire = nullptr;
+        cudaEvent_t ev_commit = nullptr; // compute done -> safe to spill column
+    };
+
+    PinnedHostPool m_pinned;                       // weights + KV mirror arena
+    std::unordered_map<std::string, OffloadedTensor> m_offloaded_tensors;
+    std::vector<uint8_t*> m_layer_host_base;       // [num_layers], null if resident
+    std::vector<size_t>   m_layer_bytes;           // packed block size per layer
+    size_t m_max_layer_bytes = 0;
+
+    std::vector<float*> m_h_k_mirror;              // per offloaded layer
+    std::vector<float*> m_h_v_mirror;
+    std::vector<int>    m_kv_host_filled;          // tokens spilled so far per offloaded layer
+    size_t m_single_layer_kv_bytes = 0;
+
+    WeightSlot m_wslots[kNumSlots];
+    KVSlot     m_kvslots[kNumSlots];
+    cudaStream_t m_transfer_stream = nullptr;
 };
