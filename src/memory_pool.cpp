@@ -1,22 +1,35 @@
 ﻿#include "memory_pool.h"
 #include "blackwell/weight_loader.h"
 #include "common.h"
+#include <algorithm>
 #include <iostream>
 
 VRAMArena::VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader, const ModelConfig& config, size_t max_seq_len)
     : m_config(config), m_max_seq_len(max_seq_len)
 {
     std::cout << "[VRAM Arena] Initializing static memory pools...\n";
-    allocate_weights_pool(safetensors_path, metadata_loader);
-    allocate_dynamic_pool(max_seq_len);
+    // If weight loading throws (missing tensor, I/O failure) after the arena has
+    // been cudaMalloc'd, the destructor will not run (the object was never fully
+    // constructed), so the multi-GB allocation must be released here.
+    try {
+        allocate_weights_pool(safetensors_path, metadata_loader);
+        allocate_dynamic_pool(max_seq_len);
+    } catch (...) {
+        release_pools();
+        throw;
+    }
+}
+
+void VRAMArena::release_pools() {
+    if (d_weights_arena) { cudaFree(d_weights_arena); d_weights_arena = nullptr; }
+    if (d_activation_A)  { cudaFree(d_activation_A);  d_activation_A  = nullptr; }
+    if (d_activation_B)  { cudaFree(d_activation_B);  d_activation_B  = nullptr; }
+    if (d_k_cache)       { cudaFree(d_k_cache);       d_k_cache       = nullptr; }
+    if (d_v_cache)       { cudaFree(d_v_cache);       d_v_cache       = nullptr; }
 }
 
 VRAMArena::~VRAMArena() {
-    if (d_weights_arena) cudaFree(d_weights_arena);
-    if (d_activation_A)  cudaFree(d_activation_A);
-    if (d_activation_B)  cudaFree(d_activation_B);
-    if (d_k_cache)       cudaFree(d_k_cache);
-    if (d_v_cache)       cudaFree(d_v_cache);
+    release_pools();
     std::cout << "[VRAM Arena] All static device pools successfully released.\n";
 }
 
@@ -72,8 +85,11 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
     const size_t head_dim         = m_config.head_dim;
     const size_t num_layers       = m_config.num_layers;
 
-    // Ping-Pong buffers (FP32 accumulation) allocated for the maximum possible intermediate dimension
-    size_t ping_pong_bytes = intermediate_dim * sizeof(float);
+    // Ping-Pong buffers (FP32 accumulation) sized for the widest vector they ever
+    // hold. The engine stores hidden_dim activations in them; take the max with
+    // intermediate_dim so the capacity contract holds for any config, not only
+    // for models where intermediate_dim > hidden_dim.
+    size_t ping_pong_bytes = std::max(intermediate_dim, m_config.hidden_dim) * sizeof(float);
     m_activation_bytes = ping_pong_bytes; // 🎯 Сохраняем размер буферов активации
     
     CUDA_CHECK(cudaMalloc(&d_activation_A, ping_pong_bytes));

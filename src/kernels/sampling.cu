@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 #define ARGMAX_BLOCK_SIZE 512
 
@@ -80,12 +82,19 @@ struct ProbIndex {
 int sample_top_p(const float* d_logits, size_t vocab_size, float temperature, float top_p) {
     // Если температура 0 (или близка к ней), используем жадный поиск на GPU
     if (temperature < 1e-5f) {
-        int h_out;
-        int* d_out;
-        cudaMalloc(&d_out, sizeof(int));
+        int h_out = 0;
+        int* d_out = nullptr;
+        // An unchecked failure here would leave d_out dangling: the kernel launch,
+        // the copy-back and the cudaFree would all operate on a garbage pointer.
+        if (cudaMalloc(&d_out, sizeof(int)) != cudaSuccess) {
+            throw std::runtime_error("sample_top_p: cudaMalloc failed for argmax output slot");
+        }
         launch_argmax_kernel(d_logits, d_out, vocab_size);
-        cudaMemcpy(&h_out, d_out, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaError_t copy_err = cudaMemcpy(&h_out, d_out, sizeof(int), cudaMemcpyDeviceToHost);
         cudaFree(d_out);
+        if (copy_err != cudaSuccess) {
+            throw std::runtime_error("sample_top_p: failed to copy argmax result to host");
+        }
         return h_out;
     }
 
@@ -151,6 +160,14 @@ int sample_top_p(const float* d_logits, size_t vocab_size, float temperature, fl
 
 // Вычисляет логарифм вероятности конкретного токена после Softmax
 float compute_log_prob(const float* d_logits, size_t vocab_size, int target_token_id) {
+    // Guard the host-side h_logits[target_token_id] read below: an out-of-range
+    // token id would index past the end of the vector (undefined behavior).
+    if (target_token_id < 0 || static_cast<size_t>(target_token_id) >= vocab_size) {
+        throw std::out_of_range("compute_log_prob: target_token_id " +
+                                std::to_string(target_token_id) +
+                                " outside vocab_size " + std::to_string(vocab_size));
+    }
+
     // 1. Копируем логиты в оперативную память
     std::vector<float> h_logits(vocab_size);
     cudaMemcpy(h_logits.data(), d_logits, vocab_size * sizeof(float), cudaMemcpyDeviceToHost);

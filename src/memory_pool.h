@@ -48,6 +48,9 @@ public:
 private:
     void allocate_weights_pool(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader);
     void allocate_dynamic_pool(size_t max_seq_len);
+    // Frees every device pool and nulls the pointers (idempotent). Shared by the
+    // destructor and the constructor's failure path.
+    void release_pools();
 
     // Contiguous memory blocks
     void* d_weights_arena = nullptr;
