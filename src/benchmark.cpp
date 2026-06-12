@@ -1,4 +1,6 @@
-﻿#include <iostream>
+﻿#include <algorithm>
+#include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -39,11 +41,11 @@ int main() {
         float total_log_prob = 0.0f;
         int valid_tokens = 0;
 
-        for (size_t i = 0; i < tokens.size() - 1; ++i) {
+        for (size_t i = 0; i + 1 < tokens.size(); ++i) {
             int current_token = tokens[i];
             int target_token = tokens[i+1];
-            
-            float log_prob = engine.forward_eval(current_token, i, target_token);
+
+            float log_prob = engine.forward_eval(current_token, static_cast<int>(i), target_token);
             total_log_prob += log_prob;
             valid_tokens++;
 
@@ -55,6 +57,9 @@ int main() {
                       << " | Target: '" << word << "' "
                       << "| LogProb: " << std::fixed << std::setprecision(4) << log_prob << "\n";
         }
+
+        if (valid_tokens == 0)
+            throw std::runtime_error("Benchmark: eval text produced fewer than 2 tokens, nothing to score");
 
         // Формула Перплексии: exp(-1/N * sum(log(P)))
         float avg_log_prob = total_log_prob / valid_tokens;

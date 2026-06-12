@@ -17,8 +17,7 @@ struct TensorEntry {
 class SafetensorsLoader {
 public:
     // Конструктор теперь принимает путь к .safetensors ИЛИ к .index.json
-    SafetensorsLoader(const std::string& index_or_file_path);
-    ~SafetensorsLoader();
+    explicit SafetensorsLoader(const std::string& index_or_file_path);
 
     SafetensorsLoader(const SafetensorsLoader&) = delete;
     SafetensorsLoader& operator=(const SafetensorsLoader&) = delete;
@@ -31,14 +30,5 @@ private:
     void load_single_file(const std::string& file_path);
     void load_index_file(const std::string& index_path);
 
-    // Структура для удержания системных ресурсов каждого смаппленного файла
-    struct MappedFile {
-        void* h_file = nullptr;
-        void* h_map = nullptr;
-        const uint8_t* mapped_data = nullptr;
-        size_t file_size = 0;
-    };
-
-    std::vector<MappedFile> mapped_files;
     std::unordered_map<std::string, TensorEntry> registry;
 };

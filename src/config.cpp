@@ -63,7 +63,20 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
     cfg.num_attention_heads = j.at("num_attention_heads").get<size_t>();
     cfg.num_key_value_heads = j.at("num_key_value_heads").get<size_t>();
     cfg.vocab_size          = j.at("vocab_size").get<size_t>();
+
+    if (cfg.hidden_dim == 0 || cfg.intermediate_dim == 0 || cfg.num_layers == 0 ||
+        cfg.num_attention_heads == 0 || cfg.num_key_value_heads == 0 || cfg.vocab_size == 0)
+        throw std::runtime_error("ConfigLoader: " + json_path +
+                                 " declares a zero-sized model dimension");
+    if (cfg.num_attention_heads % cfg.num_key_value_heads != 0)
+        throw std::runtime_error(
+            "ConfigLoader: num_attention_heads (" + std::to_string(cfg.num_attention_heads) +
+            ") is not a multiple of num_key_value_heads (" +
+            std::to_string(cfg.num_key_value_heads) + "); GQA grouping would be broken");
+
     cfg.head_dim            = j.value("head_dim", cfg.hidden_dim / cfg.num_attention_heads);
+    if (cfg.head_dim == 0)
+        throw std::runtime_error("ConfigLoader: head_dim resolved to zero");
 
     cfg.rope_theta          = j.value("rope_theta", 10000.0f);
     cfg.rms_norm_eps        = j.value("rms_norm_eps", 1e-6f);

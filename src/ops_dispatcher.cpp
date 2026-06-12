@@ -5,12 +5,19 @@
 #include "kernels/bf16_linear_residual.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <string>
 
 LinearDispatcher::LinearDispatcher(const VRAMArena& arena, const ModelConfig& config)
     : m_arena(arena), m_config(config)
 {
     if (m_config.quant_strategy == QuantStrategy::ROWWISE_FP8) {
-        cudaMalloc(&d_token_scale, 2 * sizeof(float));
+        const cudaError_t err = cudaMalloc(&d_token_scale, 2 * sizeof(float));
+        if (err != cudaSuccess) {
+            d_token_scale = nullptr; // value is unspecified on failure
+            throw std::runtime_error(
+                "LinearDispatcher: failed to allocate per-token scale buffer: " +
+                std::string(cudaGetErrorString(err)));
+        }
     }
 }
 
@@ -75,5 +82,10 @@ void LinearDispatcher::forward(const std::string& base_name,
         }
         break;
     }
+
+    default:
+        // Defensive: ModelConfig::quant_strategy is set once by ConfigLoader, but a
+        // silent fall-through here would leave d_out untouched and corrupt decoding.
+        throw std::logic_error("LinearDispatcher: unhandled QuantStrategy for " + base_name);
     }
 }

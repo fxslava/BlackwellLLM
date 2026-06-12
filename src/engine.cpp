@@ -235,7 +235,8 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
 
     impl->step_embedding(token_id);
 
-    for (size_t i = 0; i < impl->m_config.num_layers; ++i) {
+    const int num_layers = static_cast<int>(impl->m_config.num_layers);
+    for (int i = 0; i < num_layers; ++i) {
         impl->step_attention_norm(i);
         impl->step_attention_qkv_projections(i);
         impl->step_attention_math(i, pos);

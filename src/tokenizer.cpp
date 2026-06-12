@@ -106,9 +106,11 @@ std::vector<int> LlamaTokenizer::encode(const std::string& text, bool add_bos) {
 }
 
 std::string LlamaTokenizer::decode(int token_id) {
-    if (decoder_.find(token_id) == decoder_.end()) return "";
+    auto it = decoder_.find(token_id);
+    if (it == decoder_.end()) return "";
 
-    std::string token_str = decoder_[token_id];
+    const std::string& token_str = it->second;
+    if (token_str.empty()) return "";
 
     // Глушим системные маркеры
     if (token_str.front() == '<' && token_str.back() == '>') {

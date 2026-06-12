@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <cstddef>
+#include <stdexcept>
 
 #define CUDA_CHECK(call) \
     do { \
@@ -21,7 +22,7 @@ public:
     T* d_ptr = nullptr;
     size_t num_elements = 0;
 
-    CudaVector(size_t size) : num_elements(size) {
+    explicit CudaVector(size_t size) : num_elements(size) {
         CUDA_CHECK(cudaMalloc(&d_ptr, num_elements * sizeof(T)));
         CUDA_CHECK(cudaMemset(d_ptr, 0, num_elements * sizeof(T)));
     }

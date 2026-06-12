@@ -1,6 +1,7 @@
 ﻿#include "blackwell/weight_loader.h"
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <cuda_runtime.h>
 #include <vector>
@@ -28,11 +29,20 @@ public:
 
     void load_to_vram(const std::string& filepath, size_t offset, size_t size, void* d_ptr) override {
         FILE* f = get_or_open_file(filepath);
-        _fseeki64(f, offset, SEEK_SET);
-        
+        if (_fseeki64(f, static_cast<long long>(offset), SEEK_SET) != 0)
+            throw std::runtime_error("StandardLoader: seek to offset " + std::to_string(offset) +
+                                     " failed in " + filepath);
+
         std::vector<char> temp_buffer(size);
-        fread(temp_buffer.data(), 1, size, f);
-        cudaMemcpy(d_ptr, temp_buffer.data(), size, cudaMemcpyHostToDevice);
+        const size_t bytes_read = fread(temp_buffer.data(), 1, size, f);
+        if (bytes_read != size)
+            throw std::runtime_error("StandardLoader: short read (" + std::to_string(bytes_read) +
+                                     " of " + std::to_string(size) + " bytes) from " + filepath);
+
+        const cudaError_t err = cudaMemcpy(d_ptr, temp_buffer.data(), size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+            throw std::runtime_error("StandardLoader: cudaMemcpy to VRAM failed: " +
+                                     std::string(cudaGetErrorString(err)));
     }
 };
 

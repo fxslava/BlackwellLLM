@@ -1,13 +1,9 @@
 ﻿#include "safetensors.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
-
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#endif
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -21,28 +17,26 @@ SafetensorsLoader::SafetensorsLoader(const std::string& index_or_file_path) {
     }
 }
 
-SafetensorsLoader::~SafetensorsLoader() {
-#ifdef _WIN32
-    for (auto& mf : mapped_files) {
-        if (mf.mapped_data) UnmapViewOfFile(mf.mapped_data);
-        if (mf.h_map && mf.h_map != INVALID_HANDLE_VALUE) CloseHandle(mf.h_map);
-        if (mf.h_file && mf.h_file != INVALID_HANDLE_VALUE) CloseHandle(mf.h_file);
-    }
-#endif
-    std::cout << "[Safetensors] Successfully unmapped " << mapped_files.size() << " files from virtual memory.\n";
-}
-
 void SafetensorsLoader::load_single_file(const std::string& file_path) {
     std::ifstream f(file_path, std::ios::binary);
     if (!f.is_open()) throw std::runtime_error("Failed to open: " + file_path);
 
+    const uint64_t file_size = static_cast<uint64_t>(fs::file_size(file_path));
+    if (file_size < 8)
+        throw std::runtime_error("Safetensors: file too small to contain a header: " + file_path);
+
     // 1. Читаем размер шапки (8 байт)
     uint64_t header_size = 0;
-    f.read(reinterpret_cast<char*>(&header_size), 8);
+    if (!f.read(reinterpret_cast<char*>(&header_size), 8))
+        throw std::runtime_error("Safetensors: failed to read header size from " + file_path);
+    if (header_size == 0 || header_size > file_size - 8)
+        throw std::runtime_error("Safetensors: corrupt header size (" + std::to_string(header_size) +
+                                 " bytes, file is " + std::to_string(file_size) + " bytes): " + file_path);
 
     // 2. Выкачиваем JSON-строку
-    std::string json_str(header_size, '\0');
-    f.read(&json_str[0], header_size);
+    std::string json_str(static_cast<size_t>(header_size), '\0');
+    if (!f.read(&json_str[0], static_cast<std::streamsize>(header_size)))
+        throw std::runtime_error("Safetensors: failed to read JSON header from " + file_path);
     json header = json::parse(json_str);
 
     // Точка на диске, где начинается бинарный блок текущего файла
@@ -53,18 +47,25 @@ void SafetensorsLoader::load_single_file(const std::string& file_path) {
 
         TensorEntry entry;
         entry.name = key;
-        entry.dtype = value["dtype"].get<std::string>();
+        entry.dtype = value.at("dtype").get<std::string>();
         entry.file_path = file_path; // 🎯 Запоминаем конкретный шард
-        
-        for (auto& dim : value["shape"]) entry.shape.push_back(dim.get<size_t>());
 
-        auto offsets = value["data_offsets"];
-        size_t start_offset = offsets[0].get<size_t>();
-        size_t end_offset   = offsets[1].get<size_t>();
+        for (auto& dim : value.at("shape")) entry.shape.push_back(dim.get<size_t>());
+
+        const auto& offsets = value.at("data_offsets");
+        size_t start_offset = offsets.at(0).get<size_t>();
+        size_t end_offset   = offsets.at(1).get<size_t>();
+
+        // Overflow-safe form of: binary_start_pos + end_offset > file_size
+        if (end_offset < start_offset ||
+            end_offset > file_size - binary_start_pos)
+            throw std::runtime_error("Safetensors: corrupt data_offsets for tensor \"" + key +
+                                     "\" [" + std::to_string(start_offset) + ", " +
+                                     std::to_string(end_offset) + ") in " + file_path);
 
         entry.byte_size = end_offset - start_offset;
         // 🎯 Считаем абсолютную позицию байт в файле
-        entry.file_offset = binary_start_pos + start_offset; 
+        entry.file_offset = binary_start_pos + start_offset;
 
         registry[key] = entry;
     }
@@ -77,7 +78,9 @@ void SafetensorsLoader::load_index_file(const std::string& index_path) {
     if (!f.is_open()) throw std::runtime_error("Failed to open index JSON: " + index_path);
 
     json index_json = json::parse(f);
-    auto weight_map = index_json["weight_map"];
+    if (!index_json.contains("weight_map") || !index_json.at("weight_map").is_object())
+        throw std::runtime_error("Safetensors: index JSON has no \"weight_map\" object: " + index_path);
+    const auto& weight_map = index_json.at("weight_map");
 
     // Deduplicate file names to map each chunk exactly once
     std::vector<std::string> unique_files;
