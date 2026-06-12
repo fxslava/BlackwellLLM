@@ -20,3 +20,15 @@ void launch_awq_gemv_kernel(const void* qweight,
                             size_t out_features,
                             size_t in_features,
                             int group_size);
+
+// Residual variant: d_residual_accum[oc] += GEMV result. Used by o_proj /
+// down_proj where the projection lands directly on the residual stream.
+// The buffer is never cleared; partials are added atomically.
+void launch_awq_gemv_residual_kernel(const void* qweight,
+                                     const void* scales,
+                                     const void* qzeros,
+                                     const float* d_in,
+                                     float* d_residual_accum,
+                                     size_t out_features,
+                                     size_t in_features,
+                                     int group_size);

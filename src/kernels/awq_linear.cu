@@ -27,7 +27,8 @@ awq_gemv_kernel(const uint32_t* __restrict__ qweight,
                 int out_features,
                 int in_features,
                 int group_size,
-                int groups_per_split)
+                int groups_per_split,
+                int accumulate)
 {
     const int packed_cols = out_features >> 3;
     const int pc = blockIdx.x * kColsPerBlock + threadIdx.x;
@@ -96,23 +97,24 @@ awq_gemv_kernel(const uint32_t* __restrict__ qweight,
         for (int r = 0; r < kRowsPerBlock; ++r) sum += smem[r][lx][lj];
 
         const size_t oi = (size_t)opc * kPackFactor + lj;
-        if (gridDim.y > 1)
+        // accumulate=1: y holds the residual stream, so the GEMV result is
+        // always added on top (split-K then also rides the same atomics).
+        if (accumulate || gridDim.y > 1)
             atomicAdd(y + oi, sum);
         else
             y[oi] = sum;
     }
 }
 
-}  // namespace
-
-void launch_awq_gemv_kernel(const void* qweight,
-                            const void* scales,
-                            const void* qzeros,
-                            const float* d_in,
-                            float* d_out,
-                            size_t out_features,
-                            size_t in_features,
-                            int group_size)
+void launch_awq_gemv_impl(const void* qweight,
+                          const void* scales,
+                          const void* qzeros,
+                          const float* d_in,
+                          float* d_out,
+                          size_t out_features,
+                          size_t in_features,
+                          int group_size,
+                          bool accumulate)
 {
     if (out_features == 0 || in_features == 0) return;
 
@@ -138,7 +140,9 @@ void launch_awq_gemv_kernel(const void* qweight,
     const int groups_per_split = (num_groups + split_k - 1) / split_k;
     split_k = (num_groups + groups_per_split - 1) / groups_per_split;
 
-    if (split_k > 1)
+    // In accumulate mode d_out is the live residual stream and must NOT be
+    // cleared; the kernel adds every partial atomically instead.
+    if (split_k > 1 && !accumulate)
         cudaMemsetAsync(d_out, 0, out_features * sizeof(float));
 
     const dim3 block(kColsPerBlock, kRowsPerBlock);
@@ -151,5 +155,34 @@ void launch_awq_gemv_kernel(const void* qweight,
                                      (int)out_features,
                                      (int)in_features,
                                      gs,
-                                     groups_per_split);
+                                     groups_per_split,
+                                     accumulate ? 1 : 0);
+}
+
+}  // namespace
+
+void launch_awq_gemv_kernel(const void* qweight,
+                            const void* scales,
+                            const void* qzeros,
+                            const float* d_in,
+                            float* d_out,
+                            size_t out_features,
+                            size_t in_features,
+                            int group_size)
+{
+    launch_awq_gemv_impl(qweight, scales, qzeros, d_in, d_out,
+                         out_features, in_features, group_size, false);
+}
+
+void launch_awq_gemv_residual_kernel(const void* qweight,
+                                     const void* scales,
+                                     const void* qzeros,
+                                     const float* d_in,
+                                     float* d_residual_accum,
+                                     size_t out_features,
+                                     size_t in_features,
+                                     int group_size)
+{
+    launch_awq_gemv_impl(qweight, scales, qzeros, d_in, d_residual_accum,
+                         out_features, in_features, group_size, true);
 }

@@ -30,11 +30,16 @@ void LinearDispatcher::forward(const std::string& base_name,
     case QuantStrategy::WEIGHT_ONLY_PACKED: {
         // AWQ / GPTQ: raw float input, no activation scaling needed.
         QuantizedTensorPtrs ptrs = m_arena.get_quantized_pointers(base_name);
-        launch_awq_gemv_kernel(ptrs.qweight, ptrs.scales, ptrs.qzeros,
-                               d_in, d_out, out_features, in_features,
-                               m_config.quant_group_size);
-        // TODO: in-place residual accumulation for packed-weight path once kernel is ready.
-        (void)d_residual_accum;
+        if (d_residual_accum == nullptr) {
+            launch_awq_gemv_kernel(ptrs.qweight, ptrs.scales, ptrs.qzeros,
+                                   d_in, d_out, out_features, in_features,
+                                   m_config.quant_group_size);
+        } else {
+            launch_awq_gemv_residual_kernel(ptrs.qweight, ptrs.scales, ptrs.qzeros,
+                                            d_in, d_residual_accum,
+                                            out_features, in_features,
+                                            m_config.quant_group_size);
+        }
         break;
     }
 

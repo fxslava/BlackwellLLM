@@ -1,6 +1,13 @@
 ﻿#include "rmsnorm.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+// Распаковка/защелкивание половинных типов для шаблонного RMSNorm
+__device__ __forceinline__ float rms_to_fp32(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float rms_to_fp32(__half v)        { return __half2float(v); }
+__device__ __forceinline__ float rms_latch(float v, __nv_bfloat16*) { return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float rms_latch(float v, __half*)        { return __half2float(__float2half(v)); }
 
 #define RMSNORM_BLOCK_SIZE 256
 
@@ -77,11 +84,15 @@ __global__ void rmsnorm_residual_bf16_weight_kernel(float* x,
     }
 }
 
-__global__ void rmsnorm_bf16_weight_kernel(const float* __restrict__ input,
+// Шаблон по типу весов: семантика HF (hidden_states.to(input_dtype)) требует,
+// чтобы и нормализованный вход, и результат защелкивались в сетку ТОГО ЖЕ
+// половинного типа, в котором хранится чекпойнт (BF16 у Llama, FP16 у AWQ).
+template <typename WT>
+__global__ void rmsnorm_half_weight_kernel(const float* __restrict__ input,
                                            float* __restrict__ output,
-                                           const __nv_bfloat16* __restrict__ weight,
+                                           const WT* __restrict__ weight,
                                            size_t hidden_dim,
-                                           float eps) 
+                                           float eps)
 {
     size_t row_offset = blockIdx.x * hidden_dim;
     const float* cur_input = input + row_offset;
@@ -106,16 +117,16 @@ __global__ void rmsnorm_bf16_weight_kernel(const float* __restrict__ input,
 
     float rsqrt = s_rsqrt;
     for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
-        // 🎯 Золотая семантика PyTorch (LlamaRMSNorm): 
+        // 🎯 Золотая семантика PyTorch (LlamaRMSNorm):
         // 1. Умножение на rsqrt
         float norm_val = cur_input[idx] * rsqrt;
         // 2. Приведение к целевому типу (hidden_states.to(input_dtype))
-        __nv_bfloat16 norm_bf16 = __float2bfloat16(norm_val);
+        float norm_latched = rms_latch(norm_val, static_cast<WT*>(nullptr));
         // 3. Умножение на веса слоя
-        float mul_val = __bfloat162float(norm_bf16) * __bfloat162float(weight[idx]);
-        
-        // Гарантируем, что lm_head получит побитово идентичный BF16-буфер
-        cur_output[idx] = __bfloat162float(__float2bfloat16(mul_val));
+        float mul_val = norm_latched * rms_to_fp32(weight[idx]);
+
+        // Гарантируем, что lm_head получит побитово идентичный half-буфер
+        cur_output[idx] = rms_latch(mul_val, static_cast<WT*>(nullptr));
     }
 }
 
@@ -131,13 +142,24 @@ void launch_rmsnorm_residual_kernel(float* d_x,
     rmsnorm_residual_bf16_weight_kernel<<<blocks, threads>>>(d_x, d_residual, bf16_w, hidden_dim, eps);
 }
 
-void launch_rmsnorm_kernel(const float* d_input, 
-                           float* d_output, 
-                           const void* d_weight, 
-                           size_t seq_len, 
-                           size_t hidden_dim, 
-                           float eps) 
+void launch_rmsnorm_kernel(const float* d_input,
+                           float* d_output,
+                           const void* d_weight,
+                           size_t seq_len,
+                           size_t hidden_dim,
+                           float eps)
 {
     const __nv_bfloat16* bf16_w = reinterpret_cast<const __nv_bfloat16*>(d_weight);
-    rmsnorm_bf16_weight_kernel<<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, bf16_w, hidden_dim, eps);
+    rmsnorm_half_weight_kernel<__nv_bfloat16><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, bf16_w, hidden_dim, eps);
+}
+
+void launch_rmsnorm_fp16_kernel(const float* d_input,
+                                float* d_output,
+                                const void* d_weight,
+                                size_t seq_len,
+                                size_t hidden_dim,
+                                float eps)
+{
+    const __half* fp16_w = reinterpret_cast<const __half*>(d_weight);
+    rmsnorm_half_weight_kernel<__half><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, fp16_w, hidden_dim, eps);
 }

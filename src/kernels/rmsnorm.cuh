@@ -8,9 +8,19 @@ void launch_rmsnorm_residual_kernel(float* d_x,
                                     size_t hidden_dim, 
                                     float eps = 1e-5f);
 
-void launch_rmsnorm_kernel(const float* d_input, 
-                           float* d_output, 
-                           const void* d_weight, 
-                           size_t seq_len, 
-                           size_t hidden_dim, 
+void launch_rmsnorm_kernel(const float* d_input,
+                           float* d_output,
+                           const void* d_weight,
+                           size_t seq_len,
+                           size_t hidden_dim,
                            float eps = 1e-5f);
+
+// Same normalization with FP16 layernorm weights (AWQ/GPTQ checkpoints);
+// the normalized input and the output are latched to the FP16 grid to mirror
+// HF's hidden_states.to(input_dtype) semantics for float16 models.
+void launch_rmsnorm_fp16_kernel(const float* d_input,
+                                float* d_output,
+                                const void* d_weight,
+                                size_t seq_len,
+                                size_t hidden_dim,
+                                float eps = 1e-5f);

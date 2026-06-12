@@ -54,6 +54,13 @@ BlackwellEngine::Impl::~Impl() {
 // ============================================================================
 // STAGE 1: Embedding
 // ============================================================================
+// AWQ/GPTQ checkpoints store every non-quantized tensor (embeddings, norm
+// weights, lm_head, biases) in FP16; BF16/FP8 checkpoints use bfloat16. The
+// same heuristic already routes the QKV bias dtype below.
+static bool half_weights_are_fp16(const ModelConfig& cfg) {
+    return cfg.quant_strategy == QuantStrategy::WEIGHT_ONLY_PACKED;
+}
+
 void BlackwellEngine::Impl::step_embedding(int token_id) {
     // d_next_token doubles as the persistent device staging slot for the current
     // token id; a CudaVector here would cost a cudaMalloc/cudaFree pair on every
@@ -63,7 +70,11 @@ void BlackwellEngine::Impl::step_embedding(int token_id) {
     CUDA_CHECK(cudaMemset(d_X_accum, 0, m_config.hidden_dim * sizeof(float)));
 
     const void* d_embed_table = arena.get_weight_ptr("model.embed_tokens.weight");
-    launch_bf16_embedding_kernel(d_next_token, d_embed_table, d_X_accum, 1, m_config.hidden_dim);
+    if (half_weights_are_fp16(m_config)) {
+        launch_fp16_embedding_kernel(d_next_token, d_embed_table, d_X_accum, 1, m_config.hidden_dim);
+    } else {
+        launch_bf16_embedding_kernel(d_next_token, d_embed_table, d_X_accum, 1, m_config.hidden_dim);
+    }
 }
 
 // ============================================================================
@@ -72,7 +83,11 @@ void BlackwellEngine::Impl::step_embedding(int token_id) {
 void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "input_layernorm.weight");
-    launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    if (half_weights_are_fp16(m_config)) {
+        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    } else {
+        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    }
 }
 
 void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
@@ -150,7 +165,11 @@ void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
 void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "post_attention_layernorm.weight");
-    launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    if (half_weights_are_fp16(m_config)) {
+        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    } else {
+        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    }
 }
 
 void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
@@ -176,7 +195,12 @@ void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
 // ============================================================================
 void BlackwellEngine::Impl::step_final_ops() {
     const void* d_w = arena.get_weight_ptr("model.norm.weight");
-    launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    const bool fp16_w = half_weights_are_fp16(m_config);
+    if (fp16_w) {
+        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    } else {
+        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+    }
 
     // Tied checkpoints omit lm_head.weight entirely; the output head shares the
     // embedding matrix (both are [vocab_size, hidden_dim], so the GEMV row-major
@@ -184,7 +208,11 @@ void BlackwellEngine::Impl::step_final_ops() {
     const void* d_head_w = m_config.tie_word_embeddings
         ? arena.get_weight_ptr("model.embed_tokens.weight")
         : arena.get_weight_ptr("lm_head.weight");
-    launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, m_config.hidden_dim);
+    if (fp16_w) {
+        launch_fp16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, m_config.hidden_dim);
+    } else {
+        launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, m_config.hidden_dim);
+    }
 }
 
 // Реализация фасада BlackwellEngine

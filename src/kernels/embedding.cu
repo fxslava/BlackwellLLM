@@ -1,6 +1,11 @@
 #include "embedding.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+// Перегрузки распаковки половинных типов в FP32 для шаблонных ядер
+__device__ __forceinline__ float weight_to_fp32(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float weight_to_fp32(__half v)        { return __half2float(v); }
 
 __global__ void embedding_lookup_kernel(const int* tokens, 
                                         const float* embed_table, 
@@ -37,9 +42,10 @@ void launch_embedding_kernel(const int* d_tokens,
     embedding_lookup_kernel<<<blocks, threads>>>(d_tokens, d_embed_table, d_output, seq_len, hidden_dim);
 }
 
-__global__ void bf16_embedding_kernel(
+template <typename WT>
+__global__ void half_typed_embedding_kernel(
     const int* __restrict__ tokens,
-    const __nv_bfloat16* __restrict__ embed_table,
+    const WT* __restrict__ embed_table,
     float* __restrict__ output,
     size_t seq_len,
     size_t hidden_dim)
@@ -55,14 +61,15 @@ __global__ void bf16_embedding_kernel(
 
     int token_id = tokens[token_idx];
 
-    // Коалесцированное чтение 2-байтового BF16
-    __nv_bfloat16 bf16_val = embed_table[token_id * hidden_dim + dim_idx];
-    
+    // Коалесцированное чтение 2-байтового BF16/FP16
+    WT half_val = embed_table[token_id * hidden_dim + dim_idx];
+
     // Аппаратная распаковка в 4-байтовый FP32 и запись в буфер активаций
-    output[idx] = __bfloat162float(bf16_val);
+    output[idx] = weight_to_fp32(half_val);
 }
 
-void launch_bf16_embedding_kernel(
+template <typename WT>
+static void launch_half_typed_embedding_kernel(
     const int* d_tokens,
     const void* d_embed_table,
     float* d_output,
@@ -73,11 +80,34 @@ void launch_bf16_embedding_kernel(
     int threads = 256;
     int blocks = (total_elements + threads - 1) / threads;
 
-    bf16_embedding_kernel<<<blocks, threads>>>(
+    half_typed_embedding_kernel<WT><<<blocks, threads>>>(
         d_tokens,
-        reinterpret_cast<const __nv_bfloat16*>(d_embed_table),
+        reinterpret_cast<const WT*>(d_embed_table),
         d_output,
         seq_len,
         hidden_dim
     );
+}
+
+void launch_bf16_embedding_kernel(
+    const int* d_tokens,
+    const void* d_embed_table,
+    float* d_output,
+    size_t seq_len,
+    size_t hidden_dim)
+{
+    launch_half_typed_embedding_kernel<__nv_bfloat16>(
+        d_tokens, d_embed_table, d_output, seq_len, hidden_dim);
+}
+
+// FP16 вариант: AWQ/GPTQ чекпойнты хранят embed_tokens в half
+void launch_fp16_embedding_kernel(
+    const int* d_tokens,
+    const void* d_embed_table,
+    float* d_output,
+    size_t seq_len,
+    size_t hidden_dim)
+{
+    launch_half_typed_embedding_kernel<__half>(
+        d_tokens, d_embed_table, d_output, seq_len, hidden_dim);
 }
