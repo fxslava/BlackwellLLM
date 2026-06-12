@@ -14,7 +14,10 @@ set(CORE_SOURCES
     ops_dispatcher.cpp
     safetensors.cpp
     memory_pool.cpp
-    tokenizer.cpp
+    tokenizer/unicode.cpp
+    tokenizer/bpe_tokenizer.cpp
+    tokenizer/chat_template.cpp
+    tokenizer/tokenizer_factory.cpp
     weight_loader.cpp
     config.cpp
 )

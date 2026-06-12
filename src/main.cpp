@@ -1,8 +1,7 @@
-﻿#include <iostream>
+#include <iostream>
 #include <string>
 #include <vector>
 #include <exception>
-#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -11,7 +10,7 @@
 #include "blackwell/engine.h"
 #include "blackwell/tokenizer.h"
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -23,45 +22,39 @@ int main() {
     std::cout << "==================================================\n\n";
 
     try {
-        std::string index_path = "F:/AI/llama3-8b-fp8/model.safetensors.index.json";
-        std::string vocab_path = "F:/AI/llama3-8b-fp8/tokenizer.json"; 
-        size_t max_context = 16384;
-        
-        LlamaTokenizer tokenizer(vocab_path);
+        // The checkpoint directory fully describes the model: weights, config
+        // and tokenizer all come from it, so any supported model (Llama-3,
+        // Qwen2.5/ChatML, ...) runs through the same code path.
+        const std::string model_dir = argc > 1 ? argv[1] : "F:/AI/llama3-8b-fp8";
+        const std::string index_path = model_dir + "/model.safetensors.index.json";
+        const size_t max_context = 16384;
+
+        auto tokenizer = blackwell::TokenizerFactory::create(model_dir);
         BlackwellEngine engine(index_path, max_context);
 
         int current_pos = 0;
-        
-        // 🎯 ФИКС 1: Собираем системный промпт через правильные ID
-        std::vector<int> history_tokens;
-        history_tokens.push_back(128000); // <|begin_of_text|>
-        history_tokens.push_back(128006); // <|start_header_id|>
-        history_tokens.push_back(9125);   // "system"
-        history_tokens.push_back(128007); // <|end_header_id|>
-        history_tokens.push_back(271);    // "\n\n"
-        
-        std::vector<int> sys_text = tokenizer.encode("You are a helpful, smart, and concise AI assistant.", false);
-        history_tokens.insert(history_tokens.end(), sys_text.begin(), sys_text.end());
-        history_tokens.push_back(128009); // <|eot_id|>
+
+        // Conversation prefix (BOS + system block) rendered by the model's own
+        // chat template; no token id appears anywhere in this file.
+        const std::vector<int> prelude = tokenizer->encode_chat_prelude(
+            "You are a helpful, smart, and concise AI assistant.");
 
         std::cout << "[System] Initializing context...\n";
         int next_token = -1;
-        for (int token : history_tokens) {
+        for (const int token : prelude) {
             next_token = engine.forward(token, current_pos, 0.0f, 1.0f);
             current_pos++;
         }
 
-        std::vector<int> eos_tokens = {128001, 128008, 128009};
-
         while (true) {
             std::cout << "\n\nUser > ";
             std::string user_prompt;
-            
+
 #ifdef _WIN32
             wchar_t wbuf[4096];
             DWORD read_chars = 0;
             HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-            FlushConsoleInputBuffer(hStdin); 
+            FlushConsoleInputBuffer(hStdin);
             if (ReadConsoleW(hStdin, wbuf, 4096, &read_chars, NULL)) {
                 while (read_chars > 0 && (wbuf[read_chars - 1] == L'\n' || wbuf[read_chars - 1] == L'\r')) read_chars--;
                 if (read_chars > 0) {
@@ -77,43 +70,34 @@ int main() {
             if (user_prompt == "exit" || user_prompt == "quit") break;
             if (user_prompt.empty()) continue;
 
-            // 🎯 ФИКС 2: Собираем реплику юзера и вызов ассистента через правильные ID
-            std::vector<int> user_tokens;
-            user_tokens.push_back(128006); // <|start_header_id|>
-            user_tokens.push_back(882);    // "user"
-            user_tokens.push_back(128007); // <|end_header_id|>
-            user_tokens.push_back(271);    // "\n\n"
-            
-            std::vector<int> text_ids = tokenizer.encode(user_prompt, false);
-            user_tokens.insert(user_tokens.end(), text_ids.begin(), text_ids.end());
-            
-            user_tokens.push_back(128009); // <|eot_id|> (Остановка юзера)
-            user_tokens.push_back(128006); // <|start_header_id|>
-            user_tokens.push_back(78191);  // "assistant"
-            user_tokens.push_back(128007); // <|end_header_id|>
-            user_tokens.push_back(271);    // "\n\n"
+            // User turn + assistant cue, framed by the chat template.
+            std::vector<int> turn_tokens =
+                tokenizer->encode_chat_message({"user", user_prompt});
+            const std::vector<int> gen_prompt = tokenizer->encode_generation_prompt();
+            turn_tokens.insert(turn_tokens.end(), gen_prompt.begin(), gen_prompt.end());
 
-            if (current_pos + user_tokens.size() >= max_context) {
+            if (current_pos + turn_tokens.size() >= max_context) {
                 std::cout << "\n[System Warning] Context limit reached!\n";
                 break;
             }
 
-            for (int token : user_tokens) {
+            for (const int token : turn_tokens) {
                 next_token = engine.forward(token, current_pos, 0.0f, 1.0f);
                 current_pos++;
             }
 
-            std::cout << "Llama > ";
+            std::cout << "Assistant > ";
 
             while (current_pos < max_context) {
-                if (std::find(eos_tokens.begin(), eos_tokens.end(), next_token) != eos_tokens.end()) {
-                    // Загоняем токен остановки в кэш, чтобы модель поняла, что она закончила!
+                if (tokenizer->is_stop(next_token)) {
+                    // Feed the stop token into the cache so the model knows the
+                    // assistant turn is closed.
                     engine.forward(next_token, current_pos, 0.0f, 1.0f);
                     current_pos++;
                     break;
                 }
 
-                std::cout << tokenizer.decode(next_token) << std::flush;
+                std::cout << tokenizer->decode(next_token) << std::flush;
 
                 next_token = engine.forward(next_token, current_pos, 0.1f, 0.9f);
                 current_pos++;
