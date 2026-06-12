@@ -251,6 +251,10 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
         weight_pointers[name] = d_dest;
     }
 
+    // Batched loaders (DirectStorage) defer the disk reads; flush() is the
+    // completion barrier after which every d_dest above is fully populated.
+    io_loader->flush();
+
     // 6. Fill the pinned mirror for offloaded layers straight from disk.
     if (offloaded_count > 0) {
         FileCache files;

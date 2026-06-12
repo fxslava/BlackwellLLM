@@ -46,9 +46,13 @@ public:
     }
 };
 
+std::unique_ptr<IWeightLoader> create_standard_loader() {
+    return std::make_unique<StandardLoader>();
+}
+
 // 🎯 Если DirectStorage выключен на уровне CMake, фабрика форсит стандартный лоадер
 #ifndef USE_DIRECT_STORAGE
 std::unique_ptr<IWeightLoader> IWeightLoader::create() {
-    return std::make_unique<StandardLoader>();
+    return create_standard_loader();
 }
 #endif
