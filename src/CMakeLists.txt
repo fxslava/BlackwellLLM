@@ -3,6 +3,20 @@ project(BlackwellLLM CXX)
 
 add_subdirectory(kernels)
 
+# 🤖 Autonomous code-agent core (tree-sitter CST + shadow graph). Isolated from
+# the CUDA inference engine; see src/agent/CMakeLists.txt. Default ON.
+option(BUILD_AGENT_CORE "Build the autonomous-agent code-analysis core (tree-sitter based, no CUDA)" ON)
+if(BUILD_AGENT_CORE)
+    add_subdirectory(agent)
+endif()
+
+# 🧰 Autonomous agent sandbox / "OS" layer (VFS + subprocess + git worktree).
+# Also isolated from CUDA; see src/agent_env/CMakeLists.txt. Default ON.
+option(BUILD_AGENT_ENV "Build the autonomous-agent sandbox OS layer (filesystem/exec/git, no CUDA)" ON)
+if(BUILD_AGENT_ENV)
+    add_subdirectory(agent_env)
+endif()
+
 # 🎯 Опция для включения DirectStorage (по умолчанию ВЫКЛЮЧЕНА)
 option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
 

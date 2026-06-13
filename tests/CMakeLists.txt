@@ -76,6 +76,39 @@ blackwell_add_test_suite(validation_tests  "${CMAKE_CURRENT_SOURCE_DIR}/validati
 blackwell_add_test_suite(benchmark_tests   "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"  benchmark)
 blackwell_add_test_suite(integration_tests "${CMAKE_CURRENT_SOURCE_DIR}/integration" integration)
 
+# Agent-core suite: pure C++ (tree-sitter), no CUDA / no blackwell_kernels, so
+# it gets its own minimal target rather than going through the macro above.
+if(TARGET agent_core)
+    file(GLOB agent_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/agent/*.cpp")
+    add_executable(agent_tests ${agent_sources})
+    target_link_libraries(agent_tests PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        agent_core
+    )
+    gtest_discover_tests(agent_tests
+        PROPERTIES LABELS agent
+        DISCOVERY_TIMEOUT 120
+    )
+endif()
+
+# Agent-env suite: pure C++ sandbox layer (filesystem / subprocess / git
+# worktree), no CUDA / no blackwell_kernels, so it too gets its own minimal
+# target rather than the CUDA-flavoured macro above.
+if(TARGET agent_env)
+    file(GLOB agent_env_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/agent_env/*.cpp")
+    add_executable(agent_env_tests ${agent_env_sources})
+    target_link_libraries(agent_env_tests PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        agent_env
+    )
+    gtest_discover_tests(agent_env_tests
+        PROPERTIES LABELS agent_env
+        DISCOVERY_TIMEOUT 120
+    )
+endif()
+
 # Standalone experiment binaries (awq_benchmark etc.). src/CMakeLists.txt does
 # not include the experiments subdirectory itself, so it is hooked up here;
 # long-term this line belongs in src/CMakeLists.txt as add_subdirectory(experiments).
