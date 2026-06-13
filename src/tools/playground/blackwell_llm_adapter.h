@@ -13,9 +13,11 @@
 // (<|start_header_id|>...<|eot_id|>). It then tokenizes (the tokenizer maps the
 // literal special-token strings to their ids), prefills the KV cache and decodes
 // greedily/at the requested temperature until a stop token OR a stop *string* is
-// seen. Each call is stateless: it re-prefills the whole conversation from
-// position 0, so the playground can edit history arbitrarily between turns
-// without corrupting the cache.
+// seen. The KV cache is reused across calls: generate() prefix-matches the new
+// prompt against the cached token history and prefills only the appended tail
+// (O(new tokens)); any divergence -- e.g. the playground edited or deleted a past
+// turn -- transparently falls back to a full reprefill from position 0, so
+// editing history can never corrupt the cache.
 #ifndef BLACKWELL_PLAYGROUND_LLM_ADAPTER_H
 #define BLACKWELL_PLAYGROUND_LLM_ADAPTER_H
 
@@ -108,6 +110,14 @@ private:
     ChatTemplate template_kind_ = ChatTemplate::ChatML;
     std::vector<std::string> stop_strings_;  // literal end markers; never emitted to UI
     size_t max_stop_len_ = 0;                // longest stop string, for the bounded tail scan
+
+    // Token history resident in the engine's KV cache from the previous call:
+    // the prior prompt plus everything we generated last turn. generate() prefix-
+    // matches the next prompt against this -- a strict extension prefills only the
+    // new tail (APPEND); any divergence forces a full reprefill from pos 0 (RESET).
+    // Mirrors the KV cache by position. Touched only on the worker thread, so no
+    // locking is needed (same as engine_).
+    std::vector<int> cached_prompt_;
 };
 
 }  // namespace playground
