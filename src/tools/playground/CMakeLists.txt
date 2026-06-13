@@ -1,19 +1,21 @@
 # ==============================================================================
-# agent_playground: a GUI "Agent Simulator / Prompt Playground" for visually
-# debugging the LLM's XML ReAct instruction-following.
+# agent_playground: a GUI "Agent Simulator / Prompt Playground" for the XML ReAct
+# protocol, now upgraded into a LIVE LLM testing environment.
 #
-# ARCHITECTURE: a local HTTP server (cpp-httplib, header-only) that serves an
-# embedded single-page HTML/JS/CSS frontend. We chose a Web UI over Dear ImGui
-# because the three things we care about -- live XML syntax highlighting, a
-# click-to-inject snippet toolbar, and zero-friction build integration -- are all
-# cheap in HTML/JS and expensive in an immediate-mode GUI (which would also drag
-# in a windowing + GPU backend).
+# ARCHITECTURE: a local HTTP server (cpp-httplib, header-only) serving an embedded
+# single-page HTML/JS/CSS frontend. We chose a Web UI over Dear ImGui because live
+# XML syntax highlighting, a click-to-inject snippet toolbar, and zero-friction
+# build integration are all cheap in HTML/JS and expensive in an immediate-mode
+# GUI.
 #
-# GROUND TRUTH: instead of re-implementing the parser in JavaScript, the server
-# compiles the REAL production parser (agent_orchestrator/tool_parser.cpp) and
-# exposes it at /api/parse. tool_parser.cpp is dependency-free (only <map>,
-# <string>, <string_view>, <optional>), so this target needs NEITHER agent_core,
-# agent_env, tree-sitter, git, NOR CUDA. It stays tiny and fast to build.
+# This target now links the REAL stack:
+#   * blackwell_core      -- CUDA inference engine + tokenizer + (optional)
+#                            DirectStorage weight loader. PRIVATE-propagates
+#                            blackwell_kernels (CUDA) and the include/ dir, exactly
+#                            as the blackwell_llm executable does.
+#   * agent_orchestrator  -- ToolParser / ToolRegistry / AgentOrchestrator and the
+#                            default agent_env+agent_core tools. (This also supplies
+#                            tool_parser.cpp, so we no longer compile it here.)
 # ==============================================================================
 
 include(FetchContent)
@@ -28,22 +30,34 @@ FetchContent_MakeAvailable(cpp_httplib)
 
 add_executable(agent_playground
     playground_server.cpp
-    # The genuine ReAct parser -- compiled in directly so the debugger validates
-    # against exactly what the orchestrator runs at inference time.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator/tool_parser.cpp
+    blackwell_llm_adapter.cpp
 )
 
 target_compile_features(agent_playground PRIVATE cxx_std_20)
 
 target_include_directories(agent_playground PRIVATE
-    # for "tool_parser.h"
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator  # orchestrator headers
 )
 
-# httplib::httplib is an INTERFACE target that also wires up ws2_32 / threads on
-# Windows. nlohmann_json is already fetched by the top-level project, so reusing
-# it adds no new download.
+# blackwell_core PUBLIC-exposes the include/ dir (blackwell/*.h) and transitively
+# links blackwell_kernels + CUDA; agent_orchestrator PUBLIC-exposes its own headers
+# and links agent_core + agent_env. Linking these two is all the propagation we
+# need -- no manual CUDA find_package, mirroring src/CMakeLists.txt's blackwell_llm.
 target_link_libraries(agent_playground PRIVATE
     httplib::httplib
     nlohmann_json::nlohmann_json
+    blackwell_core
+    agent_orchestrator
 )
+
+# When the core lib was built with DirectStorage, the engine needs the DS runtime
+# DLLs next to the executable. DS_BIN_DIR is set in src/CMakeLists.txt and inherited
+# here because this subdirectory is added after that block.
+if(USE_DIRECT_STORAGE AND WIN32)
+    add_custom_command(TARGET agent_playground POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${DS_BIN_DIR}/dstorage.dll"
+        "${DS_BIN_DIR}/dstoragecore.dll"
+        $<TARGET_FILE_DIR:agent_playground>
+        COMMENT "Copying DirectStorage runtime DLLs next to agent_playground.exe")
+endif()
