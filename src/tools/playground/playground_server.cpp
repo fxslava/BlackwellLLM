@@ -450,12 +450,12 @@ const char* kIndexHtml = R"HTMLDOC(<!DOCTYPE html>
  * ============================================================== */
 :root {
   --bg:      #0f1117;
-  --panel:   #171a23;
+  --panel:   #161922;
   --panel2:  #1d212c;
   --code:    #0b0d13;   /* darker fill for markdown code blocks   */
   --field:   #12141c;   /* editor + input background              */
-  --border:  #2a2f3c;
-  --txt:     #d7dbe6;
+  --border:  #272c38;
+  --txt:     #d9dee9;
   --muted:   #8b93a7;
   --accent:  #5b8cff;
 
@@ -464,6 +464,12 @@ const char* kIndexHtml = R"HTMLDOC(<!DOCTYPE html>
   --user: #5b8cff;
   --asst: #4fd08a;
   --obs:  #f0a64a;
+
+  /* role bubble tints (subtle) */
+  --sys-tint:  rgba(185, 139, 255, .08);
+  --user-tint: rgba( 91, 140, 255, .08);
+  --asst-tint: rgba( 79, 208, 138, .07);
+  --obs-tint:  rgba(240, 166,  74, .08);
 
   /* syntax + status */
   --tag-known:   #4fd08a;
@@ -506,10 +512,14 @@ header h1 {
   letter-spacing: .3px;
 }
 header .pill {
+  display: inline-flex;       /* keep dot + label centered on one line */
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
   font-size: 11px;
   color: var(--muted);
   border: 1px solid var(--border);
-  padding: 2px 8px;
+  padding: 3px 9px;
   border-radius: 999px;
 }
 header .spacer { flex: 1; }
@@ -540,47 +550,16 @@ input {
 }
 
 /* ============================================================== *
- *  Layout                                                        *
- * ============================================================== */
-.main {
-  display: grid;
-  grid-template-columns: 1fr 400px;
-  gap: 14px;
-  padding: 14px;
-  height: calc(100vh - 49px);
-}
-.col {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  gap: 12px;
-}
-.card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.card h2 {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  padding: 9px 12px;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: .8px;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
-}
-.card h2 .spacer { flex: 1; }
-
-/* ============================================================== *
- *  Status indicators                                             *
+ *  Status indicators -- STRICTLY sized so flexbox can never      *
+ *  stretch the dot/spinner into a giant blob.                    *
  * ============================================================== */
 .dot {
-  display: inline-block;
+  flex: 0 0 auto;
+  align-self: center;
   width: 9px;
   height: 9px;
+  min-width: 9px;
+  min-height: 9px;
   border-radius: 50%;
   background: var(--muted);
 }
@@ -594,9 +573,12 @@ input {
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
 .spin {
+  flex: 0 0 auto;
   display: inline-block;
   width: 13px;
   height: 13px;
+  min-width: 13px;
+  min-height: 13px;
   vertical-align: -2px;
   border: 2px solid var(--border);
   border-top-color: var(--accent);
@@ -606,13 +588,55 @@ input {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ============================================================== *
+ *  Layout -- every flex column that must scroll carries          *
+ *  min-height:0 so children overflow instead of compressing.     *
+ * ============================================================== */
+.main {
+  display: grid;
+  grid-template-columns: 1fr 400px;
+  gap: 14px;
+  padding: 14px;
+  height: calc(100vh - 49px);
+  min-height: 0;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 12px;
+}
+.card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.card.grow { flex: 1 1 auto; }
+.card.fixed { flex: 0 0 auto; }
+.card h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.card h2 .spacer { flex: 1; }
+
+/* ============================================================== *
  *  Model card                                                    *
  * ============================================================== */
 #modelCard .body {
   display: flex;
   flex-direction: column;
   gap: 9px;
-  padding: 11px 12px;
+  padding: 11px 14px;
 }
 .row { display: flex; align-items: center; gap: 8px; }
 .row .grow { flex: 1; }
@@ -654,59 +678,82 @@ details.chatml pre {
 }
 
 /* ============================================================== *
- *  Transcript + message blocks                                   *
+ *  Transcript -- modern chat list                                *
  * ============================================================== */
 #transcript {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 10px;
-  overflow-x: auto;
+  gap: 16px;
+  padding: 16px;
+  overflow-x: hidden;
   overflow-y: auto;
 }
+
+/* One chat row: avatar + bubble. flex-shrink:0 so rows keep their
+   natural height and the LIST scrolls instead of squishing them. */
 .msg {
-  overflow: hidden;
-  background: var(--panel2);
-  border: 1px solid var(--border);
-  border-left-width: 4px;
-  border-radius: 8px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
 }
-.msg .bar {
+.avatar {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #0f1117;
+  border-radius: 9px;
+  user-select: none;
+}
+.bubble {
+  flex: 1 1 auto;
+  min-width: 0;                 /* let code blocks scroll, not stretch */
+  padding: 8px 13px 10px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+}
+.meta {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 9px;
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .6px;
+  margin-bottom: 3px;
 }
-.msg .bar .spacer { flex: 1; }
-.msg .bar button {
+.meta .who { font-size: 12px; font-weight: 600; }
+.meta .actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.msg:hover .meta .actions { opacity: 1; }
+.meta .actions button {
   padding: 1px 7px;
   font-size: 11px;
+  color: var(--muted);
   background: transparent;
 }
 
-/* Rendered markdown body of a message. Scrolls on overflow in both axes. */
-.msg .md {
-  padding: 9px 11px;
-  font-size: 12.5px;
-  border-top: 1px solid var(--border);
-  overflow-x: auto;
-  overflow-y: auto;
-}
-
-/* role accents */
-.role-System      { border-left-color: var(--sys); }
-.role-System .bar { color: var(--sys); }
-.role-User        { border-left-color: var(--user); }
-.role-User .bar   { color: var(--user); }
-.role-Assistant      { border-left-color: var(--asst); }
-.role-Assistant .bar { color: var(--asst); }
-.role-Observation      { border-left-color: var(--obs); }
-.role-Observation .bar { color: var(--obs); }
+/* role identity: avatar fill, name color, bubble tint */
+.role-System    .avatar { background: var(--sys); }
+.role-System    .who    { color: var(--sys); }
+.role-System    .bubble { background: var(--sys-tint); border-color: rgba(185,139,255,.18); }
+.role-User      .avatar { background: var(--user); }
+.role-User      .who    { color: var(--user); }
+.role-User      .bubble { background: var(--user-tint); border-color: rgba(91,140,255,.18); }
+.role-Assistant .avatar { background: var(--asst); }
+.role-Assistant .who    { color: var(--asst); }
+.role-Assistant .bubble { background: var(--asst-tint); border-color: rgba(79,208,138,.16); }
+.role-Observation .avatar { background: var(--obs); }
+.role-Observation .who    { color: var(--obs); }
+.role-Observation .bubble { background: var(--obs-tint); border-color: rgba(240,166,74,.18); }
 
 .badge {
   font-size: 10px;
@@ -720,7 +767,8 @@ details.chatml pre {
 .badge.warn  { color: var(--warn); }
 .badge.muted { color: var(--muted); }
 
-.empty {
+.empty-state {
+  margin: auto;
   padding: 30px;
   text-align: center;
   font-style: italic;
@@ -728,13 +776,14 @@ details.chatml pre {
 }
 
 /* ============================================================== *
- *  Markdown typography (inside .md)                              *
+ *  Markdown body (inside .bubble .md)                            *
  * ============================================================== */
+.md { font-size: 13px; overflow-x: auto; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child  { margin-bottom: 0; }
-.md p  { margin: .45em 0; }
-.md h1, .md h2, .md h3, .md h4 { margin: .6em 0 .3em; line-height: 1.25; }
-.md ul, .md ol { margin: .45em 0; padding-left: 1.4em; }
+.md p  { margin: .4em 0; }
+.md h1, .md h2, .md h3, .md h4 { margin: .5em 0 .3em; line-height: 1.25; }
+.md ul, .md ol { margin: .4em 0; padding-left: 1.4em; }
 .md a { color: var(--accent); }
 .md blockquote {
   margin: .5em 0;
@@ -757,18 +806,32 @@ details.chatml pre {
 .md pre {
   margin: .5em 0;
   padding: 10px 12px;
-  max-height: 340px;
+  max-height: 360px;
   overflow-x: auto;
   overflow-y: auto;
   background: var(--code);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: 8px;
 }
 .md pre code {
   padding: 0;
   font-size: 12px;
   background: none;
   border: 0;
+}
+/* Standalone raw-XML block (e.g. a multi-line <tool_call>): rendered as a
+   distinct monospaced card so tool calls stand out from prose. */
+.md .xmlblock {
+  margin: .45em 0;
+  padding: 9px 11px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  background: var(--code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }
 /* Offline fallback: plain text wraps instead of scrolling. */
 .md pre.plain {
@@ -782,7 +845,7 @@ details.chatml pre {
 /* ============================================================== *
  *  Composer (roles + toolbar + editor + actions)                 *
  * ============================================================== */
-.composer { display: flex; flex-direction: column; }
+.composer { flex: 0 0 auto; }
 
 .roles {
   display: flex;
@@ -815,7 +878,8 @@ details.chatml pre {
 .toolbar .sep { width: 1px; align-self: stretch; margin: 0 4px; background: var(--border); }
 .toolbar button { padding: 4px 9px; font-size: 12px; }
 .toolbar .snip { color: var(--tag-known); }
-.toolbar .tool { color: var(--attr); }
+)HTMLDOC"
+        R"HTMLDOC(.toolbar .tool { color: var(--attr); }
 .toolbar .gl {
   width: 100%;
   margin-top: 2px;
@@ -825,10 +889,10 @@ details.chatml pre {
 
 /* -------------------------------------------------------------- *
  *  Editor: transparent <textarea> caret layer over a syntax-     *
- *  highlighted <pre>. For the overlay to line up PERFECTLY, the  *
- *  two layers MUST share identical box + typography metrics and  *
- *  both be absolutely positioned at the same origin/size. The    *
- *  container owns the background; both layers are transparent.   *
+ *  highlighted <pre>. The two layers MUST share identical box +  *
+ *  typography metrics and both be absolutely positioned at the   *
+ *  same origin/size. The container owns the background; both      *
+ *  layers are transparent so the highlight shows through.        *
  * -------------------------------------------------------------- */
 .editor {
   position: relative;
@@ -865,9 +929,9 @@ details.chatml pre {
 .editor pre code { font: inherit; color: inherit; }
 .editor textarea {
   z-index: 2;
-  color: transparent;     /* hide the real glyphs ... */
-  background: transparent; /* ... but let the highlighted <pre> show */
-  caret-color: #fff;       /* keep a visible caret */
+  color: transparent;      /* hide the real glyphs ... */
+  background: transparent;  /* ... but let the highlighted <pre> show */
+  caret-color: #fff;        /* keep a visible caret */
   resize: none;
   outline: none;
 }
@@ -887,8 +951,7 @@ details.chatml pre {
   padding: 10px 12px;
 }
 .composer .actions .spacer { flex: 1; }
-)HTMLDOC"
-        R"HTMLDOC(.composer .actions .primary {
+.composer .actions .primary {
   padding: 6px 14px;
   font-weight: 600;
   color: #fff;
@@ -913,7 +976,9 @@ details.chatml pre {
  *  Parser inspector                                              *
  * ============================================================== */
 #inspector {
-  padding: 11px;
+  flex: 0 0 auto;
+  max-height: 240px;
+  padding: 12px 14px;
   overflow-x: auto;
   overflow-y: auto;
 }
@@ -944,16 +1009,11 @@ details.chatml pre {
 /* ============================================================== *
  *  Rendered-transcript panel                                     *
  * ============================================================== */
-#rendered {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-}
+#rendered { flex: 1 1 auto; min-height: 0; }
 #renderedOut {
   height: 100%;
   margin: 0;
-  padding: 11px;
+  padding: 12px 14px;
   font-size: 12px;
   color: var(--muted);
   white-space: pre-wrap;
@@ -967,7 +1027,7 @@ details.chatml pre {
 <header>
   <h1>Agent Playground</h1>
   <span class="pill">XML ReAct &middot; live engine</span>
-  <span class="pill" id="enginePill"><span class="dot" id="engineDot"></span> <span id="engineState">no model</span></span>
+  <span class="pill" id="enginePill"><span class="dot" id="engineDot"></span><span id="engineState">no model</span></span>
   <span class="spacer"></span>
   <button id="seedBtn">Load demo</button>
   <button id="renderBtn">Render transcript</button>
@@ -976,9 +1036,9 @@ details.chatml pre {
 
 <div class="main">
   <div class="col">
-    <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0">
+    <div class="card grow">
       <h2>Transcript <span class="spacer"></span><span class="hint" id="genStatus"></span></h2>
-      <div id="transcript"><div class="empty">No turns yet. Pick a role, type or click a snippet, then "Add turn".</div></div>
+      <div id="transcript"><div class="empty-state">No turns yet. Pick a role, type or click a snippet, then "Add turn".</div></div>
     </div>
 
     <div class="card composer">
@@ -1019,7 +1079,7 @@ details.chatml pre {
   </div>
 
   <div class="col">
-    <div class="card" id="modelCard">
+    <div class="card fixed" id="modelCard">
       <h2>Model <span class="spacer"></span><span id="modelStateText" class="hint">empty</span></h2>
       <div class="body">
         <div class="row">
@@ -1040,11 +1100,11 @@ details.chatml pre {
       </div>
     </div>
 
-    <div class="card" style="flex:0 0 auto">
+    <div class="card fixed">
       <h2>Parser inspector &mdash; ground truth (real ToolParser)</h2>
       <div id="inspector"><div class="hint">Start typing as the Assistant role to see what the orchestrator's parser extracts.</div></div>
     </div>
-    <div class="card" id="rendered">
+    <div class="card grow" id="rendered">
       <h2>Rendered transcript (what the model sees)</h2>
       <pre id="renderedOut" class="mono">Click "Render transcript".</pre>
     </div>
@@ -1072,11 +1132,14 @@ function hlTag(tag){
   const m = tag.match(/^<\/?([\w-]+)/);
   const name = m ? m[1] : "";
   const cls = KNOWN_TAGS.has(name) ? "tag-known" : "tag-unknown";
+  // esc() the whole tag first, then colour attribute name="value" pairs.
   let inner = esc(tag).replace(/([\w-]+)=("[^"]*"|'[^']*')/g,
     '<span class="attr">$1</span>=<span class="val">$2</span>');
   return '<span class="'+cls+'">'+inner+'</span>';
 }
-// Core: escape text and wrap any <tag ...> in a colored span. Returns HTML.
+// Core: escape text and wrap any <tag ...> in a colored span. Returns safe HTML.
+// Operates purely on a raw string and always emits balanced spans, so its output
+// can never corrupt surrounding markup.
 function highlightInline(text){
   let out = "", last = 0, m; const re = /<\/?[\w-]+[^>]*>/g;
   while((m = re.exec(text))){ out += esc(text.slice(last,m.index)); out += hlTag(m[0]); last = m.index+m[0].length; }
@@ -1089,48 +1152,54 @@ function syncHL(){ hl.innerHTML = highlight(input.value); hl.parentElement.scrol
 input.addEventListener("input", () => { syncHL(); liveParse(); });
 input.addEventListener("scroll", () => { hl.parentElement.scrollTop = input.scrollTop; hl.parentElement.scrollLeft = input.scrollLeft; });
 
-/* ---------- Markdown rendering for transcript messages ---------- */
-// Configure marked (if it loaded) so RAW HTML the model emits -- crucially our
-// XML tags like <tool_call> -- is ESCAPED into visible text rather than injected
-// as live (and invisible) DOM elements. We then re-highlight those tags below.
+/* ---------- Markdown + XML pipeline (renderer-level, no DOM surgery) ----------
+   We hook marked's renderers for code / codespan / raw-html so the XML highlight
+   is produced AS marked builds the HTML string. Every renderer returns balanced,
+   already-escaped HTML, so there is no post-hoc DOM walking that could corrupt
+   marked's <pre>/<code> structure. marked receives RAW text in these tokens and
+   the renderer is responsible for escaping (which highlightInline does). */
 let markedReady = false;
+function tokenText(t){
+  if (t == null) return "";
+  if (typeof t === "string") return t;
+  return (t.text !== undefined && t.text !== null) ? t.text
+       : (t.raw  !== undefined && t.raw  !== null) ? t.raw : "";
+}
 if (window.marked && typeof marked.use === "function") {
   marked.use({
     gfm: true,
     breaks: false,
     renderer: {
+      // Fenced/indented code block: escape + highlight XML inside it.
+      code(token){
+        const text = tokenText(token);
+        const lang = (token && token.lang) ? String(token.lang).match(/\S*/)[0] : "";
+        const cls = lang ? ' class="language-' + esc(lang) + '"' : '';
+        return '<pre><code' + cls + '>' + highlightInline(text) + '</code></pre>';
+      },
+      // Inline `code`.
+      codespan(token){
+        return '<code>' + highlightInline(tokenText(token)) + '</code>';
+      },
+      // Raw HTML the model emitted -- e.g. our XML tags. Escape + highlight so the
+      // tags are VISIBLE and coloured rather than injected as (invisible) live DOM.
+      // Multi-line blocks (a standalone <tool_call>...) become a monospaced card.
       html(token){
-        const s = (typeof token === "string") ? token : (token && (token.text || token.raw) || "");
-        return esc(s);
+        const raw = tokenText(token);
+        const inner = highlightInline(raw);
+        return raw.indexOf("\n") >= 0 ? '<div class="xmlblock">' + inner + '</div>' : inner;
       }
-    }
+)HTMLDOC"
+        R"HTMLDOC(    }
   });
   markedReady = true;
 }
-// Walk every text node and apply XML highlighting in place. Because we operate on
-// the parsed DOM (text nodes hold decoded "<tool_call>" strings), this works both
-// inside fenced code blocks and in ordinary prose without corrupting marked's HTML.
-function highlightXmlInElement(root){
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-  const nodes = []; let n;
-  while ((n = walker.nextNode())) nodes.push(n);
-  nodes.forEach(tn => {
-    const t = tn.nodeValue;
-    if (t.indexOf("<") === -1) return;            // nothing tag-like here
-    const span = document.createElement("span");
-    span.innerHTML = highlightInline(t);
-    tn.parentNode.replaceChild(span, tn);
-  });
-}
 function renderMarkdown(content){
-  if (!markedReady) {
-    // Offline fallback: plain text + XML highlight, preserved whitespace.
-    return '<pre class="plain">' + highlightInline(content) + '</pre>';
+  if (markedReady) {
+    try { return marked.parse(content); }
+    catch (e) { /* fall through to plain rendering */ }
   }
-  const div = document.createElement("div");
-  div.innerHTML = marked.parse(content);
-  highlightXmlInElement(div);
-  return div.innerHTML;
+  return '<pre class="plain">' + highlightInline(content) + '</pre>';
 }
 
 /* ---------- snippet insertion ---------- */
@@ -1187,8 +1256,7 @@ async function doParse(){
 function renderInspector(insp, r){
   const lh = $("#liveHint");
   if(r.kind === "None"){
-)HTMLDOC"
-        R"HTMLDOC(    insp.innerHTML = '<div class="insp-kind insp-none">None</div>'+
+    insp.innerHTML = '<div class="insp-kind insp-none">None</div>'+
       '<div class="hint">No valid &lt;tool_call&gt; or &lt;finish&gt; found. If you expected an action, you probably typed a hallucinated/typo tag -- check the red underlines on the left.</div>';
     lh.innerHTML = '<span style="color:var(--warn)">&#9888; no actionable tag</span>';
   }else if(r.kind === "ToolCall"){
@@ -1224,7 +1292,7 @@ async function badgeFor(content){
 }
 async function renderTranscript(){
   const box = $("#transcript");
-  if(!messages.length){ box.innerHTML = '<div class="empty">No turns yet. Pick a role, type or click a snippet, then "Add turn".</div>'; return; }
+  if(!messages.length){ box.innerHTML = '<div class="empty-state">No turns yet. Pick a role, type or click a snippet, then "Add turn".</div>'; return; }
   box.innerHTML = "";
   for(let i=0;i<messages.length;i++){
     const m = messages[i];
@@ -1233,9 +1301,13 @@ async function renderTranscript(){
     let badge = "";
     if(m.role === "Assistant") badge = await badgeFor(m.content);
     el.innerHTML =
-      '<div class="bar"><span>'+m.role+'</span>'+badge+'<span class="spacer"></span>'+
-      '<button data-edit="'+i+'">edit</button><button data-del="'+i+'">delete</button></div>'+
-      '<div class="md">'+renderMarkdown(m.content)+'</div>';
+      '<div class="avatar">'+m.role.charAt(0)+'</div>'+
+      '<div class="bubble">'+
+        '<div class="meta"><span class="who">'+m.role+'</span>'+badge+
+          '<span class="actions"><button data-edit="'+i+'">edit</button>'+
+          '<button data-del="'+i+'">delete</button></span></div>'+
+        '<div class="md">'+renderMarkdown(m.content)+'</div>'+
+      '</div>';
     box.appendChild(el);
   }
   box.scrollTop = box.scrollHeight;
@@ -1279,14 +1351,14 @@ $("#renderBtn").addEventListener("click", async () => {
   });
 })();
 
-/* ---------- demo seed ---------- */
+/* ---------- demo seed (markdown + code + XML, to show the pipeline) ---------- */
 $("#seedBtn").addEventListener("click", () => {
   messages = [
     {role:"System", content:"You are a coding agent. Act using exactly one <tool_call name=\"...\"><arg name=\"...\">...</arg></tool_call> per turn, or <finish>...</finish> when done."},
     {role:"User", content:"Read main.cpp and tell me what it does."},
     {role:"Assistant", content:"I'll open the file.\n<tool_call name=\"read_file\">\n  <arg name=\"path\">main.cpp</arg>\n</tool_call>"},
     {role:"Observation", content:"int main(){ return 0; }"},
-    {role:"Assistant", content:"Here's the summary:\n\n```cpp\nint main(){ return 0; }\n```\n\n**main.cpp** is an empty entry point that returns `0`.\n<finish>main.cpp is an empty entry point that returns 0.</finish>"}
+    {role:"Assistant", content:"Here's the summary:\n\n```cpp\nint main() {\n  return 0;  // <-- exit code\n}\n```\n\n**main.cpp** is an empty entry point that returns `0`.\n<finish>main.cpp is an empty entry point that returns 0.</finish>"}
   ];
   renderTranscript();
 });
@@ -1365,7 +1437,8 @@ $("#genBtn").addEventListener("click", async () => {
   if(engineState !== "ready") return;
   awaiting = "generate";
   $("#genBtn").disabled = true; $("#reactBtn").disabled = true;
-  $("#genStatus").innerHTML = '<span class="spin"></span> generating...';
+)HTMLDOC"
+        R"HTMLDOC(  $("#genStatus").innerHTML = '<span class="spin"></span> generating...';
   const body = Object.assign({messages}, params());
   const r = await (await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)})).json();
