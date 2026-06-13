@@ -17,6 +17,15 @@ if(BUILD_AGENT_ENV)
     add_subdirectory(agent_env)
 endif()
 
+# 🤝 Autonomous agent ReAct orchestrator (LLM <-> agent_core <-> agent_env).
+# The integration seam: the first target that links BOTH isolated subsystems.
+# Still CUDA-free (talks to the model via the ILLMGenerator text interface), so
+# it requires both agent libs. Default ON when those are built.
+option(BUILD_AGENT_ORCHESTRATOR "Build the autonomous-agent ReAct orchestrator (no CUDA)" ON)
+if(BUILD_AGENT_ORCHESTRATOR AND BUILD_AGENT_CORE AND BUILD_AGENT_ENV)
+    add_subdirectory(agent_orchestrator)
+endif()
+
 # 🎯 Опция для включения DirectStorage (по умолчанию ВЫКЛЮЧЕНА)
 option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
 

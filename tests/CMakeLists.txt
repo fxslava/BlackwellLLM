@@ -109,6 +109,25 @@ if(TARGET agent_env)
     )
 endif()
 
+# Agent-orchestrator suite: the ReAct state machine (parser / dispatcher / loop).
+# Pure C++ and driven entirely by a MockLLM, so -- like the two subsystems it
+# integrates -- it needs no CUDA / no blackwell_kernels and gets its own minimal
+# target rather than the CUDA-flavoured macro above.
+if(TARGET agent_orchestrator)
+    file(GLOB agent_orch_sources CONFIGURE_DEPENDS
+         "${CMAKE_CURRENT_SOURCE_DIR}/agent_orchestrator/*.cpp")
+    add_executable(agent_orchestrator_tests ${agent_orch_sources})
+    target_link_libraries(agent_orchestrator_tests PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        agent_orchestrator
+    )
+    gtest_discover_tests(agent_orchestrator_tests
+        PROPERTIES LABELS agent_orchestrator
+        DISCOVERY_TIMEOUT 120
+    )
+endif()
+
 # Standalone experiment binaries (awq_benchmark etc.). src/CMakeLists.txt does
 # not include the experiments subdirectory itself, so it is hooked up here;
 # long-term this line belongs in src/CMakeLists.txt as add_subdirectory(experiments).
