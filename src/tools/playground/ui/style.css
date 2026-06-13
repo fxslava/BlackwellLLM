@@ -308,6 +308,13 @@ details.chatml pre {
 .role-Observation .who    { color: var(--obs); }
 .role-Observation .bubble { background: var(--obs-tint); border-color: rgba(240,166,74,.18); }
 
+/* live streaming bubble: a soft pulsing accent ring while tokens arrive */
+.msg.streaming .bubble {
+  border-color: rgba(79,208,138,.55);
+  box-shadow: 0 0 0 1px rgba(79,208,138,.25);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
 .badge {
   font-size: 10px;
   padding: 1px 7px;

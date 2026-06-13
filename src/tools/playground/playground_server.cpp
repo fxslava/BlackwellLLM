@@ -173,6 +173,7 @@ public:
         j["last_output"]= last_output_;
         j["last_chatml"]= last_chatml_;
         j["last_react"] = last_react_;
+        j["stream"]     = stream_buffer_;  // partial text of the in-flight job
         return j;
     }
 
@@ -195,6 +196,7 @@ public:
         join_worker_locked();
         state_ = State::Generating;
         message_ = "Generating...";
+        stream_buffer_.clear();  // fresh live buffer for this run
         worker_ = std::thread([this, t = std::move(transcript), p] { do_generate(t, p); });
         return "";
     }
@@ -206,6 +208,7 @@ public:
         join_worker_locked();
         state_ = State::Generating;
         message_ = "Running ReAct loop...";
+        stream_buffer_.clear();  // fresh live buffer for this run
         worker_ = std::thread([this, system = std::move(system), goal = std::move(goal),
                                max_iters, p] { do_react(system, goal, max_iters, p); });
         return "";
@@ -261,12 +264,22 @@ private:
         }
     }
 
+    // Appends a freshly decoded token to the shared live buffer under the lock so
+    // /api/status can surface generation in progress. Always returns true; a
+    // future "Stop" button would return false to abort the decode loop.
+    bool append_stream(const std::string& tok) {
+        std::lock_guard<std::mutex> lk(mu_);
+        stream_buffer_ += tok;
+        return true;
+    }
+
     void do_generate(std::string transcript, BlackwellLLMAdapter::Params p) {
         std::string out, chatml, err;
         // adapter_ is stable here: it is only mutated by do_load, which cannot run
         // concurrently with this (single worker thread + state machine).
         try {
-            out = adapter_->generate(transcript, p, &chatml);
+            out = adapter_->generate(transcript, p, &chatml,
+                                     [this](const std::string& tok) { return append_stream(tok); });
         } catch (const std::exception& e) {
             err = e.what();
         } catch (...) {
@@ -288,6 +301,11 @@ private:
         std::string err, answer;
         try {
             adapter_->set_params(p);
+            // Stream every assistant turn of the loop into the live buffer. The
+            // orchestrator only calls the single-arg generate(), so the callback
+            // has to be installed on the adapter rather than passed per-call.
+            adapter_->set_stream_callback(
+                [this](const std::string& tok) { return append_stream(tok); });
             // Provision a confined sandbox + a fresh code graph for the tools.
             namespace fs = std::filesystem;
             fs::path ws = fs::temp_directory_path() / "blackwell_playground_ws";
@@ -313,6 +331,9 @@ private:
         } catch (...) {
             err = "unknown error";
         }
+        // Detach the callback (worker-thread only, so no lock needed) so a later
+        // bare generate() can't stream into a stale buffer.
+        adapter_->set_stream_callback(nullptr);
         std::lock_guard<std::mutex> lk(mu_);
         last_kind_ = "react";
         last_chatml_.clear();
@@ -330,6 +351,7 @@ private:
     std::string last_kind_;
     std::string last_output_;
     std::string last_chatml_;
+    std::string stream_buffer_;  // partial output of the in-flight job (live UI)
     json last_react_ = json::array();
     long long result_seq_ = 0;
     std::unique_ptr<BlackwellLLMAdapter> adapter_;

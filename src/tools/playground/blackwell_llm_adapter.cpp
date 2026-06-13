@@ -103,11 +103,14 @@ BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t ma
 BlackwellLLMAdapter::~BlackwellLLMAdapter() = default;
 
 std::string BlackwellLLMAdapter::generate(const std::string& transcript) {
-    return generate(transcript, params_, nullptr);
+    // Route through the streaming-capable overload so ReAct turns (which only
+    // reach us via this entry point) feed any installed stream callback.
+    return generate(transcript, params_, nullptr, stream_cb_);
 }
 
 std::string BlackwellLLMAdapter::generate(const std::string& transcript,
-                                          const Params& params, std::string* chatml_out) {
+                                          const Params& params, std::string* chatml_out,
+                                          StreamCallback stream_cb) {
     const std::string chatml = to_chatml(transcript);
     if (chatml_out) *chatml_out = chatml;
 
@@ -137,7 +140,11 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
             ++pos;
             break;
         }
-        out += tokenizer_->decode(next);
+        const std::string piece = tokenizer_->decode(next);
+        out += piece;
+        // Surface the token to a live observer; a false return is the cooperative
+        // stop signal, so we leave the KV cache as-is and return what we have.
+        if (stream_cb && !stream_cb(piece)) break;
         next = engine_->forward(next, pos, params.temperature, params.top_p);
         ++pos;
         ++generated;

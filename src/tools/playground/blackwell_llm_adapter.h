@@ -20,6 +20,7 @@
 #define BLACKWELL_PLAYGROUND_LLM_ADAPTER_H
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -34,8 +35,15 @@ public:
     struct Params {
         float temperature = 0.2f;  // 0 => greedy/deterministic decode
         float top_p = 0.9f;
-        int max_new_tokens = 512;
+        int max_new_tokens = 2048;  // generous cap: code completions rarely fit in 512
     };
+
+    // Invoked once per freshly decoded token, with the *incremental* piece of
+    // text (not the running total). Returning false is a cooperative "stop"
+    // signal: the decode loop emits no further tokens and returns what it has so
+    // far. Runs on the engine's worker thread, so an implementation that touches
+    // shared state must do its own locking.
+    using StreamCallback = std::function<bool(const std::string& new_token)>;
 
     // Loads tokenizer + engine from a HuggingFace-layout checkpoint directory.
     // This is the SLOW call (DirectStorage weight streaming, VRAM allocation);
@@ -49,13 +57,21 @@ public:
     // ILLMGenerator: continue the role-tagged transcript as the assistant.
     std::string generate(const std::string& transcript) override;
 
-    // Same, but with explicit sampling params and an optional capture of the
-    // exact ChatML string handed to the model (for the UI's debug panel).
+    // Same, but with explicit sampling params, an optional capture of the exact
+    // ChatML string handed to the model (for the UI's debug panel), and an
+    // optional per-token streaming callback (for live UI rendering / "Stop").
     std::string generate(const std::string& transcript, const Params& params,
-                         std::string* chatml_out);
+                         std::string* chatml_out, StreamCallback stream_cb = nullptr);
 
     void set_params(const Params& p) { params_ = p; }
     const Params& params() const { return params_; }
+
+    // Install a streaming callback that the ILLMGenerator entry point
+    // (generate(transcript)) will forward tokens to. This is how the ReAct loop
+    // streams: the orchestrator only ever calls the single-argument override, so
+    // the callback has to live on the adapter rather than the call site. Pass
+    // nullptr to detach.
+    void set_stream_callback(StreamCallback cb) { stream_cb_ = std::move(cb); }
     const std::string& model_dir() const { return model_dir_; }
     size_t max_seq_len() const { return max_seq_len_; }
 
@@ -70,6 +86,7 @@ private:
     std::unique_ptr<blackwell::ITokenizer> tokenizer_;
     std::unique_ptr<BlackwellEngine> engine_;
     Params params_;
+    StreamCallback stream_cb_;  // forwarded to by generate(transcript); may be null
 };
 
 }  // namespace playground

@@ -279,7 +279,7 @@ function params(){
   return {
     temperature: parseFloat($("#temp").value) || 0,
     top_p: parseFloat($("#topp").value) || 0.9,
-    max_new_tokens: parseInt($("#maxtok").value) || 512
+    max_new_tokens: parseInt($("#maxtok").value) || 2048
   };
 }
 function setEngineUI(s){
@@ -303,15 +303,61 @@ function setEngineUI(s){
     gs.textContent = "";
   }
 }
+/* ---------- live streaming preview ----------
+   A throwaway "Assistant" bubble appended to the transcript while the engine is
+   decoding. It is NOT part of `messages`: renderTranscript() rebuilds #transcript
+   from scratch and would wipe it, so we only ever poke it directly here and tear
+   it down before the real (completed) turn is committed. */
+function ensureStreamEl(){
+  const box = $("#transcript");
+  let el = $("#streamMsg");
+  if(!el){
+    const empty = box.querySelector(".empty-state");
+    if(empty) empty.remove();
+    el = document.createElement("div");
+    el.id = "streamMsg";
+    el.className = "msg role-Assistant streaming";
+    el.innerHTML =
+      '<div class="avatar">A</div>'+
+      '<div class="bubble">'+
+        '<div class="meta"><span class="who">Assistant</span>'+
+          '<span class="badge muted"><span class="spin"></span> streaming&hellip;</span></div>'+
+        '<div class="md"></div>'+
+      '</div>';
+    box.appendChild(el);
+  }
+  return el;
+}
+function updateStreamPreview(text){
+  const el = ensureStreamEl();
+  // renderMarkdown handles partial input: an unterminated ```cpp fence still
+  // formats as a (growing) code block, so the user watches it type out.
+  el.querySelector(".md").innerHTML = renderMarkdown(text || "");
+  const box = $("#transcript");
+  box.scrollTop = box.scrollHeight;
+}
+function clearStreamPreview(){
+  const el = $("#streamMsg");
+  if(el) el.remove();
+}
+
+let pollTimer = null;
+function schedulePoll(busy){ clearTimeout(pollTimer); pollTimer = setTimeout(pollStatus, busy ? 150 : 800); }
+
 async function pollStatus(){
   let s;
-  try{ s = await (await fetch("/api/status")).json(); }catch(e){ return; }
+  try{ s = await (await fetch("/api/status")).json(); }catch(e){ schedulePoll(false); return; }
   if(!seqInit){ lastSeq = s.result_seq; seqInit = true; }   // ignore pre-existing result
   setEngineUI(s);
+
+  // Live token stream: paint the partial output while a job we kicked off runs.
+  if(awaiting && s.state === "generating") updateStreamPreview(s.stream);
+
   if(s.result_seq > lastSeq){
     lastSeq = s.result_seq;
     const kind = s.last_kind, was = awaiting;
     awaiting = null;
+    clearStreamPreview();   // hand off from the live bubble to the committed turn
     if(kind === "generate" && was === "generate"){
       if(s.last_output){ messages.push({role:"Assistant", content:s.last_output}); renderTranscript(); }
       if(s.last_chatml){ $("#chatmlBox").style.display=""; $("#chatmlOut").textContent = s.last_chatml; }
@@ -323,8 +369,10 @@ async function pollStatus(){
     }
     setEngineUI(s);  // re-enable buttons now that awaiting cleared
   }
+  // Poll fast while the engine is busy (loading/generating) so the stream is
+  // smooth; idle back off to keep the status endpoint cheap.
+  schedulePoll(s.busy);
 }
-setInterval(pollStatus, 800);
 pollStatus();
 
 $("#loadBtn").addEventListener("click", async () => {
@@ -345,7 +393,8 @@ $("#genBtn").addEventListener("click", async () => {
   const body = Object.assign({messages}, params());
   const r = await (await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)})).json();
-  if(!r.ok){ awaiting = null; $("#genStatus").textContent = ""; $("#modelMsg").textContent = r.message; pollStatus(); }
+  if(!r.ok){ awaiting = null; $("#genStatus").textContent = ""; $("#modelMsg").textContent = r.message; }
+  pollStatus();  // immediately reflect new state + start fast polling for the stream
 });
 
 $("#reactBtn").addEventListener("click", async () => {
@@ -359,7 +408,8 @@ $("#reactBtn").addEventListener("click", async () => {
   const body = Object.assign({system:sys, goal:lastUser.content, max_iterations: parseInt($("#iters").value)||8}, params());
   const r = await (await fetch("/api/react",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)})).json();
-  if(!r.ok){ awaiting = null; $("#genStatus").textContent = ""; $("#modelMsg").textContent = r.message; pollStatus(); }
+  if(!r.ok){ awaiting = null; $("#genStatus").textContent = ""; $("#modelMsg").textContent = r.message; }
+  pollStatus();  // immediately reflect new state + start fast polling for the stream
 });
 
 syncHL(); liveParse();
