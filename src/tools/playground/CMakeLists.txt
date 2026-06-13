@@ -50,6 +50,16 @@ target_link_libraries(agent_playground PRIVATE
     agent_orchestrator
 )
 
+# The frontend is no longer embedded in the C++ binary -- it lives in ui/ and is
+# served as static files. Copy it next to the executable on every build so the
+# server (which resolves <exe_dir>/ui) finds it. Tweaking CSS/JS now only needs a
+# browser refresh; recompiling C++ is no longer required to iterate on the UI.
+add_custom_command(TARGET agent_playground POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/ui"
+        "$<TARGET_FILE_DIR:agent_playground>/ui"
+    COMMENT "Copying agent_playground UI assets (ui/) next to the executable")
+
 # When the core lib was built with DirectStorage, the engine needs the DS runtime
 # DLLs next to the executable. DS_BIN_DIR is set in src/CMakeLists.txt and inherited
 # here because this subdirectory is added after that block.

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlackwellLLM &mdash; Agent Playground</title>
+
+<!-- Markdown renderer + universal syntax highlighter (CDN). If unreachable
+     (offline), the UI degrades to plain text + XML highlighting and still works.
+     highlight.js's "common" bundle ships C, C++, Python, JS, and ~30 more. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Agent Playground</h1>
+  <span class="pill">XML ReAct &middot; live engine</span>
+  <span class="pill" id="enginePill"><span class="dot" id="engineDot"></span><span id="engineState">no model</span></span>
+  <span class="spacer"></span>
+  <button id="seedBtn">Load demo</button>
+  <button id="renderBtn">Render transcript</button>
+  <button id="clearBtn">Clear</button>
+</header>
+
+<div class="main">
+  <div class="col">
+    <div class="card grow">
+      <h2>Transcript <span class="spacer"></span><span class="hint" id="genStatus"></span></h2>
+      <div id="transcript"><div class="empty-state">No turns yet. Pick a role, type or click a snippet, then "Add turn".</div></div>
+    </div>
+
+    <div class="card composer">
+      <div class="roles">
+        <span class="lbl">Input role:</span>
+        <button data-r="System">System</button>
+        <button data-r="User">User</button>
+        <button data-r="Assistant" class="active">Assistant</button>
+        <button data-r="Observation">Observation</button>
+      </div>
+
+      <div class="toolbar" id="toolbar">
+        <div class="grp">
+          <button class="snip" data-snip="toolcall">&lt;tool_call&gt;</button>
+          <button class="snip" data-snip="toolcall_sc">&lt;tool_call/&gt;</button>
+          <button class="snip" data-snip="arg">&lt;arg&gt;</button>
+          <button class="snip" data-snip="finish">&lt;finish&gt;</button>
+          <button class="snip" data-snip="finish_sc">&lt;finish/&gt;</button>
+        </div>
+        <div class="sep"></div>
+        <div class="grp" id="toolBtns"></div>
+        <div class="gl">Green = structural tags. Blue = full tool_call for a registered tool. Caret lands where you'll type next.</div>
+      </div>
+
+      <div class="editor">
+        <pre aria-hidden="true"><code id="hl"></code></pre>
+        <textarea id="input" spellcheck="false" placeholder="Type the turn here. Unknown tags (e.g. <file_content>) are flagged in red -- that's how you catch hallucinations."></textarea>
+      </div>
+
+      <div class="actions">
+        <span class="hint" id="liveHint"></span>
+        <span class="spacer"></span>
+        <button id="addBtn" class="primary">Add turn &#9166;</button>
+        <button id="genBtn" class="gen" disabled title="Run the real model to produce the next assistant turn">Generate (model)</button>
+        <button id="reactBtn" class="react" disabled title="Run the real ReAct loop with real tools">Run ReAct</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card fixed" id="modelCard">
+      <h2>Model <span class="spacer"></span><span id="modelStateText" class="hint">empty</span></h2>
+      <div class="body">
+        <div class="row">
+          <input class="grow" id="modelPath" placeholder="checkpoint dir, e.g. F:/AI/qwen2.5-coder-7b">
+          <button id="loadBtn">Load Model</button>
+        </div>
+        <div class="row">
+          <div class="field"><label>temp</label><input id="temp" type="number" step="0.05" min="0" max="2" value="0.20"></div>
+          <div class="field"><label>top_p</label><input id="topp" type="number" step="0.05" min="0" max="1" value="0.90"></div>
+          <div class="field"><label>max tokens</label><input id="maxtok" type="number" step="32" min="1" value="512"></div>
+          <div class="field"><label>react iters</label><input id="iters" type="number" step="1" min="1" value="8"></div>
+        </div>
+        <div class="modelmsg" id="modelMsg">No model loaded. The manual simulator works without one.</div>
+        <details class="chatml" id="chatmlBox" style="display:none">
+          <summary>Last ChatML prompt sent to the model</summary>
+          <pre id="chatmlOut"></pre>
+        </details>
+      </div>
+    </div>
+
+    <div class="card fixed">
+      <h2>Parser inspector &mdash; ground truth (real ToolParser)</h2>
+      <div id="inspector"><div class="hint">Start typing as the Assistant role to see what the orchestrator's parser extracts.</div></div>
+    </div>
+    <div class="card grow" id="rendered">
+      <h2>Rendered transcript (what the model sees)</h2>
+      <pre id="renderedOut" class="mono">Click "Render transcript".</pre>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
