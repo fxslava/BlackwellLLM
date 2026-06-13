@@ -439,124 +439,528 @@ const char* kIndexHtml = R"HTMLDOC(<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BlackwellLLM &mdash; Agent Playground</title>
+
+<!-- Lightweight Markdown renderer (CDN). If unreachable (offline), the UI falls
+     back to plain-text + XML highlighting, so the tool still works. -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+
 <style>
-  :root{
-    --bg:#0f1117; --panel:#171a23; --panel2:#1d212c; --border:#2a2f3c;
-    --txt:#d7dbe6; --muted:#8b93a7; --accent:#5b8cff;
-    --sys:#b98bff; --user:#5b8cff; --asst:#4fd08a; --obs:#f0a64a;
-    --tag-known:#4fd08a; --tag-unknown:#ff5c6c; --attr:#8bd0ff; --val:#f0a64a;
-    --ok:#4fd08a; --warn:#ff5c6c; --busy:#f0a64a;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;
-    background:var(--bg);color:var(--txt)}
-  code,pre,textarea,input,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace}
-  header{display:flex;align-items:center;gap:12px;padding:10px 16px;
-    background:var(--panel);border-bottom:1px solid var(--border)}
-  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
-  header .pill{font-size:11px;color:var(--muted);border:1px solid var(--border);
-    padding:2px 8px;border-radius:999px}
-  header .spacer{flex:1}
-  button{font:inherit;cursor:pointer;background:var(--panel2);color:var(--txt);
-    border:1px solid var(--border);border-radius:7px;padding:5px 10px}
-  button:hover{border-color:var(--accent)}
-  button:active{transform:translateY(1px)}
-  button:disabled{opacity:.4;cursor:not-allowed}
-  input{background:#12141c;color:var(--txt);border:1px solid var(--border);
-    border-radius:6px;padding:5px 8px;font-size:12.5px}
-  .main{display:grid;grid-template-columns:1fr 400px;gap:14px;padding:14px;
-    height:calc(100vh - 49px)}
-  .col{display:flex;flex-direction:column;min-height:0;gap:12px}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px}
-  .card h2{font-size:11px;text-transform:uppercase;letter-spacing:.8px;
-    color:var(--muted);margin:0;padding:9px 12px;border-bottom:1px solid var(--border);
-    display:flex;align-items:center;gap:8px}
-  .card h2 .spacer{flex:1}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
-  .dot.ready{background:var(--ok)} .dot.error{background:var(--warn)}
-  .dot.loading,.dot.generating{background:var(--busy);animation:pulse 1s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-  .spin{width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--accent);
-    border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  #modelCard .body{padding:11px 12px;display:flex;flex-direction:column;gap:9px}
-  .row{display:flex;gap:8px;align-items:center}
-  .row .grow{flex:1}
-  .field{display:flex;flex-direction:column;gap:3px}
-  .field label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  .field input{width:74px}
-  .modelmsg{font-size:11.5px;color:var(--muted);word-break:break-word}
-  details.chatml{font-size:11px}
-  details.chatml summary{cursor:pointer;color:var(--muted);padding:2px 0}
-  details.chatml pre{margin:6px 0 0;padding:8px;background:#12141c;border:1px solid var(--border);
-    border-radius:6px;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;
-    font-size:11px;color:var(--attr)}
-  #transcript{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:9px}
-  .msg{border:1px solid var(--border);border-left-width:4px;border-radius:8px;
-    background:var(--panel2);overflow:hidden}
-  .msg .bar{display:flex;align-items:center;gap:8px;padding:5px 9px;font-size:11px;
-    text-transform:uppercase;letter-spacing:.6px;font-weight:600}
-  .msg .bar .spacer{flex:1}
-  .msg .bar button{padding:1px 7px;font-size:11px;background:transparent}
-  .msg pre{margin:0;padding:9px 11px;white-space:pre-wrap;word-break:break-word;
-    font-size:12.5px;border-top:1px solid var(--border)}
-  .role-System{border-left-color:var(--sys)} .role-System .bar{color:var(--sys)}
-  .role-User{border-left-color:var(--user)} .role-User .bar{color:var(--user)}
-  .role-Assistant{border-left-color:var(--asst)} .role-Assistant .bar{color:var(--asst)}
-  .role-Observation{border-left-color:var(--obs)} .role-Observation .bar{color:var(--obs)}
-  .badge{font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid currentColor;
-    text-transform:none;letter-spacing:0}
-  .badge.ok{color:var(--ok)} .badge.warn{color:var(--warn)} .badge.muted{color:var(--muted)}
-  .empty{color:var(--muted);text-align:center;padding:30px;font-style:italic}
-  .composer{display:flex;flex-direction:column}
-  .roles{display:flex;gap:6px;padding:9px 12px;flex-wrap:wrap;align-items:center}
-  .roles .lbl{font-size:11px;color:var(--muted);margin-right:2px}
-  .roles button{border-radius:999px}
-  .roles button.active{color:#0f1117;font-weight:700;border-color:transparent}
-  .roles button[data-r=System].active{background:var(--sys)}
-  .roles button[data-r=User].active{background:var(--user)}
-  .roles button[data-r=Assistant].active{background:var(--asst)}
-  .roles button[data-r=Observation].active{background:var(--obs)}
-  .toolbar{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px;
-    border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
-  .toolbar .grp{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-  .toolbar .sep{width:1px;align-self:stretch;background:var(--border);margin:0 4px}
-  .toolbar button{font-size:12px;padding:4px 9px}
-  .toolbar .snip{color:var(--tag-known)}
-  .toolbar .tool{color:var(--attr)}
-  .toolbar .gl{font-size:10px;color:var(--muted);width:100%;margin-top:2px}
-  .editor{position:relative;height:170px;margin:0}
-  .editor pre,.editor textarea{position:absolute;inset:0;margin:0;padding:11px 13px;
-    border:0;white-space:pre-wrap;word-break:break-word;overflow:auto;
-    font-size:13px;line-height:1.55;letter-spacing:0;tab-size:2}
-  .editor pre{pointer-events:none;color:var(--txt);background:transparent;z-index:1}
-  .editor textarea{color:transparent;background:#12141c;caret-color:#fff;
-    resize:none;z-index:2;outline:none}
-  .editor textarea::selection{background:#33415f}
-  .tag-known{color:var(--tag-known)}
-  .tag-unknown{color:var(--tag-unknown);text-decoration:wavy underline}
-  .attr{color:var(--attr)} .val{color:var(--val)}
-  .composer .actions{display:flex;gap:8px;padding:10px 12px;align-items:center;flex-wrap:wrap}
-  .composer .actions .spacer{flex:1}
-  .composer .actions .primary{background:var(--accent);color:#fff;border-color:transparent;
-    font-weight:600;padding:6px 14px}
-  .composer .actions .gen{background:var(--asst);color:#0f1117;border-color:transparent;font-weight:700}
-  .composer .actions .react{background:var(--sys);color:#0f1117;border-color:transparent;font-weight:700}
-  .hint{font-size:11px;color:var(--muted)}
-  #inspector{padding:11px;overflow:auto}
-  .kv{display:flex;gap:8px;margin:3px 0;font-size:12.5px}
-  .kv .k{color:var(--muted);min-width:64px}
-  .kv .v{word-break:break-word}
-  .insp-kind{font-size:18px;font-weight:700;margin-bottom:6px}
-  .insp-none{color:var(--warn)} .insp-call{color:var(--asst)} .insp-finish{color:var(--user)}
-  .argrow{display:flex;gap:8px;font-size:12px;padding:2px 0;border-top:1px dashed var(--border)}
-  .argrow .ak{color:var(--attr);min-width:70px}
-  .argrow .av{white-space:pre-wrap;word-break:break-word;color:var(--val)}
-  #rendered{flex:1;min-height:0;display:flex;flex-direction:column}
-  #renderedOut{margin:0;padding:11px;overflow:auto;height:100%;white-space:pre-wrap;
-    word-break:break-word;font-size:12px;color:var(--muted)}
-  .insp-note{font-size:11px;color:var(--muted);margin-top:8px;border-top:1px solid var(--border);
-    padding-top:8px}
+/* ============================================================== *
+ *  Design tokens                                                 *
+ * ============================================================== */
+:root {
+  --bg:      #0f1117;
+  --panel:   #171a23;
+  --panel2:  #1d212c;
+  --code:    #0b0d13;   /* darker fill for markdown code blocks   */
+  --field:   #12141c;   /* editor + input background              */
+  --border:  #2a2f3c;
+  --txt:     #d7dbe6;
+  --muted:   #8b93a7;
+  --accent:  #5b8cff;
+
+  /* role accents */
+  --sys:  #b98bff;
+  --user: #5b8cff;
+  --asst: #4fd08a;
+  --obs:  #f0a64a;
+
+  /* syntax + status */
+  --tag-known:   #4fd08a;
+  --tag-unknown: #ff5c6c;
+  --attr: #8bd0ff;
+  --val:  #f0a64a;
+  --ok:   #4fd08a;
+  --warn: #ff5c6c;
+  --busy: #f0a64a;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--txt);
+}
+
+code, pre, textarea, input, .mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+/* ============================================================== *
+ *  Header                                                        *
+ * ============================================================== */
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+header h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .3px;
+}
+header .pill {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+header .spacer { flex: 1; }
+
+/* ============================================================== *
+ *  Buttons + inputs                                              *
+ * ============================================================== */
+button {
+  font: inherit;
+  cursor: pointer;
+  background: var(--panel2);
+  color: var(--txt);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 10px;
+}
+button:hover  { border-color: var(--accent); }
+button:active { transform: translateY(1px); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+input {
+  background: var(--field);
+  color: var(--txt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
+
+/* ============================================================== *
+ *  Layout                                                        *
+ * ============================================================== */
+.main {
+  display: grid;
+  grid-template-columns: 1fr 400px;
+  gap: 14px;
+  padding: 14px;
+  height: calc(100vh - 49px);
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 12px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.card h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 9px 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.card h2 .spacer { flex: 1; }
+
+/* ============================================================== *
+ *  Status indicators                                             *
+ * ============================================================== */
+.dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.dot.ready { background: var(--ok); }
+.dot.error { background: var(--warn); }
+.dot.loading,
+.dot.generating {
+  background: var(--busy);
+  animation: pulse 1s infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+
+.spin {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  vertical-align: -2px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ============================================================== *
+ *  Model card                                                    *
+ * ============================================================== */
+#modelCard .body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 11px 12px;
+}
+.row { display: flex; align-items: center; gap: 8px; }
+.row .grow { flex: 1; }
+
+.field { display: flex; flex-direction: column; gap: 3px; }
+.field label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--muted);
+}
+.field input { width: 74px; }
+
+.modelmsg {
+  font-size: 11.5px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+details.chatml { font-size: 11px; }
+details.chatml summary {
+  cursor: pointer;
+  padding: 2px 0;
+  color: var(--muted);
+}
+details.chatml pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 160px;
+  overflow-x: auto;
+  overflow-y: auto;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--attr);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ============================================================== *
+ *  Transcript + message blocks                                   *
+ * ============================================================== */
+#transcript {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+.msg {
+  overflow: hidden;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 8px;
+}
+.msg .bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+}
+.msg .bar .spacer { flex: 1; }
+.msg .bar button {
+  padding: 1px 7px;
+  font-size: 11px;
+  background: transparent;
+}
+
+/* Rendered markdown body of a message. Scrolls on overflow in both axes. */
+.msg .md {
+  padding: 9px 11px;
+  font-size: 12.5px;
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+  overflow-y: auto;
+}
+
+/* role accents */
+.role-System      { border-left-color: var(--sys); }
+.role-System .bar { color: var(--sys); }
+.role-User        { border-left-color: var(--user); }
+.role-User .bar   { color: var(--user); }
+.role-Assistant      { border-left-color: var(--asst); }
+.role-Assistant .bar { color: var(--asst); }
+.role-Observation      { border-left-color: var(--obs); }
+.role-Observation .bar { color: var(--obs); }
+
+.badge {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.badge.ok    { color: var(--ok); }
+.badge.warn  { color: var(--warn); }
+.badge.muted { color: var(--muted); }
+
+.empty {
+  padding: 30px;
+  text-align: center;
+  font-style: italic;
+  color: var(--muted);
+}
+
+/* ============================================================== *
+ *  Markdown typography (inside .md)                              *
+ * ============================================================== */
+.md > :first-child { margin-top: 0; }
+.md > :last-child  { margin-bottom: 0; }
+.md p  { margin: .45em 0; }
+.md h1, .md h2, .md h3, .md h4 { margin: .6em 0 .3em; line-height: 1.25; }
+.md ul, .md ol { margin: .45em 0; padding-left: 1.4em; }
+.md a { color: var(--accent); }
+.md blockquote {
+  margin: .5em 0;
+  padding: .2em .8em;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.md table { border-collapse: collapse; }
+.md th, .md td { border: 1px solid var(--border); padding: 3px 7px; }
+
+/* Inline code: subtle distinct chip. */
+.md code {
+  padding: 1px 5px;
+  font-size: 12px;
+  background: var(--code);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+/* Fenced code block: darker, padded, horizontally scrollable (no wrap). */
+.md pre {
+  margin: .5em 0;
+  padding: 10px 12px;
+  max-height: 340px;
+  overflow-x: auto;
+  overflow-y: auto;
+  background: var(--code);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.md pre code {
+  padding: 0;
+  font-size: 12px;
+  background: none;
+  border: 0;
+}
+/* Offline fallback: plain text wraps instead of scrolling. */
+.md pre.plain {
+  background: none;
+  border: 0;
+  padding: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ============================================================== *
+ *  Composer (roles + toolbar + editor + actions)                 *
+ * ============================================================== */
+.composer { display: flex; flex-direction: column; }
+
+.roles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+}
+.roles .lbl { margin-right: 2px; font-size: 11px; color: var(--muted); }
+.roles button { border-radius: 999px; }
+.roles button.active {
+  color: #0f1117;
+  font-weight: 700;
+  border-color: transparent;
+}
+.roles button[data-r=System].active      { background: var(--sys); }
+.roles button[data-r=User].active         { background: var(--user); }
+.roles button[data-r=Assistant].active    { background: var(--asst); }
+.roles button[data-r=Observation].active  { background: var(--obs); }
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.toolbar .grp { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.toolbar .sep { width: 1px; align-self: stretch; margin: 0 4px; background: var(--border); }
+.toolbar button { padding: 4px 9px; font-size: 12px; }
+.toolbar .snip { color: var(--tag-known); }
+.toolbar .tool { color: var(--attr); }
+.toolbar .gl {
+  width: 100%;
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* -------------------------------------------------------------- *
+ *  Editor: transparent <textarea> caret layer over a syntax-     *
+ *  highlighted <pre>. For the overlay to line up PERFECTLY, the  *
+ *  two layers MUST share identical box + typography metrics and  *
+ *  both be absolutely positioned at the same origin/size. The    *
+ *  container owns the background; both layers are transparent.   *
+ * -------------------------------------------------------------- */
+.editor {
+  position: relative;
+  height: 180px;
+  background: var(--field);
+  border-bottom: 1px solid var(--border);
+}
+.editor pre,
+.editor textarea {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 12px 13px;
+  border: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  letter-spacing: 0;
+  tab-size: 2;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+.editor pre {
+  z-index: 1;
+  color: var(--txt);
+  background: transparent;
+  pointer-events: none;   /* clicks fall through to the textarea */
+}
+.editor pre code { font: inherit; color: inherit; }
+.editor textarea {
+  z-index: 2;
+  color: transparent;     /* hide the real glyphs ... */
+  background: transparent; /* ... but let the highlighted <pre> show */
+  caret-color: #fff;       /* keep a visible caret */
+  resize: none;
+  outline: none;
+}
+.editor textarea::selection { background: #33415f; }
+
+/* syntax highlight spans (shared by editor + transcript markdown) */
+.tag-known   { color: var(--tag-known); }
+.tag-unknown { color: var(--tag-unknown); text-decoration: wavy underline; }
+.attr { color: var(--attr); }
+.val  { color: var(--val); }
+
+.composer .actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.composer .actions .spacer { flex: 1; }
+)HTMLDOC"
+        R"HTMLDOC(.composer .actions .primary {
+  padding: 6px 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
+}
+.composer .actions .gen {
+  font-weight: 700;
+  color: #0f1117;
+  background: var(--asst);
+  border-color: transparent;
+}
+.composer .actions .react {
+  font-weight: 700;
+  color: #0f1117;
+  background: var(--sys);
+  border-color: transparent;
+}
+.hint { font-size: 11px; color: var(--muted); }
+
+/* ============================================================== *
+ *  Parser inspector                                              *
+ * ============================================================== */
+#inspector {
+  padding: 11px;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+.kv { display: flex; gap: 8px; margin: 3px 0; font-size: 12.5px; }
+.kv .k { min-width: 64px; color: var(--muted); }
+.kv .v { word-break: break-word; }
+.insp-kind { margin-bottom: 6px; font-size: 18px; font-weight: 700; }
+.insp-none   { color: var(--warn); }
+.insp-call   { color: var(--asst); }
+.insp-finish { color: var(--user); }
+.argrow {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+  border-top: 1px dashed var(--border);
+}
+.argrow .ak { min-width: 70px; color: var(--attr); }
+.argrow .av { color: var(--val); white-space: pre-wrap; word-break: break-word; }
+.insp-note {
+  margin-top: 8px;
+  padding-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+}
+
+/* ============================================================== *
+ *  Rendered-transcript panel                                     *
+ * ============================================================== */
+#rendered {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+#renderedOut {
+  height: 100%;
+  margin: 0;
+  padding: 11px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  overflow-y: auto;
+}
 </style>
 </head>
 <body>
@@ -648,8 +1052,7 @@ const char* kIndexHtml = R"HTMLDOC(<!DOCTYPE html>
 </div>
 
 <script>
-)HTMLDOC"
-        R"HTMLDOC("use strict";
+"use strict";
 const CARET = String.fromCharCode(0x2038);    // caret-placement sentinel for snippets
 const KNOWN_TAGS = new Set(["tool_call","arg","finish"]);
 const TOOL_ARGS = {
@@ -663,8 +1066,8 @@ let editIndex = -1;
 const $ = s => document.querySelector(s);
 const input = $("#input"), hl = $("#hl");
 
-/* ---------- XML syntax highlighting (overlay) ---------- */
-function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+/* ---------- XML syntax highlighting ---------- */
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function hlTag(tag){
   const m = tag.match(/^<\/?([\w-]+)/);
   const name = m ? m[1] : "";
@@ -673,15 +1076,62 @@ function hlTag(tag){
     '<span class="attr">$1</span>=<span class="val">$2</span>');
   return '<span class="'+cls+'">'+inner+'</span>';
 }
-function highlight(text){
+// Core: escape text and wrap any <tag ...> in a colored span. Returns HTML.
+function highlightInline(text){
   let out = "", last = 0, m; const re = /<\/?[\w-]+[^>]*>/g;
   while((m = re.exec(text))){ out += esc(text.slice(last,m.index)); out += hlTag(m[0]); last = m.index+m[0].length; }
   out += esc(text.slice(last));
-  return out + "\n";
+  return out;
 }
+// Editor overlay variant: trailing newline keeps the last line's height.
+function highlight(text){ return highlightInline(text) + "\n"; }
 function syncHL(){ hl.innerHTML = highlight(input.value); hl.parentElement.scrollTop = input.scrollTop; }
 input.addEventListener("input", () => { syncHL(); liveParse(); });
 input.addEventListener("scroll", () => { hl.parentElement.scrollTop = input.scrollTop; hl.parentElement.scrollLeft = input.scrollLeft; });
+
+/* ---------- Markdown rendering for transcript messages ---------- */
+// Configure marked (if it loaded) so RAW HTML the model emits -- crucially our
+// XML tags like <tool_call> -- is ESCAPED into visible text rather than injected
+// as live (and invisible) DOM elements. We then re-highlight those tags below.
+let markedReady = false;
+if (window.marked && typeof marked.use === "function") {
+  marked.use({
+    gfm: true,
+    breaks: false,
+    renderer: {
+      html(token){
+        const s = (typeof token === "string") ? token : (token && (token.text || token.raw) || "");
+        return esc(s);
+      }
+    }
+  });
+  markedReady = true;
+}
+// Walk every text node and apply XML highlighting in place. Because we operate on
+// the parsed DOM (text nodes hold decoded "<tool_call>" strings), this works both
+// inside fenced code blocks and in ordinary prose without corrupting marked's HTML.
+function highlightXmlInElement(root){
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const nodes = []; let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+  nodes.forEach(tn => {
+    const t = tn.nodeValue;
+    if (t.indexOf("<") === -1) return;            // nothing tag-like here
+    const span = document.createElement("span");
+    span.innerHTML = highlightInline(t);
+    tn.parentNode.replaceChild(span, tn);
+  });
+}
+function renderMarkdown(content){
+  if (!markedReady) {
+    // Offline fallback: plain text + XML highlight, preserved whitespace.
+    return '<pre class="plain">' + highlightInline(content) + '</pre>';
+  }
+  const div = document.createElement("div");
+  div.innerHTML = marked.parse(content);
+  highlightXmlInElement(div);
+  return div.innerHTML;
+}
 
 /* ---------- snippet insertion ---------- */
 function insertSnippet(text){
@@ -737,7 +1187,8 @@ async function doParse(){
 function renderInspector(insp, r){
   const lh = $("#liveHint");
   if(r.kind === "None"){
-    insp.innerHTML = '<div class="insp-kind insp-none">None</div>'+
+)HTMLDOC"
+        R"HTMLDOC(    insp.innerHTML = '<div class="insp-kind insp-none">None</div>'+
       '<div class="hint">No valid &lt;tool_call&gt; or &lt;finish&gt; found. If you expected an action, you probably typed a hallucinated/typo tag -- check the red underlines on the left.</div>';
     lh.innerHTML = '<span style="color:var(--warn)">&#9888; no actionable tag</span>';
   }else if(r.kind === "ToolCall"){
@@ -784,7 +1235,7 @@ async function renderTranscript(){
     el.innerHTML =
       '<div class="bar"><span>'+m.role+'</span>'+badge+'<span class="spacer"></span>'+
       '<button data-edit="'+i+'">edit</button><button data-del="'+i+'">delete</button></div>'+
-      '<pre>'+highlight(m.content)+'</pre>';
+      '<div class="md">'+renderMarkdown(m.content)+'</div>';
     box.appendChild(el);
   }
   box.scrollTop = box.scrollHeight;
@@ -835,7 +1286,7 @@ $("#seedBtn").addEventListener("click", () => {
     {role:"User", content:"Read main.cpp and tell me what it does."},
     {role:"Assistant", content:"I'll open the file.\n<tool_call name=\"read_file\">\n  <arg name=\"path\">main.cpp</arg>\n</tool_call>"},
     {role:"Observation", content:"int main(){ return 0; }"},
-    {role:"Assistant", content:"<finish>main.cpp is an empty entry point that returns 0.</finish>"}
+    {role:"Assistant", content:"Here's the summary:\n\n```cpp\nint main(){ return 0; }\n```\n\n**main.cpp** is an empty entry point that returns `0`.\n<finish>main.cpp is an empty entry point that returns 0.</finish>"}
   ];
   renderTranscript();
 });
@@ -888,8 +1339,7 @@ async function pollStatus(){
     if(kind === "generate" && was === "generate"){
       if(s.last_output){ messages.push({role:"Assistant", content:s.last_output}); renderTranscript(); }
       if(s.last_chatml){ $("#chatmlBox").style.display=""; $("#chatmlOut").textContent = s.last_chatml; }
-)HTMLDOC"
-        R"HTMLDOC(    } else if(kind === "react" && was === "react"){
+    } else if(kind === "react" && was === "react"){
       if(Array.isArray(s.last_react) && s.last_react.length){
         messages = s.last_react.map(m => ({role:m.role, content:m.content}));
         renderTranscript();
