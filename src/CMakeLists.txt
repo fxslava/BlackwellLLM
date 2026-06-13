@@ -26,6 +26,15 @@ if(BUILD_AGENT_ORCHESTRATOR AND BUILD_AGENT_CORE AND BUILD_AGENT_ENV)
     add_subdirectory(agent_orchestrator)
 endif()
 
+# 🛠️ Agent Simulator / Prompt Playground: a local-HTTP-server GUI for visually
+# debugging the XML ReAct protocol. Compiles ONLY the dependency-free
+# tool_parser.cpp (no agent_core/agent_env/tree-sitter/git/CUDA), so it is safe
+# to build even when the heavier agent subsystems are off. Default ON.
+option(BUILD_AGENT_PLAYGROUND "Build the GUI Agent Simulator / Prompt Playground tool (no CUDA)" ON)
+if(BUILD_AGENT_PLAYGROUND)
+    add_subdirectory(tools/playground)
+endif()
+
 # 🎯 Опция для включения DirectStorage (по умолчанию ВЫКЛЮЧЕНА)
 option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
 
