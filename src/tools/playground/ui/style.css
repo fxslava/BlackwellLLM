@@ -179,13 +179,14 @@ input {
 }
 .sidebar h2 .spacer { flex: 1; }
 .sidebar h2 .mini { padding: 2px 7px; font-size: 11px; text-transform: none; letter-spacing: 0; }
-#branchList { overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+#branchList { overflow-y: auto; padding: 8px 10px 8px 8px; }
 .branch-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 6px;
-  padding: 7px 9px;
+  margin: 1px 0;
+  padding: 6px 9px;
   border-radius: 7px;
   cursor: pointer;
   border: 1px solid transparent;
@@ -196,7 +197,29 @@ input {
 .branch-item.active { background: var(--panel2); border-color: var(--accent); }
 .branch-item .bname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .branch-item .bseq { flex: 0 0 auto; font-size: 10.5px; color: var(--muted); }
+.branch-item .forkat { color: var(--muted); font-size: 10.5px; }
+
+/* Recursive branch tree: nested lists with git-graph connector lines drawn from
+ * pseudo-elements. Each child level indents; a vertical rail runs down a sibling
+ * group with a horizontal tick to each row, and the last child's rail stops at
+ * its tick -- forming |-, |- ... `-  lineage lines. */
+.branch-tree, .branch-children { list-style: none; margin: 0; padding: 0; }
+.branch-node { position: relative; }
+.branch-children { padding-left: 16px; }
+.branch-children > .branch-node::before {   /* horizontal tick to the row */
+  content: ""; position: absolute; top: 15px; left: -7px; width: 9px; height: 1px;
+  background: var(--border);
+}
+.branch-children > .branch-node::after {    /* vertical rail through siblings */
+  content: ""; position: absolute; top: 0; bottom: 0; left: -7px; width: 1px;
+  background: var(--border);
+}
+.branch-children > .branch-node:last-child::after { bottom: auto; height: 15px; }
+
 .sidebar-hint { padding: 8px 12px; font-size: 10.5px; color: var(--muted); border-top: 1px solid var(--border); }
+
+/* Inherited (ancestor) turns shown in a child branch: shared lineage, read-only. */
+.msg.inherited .bubble { opacity: .72; border-style: dashed; }
 .col {
   display: flex;
   flex-direction: column;
