@@ -4,12 +4,19 @@
 #include "safetensors.h"
 #include "memory_pool.h"
 #include "ops_dispatcher.h"
+#include "kv_cache/ikv_cache_manager.h"
+#include <memory>
 
 struct BlackwellEngine::Impl {
     ModelConfig m_config;
     SafetensorsLoader loader;
     VRAMArena arena;
     LinearDispatcher dispatcher;
+
+    // KV-cache strategy (chosen once at construction; see IKVCacheManager).
+    // Declared after `arena` so it is destroyed before it -- the adapter holds a
+    // reference into the arena. Defaults to the legacy continuous FP32 cache.
+    std::unique_ptr<blackwell::IKVCacheManager> kv_mgr;
 
     float *d_X_accum = nullptr;
     float *d_X_norm = nullptr;
@@ -18,7 +25,8 @@ struct BlackwellEngine::Impl {
     float *d_logits = nullptr;
     int *d_next_token = nullptr;
 
-    Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers);
+    Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
+         BlackwellEngine::KVCacheMode kv_mode);
     ~Impl();
 
     void step_embedding(int token_id);

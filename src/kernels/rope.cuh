@@ -21,3 +21,15 @@ void launch_fused_rope_kv_kernel(
     size_t head_dim,
     size_t max_seq_len,
     float rope_theta = 500000.0f);
+
+// rotate_half RoPE applied IN PLACE to a [num_heads, head_dim] buffer, with no
+// cache write. Used by the paged KV path, which appends the rotated K/V into a
+// scattered physical page rather than a contiguous slab (so it cannot use the
+// fused rope+cache-write kernel above). Apply once to Q and once to K.
+//   HARD CONTRACT: head_dim even, head_dim/2 <= 1024.
+void launch_rope_inplace(
+    float* d_X,
+    int pos,
+    size_t num_heads,
+    size_t head_dim,
+    float rope_theta = 500000.0f);

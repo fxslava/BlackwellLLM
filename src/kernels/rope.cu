@@ -98,3 +98,17 @@ void launch_fused_rope_kv_kernel(
     rope_q_kernel<<<q_heads, threads>>>(d_Q, pos, head_dim, rope_theta);
     rope_kv_append_kernel<<<kv_heads, threads>>>(d_K, d_V, d_K_cache, d_V_cache, pos, head_dim, max_seq_len, rope_theta);
 }
+
+// In-place rotate_half over a [num_heads, head_dim] buffer (no cache write).
+// rope_q_kernel is layout-agnostic -- it rotates any such buffer -- so it serves
+// for both Q and K on the paged path.
+void launch_rope_inplace(
+    float* d_X,
+    int pos,
+    size_t num_heads,
+    size_t head_dim,
+    float rope_theta)
+{
+    dim3 threads(head_dim / 2);
+    rope_q_kernel<<<num_heads, threads>>>(d_X, pos, head_dim, rope_theta);
+}

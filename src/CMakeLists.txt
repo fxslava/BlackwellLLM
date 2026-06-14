@@ -37,6 +37,8 @@ set(CORE_SOURCES
     ops_dispatcher.cpp
     safetensors.cpp
     memory_pool.cpp
+    kv_cache/continuous_kv_manager.cpp
+    kv_cache/paged_kv_manager.cpp
     tokenizer/unicode.cpp
     tokenizer/bpe_tokenizer.cpp
     tokenizer/chat_template.cpp

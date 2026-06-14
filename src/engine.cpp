@@ -10,6 +10,8 @@
 #include "kernels/attention.cuh"
 #include "kernels/swiglu.cuh"
 #include "kernels/sampling.cuh"
+#include "kv_cache/continuous_kv_manager.h"
+#include "kv_cache/paged_kv_manager.h"
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -32,7 +34,8 @@ static size_t resolve_num_gpu_layers(size_t requested) {
 // Initializer list mirrors the declaration order in engine_impl.h: members are
 // constructed in declaration order regardless of the list, and arena consumes
 // both loader and m_config, so the textual order must not suggest otherwise.
-BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers)
+BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
+                            BlackwellEngine::KVCacheMode kv_mode)
     : m_config(ConfigLoader::load_from_json(
           (std::filesystem::path(index_path).parent_path() / "config.json").string())),
       loader(index_path),
@@ -60,6 +63,14 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
     if (arena.get_k_cache_size() > 0) {
         CUDA_CHECK(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
         CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
+    }
+
+    // KV-cache strategy. Continuous (default) wraps the existing VRAMArena flow
+    // (behavior-preserving). Paged uses the bf16 CoW cache + paged-flash kernel.
+    if (kv_mode == BlackwellEngine::KVCacheMode::Paged) {
+        kv_mgr = std::make_unique<blackwell::PagedKVManager>(m_config, max_seq_len);
+    } else {
+        kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(arena, m_config);
     }
 }
 
@@ -162,24 +173,13 @@ void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
 }
 
 void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
-    // For offloaded layers the prefix [0, pos) must sit in the KV staging slot
-    // before the attention kernel scans it (incremental copy, compute-stream
-    // ordered); resident layers resolve straight into the global VRAM pool.
-    arena.prepare_layer_kv(layer_idx, pos);
-
-    float* d_layer_k_cache = arena.get_layer_k_cache(layer_idx);
-    float* d_layer_v_cache = arena.get_layer_v_cache(layer_idx);
-
-    launch_fused_rope_kv_kernel(d_Q, d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos,
-        m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
-        arena.get_max_seq_len(), m_config.rope_theta);
-    launch_attention_decoding_kernel(d_Q, d_layer_k_cache, d_layer_v_cache, d_Attn_out, pos,
-        m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
-        arena.get_max_seq_len());
-
-    // Spill the freshly written KV column back to the pinned host mirror once
-    // the kernels above complete (event-ordered on the transfer stream).
-    arena.commit_layer_kv(layer_idx, pos);
+    // Delegated to the active KV-cache strategy. The continuous adapter runs the
+    // exact legacy sequence (prepare_layer_kv -> fused RoPE+append -> decode
+    // attention -> commit_layer_kv); the paged adapter routes through the block
+    // table + paged-flash kernel. The single virtual call sits at per-layer
+    // granularity and is monomorphic, so it is free relative to the kernel
+    // launches it wraps.
+    kv_mgr->attention_decode(layer_idx, pos, d_Q, d_K, d_V, d_Attn_out);
 }
 
 void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
@@ -250,16 +250,27 @@ void BlackwellEngine::Impl::step_final_ops() {
 }
 
 // Реализация фасада BlackwellEngine
-BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers)
-    : pImpl(std::make_unique<Impl>(index_path, max_seq_len, num_gpu_layers)) {}
+BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
+                                 KVCacheMode kv_mode)
+    : pImpl(std::make_unique<Impl>(index_path, max_seq_len, num_gpu_layers, kv_mode)) {}
 
 BlackwellEngine::~BlackwellEngine() = default;
+
+// Sequence branching delegates to the active KV-cache strategy. Continuous
+// throws (CoW unsupported); Paged shares / rolls back KV pages.
+void BlackwellEngine::fork(int parent_id, int child_id) {
+    pImpl->kv_mgr->fork(parent_id, child_id);
+}
+
+void BlackwellEngine::rewind(int seq_id, int pos) {
+    pImpl->kv_mgr->rewind(seq_id, pos);
+}
 
 // ============================================================================
 // Shared decoder pipeline: embedding -> N transformer layers -> final norm/head.
 // Leaves the logits for token `pos` in impl->d_logits.
 // ============================================================================
-static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos) {
+static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos, int seq_id) {
     const size_t max_seq_len = impl->arena.get_max_seq_len();
     if (pos < 0 || static_cast<size_t>(pos) >= max_seq_len)
         throw std::out_of_range(
@@ -268,6 +279,13 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
             " (the RoPE/KV append kernel would write out of bounds)");
 
     impl->step_embedding(token_id);
+
+    // Per-token KV control plane: latch the target sequence before the layer
+    // sweep. The paged manager resolves the CoW append slot, stages this
+    // sequence's block table, and (groundwork) ensures it is GPU-resident -- so
+    // decoding any forked branch is just forward(..., seq_id). The continuous
+    // manager accepts only seq_id 0.
+    impl->kv_mgr->prepare_decode_step(seq_id, pos);
 
     const int num_layers = static_cast<int>(impl->m_config.num_layers);
     for (int i = 0; i < num_layers; ++i) {
@@ -292,17 +310,17 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
 // ============================================================================
 // Full Engine Inference
 // ============================================================================
-int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p) {
+int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p, int seq_id) {
     auto* impl = pImpl.get();
-    run_decoder_stack(impl, token_id, pos);
+    run_decoder_stack(impl, token_id, pos, seq_id);
     return sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature, top_p);
 }
 
 // ============================================================================
 // Evaluation Inference (Для расчета Перплексии)
 // ============================================================================
-float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id) {
+float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id, int seq_id) {
     auto* impl = pImpl.get();
-    run_decoder_stack(impl, token_id, pos);
+    run_decoder_stack(impl, token_id, pos, seq_id);
     return compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
 }
