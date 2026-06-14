@@ -188,14 +188,19 @@ void BlackwellLLMAdapter::load_chat_config() {
     }
 }
 
-BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len)
-    : model_dir_(model_dir), max_seq_len_(max_seq_len) {
+BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len,
+                                         bool use_paged_attention)
+    : model_dir_(model_dir), max_seq_len_(max_seq_len),
+      use_paged_attention_(use_paged_attention) {
     // Tokenizer + chat-template config come from the checkpoint's JSON sidecars.
     tokenizer_ = blackwell::TokenizerFactory::create(model_dir);
     load_chat_config();  // sets template_kind_, stop_strings_, max_stop_len_
     // The index file fully describes the weight shards; the engine streams them.
     const std::string index_path = model_dir + "/model.safetensors.index.json";
-    engine_ = std::make_unique<BlackwellEngine>(index_path, max_seq_len_);
+    const auto kv_mode = use_paged_attention_ ? BlackwellEngine::KVCacheMode::Paged
+                                              : BlackwellEngine::KVCacheMode::Continuous;
+    engine_ = std::make_unique<BlackwellEngine>(index_path, max_seq_len_,
+                                                static_cast<size_t>(-1), kv_mode);
 }
 
 BlackwellLLMAdapter::~BlackwellLLMAdapter() = default;
@@ -208,7 +213,7 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript) {
 
 std::string BlackwellLLMAdapter::generate(const std::string& transcript,
                                           const Params& params, std::string* prompt_out,
-                                          StreamCallback stream_cb) {
+                                          StreamCallback stream_cb, int seq_id) {
     const std::string prompt_text = apply_chat_template(transcript, template_kind_);
     if (prompt_out) *prompt_out = prompt_text;
 
@@ -219,40 +224,45 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
 
     const size_t cap = max_seq_len_;
 
-    // ---- Append-or-Reset prefix match (incremental KV reuse) -----------------
-    // cached_prompt_ mirrors the tokens currently resident in the engine's KV
-    // cache (last turn's prompt + everything we then generated). If the whole of
-    // it is a prefix of the new prompt, the conversation only grew at the end, so
-    // we KEEP that KV and prefill ONLY the new tail -- O(new tokens) instead of
-    // O(N). Any divergence (an edited/deleted past turn, or a shorter prompt) means
-    // the cached KV is stale, so we RESET: clear it and reprefill from pos 0.
-    // Overwriting the cache from position 0 is sufficient -- slots past the new
-    // length are never attended to.
-    const bool append = cached_prompt_.size() <= prompt.size() &&
-                        std::equal(cached_prompt_.begin(), cached_prompt_.end(), prompt.begin());
-    if (!append) cached_prompt_.clear();  // RESET
+    // Per-branch KV-reuse history (seq 0 = main). Every forward below targets this
+    // sequence, so parallel branches never clobber each other's KV cache.
+    std::vector<int>& cached = cached_prompt_by_seq_[seq_id];
 
-    int pos = static_cast<int>(cached_prompt_.size());  // APPEND: start past the reused prefix
+    // ---- Append-or-Reset prefix match (incremental KV reuse) -----------------
+    // `cached` mirrors the tokens currently resident in this sequence's KV cache
+    // (last turn's prompt + everything we then generated). If the whole of it is a
+    // prefix of the new prompt, the conversation only grew at the end, so we KEEP
+    // that KV and prefill ONLY the new tail -- O(new tokens) instead of O(N). Any
+    // divergence (an edited/deleted past turn, or a shorter prompt) means the
+    // cached KV is stale, so we RESET: clear it and reprefill from pos 0. The
+    // engine treats forward(token, pos) as position-addressed, so reprefilling
+    // from 0 truncates+rewrites this sequence; slots past the new length are
+    // never attended to.
+    const bool append = cached.size() <= prompt.size() &&
+                        std::equal(cached.begin(), cached.end(), prompt.begin());
+    if (!append) cached.clear();  // RESET
+
+    int pos = static_cast<int>(cached.size());  // APPEND: start past the reused prefix
     int next = -1;
 
     // Prefill only the tokens not already resident, deterministically (temperature
     // 0): only the final forward of the prefill yields the first generated token.
-    for (size_t i = cached_prompt_.size(); i < prompt.size(); ++i) {
+    for (size_t i = cached.size(); i < prompt.size(); ++i) {
         if (static_cast<size_t>(pos) >= cap) {  // prompt overflows the window
-            cached_prompt_.clear();             // KV is now partial -> force a reset next call
+            cached.clear();                     // KV is now partial -> force a reset next call
             return "";
         }
-        next = engine_->forward(prompt[i], pos, 0.0f, 1.0f);
+        next = engine_->forward(prompt[i], pos, 0.0f, 1.0f, seq_id);
         ++pos;
     }
-    cached_prompt_ = prompt;  // KV now holds exactly `prompt` at positions 0..N-1
+    cached = prompt;  // KV now holds exactly `prompt` at positions 0..N-1
 
     // Regenerating an identical prompt forwarded nothing, leaving `next` unset;
     // re-run the final token (same id, same slot -> idempotent) to recover the
     // first-token logits.
     if (next < 0) {
         pos = static_cast<int>(prompt.size()) - 1;
-        next = engine_->forward(prompt.back(), pos, 0.0f, 1.0f);
+        next = engine_->forward(prompt.back(), pos, 0.0f, 1.0f, seq_id);
         ++pos;
     }
 
@@ -271,9 +281,9 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
     while (static_cast<size_t>(pos) < cap && generated < params.max_new_tokens) {
         if (tokenizer_->is_stop(next)) {
             // Real eos token: feed it so the cache reflects a closed turn, then halt.
-            // It is a stop, so it is NOT committed to cached_prompt_; next turn the
+            // It is a stop, so it is NOT committed to `cached`; next turn the
             // template re-emits the closing marker over this same slot.
-            engine_->forward(next, pos, 0.0f, 1.0f);
+            engine_->forward(next, pos, 0.0f, 1.0f, seq_id);
             ++pos;
             break;
         }
@@ -320,8 +330,8 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
 
         // Commit the confirmed token to the session history (mirrors the KV write
         // below) so the next turn can append straight onto it, then advance.
-        cached_prompt_.push_back(next);
-        next = engine_->forward(next, pos, params.temperature, params.top_p);
+        cached.push_back(next);
+        next = engine_->forward(next, pos, params.temperature, params.top_p, seq_id);
         ++pos;
         ++generated;
     }
@@ -334,6 +344,15 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
         stream_cb(out.substr(emitted));
     }
     return out;
+}
+
+void BlackwellLLMAdapter::fork_sequence(int parent_id, int child_id) {
+    // Engine-level CoW branch: the child shares the parent's KV pages until it
+    // writes (throws under the continuous cache). Seed the child's reuse history
+    // from the parent so continuing the child from the fork point appends (reuse)
+    // rather than reprefilling.
+    engine_->fork(parent_id, child_id);
+    cached_prompt_by_seq_[child_id] = cached_prompt_by_seq_[parent_id];
 }
 
 }  // namespace playground

@@ -25,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "blackwell/engine.h"
@@ -57,7 +58,13 @@ public:
     // and reads tokenizer_config.json to pick the chat template + stop strings.
     // This is the SLOW call (DirectStorage weight streaming, VRAM allocation);
     // ModelService runs it on a background thread. Throws on failure.
-    explicit BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len = 8192);
+    //
+    // use_paged_attention: when true the engine is built with the bf16 Paged KV
+    // cache (Copy-on-Write fork/rewind, branching support); the default keeps the
+    // legacy FP32 continuous cache. This is an engine-construction choice fixed at
+    // load time, not a per-generate sampling parameter.
+    explicit BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len = 8192,
+                                 bool use_paged_attention = false);
     ~BlackwellLLMAdapter() override;
 
     BlackwellLLMAdapter(const BlackwellLLMAdapter&) = delete;
@@ -69,8 +76,17 @@ public:
     // Same, but with explicit sampling params, an optional capture of the exact
     // prompt string handed to the model (for the UI's debug panel), and an
     // optional per-token streaming callback (for live UI rendering / "Stop").
+    // seq_id selects which branch (engine sequence) to decode on; default 0 =
+    // "main". Each branch keeps its own KV-reuse history (see fork_sequence).
     std::string generate(const std::string& transcript, const Params& params,
-                         std::string* prompt_out, StreamCallback stream_cb = nullptr);
+                         std::string* prompt_out, StreamCallback stream_cb = nullptr,
+                         int seq_id = 0);
+
+    // Branch the engine KV cache (Paged mode only): share the parent's pages via
+    // CoW and seed the child's token-history mirror from the parent. Throws under
+    // the continuous cache (no branching). Host-only and fast; the caller must
+    // serialize it against generation (ModelService runs it only when idle).
+    void fork_sequence(int parent_id, int child_id);
 
     void set_params(const Params& p) { params_ = p; }
     const Params& params() const { return params_; }
@@ -83,6 +99,7 @@ public:
     void set_stream_callback(StreamCallback cb) { stream_cb_ = std::move(cb); }
     const std::string& model_dir() const { return model_dir_; }
     size_t max_seq_len() const { return max_seq_len_; }
+    bool use_paged_attention() const { return use_paged_attention_; }
 
     // Detected chat dialect + the stop strings collected for this checkpoint.
     ChatTemplate chat_template() const { return template_kind_; }
@@ -102,6 +119,7 @@ private:
 
     std::string model_dir_;
     size_t max_seq_len_;
+    bool use_paged_attention_;  // engine built with the Paged (CoW) KV cache
     std::unique_ptr<blackwell::ITokenizer> tokenizer_;
     std::unique_ptr<BlackwellEngine> engine_;
     Params params_;
@@ -116,8 +134,9 @@ private:
     // matches the next prompt against this -- a strict extension prefills only the
     // new tail (APPEND); any divergence forces a full reprefill from pos 0 (RESET).
     // Mirrors the KV cache by position. Touched only on the worker thread, so no
-    // locking is needed (same as engine_).
-    std::vector<int> cached_prompt_;
+    // locking is needed (same as engine_). Keyed by engine seq_id (branch): seq 0
+    // is "main"; fork_sequence() copies the parent branch's history to the child.
+    std::unordered_map<int, std::vector<int>> cached_prompt_by_seq_;
 };
 
 }  // namespace playground

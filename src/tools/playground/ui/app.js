@@ -5,12 +5,58 @@ const TOOL_ARGS = {
   read_file:["path"], write_file:["path","content"], patch_file:["path","find","replace"],
   list_dir:["path"], analyze_source:["source"], callers_of:["symbol"], callees_of:["symbol"]
 };
-let messages = [];
+// Branching state: a map of engine seq_id -> {name, messages}. seq 0 is "main".
+// `messages` always aliases the active branch's array, so all existing in-place
+// mutations (push/splice) keep working; reassignments go through setMessages().
+let branches = { 0: { name: "main", messages: [] } };
+let currentBranch = 0;
+let nextSeqId = 1;            // monotonic id assigned to each new branch
+let messages = branches[0].messages;
+let enginePaged = false;      // engine loaded with Paged (CoW) attention?
 let currentRole = "Assistant";
 let editIndex = -1;
 
 const $ = s => document.querySelector(s);
 const input = $("#input"), hl = $("#hl");
+
+/* ---------- branches (Paged-attention CoW) ---------- */
+function setMessages(arr){ messages = arr; branches[currentBranch].messages = arr; }
+function switchBranch(id){
+  if(!(id in branches)) return;
+  currentBranch = id;
+  messages = branches[id].messages;
+  renderBranches();
+  renderTranscript();
+}
+function renderBranches(){
+  const box = $("#branchList");
+  if(!box) return;
+  box.innerHTML = "";
+  Object.keys(branches).map(Number).sort((a,b) => a-b).forEach(id => {
+    const b = branches[id];
+    const el = document.createElement("div");
+    el.className = "branch-item" + (id === currentBranch ? " active" : "");
+    el.innerHTML = '<span class="bname">'+esc(b.name)+'</span><span class="bseq">seq '+id+'</span>';
+    el.onclick = () => switchBranch(id);
+    box.appendChild(el);
+  });
+}
+// Fork a new branch from message `msgIndex` of the current branch: copy turns
+// 0..msgIndex into a fresh branch and CoW-fork the engine KV cache behind it.
+async function forkFrom(msgIndex){
+  if(!enginePaged){ $("#modelMsg").textContent = "Enable Paged Attention (reload the model) to fork branches."; return; }
+  const parentSeq = currentBranch;
+  const childSeq = nextSeqId++;
+  const copied = branches[parentSeq].messages.slice(0, msgIndex + 1).map(m => ({role:m.role, content:m.content}));
+  let r;
+  try {
+    r = await (await fetch("/api/branch/fork",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({parent_seq_id: parentSeq, new_seq_id: childSeq})})).json();
+  } catch(e){ $("#modelMsg").textContent = "fork request failed"; return; }
+  if(!r.ok){ $("#modelMsg").textContent = r.message || "fork rejected"; return; }
+  branches[childSeq] = { name: "branch "+childSeq+" @msg"+msgIndex, messages: copied };
+  switchBranch(childSeq);
+}
 
 /* ---------- XML syntax highlighting ---------- */
 function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
@@ -208,13 +254,15 @@ async function renderTranscript(){
       '<div class="avatar">'+m.role.charAt(0)+'</div>'+
       '<div class="bubble">'+
         '<div class="meta"><span class="who">'+m.role+'</span>'+badge+
-          '<span class="actions"><button data-edit="'+i+'">edit</button>'+
+          '<span class="actions"><button data-fork="'+i+'" title="Fork a new branch from this turn">fork</button>'+
+          '<button data-edit="'+i+'">edit</button>'+
           '<button data-del="'+i+'">delete</button></span></div>'+
         '<div class="md">'+renderMarkdown(m.content)+'</div>'+
       '</div>';
     box.appendChild(el);
   }
   box.scrollTop = box.scrollHeight;
+  box.querySelectorAll('[data-fork]').forEach(b => b.onclick = () => forkFrom(+b.dataset.fork));
   box.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { messages.splice(+b.dataset.del,1); renderTranscript(); });
   box.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
     const i = +b.dataset.edit; const m = messages[i];
@@ -235,7 +283,7 @@ $("#addBtn").addEventListener("click", () => {
   input.value = ""; syncHL(); liveParse(); renderTranscript();
 });
 input.addEventListener("keydown", e => { if((e.ctrlKey||e.metaKey) && e.key === "Enter"){ e.preventDefault(); $("#addBtn").click(); } });
-$("#clearBtn").addEventListener("click", () => { messages = []; renderTranscript(); $("#renderedOut").textContent = 'Click "Render transcript".'; });
+$("#clearBtn").addEventListener("click", () => { setMessages([]); renderTranscript(); $("#renderedOut").textContent = 'Click "Render transcript".'; });
 $("#renderBtn").addEventListener("click", async () => {
   const r = await (await fetch("/api/render",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({messages})})).json();
@@ -257,13 +305,13 @@ $("#renderBtn").addEventListener("click", async () => {
 
 /* ---------- demo seed (markdown + cpp code + XML, to show the pipeline) ---------- */
 $("#seedBtn").addEventListener("click", () => {
-  messages = [
+  setMessages([
     {role:"System", content:"You are a coding agent. Act using exactly one <tool_call name=\"...\"><arg name=\"...\">...</arg></tool_call> per turn, or <finish>...</finish> when done."},
     {role:"User", content:"Read main.cpp and tell me what it does."},
     {role:"Assistant", content:"I'll open the file.\n<tool_call name=\"read_file\">\n  <arg name=\"path\">main.cpp</arg>\n</tool_call>"},
     {role:"Observation", content:"int main(){ return 0; }"},
     {role:"Assistant", content:"Here's the summary:\n\n```cpp\n#include <vector>\nint main() {\n  std::vector<int> v{1, 2, 3};  // <-- exit code below\n  return 0;\n}\n```\n\nAnd the Python equivalent:\n\n```python\ndef main() -> int:\n    return 0  # done\n```\n\n**main.cpp** is an empty entry point that returns `0`.\n<finish>main.cpp is an empty entry point that returns 0.</finish>"}
-  ];
+  ]);
   renderTranscript();
 });
 
@@ -284,6 +332,11 @@ function params(){
 }
 function setEngineUI(s){
   engineState = s.state;
+  enginePaged = !!s.paged;
+  const bh = $("#branchHint");
+  if(bh) bh.textContent = enginePaged
+    ? 'Click "fork" on a turn to branch from it.'
+    : 'Load a model with Paged Attention to branch conversations (CoW).';
   $("#engineDot").className = "dot " + s.state;
   $("#engineState").textContent = s.state==="ready" ? "ready" : s.state==="loading" ? "loading" :
     s.state==="generating" ? "working" : s.state==="error" ? "error" : "no model";
@@ -363,7 +416,7 @@ async function pollStatus(){
       if(s.last_chatml){ $("#chatmlBox").style.display=""; $("#chatmlOut").textContent = s.last_chatml; }
     } else if(kind === "react" && was === "react"){
       if(Array.isArray(s.last_react) && s.last_react.length){
-        messages = s.last_react.map(m => ({role:m.role, content:m.content}));
+        setMessages(s.last_react.map(m => ({role:m.role, content:m.content})));
         renderTranscript();
       }
     }
@@ -378,9 +431,15 @@ pollStatus();
 $("#loadBtn").addEventListener("click", async () => {
   const path = $("#modelPath").value.trim();
   if(!path){ $("#modelMsg").textContent = "Enter a checkpoint directory first."; return; }
+  const usePaged = $("#usePaged").checked;
+  // A fresh load resets the engine's seq ids; collapse to a single 'main' branch
+  // (keeping the current transcript as its history) so UI ids match the engine.
+  branches = { 0: { name: "main", messages: branches[currentBranch].messages } };
+  currentBranch = 0; nextSeqId = 1; messages = branches[0].messages;
+  renderBranches(); renderTranscript();
   $("#modelMsg").textContent = "Requesting load...";
   const r = await (await fetch("/api/model/load",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({path})})).json();
+    body:JSON.stringify({path, use_paged_attention: usePaged})})).json();
   if(!r.ok) $("#modelMsg").textContent = r.message;
   pollStatus();
 });
@@ -390,7 +449,7 @@ $("#genBtn").addEventListener("click", async () => {
   awaiting = "generate";
   $("#genBtn").disabled = true; $("#reactBtn").disabled = true;
   $("#genStatus").innerHTML = '<span class="spin"></span> generating...';
-  const body = Object.assign({messages}, params());
+  const body = Object.assign({messages, seq_id: currentBranch}, params());
   const r = await (await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)})).json();
   if(!r.ok){ awaiting = null; $("#genStatus").textContent = ""; $("#modelMsg").textContent = r.message; }
@@ -412,4 +471,10 @@ $("#reactBtn").addEventListener("click", async () => {
   pollStatus();  // immediately reflect new state + start fast polling for the stream
 });
 
+$("#forkMainBtn").addEventListener("click", () => {
+  if(!messages.length){ $("#modelMsg").textContent = "Nothing to fork yet -- add a turn first."; return; }
+  forkFrom(messages.length - 1);   // fork from the end of the current branch
+});
+
+renderBranches();
 syncHL(); liveParse();

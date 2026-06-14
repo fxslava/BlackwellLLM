@@ -102,6 +102,35 @@ TEST(PagedEngineIntegration, ForkedBranchIsDecodable) {
     SUCCEED() << "Forked branch decoded independently via seq_id.";
 }
 
+// Regression: forward(token, pos) is position-addressed, so re-decoding an
+// existing position (pos < current length) must reconcile (rewind+append), NOT
+// throw "pos out of sync". This is the pattern the playground adapter hits via
+// incremental KV reuse / eos re-feed across two requests.
+TEST(PagedEngineIntegration, RedecodeExistingPositionReconciles) {
+    if (!file_exists(qwen_index_path())) {
+        GTEST_SKIP() << "Model checkpoint not found at " << qwen_index_path();
+    }
+    BlackwellEngine engine(qwen_index_path(), /*max_seq_len=*/128,
+                           /*num_gpu_layers=*/static_cast<size_t>(-1),
+                           BlackwellEngine::KVCacheMode::Paged);
+
+    int t = kQwenBos;
+    ASSERT_NO_THROW({ for (int pos = 0; pos < 5; ++pos) t = engine.forward(t, pos); });  // length -> 5
+
+    // Re-decode position 4 (pos < length 5): the eos-refeed / replay pattern.
+    ASSERT_NO_THROW({ t = engine.forward(t, /*pos=*/4); });
+    // Reset-style replay from position 0, then continue.
+    ASSERT_NO_THROW({
+        t = engine.forward(kQwenBos, /*pos=*/0);
+        t = engine.forward(t, /*pos=*/1);
+    });
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << "CUDA fault during position-addressed redecode";
+
+    // A forward gap (pos beyond the end) is still a clean error, not a fault.
+    EXPECT_THROW(engine.forward(t, /*pos=*/50), std::runtime_error);
+    SUCCEED();
+}
+
 TEST(PagedEngineIntegration, ContinuousModeRejectsBranching) {
     if (!file_exists(qwen_index_path())) {
         GTEST_SKIP() << "Model checkpoint not found at " << qwen_index_path();

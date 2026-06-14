@@ -59,13 +59,20 @@ void PagedKVManager::prepare_decode_step(SeqId seq, int pos) {
     // any device page is touched (today: throws if swapped; nothing swaps yet).
     ensure_resident(internal);
 
-    // The append slot index is the sequence's current length; keep the engine's
-    // pos and the manager's length in lock-step so the token lands at pos.
-    if (m_seqmgr->length(internal) != pos)
+    // forward(token, pos) is POSITION-ADDRESSED, exactly like the continuous
+    // cache: writing slot `pos` invalidates everything from `pos` on. Callers
+    // legitimately drive us with pos <= length -- the adapter's incremental KV
+    // reuse re-feeds the eos token, replays the last token on an identical
+    // prompt, and resets to pos 0 on divergence. Reconcile by truncating the
+    // sequence to `pos` (rewind drops/decrefs the now-stale tail pages) so the
+    // reserve below lands exactly at `pos`. Only a forward gap is a real error.
+    const int len = m_seqmgr->length(internal);
+    if (pos > len)
         throw std::runtime_error(
             "PagedKVManager: decode pos " + std::to_string(pos) +
-            " out of sync with sequence length " +
-            std::to_string(m_seqmgr->length(internal)));
+            " skips past sequence length " + std::to_string(len) + " (KV gap)");
+    if (pos < len)
+        m_seqmgr->rewind(internal, pos);
 
     // Resolve the physical slot (CoW the target page if it is fork-shared) and
     // stage the device block table; latch the context for the layer sweep.

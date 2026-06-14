@@ -174,30 +174,49 @@ public:
         j["last_chatml"]= last_chatml_;
         j["last_react"] = last_react_;
         j["stream"]     = stream_buffer_;  // partial text of the in-flight job
+        j["paged"]      = (adapter_ && adapter_->use_paged_attention());  // active KV strategy
         return j;
     }
 
     // Each of these returns "" on success, or a human-readable rejection reason
     // ("busy: ...", "no model loaded") when the request cannot start right now.
-    std::string start_load(const std::string& dir) {
+    std::string start_load(const std::string& dir, bool use_paged) {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_locked()) return "busy: " + message_;
         join_worker_locked();
         state_ = State::Loading;
         model_dir_ = dir;
-        message_ = "Loading model from " + dir + " ...";
-        worker_ = std::thread([this, dir] { do_load(dir); });
+        message_ = std::string("Loading model from ") + dir +
+                   (use_paged ? " (paged attention) ..." : " ...");
+        worker_ = std::thread([this, dir, use_paged] { do_load(dir, use_paged); });
         return "";
     }
 
-    std::string start_generate(std::string transcript, BlackwellLLMAdapter::Params p) {
+    std::string start_generate(std::string transcript, BlackwellLLMAdapter::Params p, int seq_id) {
         std::lock_guard<std::mutex> lk(mu_);
         if (state_ != State::Ready) return ready_reason_locked();
         join_worker_locked();
         state_ = State::Generating;
         message_ = "Generating...";
         stream_buffer_.clear();  // fresh live buffer for this run
-        worker_ = std::thread([this, t = std::move(transcript), p] { do_generate(t, p); });
+        worker_ = std::thread([this, t = std::move(transcript), p, seq_id] { do_generate(t, p, seq_id); });
+        return "";
+    }
+
+    // Branch the loaded sequence's KV cache (Paged mode). fork_sequence is
+    // host-only and fast, so it runs synchronously -- but only when idle (Ready),
+    // which guarantees no generate is touching the engine concurrently.
+    std::string fork(int parent_seq, int child_seq) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (state_ != State::Ready) return ready_reason_locked();
+        join_worker_locked();
+        try {
+            adapter_->fork_sequence(parent_seq, child_seq);
+        } catch (const std::exception& e) {
+            return std::string("fork failed: ") + e.what();
+        } catch (...) {
+            return "fork failed: unknown error";
+        }
         return "";
     }
 
@@ -242,11 +261,11 @@ private:
 
     // --- worker-thread bodies (exactly one runs at a time) --------------------
 
-    void do_load(std::string dir) {
+    void do_load(std::string dir, bool use_paged) {
         std::unique_ptr<BlackwellLLMAdapter> ad;
         std::string err;
         try {
-            ad = std::make_unique<BlackwellLLMAdapter>(dir, kMaxSeqLen);  // SLOW
+            ad = std::make_unique<BlackwellLLMAdapter>(dir, kMaxSeqLen, use_paged);  // SLOW
         } catch (const std::exception& e) {
             err = e.what();
         } catch (...) {
@@ -256,7 +275,8 @@ private:
         if (err.empty()) {
             adapter_ = std::move(ad);
             state_ = State::Ready;
-            message_ = "Model ready: " + dir;
+            message_ = std::string("Model ready: ") + dir +
+                       (use_paged ? " [paged attention]" : "");
         } else {
             adapter_.reset();
             state_ = State::Error;
@@ -273,13 +293,14 @@ private:
         return true;
     }
 
-    void do_generate(std::string transcript, BlackwellLLMAdapter::Params p) {
+    void do_generate(std::string transcript, BlackwellLLMAdapter::Params p, int seq_id) {
         std::string out, chatml, err;
         // adapter_ is stable here: it is only mutated by do_load, which cannot run
         // concurrently with this (single worker thread + state machine).
         try {
             out = adapter_->generate(transcript, p, &chatml,
-                                     [this](const std::string& tok) { return append_stream(tok); });
+                                     [this](const std::string& tok) { return append_stream(tok); },
+                                     seq_id);
         } catch (const std::exception& e) {
             err = e.what();
         } catch (...) {
@@ -425,13 +446,18 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/model/load", [&model](const httplib::Request& req, httplib::Response& res) {
         std::string path;
-        try { path = json::parse(req.body).value("path", std::string{}); } catch (...) {}
+        bool use_paged = false;  // backward compatible: default to the continuous cache
+        try {
+            const json b = json::parse(req.body);
+            path = b.value("path", std::string{});
+            use_paged = b.value("use_paged_attention", false);
+        } catch (...) {}
         if (path.empty()) {
             res.set_content(json{{"ok", false}, {"message", "model path is empty"}}.dump(),
                             "application/json");
             return;
         }
-        const std::string err = model.start_load(path);
+        const std::string err = model.start_load(path, use_paged);
         res.set_content(json{{"ok", err.empty()},
                              {"message", err.empty() ? "loading started" : err}}.dump(),
                         "application/json");
@@ -441,8 +467,9 @@ int main(int argc, char** argv) {
         json body = json::object();
         try { body = json::parse(req.body); } catch (...) {}
         json messages = body.contains("messages") ? body["messages"] : json::array();
+        const int seq_id = body.value("seq_id", 0);  // which branch to decode on (default: main)
         const std::string err =
-            model.start_generate(render_transcript(messages), params_from_json(body));
+            model.start_generate(render_transcript(messages), params_from_json(body), seq_id);
         res.set_content(json{{"ok", err.empty()},
                              {"message", err.empty() ? "generation started" : err}}.dump(),
                         "application/json");
@@ -462,6 +489,29 @@ int main(int argc, char** argv) {
         const std::string err = model.start_react(system, goal, max_iters, params_from_json(body));
         res.set_content(json{{"ok", err.empty()},
                              {"message", err.empty() ? "react started" : err}}.dump(),
+                        "application/json");
+    });
+
+    // --- branching: CoW-fork the engine KV cache for a new conversation branch -
+    // The frontend assigns the child's seq_id (a monotonic counter) and sends it
+    // with the parent. Routes to BlackwellEngine::fork via the adapter; only valid
+    // in Paged mode (the continuous cache rejects branching with a clear error).
+    svr.Post("/api/branch/fork", [&model](const httplib::Request& req, httplib::Response& res) {
+        int parent = 0, child = -1;
+        try {
+            const json b = json::parse(req.body);
+            parent = b.value("parent_seq_id", 0);
+            child  = b.value("new_seq_id", -1);
+        } catch (...) {}
+        if (child < 0) {
+            res.set_content(json{{"ok", false}, {"message", "new_seq_id is required"}}.dump(),
+                            "application/json");
+            return;
+        }
+        const std::string err = model.fork(parent, child);
+        res.set_content(json{{"ok", err.empty()},
+                             {"seq_id", child},
+                             {"message", err.empty() ? "forked" : err}}.dump(),
                         "application/json");
     });
 

@@ -26,6 +26,12 @@
 </header>
 
 <div class="main">
+  <div class="sidebar">
+    <h2>Branches <span class="spacer"></span><button id="forkMainBtn" class="mini" title="Fork a new branch from the end of the current one">+ fork</button></h2>
+    <div id="branchList"></div>
+    <div class="sidebar-hint" id="branchHint">Load a model with Paged Attention to branch conversations (CoW).</div>
+  </div>
+
   <div class="col">
     <div class="card grow">
       <h2>Transcript <span class="spacer"></span><span class="hint" id="genStatus"></span></h2>
@@ -76,6 +82,11 @@
         <div class="row">
           <input class="grow" id="modelPath" placeholder="checkpoint dir, e.g. F:/AI/qwen2.5-coder-7b">
           <button id="loadBtn">Load Model</button>
+        </div>
+        <div class="row">
+          <label class="checkbox" title="Builds the engine with the bf16 paged KV cache (Copy-on-Write fork/rewind). Off = legacy FP32 continuous cache.">
+            <input type="checkbox" id="usePaged"> Enable Paged Attention (CoW / Branching Support)
+          </label>
         </div>
         <div class="row">
           <div class="field"><label>temp</label><input id="temp" type="number" step="0.05" min="0" max="2" value="0.20"></div>
