@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 #include <cuda_runtime.h>
 
 #include "../../src/paging/paged_kv_cache.h"
@@ -152,6 +153,47 @@ int main() {
     EXPECT_EQ(mgr.page_ref_count(p_b0), 1);             // parent now sole owner
     EXPECT_EQ(mgr.block_page(p, 0), p_b0);              // parent still points there
     EXPECT_EQ(mgr.length(p), N);
+
+    // ---------------------------------------------------------------------
+    // 5. KV layer offloading: an offloaded layer's pages must round-trip
+    //    through the pinned host mirror (spill_out_page -> stage_in_layer),
+    //    while a resident layer's stage/spill stay pure no-ops. This is the
+    //    seam that keeps the paged pool from sizing for ALL layers in VRAM.
+    // ---------------------------------------------------------------------
+    std::printf("[5] KV layer offloading (host-mirror stage/spill round-trip)\n");
+    {
+        const int nl = 2, kvh = 2, hd = 16, tp = 8, mb = 8;
+        SequenceManager om(nl, kvh, hd, tp, mb, /*num_gpu_layers=*/1);  // layer 1 offloaded
+        EXPECT(!om.layer_is_offloaded(0));
+        EXPECT(om.layer_is_offloaded(1));
+        EXPECT_EQ(om.num_gpu_layers(), 1);
+
+        const SeqId s = om.create_sequence();
+        const AppendSlot a = om.reserve_append_slot(s);     // allocate block 0's page
+        const int per_page = kvh * PAGE_SIZE * hd;          // 2*16*16 = 512 elems
+
+        std::vector<kv_t> pat(per_page), back(per_page, __float2bfloat16(0.f));
+        for (int i = 0; i < per_page; ++i) pat[i] = __float2bfloat16((float)(i % 37) + 0.5f);
+
+        kv_t* d_k = om.layer_k_pool(1);                     // layer 1's staging slab
+        const size_t poff = (size_t)a.page * per_page;
+        // write pattern -> slot, spill to host mirror, clobber the slot, stage back
+        cudaMemcpy(d_k + poff, pat.data(), per_page * sizeof(kv_t), cudaMemcpyHostToDevice);
+        om.spill_out_page(1, a.page);  cudaStreamSynchronize(0);
+        cudaMemset(d_k + poff, 0, per_page * sizeof(kv_t));            // destroy device copy
+        om.stage_in_layer(1, s);       cudaStreamSynchronize(0);
+        cudaMemcpy(back.data(), d_k + poff, per_page * sizeof(kv_t), cudaMemcpyDeviceToHost);
+
+        int mismatches = 0;
+        for (int i = 0; i < per_page; ++i)
+            if (__bfloat162float(back[i]) != __bfloat162float(pat[i])) ++mismatches;
+        EXPECT_EQ(mismatches, 0);   // page survived the trip through pinned host RAM
+
+        // Resident layer 0: stage/spill must do nothing (and must not touch device).
+        om.stage_in_layer(0, s);
+        om.spill_out_page(0, a.page);
+        EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+    }
 
     std::printf("\n%d checks, %d failures -> %s\n",
                 g_checks, g_fail, g_fail ? "FAIL" : "PASS");

@@ -6,7 +6,8 @@
 
 namespace blackwell {
 
-PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len)
+PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
+                               size_t num_gpu_layers)
     : m_config(config),
       m_num_q_heads(static_cast<int>(config.num_attention_heads)),
       m_num_kv_heads(static_cast<int>(config.num_key_value_heads)),
@@ -15,14 +16,21 @@ PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len)
 {
     const int max_blocks =
         static_cast<int>((max_seq_len + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE);
-    // Headroom for concurrent fork branches. Pool VRAM scales with this; the
-    // engine passes max_seq_len, so size it modestly and tune later if needed.
+    // Headroom for concurrent fork branches. Device-pool VRAM now scales with the
+    // RESIDENT layer count (offloaded layers cost only host RAM + 2 staging slabs),
+    // so this factor inflates the host mirror cheaply rather than VRAM.
     constexpr int kBranchFactor = 4;
     const int total_pages = max_blocks * kBranchFactor;
 
+    // Resolve the GPU/CPU split: clamp SIZE_MAX / oversize to "all resident".
+    const int gpu_layers =
+        (num_gpu_layers == static_cast<size_t>(-1) || num_gpu_layers > config.num_layers)
+            ? static_cast<int>(config.num_layers)
+            : static_cast<int>(num_gpu_layers);
+
     m_seqmgr = std::make_unique<paging::SequenceManager>(
         static_cast<int>(config.num_layers), m_num_kv_heads, m_head_dim,
-        total_pages, max_blocks);
+        total_pages, max_blocks, gpu_layers);
 
     // Engine sequence 0 always exists -- the default decode stream.
     const paging::SeqId s0 = m_seqmgr->create_sequence();
@@ -94,6 +102,11 @@ void PagedKVManager::attention_decode(int layer_idx, int pos,
     launch_rope_inplace(d_Q, pos, m_num_q_heads,  m_head_dim, m_rope_theta);
     launch_rope_inplace(d_K, pos, m_num_kv_heads, m_head_dim, m_rope_theta);
 
+    // KV-offloaded layer: fault its live pages back from the pinned host mirror
+    // into its device staging slab BEFORE the append/attention read it (no-op for
+    // resident layers). Same stream as the kernels below => correctly ordered.
+    m_seqmgr->stage_in_layer(layer_idx, m_active);
+
     paging::kv_t* k_pool = m_seqmgr->layer_k_pool(layer_idx);
     paging::kv_t* v_pool = m_seqmgr->layer_v_pool(layer_idx);
 
@@ -104,6 +117,10 @@ void PagedKVManager::attention_decode(int layer_idx, int pos,
     // Exact attention over the sequence prefix via the block table.
     launch_paged_flash_attention_decode(d_Q, k_pool, v_pool, d_O, m_block_table,
                                         m_seq_len, m_num_q_heads, m_num_kv_heads, m_head_dim);
+
+    // Spill the page just written back to the host mirror so it survives the
+    // staging slab being reused by the next offloaded layer (no-op if resident).
+    m_seqmgr->spill_out_page(layer_idx, m_append_page);
 }
 
 void PagedKVManager::prepare_prefill_step(SeqId, int, int) {

@@ -68,7 +68,12 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
     // KV-cache strategy. Continuous (default) wraps the existing VRAMArena flow
     // (behavior-preserving). Paged uses the bf16 CoW cache + paged-flash kernel.
     if (kv_mode == BlackwellEngine::KVCacheMode::Paged) {
-        kv_mgr = std::make_unique<blackwell::PagedKVManager>(m_config, max_seq_len);
+        // Match the weight-offload split: layers [num_gpu_layers, num_layers) keep
+        // their paged KV in the pinned host mirror, not VRAM. Without this the
+        // paged pool sizes for ALL layers and silently maxes VRAM despite the
+        // arena reporting offloading active.
+        kv_mgr = std::make_unique<blackwell::PagedKVManager>(m_config, max_seq_len,
+                                                             arena.num_gpu_layers());
     } else {
         kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(arena, m_config);
     }

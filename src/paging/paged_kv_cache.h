@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 #include <stack>
 #include <unordered_map>
@@ -77,21 +78,51 @@ private:
 // ---------------------------------------------------------------------------
 class SequenceManager {
 public:
+    // num_gpu_layers: how many LEADING layers keep their KV pages resident in the
+    // device pool. The remaining (num_layers - num_gpu_layers) layers are "KV
+    // offloaded": their pages live in a pinned host mirror and are streamed into a
+    // small set of device staging slabs on demand (stage_in_layer / spill_out_page).
+    // A negative value (the default) or a value >= num_layers keeps EVERY layer
+    // resident -- byte-for-byte the original all-VRAM behaviour (no host mirror,
+    // no staging slots), so existing all-resident call sites are unchanged.
     SequenceManager(int num_layers, int num_kv_heads, int head_dim,
-                    int total_pages, int max_blocks_per_seq)
+                    int total_pages, int max_blocks_per_seq, int num_gpu_layers = -1)
         : m_num_layers(num_layers), m_num_kv_heads(num_kv_heads),
           m_head_dim(head_dim), m_total_pages(total_pages),
           m_max_blocks(max_blocks_per_seq), m_alloc(total_pages) {
-        const size_t per_page = per_page_elems();
-        const size_t pool_elems = (size_t)num_layers * total_pages * per_page;
+        m_resident  = (num_gpu_layers < 0 || num_gpu_layers > num_layers)
+                          ? num_layers : num_gpu_layers;
+        m_offloaded = num_layers - m_resident;
+        m_slab_elems = (size_t)total_pages * per_page_elems();   // one layer's pool
+
+        // The device pool holds the resident layers' slabs, plus -- only when KV
+        // offloading is active -- kNumSlots transient staging slabs that offloaded
+        // layers cycle through (slot = layer % kNumSlots). This is what bounds VRAM:
+        // device KV scales with m_resident, not num_layers.
+        const int device_slabs = m_resident + (m_offloaded > 0 ? kNumSlots : 0);
+        const size_t pool_elems = (size_t)device_slabs * m_slab_elems;
         CUDA_CHECK(cudaMalloc(&m_d_k_pool, pool_elems * sizeof(kv_t)));
         CUDA_CHECK(cudaMalloc(&m_d_v_pool, pool_elems * sizeof(kv_t)));
         CUDA_CHECK(cudaMemset(m_d_k_pool, 0, pool_elems * sizeof(kv_t)));
         CUDA_CHECK(cudaMemset(m_d_v_pool, 0, pool_elems * sizeof(kv_t)));
         CUDA_CHECK(cudaMalloc(&m_d_block_scratch, max_blocks_per_seq * sizeof(int32_t)));
+
+        // Pinned host mirror for the offloaded layers (page-indexed, identical
+        // per-layer layout). cudaHostAlloc so stage/spill are true DMA transfers
+        // with no pageable bounce buffer -- the same requirement PinnedHostPool
+        // enforces for the continuous cache.
+        if (m_offloaded > 0) {
+            const size_t mirror_bytes = (size_t)m_offloaded * m_slab_elems * sizeof(kv_t);
+            CUDA_CHECK(cudaHostAlloc(&m_h_k_mirror, mirror_bytes, cudaHostAllocDefault));
+            CUDA_CHECK(cudaHostAlloc(&m_h_v_mirror, mirror_bytes, cudaHostAllocDefault));
+            std::memset(m_h_k_mirror, 0, mirror_bytes);
+            std::memset(m_h_v_mirror, 0, mirror_bytes);
+        }
     }
     ~SequenceManager() {
         cudaFree(m_d_k_pool); cudaFree(m_d_v_pool); cudaFree(m_d_block_scratch);
+        if (m_h_k_mirror) cudaFreeHost(m_h_k_mirror);
+        if (m_h_v_mirror) cudaFreeHost(m_h_v_mirror);
     }
     SequenceManager(const SequenceManager&) = delete;
     SequenceManager& operator=(const SequenceManager&) = delete;
@@ -122,9 +153,17 @@ public:
             PageId pid = bt.pages[block];
             if (m_alloc.ref_count(pid) > 1) {                // shared -> CoW
                 PageId np = m_alloc.allocate();
-                launch_cow_copy_page(m_d_k_pool, m_d_v_pool, pid, np,
-                                     m_num_layers, m_total_pages,
-                                     m_num_kv_heads, m_head_dim, stream);
+                // Resident layers occupy the first m_resident device slabs in the
+                // SAME [layer][page] layout the kernel expects, so the device copy
+                // runs over exactly those layers. (m_resident == m_num_layers in
+                // the all-resident default -> identical to the original call.)
+                if (m_resident > 0)
+                    launch_cow_copy_page(m_d_k_pool, m_d_v_pool, pid, np,
+                                         m_resident, m_total_pages,
+                                         m_num_kv_heads, m_head_dim, stream);
+                // Offloaded layers live in the host mirror; duplicate the page there
+                // too so the forked child carries their full history when re-staged.
+                cow_copy_page_host(pid, np, stream);
                 m_alloc.decref(pid);
                 bt.pages[block] = np;
             }
@@ -175,23 +214,87 @@ public:
         return m_d_block_scratch;
     }
 
-    kv_t* layer_k_pool(int layer) const {
-        return m_d_k_pool + (size_t)layer * m_total_pages * per_page_elems();
-    }
-    kv_t* layer_v_pool(int layer) const {
-        return m_d_v_pool + (size_t)layer * m_total_pages * per_page_elems();
-    }
+    bool layer_is_offloaded(int layer) const { return layer >= m_resident; }
+
+    // Device base of a layer's KV pool. Resident layers map to their own slab;
+    // offloaded layers map to the staging slab they cycle through (layer % slots).
+    // For an offloaded layer the returned pointer is only valid AFTER a matching
+    // stage_in_layer() (the kernels read/write through it, exactly as for resident
+    // layers -- callers never branch on residency).
+    kv_t* layer_k_pool(int layer) const { return m_d_k_pool + (size_t)slab_of(layer) * m_slab_elems; }
+    kv_t* layer_v_pool(int layer) const { return m_d_v_pool + (size_t)slab_of(layer) * m_slab_elems; }
     kv_t* k_pool() const { return m_d_k_pool; }
     kv_t* v_pool() const { return m_d_v_pool; }
 
-    int free_pages() const { return m_alloc.free_pages(); }
+    // ---- KV offloading: page-aware stage-in / spill-out -------------------
+    // Bring an offloaded layer's live KV pages back into its device staging slab
+    // BEFORE the layer's append/attention. Driven by the sequence's block table,
+    // so only the pages it actually occupies are transferred (host -> device).
+    // No-op for resident layers. Stream-ordered against the kernels (same stream).
+    void stage_in_layer(int layer, SeqId s, cudaStream_t stream = 0) {
+        if (!layer_is_offloaded(layer)) return;
+        const BlockTable& bt = seq(s);
+        kv_t* d_k = layer_k_pool(layer);
+        kv_t* d_v = layer_v_pool(layer);
+        const kv_t* h_k = host_k_base(layer);
+        const kv_t* h_v = host_v_base(layer);
+        const size_t pp = per_page_elems(), page_bytes = pp * sizeof(kv_t);
+        for (PageId p : bt.pages) {
+            const size_t off = (size_t)p * pp;
+            CUDA_CHECK(cudaMemcpyAsync(d_k + off, h_k + off, page_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_v + off, h_v + off, page_bytes, cudaMemcpyHostToDevice, stream));
+        }
+    }
+
+    // Spill the single page just appended (device staging slab -> host mirror)
+    // AFTER the layer's attention, so the freshly written column survives the slab
+    // being reused by the next offloaded layer. No-op for resident layers.
+    void spill_out_page(int layer, PageId page, cudaStream_t stream = 0) {
+        if (!layer_is_offloaded(layer)) return;
+        const size_t pp = per_page_elems(), off = (size_t)page * pp, page_bytes = pp * sizeof(kv_t);
+        CUDA_CHECK(cudaMemcpyAsync(host_k_base(layer) + off, layer_k_pool(layer) + off,
+                                   page_bytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_v_base(layer) + off, layer_v_pool(layer) + off,
+                                   page_bytes, cudaMemcpyDeviceToHost, stream));
+    }
+
+    int  num_gpu_layers() const { return m_resident; }
+    int  free_pages()     const { return m_alloc.free_pages(); }
 
 private:
+    static constexpr int kNumSlots = 2;   // device staging slabs for offloaded layers
+
     size_t per_page_elems() const {
         return (size_t)m_num_kv_heads * PAGE_SIZE * m_head_dim;
     }
     BlockTable&       seq(SeqId s)       { return m_seqs.at(s); }
     const BlockTable& seq(SeqId s) const { return m_seqs.at(s); }
+
+    // Device slab backing a layer's KV pool: its own slab if resident, else the
+    // staging slab it cycles through (slot = layer % kNumSlots, after the resident
+    // slabs). For the all-resident default this is just `layer`.
+    int slab_of(int layer) const {
+        return layer_is_offloaded(layer) ? (m_resident + (layer % kNumSlots)) : layer;
+    }
+    // Base of an offloaded layer's pages in the pinned host mirror.
+    kv_t* host_k_base(int layer) const { return m_h_k_mirror + (size_t)(layer - m_resident) * m_slab_elems; }
+    kv_t* host_v_base(int layer) const { return m_h_v_mirror + (size_t)(layer - m_resident) * m_slab_elems; }
+
+    // Host-side CoW for offloaded layers' mirror pages. Waits for any in-flight
+    // spill (async D2H on `stream`) to land, then duplicates src->dst for every
+    // offloaded layer. CoW is a rare fork-boundary event, so the sync is cheap.
+    void cow_copy_page_host(PageId src, PageId dst, cudaStream_t stream = 0) {
+        if (m_offloaded <= 0) return;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const size_t pp = per_page_elems(), page_bytes = pp * sizeof(kv_t);
+        for (int oi = 0; oi < m_offloaded; ++oi) {
+            const size_t base = (size_t)oi * m_slab_elems;
+            std::memcpy(m_h_k_mirror + base + (size_t)dst * pp,
+                        m_h_k_mirror + base + (size_t)src * pp, page_bytes);
+            std::memcpy(m_h_v_mirror + base + (size_t)dst * pp,
+                        m_h_v_mirror + base + (size_t)src * pp, page_bytes);
+        }
+    }
 
     int m_num_layers, m_num_kv_heads, m_head_dim, m_total_pages, m_max_blocks;
     PageAllocator m_alloc;
@@ -201,6 +304,13 @@ private:
     kv_t*    m_d_k_pool = nullptr;
     kv_t*    m_d_v_pool = nullptr;
     int32_t* m_d_block_scratch = nullptr;
+
+    // KV offloading state (m_offloaded == 0 => everything resident, all no-ops).
+    int    m_resident = 0;      // leading layers kept in the device pool
+    int    m_offloaded = 0;     // num_layers - m_resident, mirrored to host
+    size_t m_slab_elems = 0;    // elements in one layer's pool (total_pages*per_page)
+    kv_t*  m_h_k_mirror = nullptr;   // pinned host mirror for offloaded layers' K pages
+    kv_t*  m_h_v_mirror = nullptr;   // ... and V pages
 };
 
 }} // namespace blackwell::paging

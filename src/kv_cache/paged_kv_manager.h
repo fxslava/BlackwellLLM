@@ -20,7 +20,13 @@ namespace blackwell {
 // internally-generated ids via m_id_map; engine seq 0 is created at construction.
 class PagedKVManager : public IKVCacheManager {
 public:
-    PagedKVManager(const ModelConfig& config, size_t max_seq_len);
+    // num_gpu_layers: leading layers whose paged KV stays resident in VRAM; the
+    // rest are KV-offloaded to a pinned host mirror inside the SequenceManager and
+    // streamed per layer during decode. SIZE_MAX (default) keeps every layer
+    // resident (the original behaviour). Mirrors the weight-offload split the
+    // VRAMArena applies, so paged mode matches continuous mode's VRAM ceiling.
+    PagedKVManager(const ModelConfig& config, size_t max_seq_len,
+                   size_t num_gpu_layers = static_cast<size_t>(-1));
 
     void prepare_decode_step(SeqId seq, int pos) override;
     void prepare_prefill_step(SeqId seq, int start_pos, int num_tokens) override;
