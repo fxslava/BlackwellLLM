@@ -189,9 +189,9 @@ void BlackwellLLMAdapter::load_chat_config() {
 }
 
 BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len,
-                                         bool use_paged_attention)
+                                         bool use_paged_attention, size_t num_gpu_layers)
     : model_dir_(model_dir), max_seq_len_(max_seq_len),
-      use_paged_attention_(use_paged_attention) {
+      use_paged_attention_(use_paged_attention), num_gpu_layers_(num_gpu_layers) {
     // Tokenizer + chat-template config come from the checkpoint's JSON sidecars.
     tokenizer_ = blackwell::TokenizerFactory::create(model_dir);
     load_chat_config();  // sets template_kind_, stop_strings_, max_stop_len_
@@ -199,8 +199,11 @@ BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t ma
     const std::string index_path = model_dir + "/model.safetensors.index.json";
     const auto kv_mode = use_paged_attention_ ? BlackwellEngine::KVCacheMode::Paged
                                               : BlackwellEngine::KVCacheMode::Continuous;
+    // num_gpu_layers_ drives the CPU/GPU weight split inside the engine (SIZE_MAX =
+    // everything resident in VRAM). The engine offloads the remainder to pinned
+    // host RAM regardless of the quant backend (AWQ packed / FP8 / bf16).
     engine_ = std::make_unique<BlackwellEngine>(index_path, max_seq_len_,
-                                                static_cast<size_t>(-1), kv_mode);
+                                                num_gpu_layers_, kv_mode);
 }
 
 BlackwellLLMAdapter::~BlackwellLLMAdapter() = default;

@@ -175,20 +175,32 @@ public:
         j["last_react"] = last_react_;
         j["stream"]     = stream_buffer_;  // partial text of the in-flight job
         j["paged"]      = (adapter_ && adapter_->use_paged_attention());  // active KV strategy
+        // Active CPU/GPU layer split: -1 = all layers resident in VRAM.
+        j["gpu_layers"] = (adapter_ && adapter_->num_gpu_layers() != static_cast<size_t>(-1))
+                              ? static_cast<long long>(adapter_->num_gpu_layers())
+                              : -1;
         return j;
     }
 
     // Each of these returns "" on success, or a human-readable rejection reason
     // ("busy: ...", "no model loaded") when the request cannot start right now.
-    std::string start_load(const std::string& dir, bool use_paged) {
+    // num_gpu_layers: SIZE_MAX = all layers resident in VRAM; otherwise the number
+    // of leading layers to keep on the GPU (the rest are offloaded to CPU RAM).
+    std::string start_load(const std::string& dir, bool use_paged, size_t num_gpu_layers) {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_locked()) return "busy: " + message_;
         join_worker_locked();
         state_ = State::Loading;
         model_dir_ = dir;
+        const std::string layers =
+            (num_gpu_layers == static_cast<size_t>(-1))
+                ? std::string()
+                : " [" + std::to_string(num_gpu_layers) + " GPU layers]";
         message_ = std::string("Loading model from ") + dir +
-                   (use_paged ? " (paged attention) ..." : " ...");
-        worker_ = std::thread([this, dir, use_paged] { do_load(dir, use_paged); });
+                   (use_paged ? " (paged attention)" : "") + layers + " ...";
+        worker_ = std::thread([this, dir, use_paged, num_gpu_layers] {
+            do_load(dir, use_paged, num_gpu_layers);
+        });
         return "";
     }
 
@@ -261,11 +273,12 @@ private:
 
     // --- worker-thread bodies (exactly one runs at a time) --------------------
 
-    void do_load(std::string dir, bool use_paged) {
+    void do_load(std::string dir, bool use_paged, size_t num_gpu_layers) {
         std::unique_ptr<BlackwellLLMAdapter> ad;
         std::string err;
         try {
-            ad = std::make_unique<BlackwellLLMAdapter>(dir, kMaxSeqLen, use_paged);  // SLOW
+            ad = std::make_unique<BlackwellLLMAdapter>(dir, kMaxSeqLen, use_paged,
+                                                       num_gpu_layers);  // SLOW
         } catch (const std::exception& e) {
             err = e.what();
         } catch (...) {
@@ -275,8 +288,12 @@ private:
         if (err.empty()) {
             adapter_ = std::move(ad);
             state_ = State::Ready;
+            const std::string layers =
+                (num_gpu_layers == static_cast<size_t>(-1))
+                    ? std::string(" [all layers on GPU]")
+                    : " [" + std::to_string(num_gpu_layers) + " GPU layers, rest on CPU]";
             message_ = std::string("Model ready: ") + dir +
-                       (use_paged ? " [paged attention]" : "");
+                       (use_paged ? " [paged attention]" : "") + layers;
         } else {
             adapter_.reset();
             state_ = State::Error;
@@ -446,18 +463,24 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/model/load", [&model](const httplib::Request& req, httplib::Response& res) {
         std::string path;
-        bool use_paged = false;  // backward compatible: default to the continuous cache
+        bool use_paged = false;     // backward compatible: default to the continuous cache
+        long long gpu_layers = -1;  // -1 / absent => keep all layers resident in VRAM
         try {
             const json b = json::parse(req.body);
             path = b.value("path", std::string{});
             use_paged = b.value("use_paged_attention", false);
+            gpu_layers = b.value("num_gpu_layers", static_cast<long long>(-1));
         } catch (...) {}
         if (path.empty()) {
             res.set_content(json{{"ok", false}, {"message", "model path is empty"}}.dump(),
                             "application/json");
             return;
         }
-        const std::string err = model.start_load(path, use_paged);
+        // Map the request's signed count to the engine's size_t contract: any
+        // negative value (the UI's "all") becomes SIZE_MAX = every layer on GPU.
+        const size_t num_gpu_layers =
+            gpu_layers < 0 ? static_cast<size_t>(-1) : static_cast<size_t>(gpu_layers);
+        const std::string err = model.start_load(path, use_paged, num_gpu_layers);
         res.set_content(json{{"ok", err.empty()},
                              {"message", err.empty() ? "loading started" : err}}.dump(),
                         "application/json");

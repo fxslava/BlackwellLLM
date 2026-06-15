@@ -485,6 +485,10 @@ $("#loadBtn").addEventListener("click", async () => {
   const path = $("#modelPath").value.trim();
   if(!path){ $("#modelMsg").textContent = "Enter a checkpoint directory first."; return; }
   const usePaged = $("#usePaged").checked;
+  // GPU Offload Layers: leading layers kept in VRAM; rest stream from CPU RAM.
+  // Blank or < 0 means "all on GPU" (-1), matching the backend's SIZE_MAX default.
+  const gpuRaw = parseInt($("#gpuLayers").value, 10);
+  const gpuLayers = Number.isFinite(gpuRaw) ? gpuRaw : -1;
   // A fresh load resets the engine's seq ids; collapse the tree to a single
   // 'main' branch (keeping the currently visible transcript as its history) so
   // UI seq ids match the engine again.
@@ -494,7 +498,7 @@ $("#loadBtn").addEventListener("click", async () => {
   renderBranches(); renderTranscript();
   $("#modelMsg").textContent = "Requesting load...";
   const r = await (await fetch("/api/model/load",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({path, use_paged_attention: usePaged})})).json();
+    body:JSON.stringify({path, use_paged_attention: usePaged, num_gpu_layers: gpuLayers})})).json();
   if(!r.ok) $("#modelMsg").textContent = r.message;
   pollStatus();
 });

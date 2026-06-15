@@ -63,8 +63,15 @@ public:
     // cache (Copy-on-Write fork/rewind, branching support); the default keeps the
     // legacy FP32 continuous cache. This is an engine-construction choice fixed at
     // load time, not a per-generate sampling parameter.
+    //
+    // num_gpu_layers: how many leading transformer layers stay resident in VRAM;
+    // the remainder are offloaded to pinned CPU RAM and streamed in on demand by
+    // the engine. SIZE_MAX (the default) keeps every layer on the GPU. The engine
+    // performs the weight distribution itself, quant-agnostically (AWQ / FP8 /
+    // bf16), so no backend-specific handling is needed in the adapter.
     explicit BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len = 8192,
-                                 bool use_paged_attention = false);
+                                 bool use_paged_attention = false,
+                                 size_t num_gpu_layers = static_cast<size_t>(-1));
     ~BlackwellLLMAdapter() override;
 
     BlackwellLLMAdapter(const BlackwellLLMAdapter&) = delete;
@@ -100,6 +107,8 @@ public:
     const std::string& model_dir() const { return model_dir_; }
     size_t max_seq_len() const { return max_seq_len_; }
     bool use_paged_attention() const { return use_paged_attention_; }
+    // SIZE_MAX => all layers resident on the GPU; otherwise the GPU-resident count.
+    size_t num_gpu_layers() const { return num_gpu_layers_; }
 
     // Detected chat dialect + the stop strings collected for this checkpoint.
     ChatTemplate chat_template() const { return template_kind_; }
@@ -120,6 +129,7 @@ private:
     std::string model_dir_;
     size_t max_seq_len_;
     bool use_paged_attention_;  // engine built with the Paged (CoW) KV cache
+    size_t num_gpu_layers_;     // leading layers kept in VRAM; rest offloaded to CPU RAM
     std::unique_ptr<blackwell::ITokenizer> tokenizer_;
     std::unique_ptr<BlackwellEngine> engine_;
     Params params_;
