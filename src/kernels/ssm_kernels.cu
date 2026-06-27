@@ -44,9 +44,14 @@ __global__ void causal_conv1d_update_kernel(const float* __restrict__ x_new,
 }
 
 // ============================================================================
-// 2. Gated linear-attention recurrent update.
-//    grid.x = head, blockDim.x = value_head_dim (one thread per output channel j).
-//    Each thread walks the Dk contraction once, updating its column S[:, j].
+// 2. GatedDeltaNet recurrent update.
+//    grid.x = head, blockDim.x = value_head_dim (one thread per output channel d).
+//    Thread d owns column S[:, d]. Two passes over the Dk contraction:
+//      pass 1 computes Sk[d] = Σ_i S[i,d]·k[i]   (value currently keyed by k)
+//      pass 2 writes  S[i,d] := a·S[i,d] + β·(v[d] - Sk[d])·k[i]   (delta rule)
+//             and accumulates out[d] = Σ_i S_new[i,d]·q[i].
+//    S[i,d] is element Sh[i*Dv + d]; threads in a block read the same i with
+//    consecutive d, so every state access is coalesced.
 // ============================================================================
 __global__ void selective_scan_update_kernel(const float* __restrict__ q,
                                              const float* __restrict__ k,
@@ -55,35 +60,43 @@ __global__ void selective_scan_update_kernel(const float* __restrict__ q,
                                              const float* __restrict__ dt_raw,
                                              const float* __restrict__ dt_bias,
                                              const float* __restrict__ A_log,
+                                             const float* __restrict__ beta,
                                              float* __restrict__ state,
                                              float* __restrict__ out,
                                              int Dk, int Dv, bool gate_silu) {
     const int h = blockIdx.x;
-    const int j = threadIdx.x;          // output channel in [0, Dv)
-    if (j >= Dv) return;
+    const int d = threadIdx.x;          // output channel in [0, Dv)
+    if (d >= Dv) return;
 
-    // Per-head discretization scalars (recomputed per thread; cheap vs the loop).
     const float dt = softplus_stable(dt_raw[h] + dt_bias[h]);
-    const float a  = __expf(dt * (-__expf(A_log[h])));   // decay in (0,1)
+    const float a  = __expf(dt * (-__expf(A_log[h])));   // gate / decay in (0,1)
+    const float b  = beta[h];                            // write strength
 
     const float* __restrict__ qh = q + (size_t)h * Dk;
     const float* __restrict__ kh = k + (size_t)h * Dk;
-    const float vj = v[(size_t)h * Dv + j];
-    float* __restrict__ Sh = state + (size_t)h * Dk * Dv;   // [Dk, Dv] row-major
+    const float vd = v[(size_t)h * Dv + d];
+    float* __restrict__ Sh = state + (size_t)h * Dk * Dv;   // [Dk, Dv]
 
-    // S[:, j] := a*S[:, j] + (dt*k) * vj ;  out[j] = Σ_i q[i] * S[i, j]
+    // pass 1: value the current key already retrieves under the PRE-update state.
+    float Sk = 0.0f;
+    for (int i = 0; i < Dk; ++i) Sk += Sh[(size_t)i * Dv + d] * kh[i];
+
+    // delta-rule correction for this output channel (scalar in d).
+    const float corr = b * (vd - Sk);
+
+    // pass 2: write the gated delta update and read out with q.
     float acc = 0.0f;
     for (int i = 0; i < Dk; ++i) {
-        const float s = a * Sh[(size_t)i * Dv + j] + (dt * kh[i]) * vj;
-        Sh[(size_t)i * Dv + j] = s;
+        const float s = a * Sh[(size_t)i * Dv + d] + corr * kh[i];
+        Sh[(size_t)i * Dv + d] = s;
         acc += qh[i] * s;
     }
 
     if (z) {
-        float g = z[(size_t)h * Dv + j];
+        float g = z[(size_t)h * Dv + d];
         acc *= gate_silu ? silu(g) : g;
     }
-    out[(size_t)h * Dv + j] = acc;
+    out[(size_t)h * Dv + d] = acc;
 }
 
 // ----------------------------------------------------------------------------
@@ -103,14 +116,15 @@ void launch_causal_conv1d_update(const float* d_x_new, float* d_conv_state,
 void launch_selective_scan_update(const float* d_q, const float* d_k,
                                   const float* d_v, const float* d_z,
                                   const float* d_dt_raw, const float* d_dt_bias,
-                                  const float* d_A_log, float* d_state, float* d_out,
+                                  const float* d_A_log, const float* d_beta,
+                                  float* d_state, float* d_out,
                                   int num_heads, int key_head_dim, int value_head_dim,
                                   bool gate_silu, cudaStream_t stream) {
     // One block per head; one thread per output (value) channel.
     dim3 grid(num_heads);
     dim3 block(value_head_dim);
     selective_scan_update_kernel<<<grid, block, 0, stream>>>(
-        d_q, d_k, d_v, d_z, d_dt_raw, d_dt_bias, d_A_log,
+        d_q, d_k, d_v, d_z, d_dt_raw, d_dt_bias, d_A_log, d_beta,
         d_state, d_out, key_head_dim, value_head_dim, gate_silu);
 }
 

@@ -54,6 +54,12 @@ struct ModelConfig {
     std::string quant_method;     // kept for VRAMArena internal weight-routing logic
     int quant_bits;
     int quant_group_size;
+
+    // Tensor-name prefix for the decoder body. Flat checkpoints (Qwen2.5/Llama)
+    // use "model."; multimodal Qwen3.5 nests the language model, so its weights
+    // are "model.language_model.*". Embeddings/final-norm hang off this prefix;
+    // lm_head is always top-level "lm_head.weight".
+    std::string weight_prefix;
 };
 
 class ConfigLoader {

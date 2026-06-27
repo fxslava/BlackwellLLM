@@ -95,6 +95,11 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
     cfg.tie_word_embeddings = j.value("tie_word_embeddings", t.value("tie_word_embeddings", false));
     cfg.attn_output_gate    = t.value("attn_output_gate", false);
 
+    // Multimodal Qwen3.5 nests the decoder under model.language_model.*; flat
+    // checkpoints keep it at model.*. Keyed on the same text_config nesting the
+    // dimensions were read from, so the two always agree.
+    cfg.weight_prefix = j.contains("text_config") ? "model.language_model." : "model.";
+
     // RoPE. Qwen3.5 wraps the parameters in a "rope_parameters" object and applies a
     // PARTIAL rotary (only head_dim * partial_rotary_factor channels are rotated).
     // Flat checkpoints expose a top-level "rope_theta" and rotate the full head.

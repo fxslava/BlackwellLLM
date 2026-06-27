@@ -15,6 +15,7 @@ set(SOURCES
     rope.cu
     sampling.cu
     ssm_kernels.cu
+    sym_int4_linear.cu
     swiglu.cu
 )
 

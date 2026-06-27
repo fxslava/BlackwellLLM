@@ -93,12 +93,33 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
     // CoW branching needs BOTH a branching-capable cache (paged) AND the absence
     // of a recurrent SSM state we cannot snapshot. Linear layers veto branching.
     m_caps.supports_cow_branching      = kv_mgr->supports_branching() && linear == 0;
+
+    // Map absolute layer -> linear ordinal (-1 for full-attention layers), and
+    // allocate the SSM recurrent state for hybrid models. No CoW => a single
+    // active sequence (branching is vetoed above), so the pool holds one slot.
+    m_linear_layer_index.assign(m_config.num_layers, -1);
+    if (m_caps.requires_ssm_subsystem) {
+        int ord = 0;
+        for (size_t i = 0; i < m_config.layer_types.size(); ++i)
+            if (m_config.layer_types[i] == AttnKind::Linear)
+                m_linear_layer_index[i] = ord++;
+        ssm_state = std::make_unique<blackwell::ssm::SsmStatePool>(
+            blackwell::ssm::SsmGeometry::from_config(m_config), /*max_sequences=*/1);
+
+        const auto& L = m_config.linear;
+        const size_t conv_dim = 2 * L.num_key_heads * L.key_head_dim
+                                  + L.num_value_heads * L.value_head_dim;
+        const size_t v_dim    = L.num_value_heads * L.value_head_dim;
+        CUDA_CHECK(cudaMalloc(&d_ssm_qkv, conv_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_z,   v_dim    * sizeof(float)));
+    }
 }
 
 BlackwellEngine::Impl::~Impl() {
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
     cudaFree(d_Attn_out); cudaFree(d_Gate); cudaFree(d_Up); cudaFree(d_Swiglu_out);
     cudaFree(d_logits); cudaFree(d_next_token);
+    cudaFree(d_ssm_qkv); cudaFree(d_ssm_z);
 }
 
 // ============================================================================
@@ -119,7 +140,7 @@ void BlackwellEngine::Impl::step_embedding(int token_id) {
 
     CUDA_CHECK(cudaMemset(d_X_accum, 0, m_config.hidden_dim * sizeof(float)));
 
-    const void* d_embed_table = arena.get_weight_ptr("model.embed_tokens.weight");
+    const void* d_embed_table = arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight");
     if (half_weights_are_fp16(m_config)) {
         launch_fp16_embedding_kernel(d_next_token, d_embed_table, d_X_accum, 1, m_config.hidden_dim);
     } else {
@@ -135,7 +156,7 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
     // block is staged in VRAM (no-op for resident layers). Every step repeats
     // the call so the integration tests, which drive steps directly, stay safe.
     arena.ensure_layer_ready(layer_idx);
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
+    std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "input_layernorm.weight");
     if (half_weights_are_fp16(m_config)) {
         launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
@@ -146,7 +167,7 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
 
 void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".self_attn.";
+    std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".self_attn.";
 
     const size_t q_dim  = m_config.num_attention_heads * m_config.head_dim;
     const size_t kv_dim = m_config.num_key_value_heads * m_config.head_dim;
@@ -205,10 +226,68 @@ void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
 
 void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string base = "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
+    std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
 
     dispatcher.forward(base, d_Attn_out, nullptr,
                        m_config.hidden_dim, m_config.hidden_dim, d_X_accum);
+}
+
+// ============================================================================
+// STAGE 2b: Linear-attention (SSM) layer — replaces softmax attention for the
+// AttnKind::Linear layers of a hybrid model. Bypasses the KV cache entirely; the
+// per-layer recurrent state lives in SsmStatePool and evolves in place.
+// ============================================================================
+void BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
+    arena.ensure_layer_ready(layer_idx);
+    const int li = m_linear_layer_index[layer_idx];
+    const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
+    const std::string la   = base + "linear_attn.";
+
+    // Per-(sequence, layer) recurrent state. Sequence 0 only: hybrid models forbid
+    // forks (ModelCapabilities::supports_cow_branching == false).
+    float* d_state = ssm_state->rec_state(0, li);
+    float* d_conv  = ssm_state->conv_state(0, li);
+    (void)d_state; (void)d_conv; (void)pos;
+
+    const auto& L = m_config.linear;
+    const size_t conv_dim = 2 * L.num_key_heads * L.key_head_dim
+                              + L.num_value_heads * L.value_head_dim;   // q|k|v
+    const size_t v_dim    = L.num_value_heads * L.value_head_dim;       // gate width
+
+    // 1. input RMSNorm (bf16 weight; this checkpoint's norms are bf16) -> d_X_norm.
+    launch_rmsnorm_kernel(d_X_accum, d_X_norm,
+                          arena.get_weight_ptr(base + "input_layernorm.weight"),
+                          1, m_config.hidden_dim, m_config.rms_norm_eps);
+
+    // 2. Quantized (symmetric int4) in-projections feed the SSM. These connect the
+    //    loaded weight_packed/weight_scale tensors to the path via the now-real
+    //    COMPRESSED_TENSORS_INT4 GEMV (validated self-consistent in
+    //    test_sym_int4_gemv.cu):
+    //      qkv = in_proj_qkv(x_norm)  [conv_dim]
+    //      z   = in_proj_z(x_norm)    [v_dim]   (output gate)
+    dispatcher.forward(la + "in_proj_qkv", d_X_norm, d_ssm_qkv, conv_dim, m_config.hidden_dim);
+    dispatcher.forward(la + "in_proj_z",   d_X_norm, d_ssm_z,   v_dim,    m_config.hidden_dim);
+
+    // 3-6. Remaining GatedDeltaNet assembly (kernels themselves validated standalone
+    // in test_ssm_kernels.cu):
+    //   - causal_conv1d_update over qkv  (conv1d.weight is bf16 [conv_dim,1,K] -> needs
+    //     a bf16 conv variant or a converted copy);
+    //   - bf16 GEMVs in_proj_a / in_proj_b -> per-head dt / beta sources, with
+    //     dt = softplus(a + dt_bias), beta = sigmoid(b);
+    //   - split qkv into q,k,v (GQA broadcast num_key_heads -> num_value_heads),
+    //     L2-normalize k per head (stability precondition, see ssm_kernels.cuh);
+    //   - launch_selective_scan_update(... d_state ...);
+    //   - per-head RMSNorm(o, linear_attn.norm[Dv]) with the z gate, then
+    //     out_proj (int4) accumulating into d_X_accum.
+    // These steps need bf16 helper kernels and the exact HF gate/split/normalize
+    // ordering, which is unverified without golden dumps. We stop here so the SSM
+    // layer fails precisely rather than emitting unverified logits; the int4
+    // in_proj path above is exercised on the real weights.
+    throw std::runtime_error(
+        "BlackwellEngine: SSM layer " + std::to_string(layer_idx) +
+        " int4 in_proj wired and exercised; GatedDeltaNet assembly (bf16 conv1d + "
+        "a/b gates + delta scan + output norm/gate + out_proj) pending HF-reference "
+        "reconciliation and golden-dump verification.");
 }
 
 // ============================================================================
@@ -216,7 +295,7 @@ void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
 // ============================================================================
 void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
+    std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "post_attention_layernorm.weight");
     if (half_weights_are_fp16(m_config)) {
         launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
@@ -227,7 +306,7 @@ void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
 
 void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".mlp.";
+    std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".mlp.";
 
     dispatcher.forward(prefix + "gate_proj", d_X_norm, d_Gate,
                        m_config.intermediate_dim, m_config.hidden_dim);
@@ -237,7 +316,7 @@ void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
 
 void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string base = "model.layers." + std::to_string(layer_idx) + ".mlp.down_proj";
+    std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".mlp.down_proj";
 
     launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, m_config.intermediate_dim);
 
@@ -249,7 +328,7 @@ void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
 // STAGE 4: Final Operations
 // ============================================================================
 void BlackwellEngine::Impl::step_final_ops() {
-    const void* d_w = arena.get_weight_ptr("model.norm.weight");
+    const void* d_w = arena.get_weight_ptr(m_config.weight_prefix + "norm.weight");
     const bool fp16_w = half_weights_are_fp16(m_config);
     if (fp16_w) {
         launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
@@ -261,7 +340,7 @@ void BlackwellEngine::Impl::step_final_ops() {
     // embedding matrix (both are [vocab_size, hidden_dim], so the GEMV row-major
     // W @ x contract holds unchanged).
     const void* d_head_w = m_config.tie_word_embeddings
-        ? arena.get_weight_ptr("model.embed_tokens.weight")
+        ? arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight")
         : arena.get_weight_ptr("lm_head.weight");
     if (fp16_w) {
         launch_fp16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, m_config.hidden_dim);
@@ -334,11 +413,23 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
         // the compute stream (no-op when i+1 is VRAM-resident).
         impl->arena.prefetch_layer(i + 1, pos);
 
-        impl->step_attention_norm(i);
-        impl->step_attention_qkv_projections(i);
-        impl->step_attention_math(i, pos);
-        impl->step_attention_out(i);
+        // Hybrid dispatch: an empty layer_types means the legacy uniform-Full
+        // layout, so this is a plain `if` per layer with no effect on existing
+        // models. Linear layers bypass the KV cache and run the SSM path.
+        const bool is_linear =
+            !impl->m_config.layer_types.empty() &&
+            impl->m_config.layer_types[i] == AttnKind::Linear;
 
+        if (is_linear) {
+            impl->step_linear_attention(i, pos);
+        } else {
+            impl->step_attention_norm(i);
+            impl->step_attention_qkv_projections(i);
+            impl->step_attention_math(i, pos);
+            impl->step_attention_out(i);
+        }
+
+        // The MLP block is identical for both layer kinds.
         impl->step_mlp_norm(i);
         impl->step_mlp_projections(i);
         impl->step_mlp_out(i);

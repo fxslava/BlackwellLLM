@@ -66,23 +66,30 @@ static void cpu_conv1d(const std::vector<float>& x_new, std::vector<float>& stat
     }
 }
 
+// GatedDeltaNet reference: S := a*S + beta*(v - S k) k^T ; o = S q ; gate silu(z).
 static void cpu_scan(const std::vector<float>& q, const std::vector<float>& k,
                      const std::vector<float>& v, const std::vector<float>& z,
                      const std::vector<float>& dt_raw, const std::vector<float>& dt_bias,
-                     const std::vector<float>& A_log, std::vector<float>& S,
-                     std::vector<float>& out, int H, int Dk, int Dv, bool gate) {
+                     const std::vector<float>& A_log, const std::vector<float>& beta,
+                     std::vector<float>& S, std::vector<float>& out,
+                     int H, int Dk, int Dv, bool gate) {
     for (int h = 0; h < H; ++h) {
         float dt = cpu_softplus(dt_raw[h] + dt_bias[h]);
         float a  = std::exp(dt * (-std::exp(A_log[h])));
-        for (int j = 0; j < Dv; ++j) {
-            float vj = v[h*Dv+j], acc = 0.f;
+        float b  = beta[h];
+        for (int d = 0; d < Dv; ++d) {
+            // pass 1: value currently keyed by k under the pre-update state.
+            float Sk = 0.f;
+            for (int i = 0; i < Dk; ++i) Sk += S[(size_t)h*Dk*Dv + i*Dv + d] * k[h*Dk+i];
+            float corr = b * (v[h*Dv+d] - Sk), acc = 0.f;
+            // pass 2: delta write + read with q.
             for (int i = 0; i < Dk; ++i) {
-                float s = a * S[(size_t)h*Dk*Dv + i*Dv + j] + (dt*k[h*Dk+i])*vj;
-                S[(size_t)h*Dk*Dv + i*Dv + j] = s;
+                float s = a * S[(size_t)h*Dk*Dv + i*Dv + d] + corr * k[h*Dk+i];
+                S[(size_t)h*Dk*Dv + i*Dv + d] = s;
                 acc += q[h*Dk+i] * s;
             }
-            if (!z.empty()) { float g = z[h*Dv+j]; acc *= gate ? cpu_silu(g) : g; }
-            out[h*Dv+j] = acc;
+            if (!z.empty()) { float g = z[h*Dv+d]; acc *= gate ? cpu_silu(g) : g; }
+            out[h*Dv+d] = acc;
         }
     }
 }
@@ -132,18 +139,20 @@ int main() {
     printf("\n[2] selective_scan_update vs CPU reference (multi-step recurrence)\n");
     {
         const int H = 32, Dk = 128, Dv = 128, STEPS = 64;   // Qwen3.5 linear geometry
-        std::vector<float> dt_bias(H), A_log(H);
+        std::vector<float> dt_bias(H), A_log(H), beta(H);
         for (auto& e : dt_bias) e = U(rng)*0.1f;
         for (auto& e : A_log)  e = U(rng)*0.5f;             // A=-exp(A_log) < 0 -> stable decay
+        for (auto& e : beta)   e = 1.f/(1.f+std::exp(-U(rng))); // sigmoid -> write strength in (0,1)
 
         std::vector<float> S_ref((size_t)H*Dk*Dv, 0.f);
-        float *dS,*dq,*dk,*dv,*dz,*ddt,*ddtb,*dA,*dout;
+        float *dS,*dq,*dk,*dv,*dz,*ddt,*ddtb,*dA,*dbeta,*dout;
         CU(cudaMalloc(&dS,(size_t)H*Dk*Dv*4)); CU(cudaMemset(dS,0,(size_t)H*Dk*Dv*4));
         CU(cudaMalloc(&dq,H*Dk*4)); CU(cudaMalloc(&dk,H*Dk*4)); CU(cudaMalloc(&dv,H*Dv*4));
         CU(cudaMalloc(&dz,H*Dv*4)); CU(cudaMalloc(&ddt,H*4)); CU(cudaMalloc(&ddtb,H*4));
-        CU(cudaMalloc(&dA,H*4)); CU(cudaMalloc(&dout,H*Dv*4));
+        CU(cudaMalloc(&dA,H*4)); CU(cudaMalloc(&dbeta,H*4)); CU(cudaMalloc(&dout,H*Dv*4));
         CU(cudaMemcpy(ddtb,dt_bias.data(),H*4,cudaMemcpyHostToDevice));
         CU(cudaMemcpy(dA,A_log.data(),H*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dbeta,beta.data(),H*4,cudaMemcpyHostToDevice));
 
         float worst_out = 0.f, worst_state = 0.f, max_state_mag = 0.f;
         bool finite_all = true;
@@ -152,16 +161,23 @@ int main() {
             for (auto& e:q) e=U(rng); for (auto& e:k) e=U(rng);
             for (auto& e:v) e=U(rng); for (auto& e:z) e=U(rng);
             for (auto& e:dt) e=U(rng)*0.5f;
+            // GatedDeltaNet precondition: L2-normalize k per head so the delta-rule
+            // operator (a - b*||k||^2) stays a contraction (see ssm_kernels.cuh).
+            for (int h=0; h<H; ++h) {
+                float n=0.f; for (int i=0;i<Dk;++i) n += k[h*Dk+i]*k[h*Dk+i];
+                n = std::sqrt(n) + 1e-6f;
+                for (int i=0;i<Dk;++i) k[h*Dk+i] /= n;
+            }
 
             std::vector<float> S_ref_step = S_ref;
-            cpu_scan(q,k,v,z,dt,dt_bias,A_log,S_ref,out_ref,H,Dk,Dv,/*gate=*/true);
+            cpu_scan(q,k,v,z,dt,dt_bias,A_log,beta,S_ref,out_ref,H,Dk,Dv,/*gate=*/true);
 
             CU(cudaMemcpy(dq,q.data(),H*Dk*4,cudaMemcpyHostToDevice));
             CU(cudaMemcpy(dk,k.data(),H*Dk*4,cudaMemcpyHostToDevice));
             CU(cudaMemcpy(dv,v.data(),H*Dv*4,cudaMemcpyHostToDevice));
             CU(cudaMemcpy(dz,z.data(),H*Dv*4,cudaMemcpyHostToDevice));
             CU(cudaMemcpy(ddt,dt.data(),H*4,cudaMemcpyHostToDevice));
-            ssm::launch_selective_scan_update(dq,dk,dv,dz,ddt,ddtb,dA,dS,dout,H,Dk,Dv,true,0);
+            ssm::launch_selective_scan_update(dq,dk,dv,dz,ddt,ddtb,dA,dbeta,dS,dout,H,Dk,Dv,true,0);
             CU(cudaDeviceSynchronize());
 
             std::vector<float> out_gpu(H*Dv), S_gpu((size_t)H*Dk*Dv);
@@ -179,7 +195,7 @@ int main() {
         printf("    worst|out-ref|=%.2e  worst|S-ref|=%.2e  max|S|=%.2f\n",
                worst_out, worst_state, max_state_mag);
         cudaFree(dS);cudaFree(dq);cudaFree(dk);cudaFree(dv);cudaFree(dz);
-        cudaFree(ddt);cudaFree(ddtb);cudaFree(dA);cudaFree(dout);
+        cudaFree(ddt);cudaFree(ddtb);cudaFree(dA);cudaFree(dbeta);cudaFree(dout);
     }
 
     // ----------------------------------------------------------- state pool

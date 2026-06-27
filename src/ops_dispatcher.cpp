@@ -3,7 +3,9 @@
 #include "kernels/awq_linear.cuh"
 #include "kernels/bf16_linear.cuh"
 #include "kernels/bf16_linear_residual.cuh"
+#include "kernels/sym_int4_linear.cuh"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <stdexcept>
 #include <string>
 
@@ -50,15 +52,27 @@ void LinearDispatcher::forward(const std::string& base_name,
         break;
     }
 
-    case QuantStrategy::COMPRESSED_TENSORS_INT4:
-        // Symmetric int4 pack-quantized (compressed-tensors): weight_packed +
-        // weight_scale, no zero-point, group_size 32. The config parser/binder
-        // accept this checkpoint so it loads and validates, but the dequant GEMV
-        // is not implemented yet -- fail loudly rather than mis-routing through the
-        // asymmetric AWQ path (qzeros) and corrupting decode.
-        throw std::runtime_error(
-            "LinearDispatcher: COMPRESSED_TENSORS_INT4 (symmetric pack-quant) dequant "
-            "not yet implemented for " + base_name);
+    case QuantStrategy::COMPRESSED_TENSORS_INT4: {
+        // Symmetric int4 pack-quantized (compressed-tensors): weight_packed (int32,
+        // 8 nibbles each) + weight_scale (bf16, per group of group_size inputs),
+        // no zero-point. Dequant GEMV is validated for self-consistency in
+        // test_sym_int4_gemv.cu (cos 1.0); exact-checkpoint parity is pinned by the
+        // golden-dump integration test.
+        const auto* packed = static_cast<const int32_t*>(
+            m_arena.get_weight_ptr(base_name + ".weight_packed"));
+        const auto* scales = static_cast<const __nv_bfloat16*>(
+            m_arena.get_weight_ptr(base_name + ".weight_scale"));
+        if (d_residual_accum == nullptr) {
+            launch_sym_int4_gemv(packed, scales, d_in, d_out,
+                                 static_cast<int>(out_features), static_cast<int>(in_features),
+                                 m_config.quant_group_size);
+        } else {
+            launch_sym_int4_gemv_residual(packed, scales, d_in, d_residual_accum,
+                                          static_cast<int>(out_features), static_cast<int>(in_features),
+                                          m_config.quant_group_size);
+        }
+        break;
+    }
 
     case QuantStrategy::ROWWISE_FP8: {
         // Compute per-token activation scale, then dispatch the appropriate FP8 GEMV.

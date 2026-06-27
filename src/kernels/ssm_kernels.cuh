@@ -9,18 +9,27 @@
 // AttnKind::Linear layers. State is fp32 and evolves strictly in place (no CoW),
 // matching SsmStatePool's flat per-sequence arenas.
 //
-// MATH NOTE (reference recurrence). This is the Mamba2 / gated-linear-attention
-// ("SSD", diagonal-A) step:
+// MATH NOTE (GatedDeltaNet recurrence). selective_scan_update implements the
+// gated delta rule used by the Qwen3.5 linear layers:
 //     dt     = softplus(dt_raw + dt_bias[h])                 (scalar per head)
-//     a      = exp(dt * (-exp(A_log[h])))                    (decay in (0,1))
-//     S[h]  := a * S[h] + (dt * k) ⊗ v                       (Dk x Dv outer product)
-//     o[h]   = qᵀ · S[h]                                     (-> Dv)
+//     a      = exp(dt * (-exp(A_log[h])))                    (gate / decay in (0,1))
+//     β      = beta[h]                                       (write strength, in (0,1))
+//     Sk     = S[h]·k        (the value currently associated with key k; ∈ R^Dv)
+//     S[h]  := a·S[h] + β·(v - Sk) ⊗ k                       (delta-rule write)
+//     o[h]   = S[h]·q                                        (-> Dv)
 //     o[h]  := o[h] * silu(z[h])                             (optional output gate)
-// Qwen3.5's GatedDeltaNet additionally carries the delta-rule correction
-// S := S(aI - β k kᵀ) + β k vᵀ; that extra term is the documented reconciliation
-// point before claiming bit-exact parity with the HF checkpoint. The standalone
-// test validates THIS recurrence against a CPU reference (shape + stability +
-// parity), proving the kernel/allocator plumbing in isolation.
+// This is the dimensionally-consistent form of S := S(aI - β k kᵀ) + β v kᵀ:
+// expanding S(aI - βkkᵀ) = a·S - β(S·k)kᵀ, and grouping the write gives
+// a·S + β(v - S·k)kᵀ. State S[h] is laid out [Dk][Dv] (element S[i*Dv+d]); the
+// kernel reads/writes it in place.
+//
+// STABILITY PRECONDITION: k must be L2-NORMALIZED per head (‖k‖₂ = 1) before this
+// call, exactly as the HF GatedDeltaNet does. The write operator along k is
+// (a - β‖k‖²); with ‖k‖²=1 and a,β ∈ (0,1) its eigenvalue stays in (-1,1) so the
+// recurrence is a contraction. Un-normalized k makes β‖k‖² > 1 and the state
+// diverges. Normalization is the caller's job (kept out of this core op). The standalone test validates THIS recurrence
+// against a CPU reference (shape + multi-step stability + parity); exact parity
+// with the HF checkpoint is pinned later by the golden-dump integration test.
 namespace blackwell { namespace ssm {
 
 // Causal depthwise conv1d, single step. Per channel c in [0, conv_dim):
@@ -40,10 +49,10 @@ void launch_causal_conv1d_update(
     bool apply_silu,
     cudaStream_t stream = 0);
 
-// Gated linear-attention recurrent update, single step.
+// GatedDeltaNet recurrent update, single step.
 //   q,k:    [num_heads, key_head_dim]
 //   v,z:    [num_heads, value_head_dim]   (z nullable -> no output gate)
-//   dt_raw, dt_bias, A_log: [num_heads]
+//   dt_raw, dt_bias, A_log, beta: [num_heads]   (beta = per-head write strength)
 //   state:  [num_heads, key_head_dim, value_head_dim]  (updated in place)
 //   out:    [num_heads, value_head_dim]
 void launch_selective_scan_update(
@@ -54,6 +63,7 @@ void launch_selective_scan_update(
     const float* d_dt_raw,
     const float* d_dt_bias,
     const float* d_A_log,
+    const float* d_beta,
     float*       d_state,
     float*       d_out,
     int num_heads,
