@@ -18,6 +18,9 @@ struct BlackwellEngine::Impl {
     // reference into the arena. Defaults to the legacy continuous FP32 cache.
     std::unique_ptr<blackwell::IKVCacheManager> kv_mgr;
 
+    // Derived once from m_config (+ kv_mode) at construction; gates fork/rewind.
+    ModelCapabilities m_caps;
+
     float *d_X_accum = nullptr;
     float *d_X_norm = nullptr;
     float *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_Attn_out = nullptr;

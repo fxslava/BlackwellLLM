@@ -77,6 +77,22 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
     } else {
         kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(arena, m_config);
     }
+
+    // Derive model capabilities from the parsed layer topology. An empty
+    // layer_types is the legacy uniform-Full layout (every layer softmax attn).
+    int linear = 0, full = 0;
+    for (AttnKind k : m_config.layer_types)
+        (k == AttnKind::Linear ? linear : full)++;
+    if (m_config.layer_types.empty())
+        full = static_cast<int>(m_config.num_layers);
+
+    m_caps.num_linear_attention_layers = linear;
+    m_caps.num_full_attention_layers   = full;
+    m_caps.requires_ssm_subsystem      = linear > 0;
+    m_caps.is_hybrid                   = linear > 0 && full > 0;
+    // CoW branching needs BOTH a branching-capable cache (paged) AND the absence
+    // of a recurrent SSM state we cannot snapshot. Linear layers veto branching.
+    m_caps.supports_cow_branching      = kv_mgr->supports_branching() && linear == 0;
 }
 
 BlackwellEngine::Impl::~Impl() {
@@ -261,13 +277,32 @@ BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_l
 
 BlackwellEngine::~BlackwellEngine() = default;
 
-// Sequence branching delegates to the active KV-cache strategy. Continuous
-// throws (CoW unsupported); Paged shares / rolls back KV pages.
+ModelCapabilities BlackwellEngine::get_capabilities() const {
+    return pImpl->m_caps;
+}
+
+// Sequence branching delegates to the active KV-cache strategy, but only after a
+// capability gate: hybrid SSM models (Qwen3.5) and Continuous mode cannot snapshot
+// their state, so fork/rewind fail cleanly here instead of corrupting decode.
+static void require_branching(const ModelCapabilities& caps, const char* op) {
+    if (!caps.supports_cow_branching)
+        throw std::runtime_error(
+            std::string("BlackwellEngine::") + op + ": the loaded model does not support "
+            "CoW branching (" +
+            (caps.requires_ssm_subsystem
+                 ? "hybrid linear-attention/SSM checkpoint — recurrent state is not "
+                   "snapshot-able; run linear ReAct only"
+                 : "Continuous KV mode — construct with KVCacheMode::Paged for branching") +
+            ").");
+}
+
 void BlackwellEngine::fork(int parent_id, int child_id) {
+    require_branching(pImpl->m_caps, "fork");
     pImpl->kv_mgr->fork(parent_id, child_id);
 }
 
 void BlackwellEngine::rewind(int seq_id, int pos) {
+    require_branching(pImpl->m_caps, "rewind");
     pImpl->kv_mgr->rewind(seq_id, pos);
 }
 

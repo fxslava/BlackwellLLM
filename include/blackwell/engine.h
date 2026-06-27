@@ -3,6 +3,20 @@
 #include <string>
 #include <memory>
 
+// Static description of what the *loaded* model supports, derived once from the
+// parsed ModelConfig at construction. The agent / playground queries this before
+// attempting tree-search branching: hybrid SSM checkpoints (Qwen3.5) evolve a
+// recurrent linear-attention state that we deliberately do NOT snapshot, so they
+// run linear ReAct only -- fork/rewind are rejected rather than silently
+// corrupting state. See get_capabilities().
+struct ModelCapabilities {
+    bool supports_cow_branching = false; // fork()/rewind() permitted
+    bool requires_ssm_subsystem = false; // model has >=1 AttnKind::Linear layer
+    bool is_hybrid              = false;  // mixes Full and Linear attention layers
+    int  num_full_attention_layers   = 0;
+    int  num_linear_attention_layers = 0;
+};
+
 class BlackwellEngine {
 public:
     struct Impl;
@@ -35,6 +49,10 @@ public:
     // A forked child is decoded by passing its id as seq_id to forward().
     void fork(int parent_id, int child_id);
     void rewind(int seq_id, int pos);
+
+    // Capabilities of the loaded model. fork()/rewind() throw std::runtime_error
+    // when supports_cow_branching is false (hybrid SSM models, or Continuous mode).
+    ModelCapabilities get_capabilities() const;
 
     Impl* get_impl() const { return pImpl.get(); }
 

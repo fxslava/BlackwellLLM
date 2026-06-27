@@ -14,6 +14,7 @@ set(SOURCES
     rmsnorm.cu
     rope.cu
     sampling.cu
+    ssm_kernels.cu
     swiglu.cu
 )
 
