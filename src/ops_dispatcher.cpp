@@ -50,6 +50,16 @@ void LinearDispatcher::forward(const std::string& base_name,
         break;
     }
 
+    case QuantStrategy::COMPRESSED_TENSORS_INT4:
+        // Symmetric int4 pack-quantized (compressed-tensors): weight_packed +
+        // weight_scale, no zero-point, group_size 32. The config parser/binder
+        // accept this checkpoint so it loads and validates, but the dequant GEMV
+        // is not implemented yet -- fail loudly rather than mis-routing through the
+        // asymmetric AWQ path (qzeros) and corrupting decode.
+        throw std::runtime_error(
+            "LinearDispatcher: COMPRESSED_TENSORS_INT4 (symmetric pack-quant) dequant "
+            "not yet implemented for " + base_name);
+
     case QuantStrategy::ROWWISE_FP8: {
         // Compute per-token activation scale, then dispatch the appropriate FP8 GEMV.
         launch_quantize_per_token_kernel(d_in, d_token_scale, in_features);
