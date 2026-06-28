@@ -3,6 +3,10 @@
 #include <string>
 #include <memory>
 
+// Tier-2 request struct (blackwell/runtime_config.h). Forward-declared so the
+// public engine header stays light; engine.cpp pulls in the full definition.
+namespace blackwell { struct InferenceConfig; }
+
 // Static description of what the *loaded* model supports, derived once from the
 // parsed ModelConfig at construction. The agent / playground queries this before
 // attempting tree-search branching: hybrid SSM checkpoints (Qwen3.5) evolve a
@@ -33,6 +37,12 @@ public:
     explicit BlackwellEngine(const std::string& index_path, size_t max_seq_len = 2048,
                              size_t num_gpu_layers = static_cast<size_t>(-1),
                              KVCacheMode kv_mode = KVCacheMode::Continuous);
+
+    // Tier-2 constructor: state WHAT you want (context length, branching) and let
+    // build_and_validate_runtime() resolve the execution plan. Preferred entry
+    // point for the C-API / chat loop; the legacy constructor above maps its loose
+    // args onto an InferenceConfig + low-level overrides internally.
+    BlackwellEngine(const std::string& index_path, const blackwell::InferenceConfig& request);
     ~BlackwellEngine();
 
     // seq_id selects which sequence to decode (Paged mode; default 0). It is the

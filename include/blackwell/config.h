@@ -27,6 +27,7 @@ struct ModelConfig {
     size_t vocab_size;
     size_t head_dim;
     size_t rotary_dim;            // channels per head that receive RoPE (head_dim * partial_rotary_factor)
+    size_t max_position_embeddings; // model's trained positional range; 0 == unspecified/unbounded
 
     float rope_theta;
     float rms_norm_eps;

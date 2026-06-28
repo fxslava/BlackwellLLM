@@ -19,29 +19,18 @@
 #include <iomanip>
 #include <stdexcept>
 
-// SIZE_MAX (= "all resident") may be overridden by BLACKWELL_GPU_LAYERS so the
-// VRAM split is tunable without touching any call site.
-static size_t resolve_num_gpu_layers(size_t requested) {
-    if (requested != static_cast<size_t>(-1)) return requested;
-    if (const char* env = std::getenv("BLACKWELL_GPU_LAYERS")) {
-        char* end = nullptr;
-        const unsigned long long v = std::strtoull(env, &end, 10);
-        if (end != env && *end == '\0') return static_cast<size_t>(v);
-        throw std::invalid_argument(
-            "BLACKWELL_GPU_LAYERS is not a valid non-negative integer: " + std::string(env));
-    }
-    return static_cast<size_t>(-1);
-}
-
 // Initializer list mirrors the declaration order in engine_impl.h: members are
-// constructed in declaration order regardless of the list, and arena consumes
-// both loader and m_config, so the textual order must not suggest otherwise.
-BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
-                            BlackwellEngine::KVCacheMode kv_mode)
+// constructed in declaration order regardless of the list. The tier-3 RuntimeConfig
+// (m_runtime) is built and validated FIRST so `arena` and the KV manager can size
+// themselves from a single resolved plan instead of loose ad-hoc args.
+BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::InferenceConfig& request,
+                            const blackwell::RuntimeOverrides& overrides)
     : m_config(ConfigLoader::load_from_json(
           (std::filesystem::path(index_path).parent_path() / "config.json").string())),
+      m_caps(blackwell::derive_capabilities(m_config)),
+      m_runtime(blackwell::build_and_validate_runtime(m_config, m_caps, request, overrides)),
       loader(index_path),
-      arena(index_path, loader, m_config, max_seq_len, resolve_num_gpu_layers(num_gpu_layers)),
+      arena(index_path, loader, m_config, m_runtime.max_seq_len, m_runtime.num_gpu_layers),
       dispatcher(arena, m_config)
 {
     // 1. Bind core activation buffers from the arena
@@ -67,34 +56,26 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
         CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
     }
 
-    // KV-cache strategy. Continuous (default) wraps the existing VRAMArena flow
-    // (behavior-preserving). Paged uses the bf16 CoW cache + paged-flash kernel.
-    if (kv_mode == BlackwellEngine::KVCacheMode::Paged) {
+    // KV-cache strategy from the resolved plan. Continuous (default) wraps the
+    // existing VRAMArena flow (behavior-preserving). Paged uses the bf16 CoW cache
+    // + paged-flash kernel, with its host-mirror headroom from m_runtime.
+    if (m_runtime.kv_mode == BlackwellEngine::KVCacheMode::Paged) {
         // Match the weight-offload split: layers [num_gpu_layers, num_layers) keep
         // their paged KV in the pinned host mirror, not VRAM. Without this the
         // paged pool sizes for ALL layers and silently maxes VRAM despite the
         // arena reporting offloading active.
-        kv_mgr = std::make_unique<blackwell::PagedKVManager>(m_config, max_seq_len,
-                                                             arena.num_gpu_layers());
+        kv_mgr = std::make_unique<blackwell::PagedKVManager>(m_config, m_runtime.max_seq_len,
+                                                             arena.num_gpu_layers(),
+                                                             m_runtime.paged_branch_factor);
     } else {
         kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(arena, m_config);
     }
 
-    // Derive model capabilities from the parsed layer topology. An empty
-    // layer_types is the legacy uniform-Full layout (every layer softmax attn).
-    int linear = 0, full = 0;
-    for (AttnKind k : m_config.layer_types)
-        (k == AttnKind::Linear ? linear : full)++;
-    if (m_config.layer_types.empty())
-        full = static_cast<int>(m_config.num_layers);
-
-    m_caps.num_linear_attention_layers = linear;
-    m_caps.num_full_attention_layers   = full;
-    m_caps.requires_ssm_subsystem      = linear > 0;
-    m_caps.is_hybrid                   = linear > 0 && full > 0;
-    // CoW branching needs BOTH a branching-capable cache (paged) AND the absence
-    // of a recurrent SSM state we cannot snapshot. Linear layers veto branching.
-    m_caps.supports_cow_branching      = kv_mgr->supports_branching() && linear == 0;
+    // Finalize the one capability the topology alone could not decide: CoW
+    // branching needs BOTH a branching-capable cache (paged) AND the absence of a
+    // recurrent SSM state we cannot snapshot. derive_capabilities() filled the rest.
+    m_caps.supports_cow_branching =
+        kv_mgr->supports_branching() && m_caps.num_linear_attention_layers == 0;
 
     // Map absolute layer -> linear ordinal (-1 for full-attention layers), and
     // allocate the SSM recurrent state for hybrid models. No CoW => a single
@@ -455,10 +436,24 @@ void BlackwellEngine::Impl::step_final_ops() {
     }
 }
 
-// Реализация фасада BlackwellEngine
+// Реализация фасада BlackwellEngine.
+// Legacy constructor: map the loose positional args onto a tier-2 request plus
+// low-level overrides (explicit kv_mode + residency split), preserving the exact
+// prior behavior. require_branching stays false -- callers that want branching use
+// the InferenceConfig constructor below.
 BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
-                                 KVCacheMode kv_mode)
-    : pImpl(std::make_unique<Impl>(index_path, max_seq_len, num_gpu_layers, kv_mode)) {}
+                                 KVCacheMode kv_mode) {
+    blackwell::InferenceConfig request;
+    request.max_context_length = max_seq_len;
+    blackwell::RuntimeOverrides overrides;
+    overrides.kv_mode = kv_mode;
+    overrides.num_gpu_layers = num_gpu_layers;   // kAllLayersResident => env / all-resident
+    pImpl = std::make_unique<Impl>(index_path, request, overrides);
+}
+
+// Tier-2 constructor: the validated builder picks kv_mode (Paged iff branching).
+BlackwellEngine::BlackwellEngine(const std::string& index_path, const blackwell::InferenceConfig& request)
+    : pImpl(std::make_unique<Impl>(index_path, request, blackwell::RuntimeOverrides{})) {}
 
 BlackwellEngine::~BlackwellEngine() = default;
 

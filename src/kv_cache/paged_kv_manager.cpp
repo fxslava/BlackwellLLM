@@ -7,7 +7,7 @@
 namespace blackwell {
 
 PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
-                               size_t num_gpu_layers)
+                               size_t num_gpu_layers, int branch_factor)
     : m_config(config),
       m_num_q_heads(static_cast<int>(config.num_attention_heads)),
       m_num_kv_heads(static_cast<int>(config.num_key_value_heads)),
@@ -16,11 +16,11 @@ PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
 {
     const int max_blocks =
         static_cast<int>((max_seq_len + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE);
-    // Headroom for concurrent fork branches. Device-pool VRAM now scales with the
-    // RESIDENT layer count (offloaded layers cost only host RAM + 2 staging slabs),
-    // so this factor inflates the host mirror cheaply rather than VRAM.
-    constexpr int kBranchFactor = 4;
-    const int total_pages = max_blocks * kBranchFactor;
+    // Headroom for concurrent fork branches (RuntimeConfig::paged_branch_factor).
+    // Device-pool VRAM now scales with the RESIDENT layer count (offloaded layers
+    // cost only host RAM + 2 staging slabs), so this factor inflates the host
+    // mirror cheaply rather than VRAM.
+    const int total_pages = max_blocks * branch_factor;
 
     // Resolve the GPU/CPU split: clamp SIZE_MAX / oversize to "all resident".
     const int gpu_layers =

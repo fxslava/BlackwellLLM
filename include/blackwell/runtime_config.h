@@ -1,0 +1,114 @@
+#pragma once
+#include "blackwell/config.h"   // ModelConfig (tier 1)
+#include "blackwell/engine.h"   // BlackwellEngine::KVCacheMode, ModelCapabilities
+#include <cstddef>
+#include <optional>
+
+// ============================================================================
+// Three-tier configuration pipeline ("video-codec" model).
+//
+// Like an industrial codec (x264/FFmpeg), settings flow through three layers of
+// decreasing abstraction and increasing concreteness:
+//
+//   ModelConfig     (tier 1)  immutable FACTS parsed from the checkpoint's
+//                             config.json -- topology you cannot change
+//                             (head_dim, num_layers, norm_add_unit_offset, ...).
+//                             Lives in blackwell/config.h.
+//
+//   InferenceConfig (tier 2)  what the USER/API asks for -- a hardware-agnostic
+//                             "preset + target": context length, batch width,
+//                             whether tree-search branching is needed.
+//
+//   RuntimeConfig   (tier 3)  the fully-resolved EXECUTION PLAN the engine and
+//                             memory managers actually consume. No env lookups,
+//                             no "auto" sentinels, no defaults survive here --
+//                             every field is decided and validated.
+//
+// build_and_validate_runtime() is the codec's preset-expansion + param-validation
+// pass: it reconciles tiers 1+2 (plus optional low-level overrides) into a tier-3
+// plan, or throws an actionable error when the request is unsatisfiable.
+// ============================================================================
+
+namespace blackwell {
+
+// ── Tier 2: high-level request ──────────────────────────────────────────────
+struct InferenceConfig {
+    // Max tokens (prompt + generated) for a single sequence. Drives KV-cache and
+    // activation sizing. Analogous to a target resolution.
+    size_t max_context_length = 2048;
+
+    // Peak number of concurrently-live sequences (batch width / ReAct tree
+    // branches). > 1 reserves multi-sequence capacity; the current decode loop
+    // still drives them one at a time.
+    size_t max_batch_size = 1;
+
+    // The caller intends to fork()/rewind() sequences (agent tree-search). Forces
+    // a Copy-on-Write paged KV cache, and is REJECTED for models whose recurrent
+    // linear-attention (SSM) state cannot be snapshot (hybrid Qwen3.5).
+    bool require_branching = false;
+
+    // Default sampling knobs. Per-call forward() arguments still override these.
+    float temperature = 0.6f;
+    float top_p       = 0.9f;
+};
+
+// ── Tier 3: resolved execution plan ─────────────────────────────────────────
+struct RuntimeConfig {
+    static constexpr size_t kAllLayersResident = static_cast<size_t>(-1);
+
+    // --- sizing (validated against ModelConfig) ---
+    size_t max_seq_len   = 2048;   // == InferenceConfig::max_context_length
+    size_t max_sequences = 1;      // == InferenceConfig::max_batch_size
+
+    // --- KV-cache execution strategy ---
+    BlackwellEngine::KVCacheMode kv_mode = BlackwellEngine::KVCacheMode::Continuous;
+    int paged_branch_factor = 4;   // host-mirror page headroom for CoW fork branches
+
+    // --- weight residency / offloading ---
+    // Leading layers kept resident in VRAM; the remainder stream from pinned host
+    // RAM. kAllLayersResident == every layer resident.
+    size_t num_gpu_layers = kAllLayersResident;
+
+    // --- attention dispatch ---
+    // Qwen3.5 hybrid routes its head_dim-256 gated layers through a dedicated naive
+    // path instead of the 128-capped paged/continuous kernels. Resolved here so the
+    // engine and the validator agree on the dispatch (and so the head_dim cap is
+    // correctly waived for these models).
+    bool uses_dedicated_full_attention = false;
+};
+
+// Optional low-level overrides applied AFTER the automatic plan is derived but
+// BEFORE validation. std::nullopt means "let the builder decide". This is the
+// `-x264-params` seam: poke an individual knob without restating the whole plan.
+struct RuntimeOverrides {
+    std::optional<BlackwellEngine::KVCacheMode> kv_mode;
+    std::optional<size_t> num_gpu_layers;     // kAllLayersResident forces all-resident
+    std::optional<int>    paged_branch_factor;
+};
+
+// Hard kernel/hardware limits the validator asserts against. These mirror
+// compile-time kernel constants; they are NOT tunable, only checkable.
+struct KernelLimits {
+    static constexpr int kPagedFlashHeadDimMax = 128; // paged_flash_attention HEAD_DIM_MAX
+};
+
+// Derive the static model capabilities from the parsed topology alone
+// (counts / hybrid flags). supports_cow_branching is left false here: it depends
+// on the chosen kv_mode and is finalized by the engine once the runtime plan is
+// known. An empty layer_types means the legacy uniform full-attention layout.
+ModelCapabilities derive_capabilities(const ModelConfig& model);
+
+// Reconcile tiers 1+2 (+ overrides) into the tier-3 execution plan. Throws
+// std::invalid_argument / std::runtime_error with an actionable message when the
+// request cannot be satisfied:
+//   * require_branching on a hybrid SSM model (un-snapshot-able recurrent state);
+//   * max_context_length beyond the model's trained positional range;
+//   * paged KV on a head_dim the paged-flash kernel cannot serve (and which has
+//     no dedicated fallback);
+//   * a degenerate sizing request (zero context / batch).
+RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
+                                         const ModelCapabilities& caps,
+                                         const InferenceConfig& request,
+                                         const RuntimeOverrides& overrides = {});
+
+} // namespace blackwell

@@ -25,8 +25,11 @@ public:
     // streamed per layer during decode. SIZE_MAX (default) keeps every layer
     // resident (the original behaviour). Mirrors the weight-offload split the
     // VRAMArena applies, so paged mode matches continuous mode's VRAM ceiling.
+    // branch_factor inflates the host-mirror page pool to leave headroom for
+    // concurrent CoW fork branches (RuntimeConfig::paged_branch_factor).
     PagedKVManager(const ModelConfig& config, size_t max_seq_len,
-                   size_t num_gpu_layers = static_cast<size_t>(-1));
+                   size_t num_gpu_layers = static_cast<size_t>(-1),
+                   int branch_factor = 4);
 
     void prepare_decode_step(SeqId seq, int pos) override;
     void prepare_prefill_step(SeqId seq, int start_pos, int num_tokens) override;

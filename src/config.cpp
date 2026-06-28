@@ -91,6 +91,10 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
     if (cfg.head_dim == 0)
         throw std::runtime_error("ConfigLoader: head_dim resolved to zero");
 
+    // Trained positional range. 0 == unspecified (the runtime validator treats it
+    // as unbounded rather than rejecting every context length).
+    cfg.max_position_embeddings = t.value("max_position_embeddings", size_t{0});
+
     cfg.rms_norm_eps        = t.value("rms_norm_eps", 1e-6f);
     cfg.tie_word_embeddings = j.value("tie_word_embeddings", t.value("tie_word_embeddings", false));
     cfg.attn_output_gate    = t.value("attn_output_gate", false);

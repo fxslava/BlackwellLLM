@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "blackwell/engine.h"
 #include "blackwell/config.h"
+#include "blackwell/runtime_config.h"
 #include "safetensors.h"
 #include "memory_pool.h"
 #include "ops_dispatcher.h"
@@ -10,7 +11,14 @@
 #include <vector>
 
 struct BlackwellEngine::Impl {
+    // Declaration order is the construction order. The tier-1 config, the derived
+    // capabilities, and the validated tier-3 runtime plan must all precede `arena`
+    // and `kv_mgr`, which size themselves from m_runtime (max_seq_len, num_gpu_layers,
+    // kv_mode, paged_branch_factor).
     ModelConfig m_config;
+    ModelCapabilities m_caps;          // topology-derived; supports_cow_branching finalized in ctor body
+    blackwell::RuntimeConfig m_runtime; // resolved + validated execution plan
+
     SafetensorsLoader loader;
     VRAMArena arena;
     LinearDispatcher dispatcher;
@@ -19,9 +27,6 @@ struct BlackwellEngine::Impl {
     // Declared after `arena` so it is destroyed before it -- the adapter holds a
     // reference into the arena. Defaults to the legacy continuous FP32 cache.
     std::unique_ptr<blackwell::IKVCacheManager> kv_mgr;
-
-    // Derived once from m_config (+ kv_mode) at construction; gates fork/rewind.
-    ModelCapabilities m_caps;
 
     // Hybrid linear-attention (SSM) state. Allocated only for models with
     // AttnKind::Linear layers; null otherwise. m_linear_layer_index maps an
@@ -61,8 +66,8 @@ struct BlackwellEngine::Impl {
     float *d_full_k_cache = nullptr, *d_full_v_cache = nullptr;
     size_t m_full_kv_layer_stride = 0;     // floats per layer in each of K/V cache
 
-    Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
-         BlackwellEngine::KVCacheMode kv_mode);
+    Impl(const std::string& index_path, const blackwell::InferenceConfig& request,
+         const blackwell::RuntimeOverrides& overrides);
     ~Impl();
 
     void step_embedding(int token_id);
