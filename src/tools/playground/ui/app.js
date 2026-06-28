@@ -1,6 +1,6 @@
 "use strict";
 const CARET = String.fromCharCode(0x2038);    // caret-placement sentinel for snippets
-const KNOWN_TAGS = new Set(["tool_call","arg","finish"]);
+const KNOWN_TAGS = new Set(["tool_call","arg","finish","think"]);
 const TOOL_ARGS = {
   read_file:["path"], write_file:["path","content"], patch_file:["path","find","replace"],
   list_dir:["path"], analyze_source:["source"], callers_of:["symbol"], callees_of:["symbol"]
@@ -200,6 +200,46 @@ function renderMarkdown(content){
   return '<pre class="plain">' + highlightInline(content) + '</pre>';
 }
 
+/* ---------- reasoning (<think>) blocks: DeepSeek-style collapsible cards -------
+   Reasoning models (Qwen-3.5, DeepSeek-R1) stream a <think>...</think> chain-of-
+   thought before their real answer. Rather than dumping a wall of raw reasoning
+   (plus a red-underlined "unknown tag") into the bubble, we lift each think span
+   out of the markdown stream and render it as a collapsible <details> card:
+     * complete <think>...</think>  -> a closed "Thought process" card;
+     * an unterminated <think> (still streaming the thoughts) -> an OPEN
+       "Thinking..." card so the user watches the reasoning arrive live.
+   The prose / tool-calls around the thoughts go through the normal markdown +
+   XML-highlighter pipeline untouched. */
+function renderThink(inner, done){
+  const label = done ? "Thought process" : "Thinking…";
+  const lead  = done ? "" : '<span class="spin"></span> ';
+  const open  = done ? "" : " open";   // keep the live reasoning visible while it streams
+  return '<details class="think"'+open+'>'+
+           '<summary>'+lead+label+'</summary>'+
+           '<div class="think-body">'+renderMarkdown(inner)+'</div>'+
+         '</details>';
+}
+function renderContent(content){
+  content = content == null ? "" : String(content);
+  let out = "", last = 0, m;
+  const re = /<think>([\s\S]*?)<\/think>/gi;
+  while((m = re.exec(content))){
+    if(m.index > last) out += renderMarkdown(content.slice(last, m.index));
+    out += renderThink(m[1], true);
+    last = re.lastIndex;
+  }
+  const rest = content.slice(last);
+  const open = rest.search(/<think>/i);
+  if(open >= 0){
+    // A <think> with no matching </think> yet: the model is mid-thought (streaming).
+    if(open > 0) out += renderMarkdown(rest.slice(0, open));
+    out += renderThink(rest.slice(open + 7), false);   // 7 == "<think>".length
+  } else if(rest.length || !out){
+    out += renderMarkdown(rest);
+  }
+  return out;
+}
+
 /* ---------- snippet insertion ---------- */
 function insertSnippet(text){
   const s = input.selectionStart, e = input.selectionEnd, v = input.value;
@@ -310,7 +350,7 @@ async function renderTranscript(){
       '<div class="bubble">'+
         '<div class="meta"><span class="who">'+m.role+'</span>'+badge+
           '<span class="actions">'+actions+'</span></div>'+
-        '<div class="md">'+renderMarkdown(m.content)+'</div>'+
+        '<div class="md">'+renderContent(m.content)+'</div>'+
       '</div>';
     box.appendChild(el);
   }
@@ -436,9 +476,10 @@ function ensureStreamEl(){
 }
 function updateStreamPreview(text){
   const el = ensureStreamEl();
-  // renderMarkdown handles partial input: an unterminated ```cpp fence still
-  // formats as a (growing) code block, so the user watches it type out.
-  el.querySelector(".md").innerHTML = renderMarkdown(text || "");
+  // renderContent handles partial input: an unterminated ```cpp fence still
+  // formats as a (growing) code block, and an unterminated <think> renders as an
+  // open "Thinking..." card, so the user watches both type out.
+  el.querySelector(".md").innerHTML = renderContent(text || "");
   const box = $("#transcript");
   box.scrollTop = box.scrollHeight;
 }

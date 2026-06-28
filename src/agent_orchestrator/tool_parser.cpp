@@ -58,6 +58,38 @@ std::optional<std::string> extract_attr(std::string_view open_tag,
     return std::nullopt;
 }
 
+// True if index `pos` lies inside a <think>...</think> span. Reasoning models
+// (Qwen-3.5, DeepSeek-R1) emit a chain-of-thought there that frequently *mentions*
+// or rehearses protocol tags ("I should emit <finish> once done", "maybe call
+// <tool_call ...>"); none of those are real actions, so the scanner must skip
+// anything a think block encloses. A <think> with no matching </think> (the model
+// is still reasoning) swallows the entire tail, so we never act on half-formed
+// thoughts. Bounded: every index touched is proven in-range before use.
+bool in_think_block(std::string_view text, size_t pos) {
+    size_t scan = 0;
+    while (true) {
+        size_t open = find_element(text, "think", scan);
+        if (open == kNpos || open >= pos) return false;  // no think opener before pos
+        size_t open_end = text.find('>', open);
+        if (open_end == kNpos) return true;  // "<think" never closes its tag -> all tail is thought
+        size_t close = text.find("</think>", open_end + 1);
+        if (close == kNpos) return true;     // open-ended think -> swallows the tail (incl. pos)
+        size_t close_end = close + 8;        // strlen("</think>")
+        if (pos < close_end) return true;    // pos sits between this <think> and its close
+        scan = close_end;                    // pos is past this block; look for a later one
+    }
+}
+
+// Earliest opener of `tag` that is NOT buried inside a think block, or kNpos.
+size_t find_action_element(std::string_view text, std::string_view tag) {
+    size_t pos = 0;
+    while ((pos = find_element(text, tag, pos)) != kNpos) {
+        if (!in_think_block(text, pos)) return pos;
+        pos += 1;  // this opener is part of the model's thoughts; resume past its '<'
+    }
+    return kNpos;
+}
+
 std::string trim(std::string_view s) {
     size_t b = 0, e = s.size();
     while (b < e && is_space(s[b])) ++b;
@@ -133,9 +165,12 @@ ParsedAction ToolParser::parse(std::string_view text) {
         size_t pos;
         std::optional<ParsedAction> (*fn)(std::string_view, size_t);
     };
+    // find_action_element skips openers buried inside <think>...</think>, so the
+    // model's chain-of-thought can rehearse <finish>/<tool_call> without tripping
+    // the loop; only a tag in the *real* answer (after </think>) counts.
     std::array<Candidate, 2> cands{
-        Candidate{find_element(text, "tool_call", 0), &try_tool_call},
-        Candidate{find_element(text, "finish", 0), &try_finish},
+        Candidate{find_action_element(text, "tool_call"), &try_tool_call},
+        Candidate{find_action_element(text, "finish"), &try_finish},
     };
 
     // Order by position (earliest first); kNpos sinks to the back.

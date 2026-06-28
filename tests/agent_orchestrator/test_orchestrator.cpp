@@ -138,6 +138,64 @@ TEST(ToolParser, CrashProofOnGarbage) {
 }
 
 // ---------------------------------------------------------------------------
+// ToolParser -- reasoning-model <think> chain-of-thought handling
+// ---------------------------------------------------------------------------
+
+// The headline reasoning-model case: a <think> block must NOT abort parsing; the
+// <finish> in the real answer after </think> is found exactly as usual.
+TEST(ToolParser, ThinkBlockThenFinishParsesCleanly) {
+    auto a = ToolParser::parse(
+        "<think>some thoughts</think>\nNow here is the answer <finish/>");
+    EXPECT_EQ(a.kind, ActionKind::Finish);
+}
+
+TEST(ToolParser, ThinkBlockThenFinishWithText) {
+    auto a = ToolParser::parse(
+        "<think>Let me reason about this step by step. The user asked X, so Y.</think>\n"
+        "<finish>The answer is 42.</finish>");
+    ASSERT_EQ(a.kind, ActionKind::Finish);
+    EXPECT_EQ(a.finish_text, "The answer is 42.");
+}
+
+// Tags the model merely *rehearses* inside its thoughts must be inert: only the
+// real tool_call after </think> is acted on.
+TEST(ToolParser, TagsRehearsedInsideThinkAreIgnored) {
+    auto a = ToolParser::parse(
+        "<think>I could just <finish>give up</finish>, but I should really call "
+        "<tool_call name=\"wrong\"/> first... actually let me read the file.</think>\n"
+        "<tool_call name=\"read_file\"><arg name=\"path\">src/x.cpp</arg></tool_call>");
+    ASSERT_EQ(a.kind, ActionKind::ToolCall);
+    EXPECT_EQ(a.tool.name, "read_file");
+    ASSERT_EQ(a.tool.args.count("path"), 1u);
+    EXPECT_EQ(a.tool.args.at("path"), "src/x.cpp");
+}
+
+// A premature <finish> rehearsed in the thoughts must not shadow a later, real
+// tool_call -- the earliest action OUTSIDE the think block wins.
+TEST(ToolParser, ThinkFinishDoesNotShadowRealToolCall) {
+    auto a = ToolParser::parse(
+        "<think>maybe I'm done: <finish>done</finish></think>\n"
+        "<tool_call name=\"list_dir\"></tool_call>");
+    ASSERT_EQ(a.kind, ActionKind::ToolCall);
+    EXPECT_EQ(a.tool.name, "list_dir");
+}
+
+// An unterminated <think> (the model is still reasoning) swallows the tail: there
+// is no *completed* real answer yet, so nothing is actionable.
+TEST(ToolParser, UnterminatedThinkSwallowsTail) {
+    auto a = ToolParser::parse(
+        "<think>I will eventually emit <finish>x</finish> but I'm still thinking");
+    EXPECT_EQ(a.kind, ActionKind::None);
+}
+
+// A think block whose content is pure prose, followed by a pure-prose answer,
+// stays None (and the orchestrator will nudge) -- think changes nothing here.
+TEST(ToolParser, ThinkThenProseIsStillNone) {
+    auto a = ToolParser::parse("<think>hmm</think>\nThe answer is probably 42.");
+    EXPECT_EQ(a.kind, ActionKind::None);
+}
+
+// ---------------------------------------------------------------------------
 // ToolRegistry (dispatcher)
 // ---------------------------------------------------------------------------
 
@@ -243,6 +301,55 @@ TEST(AgentOrchestrator, PureProseGetsNudgedNotStuck) {
     EXPECT_EQ(r.iterations, 2);
     EXPECT_TRUE(history_has(orch.history(), Message::Role::Observation,
                             "No <tool_call> or <finish>"));
+}
+
+TEST(AgentOrchestrator, ReasoningModelFinishesInOneTurnDespiteThinkBlock) {
+    // A Qwen-3.5 / DeepSeek-style turn: a <think> CoT that even rehearses a
+    // <finish>, then the real <finish>. The loop must terminate on the REAL finish
+    // in a single iteration -- not abort, not get nudged for "no actionable tag",
+    // and not stop early on the thought's rehearsed finish.
+    MockLLM llm({
+        "<think>The user wants the capital of France. I might just "
+        "<finish>Paris?</finish> but let me be sure. It is Paris.</think>\n"
+        "<finish>The capital of France is Paris.</finish>",
+    });
+    ToolRegistry reg;
+    AgentOrchestrator orch(llm, reg);
+    RunResult r = orch.run("What is the capital of France?");
+
+    EXPECT_TRUE(r.finished);
+    EXPECT_FALSE(r.max_iterations_hit);
+    EXPECT_EQ(r.iterations, 1);
+    EXPECT_EQ(r.answer, "The capital of France is Paris.");
+    // The think block was preserved verbatim in the assistant turn (it streams to
+    // the client as part of the message), not stripped or treated as an error.
+    EXPECT_TRUE(history_has(orch.history(), Message::Role::Assistant, "<think>"));
+    // It was NOT nudged for a missing action tag.
+    EXPECT_FALSE(history_has(orch.history(), Message::Role::Observation,
+                             "No <tool_call> or <finish>"));
+}
+
+TEST(AgentOrchestrator, ReasoningModelToolCallAfterThink) {
+    // A reasoning turn that ends in a real tool_call (the CoT rehearses a bogus
+    // one), then finishes off the observation. The bogus in-think tool must be
+    // ignored and the real read_file dispatched.
+    MockLLM llm({
+        "<think>Should I call <tool_call name=\"bogus\"/>? No -- read the file.</think>\n"
+        "<tool_call name=\"read_file\"><arg name=\"path\">a.txt</arg></tool_call>",
+        "<finish>file read</finish>",
+    });
+    ToolRegistry reg;
+    std::string seen_path;
+    reg.register_tool("read_file", "reads a file", [&](const ToolInvocation& c) {
+        seen_path = c.args.count("path") ? c.args.at("path") : "";
+        return "contents-of-a.txt";
+    });
+    AgentOrchestrator orch(llm, reg);
+    RunResult r = orch.run("read a.txt");
+
+    EXPECT_TRUE(r.finished);
+    EXPECT_EQ(seen_path, "a.txt");  // the REAL tool call, not the rehearsed "bogus"
+    EXPECT_EQ(r.answer, "file read");
 }
 
 TEST(AgentOrchestrator, MaxIterationsSafeguard) {

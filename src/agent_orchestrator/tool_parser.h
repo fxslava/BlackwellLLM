@@ -11,6 +11,10 @@
 //     or truncated tag can ever drive an out-of-range read;
 //   * surrounding conversational prose ("yapping") is ignored -- we lock onto the
 //     earliest *valid* action and discard the rest;
+//   * reasoning models' <think>...</think> chain-of-thought is treated as inert
+//     prose: any <tool_call>/<finish> the model merely *rehearses* inside its
+//     thoughts is skipped, so parsing latches only onto a tag in the real answer
+//     after </think> (an unterminated <think> swallows the whole tail);
 //   * anything we cannot make sense of degrades to ActionKind::None instead of
 //     an exception, so the ReAct loop always gets a well-formed result.
 #ifndef BLACKWELL_AGENT_ORCH_TOOL_PARSER_H

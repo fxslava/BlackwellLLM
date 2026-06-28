@@ -488,6 +488,39 @@ details.chatml pre {
   word-break: break-word;
 }
 
+/* -------------------------------------------------------------- *
+ *  Reasoning (<think>) cards -- DeepSeek-style collapsible CoT.   *
+ *  A muted, de-emphasised block so the chain-of-thought folds     *
+ *  away behind a one-line header instead of flooding the bubble.  *
+ * -------------------------------------------------------------- */
+.md details.think {
+  margin: .5em 0;
+  background: rgba(139, 147, 167, .06);   /* faint --muted wash */
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--muted);
+  border-radius: 8px;
+}
+.md details.think > summary {
+  cursor: pointer;
+  padding: 6px 11px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+  user-select: none;
+  list-style: none;                       /* hide the native disclosure marker ... */
+}
+.md details.think > summary::-webkit-details-marker { display: none; }
+.md details.think > summary::before { content: "\25B8";  margin-right: 7px; }  /* ▸ collapsed */
+.md details.think[open] > summary::before { content: "\25BE"; }                /* ▾ expanded  */
+.md details.think[open] > summary { border-bottom: 1px solid var(--border); }
+.md details.think .think-body {
+  padding: 7px 12px 9px;
+  font-size: 12.5px;
+  color: var(--muted);                    /* reasoning reads quieter than the answer */
+}
+.md details.think .think-body > :first-child { margin-top: 0; }
+.md details.think .think-body > :last-child  { margin-bottom: 0; }
+
 /* ============================================================== *
  *  Composer (roles + toolbar + editor + actions)                 *
  * ============================================================== */
