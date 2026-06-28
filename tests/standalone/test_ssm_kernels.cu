@@ -78,9 +78,9 @@ static void cpu_scan(const std::vector<float>& q, const std::vector<float>& k,
         float a  = std::exp(dt * (-std::exp(A_log[h])));
         float b  = beta[h];
         for (int d = 0; d < Dv; ++d) {
-            // pass 1: value currently keyed by k under the pre-update state.
+            // pass 1: value keyed by k under the DECAYED state (HF gate-before-delta).
             float Sk = 0.f;
-            for (int i = 0; i < Dk; ++i) Sk += S[(size_t)h*Dk*Dv + i*Dv + d] * k[h*Dk+i];
+            for (int i = 0; i < Dk; ++i) Sk += (a * S[(size_t)h*Dk*Dv + i*Dv + d]) * k[h*Dk+i];
             float corr = b * (v[h*Dv+d] - Sk), acc = 0.f;
             // pass 2: delta write + read with q.
             for (int i = 0; i < Dk; ++i) {

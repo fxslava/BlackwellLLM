@@ -9,9 +9,11 @@
 // Weight format (verified against the Qwen3.5 checkpoint headers):
 //   weight_packed : int32 [out_features, in_features/8]
 //                   8 signed int4 per int32, packed along the INPUT dim, with
-//                   element t (t=0..7) of a word in bits [4t, 4t+4). Each nibble
-//                   is a two's-complement 4-bit value in [-8, 7] (sign-extended
-//                   on unpack). There is NO zero-point (symmetric).
+//                   element t (t=0..7) of a word in bits [4t, 4t+4). The signed
+//                   value q in [-8,7] is stored as the UNSIGNED nibble q+8, so it
+//                   is recovered as (nibble - 8) -- the compressed-tensors offset
+//                   convention, NOT two's-complement. There is no separate
+//                   zero-point tensor (symmetric).
 //   weight_scale  : bf16  [out_features, in_features/group_size]
 //                   one scale per contiguous group of `group_size` input
 //                   elements (group_size = 32 for this checkpoint).

@@ -72,4 +72,27 @@ void launch_selective_scan_update(
     bool gate_silu,
     cudaStream_t stream = 0);
 
+// ---- assembly helpers for the GatedDeltaNet decode step --------------------
+
+// bf16 -> fp32 elementwise cast (for per-layer params consumed by fp32 kernels).
+void launch_bf16_to_f32(const void* d_in_bf16, float* d_out, int n, cudaStream_t stream = 0);
+
+// sigmoid in place (in_proj_b output -> per-head write strength beta).
+void launch_sigmoid_inplace(float* d_x, int n, cudaStream_t stream = 0);
+
+// Split the conv'd qkv [q | k | v] into per-head q,k,v, L2-NORMALIZE q and k per
+// head (GatedDeltaNet precondition), and broadcast the num_key_heads q/k onto the
+// num_value_heads via repeat-interleave (value head h <- key head h / ratio).
+//   qkv : [num_key_heads*hd (q) | num_key_heads*hd (k) | num_value_heads*hd (v)]
+//   q_out,k_out,v_out : [num_value_heads, hd]
+void launch_ssm_split_norm_broadcast(
+    const float* d_qkv, float* d_q_out, float* d_k_out, float* d_v_out,
+    int num_key_heads, int num_value_heads, int head_dim, cudaStream_t stream = 0);
+
+// Per-head gated RMSNorm (Mamba2 RMSNormGated): out = rmsnorm(x * silu(z)) * gamma,
+// normalized over each head's `dv` channels. x,z,out: [num_heads, dv]; gamma: [dv].
+void launch_gated_rmsnorm_per_head(
+    const float* d_x, const float* d_z, const float* d_gamma, float* d_out,
+    int num_heads, int dv, float eps, cudaStream_t stream = 0);
+
 }} // namespace blackwell::ssm

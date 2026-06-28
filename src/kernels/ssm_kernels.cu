@@ -1,4 +1,5 @@
 #include "ssm_kernels.cuh"
+#include <cuda_bf16.h>
 
 namespace blackwell { namespace ssm {
 
@@ -77,14 +78,14 @@ __global__ void selective_scan_update_kernel(const float* __restrict__ q,
     const float vd = v[(size_t)h * Dv + d];
     float* __restrict__ Sh = state + (size_t)h * Dk * Dv;   // [Dk, Dv]
 
-    // pass 1: value the current key already retrieves under the PRE-update state.
+    // pass 1: kv_mem = (decayed state)·k  (HF applies the gate BEFORE the delta).
     float Sk = 0.0f;
-    for (int i = 0; i < Dk; ++i) Sk += Sh[(size_t)i * Dv + d] * kh[i];
+    for (int i = 0; i < Dk; ++i) Sk += (a * Sh[(size_t)i * Dv + d]) * kh[i];
 
     // delta-rule correction for this output channel (scalar in d).
     const float corr = b * (vd - Sk);
 
-    // pass 2: write the gated delta update and read out with q.
+    // pass 2: S := a·S + corr·k ; read out with q.
     float acc = 0.0f;
     for (int i = 0; i < Dk; ++i) {
         const float s = a * Sh[(size_t)i * Dv + d] + corr * kh[i];
@@ -126,6 +127,97 @@ void launch_selective_scan_update(const float* d_q, const float* d_k,
     selective_scan_update_kernel<<<grid, block, 0, stream>>>(
         d_q, d_k, d_v, d_z, d_dt_raw, d_dt_bias, d_A_log, d_beta,
         d_state, d_out, key_head_dim, value_head_dim, gate_silu);
+}
+
+// ============================================================================
+// 3. GatedDeltaNet assembly helpers
+// ============================================================================
+__global__ void bf16_to_f32_kernel(const __nv_bfloat16* __restrict__ in,
+                                    float* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
+__global__ void sigmoid_inplace_kernel(float* __restrict__ x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 1.0f / (1.0f + __expf(-x[i]));
+}
+
+// One block per value head; blockDim.x = head_dim. L2-normalizes the (broadcast)
+// query/key head over head_dim and copies the value head through.
+__global__ void split_norm_broadcast_kernel(const float* __restrict__ qkv,
+                                            float* __restrict__ q_out,
+                                            float* __restrict__ k_out,
+                                            float* __restrict__ v_out,
+                                            int num_key_heads, int num_value_heads,
+                                            int hd) {
+    const int h = blockIdx.x;           // value head [0, num_value_heads)
+    const int t = threadIdx.x;          // channel [0, hd)
+    if (h >= num_value_heads || t >= hd) return;
+
+    const int ratio = num_value_heads / num_key_heads;   // GQA group size
+    const int kh    = h / ratio;                          // source key/query head
+    const int q_off = 0;
+    const int k_off = num_key_heads * hd;
+    const int v_off = 2 * num_key_heads * hd;
+
+    const float qv = qkv[q_off + kh * hd + t];
+    const float kv = qkv[k_off + kh * hd + t];
+
+    // L2 norm over the head's hd channels (block reduction; eps matches HF l2norm).
+    __shared__ float red[1024];
+    // --- q --- (HF additionally scales the query by 1/sqrt(head_dim))
+    red[t] = qv * qv; __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+    const float q_inv = rsqrtf(red[0] + 1e-6f); __syncthreads();
+    // --- k ---
+    red[t] = kv * kv; __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+    const float k_inv = rsqrtf(red[0] + 1e-6f);
+
+    q_out[h * hd + t] = qv * q_inv * rsqrtf((float)hd);   // l2norm(q) * 1/sqrt(Dk)
+    k_out[h * hd + t] = kv * k_inv;
+    v_out[h * hd + t] = qkv[v_off + h * hd + t];
+}
+
+// Per-head gated RMSNorm: out = rmsnorm(x * silu(z)) * gamma over dv channels.
+__global__ void gated_rmsnorm_per_head_kernel(const float* __restrict__ x,
+                                              const float* __restrict__ z,
+                                              const float* __restrict__ gamma,
+                                              float* __restrict__ out,
+                                              int dv, float eps) {
+    const int h = blockIdx.x;
+    const int t = threadIdx.x;
+    if (t >= dv) return;
+    // Qwen3.5 RMSNormGated: normalize FIRST, scale by gamma, THEN apply the gate.
+    const float xv = x[h * dv + t];
+    __shared__ float red[1024];
+    red[t] = xv * xv; __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+    const float inv = rsqrtf(red[0] / dv + eps);
+    const float normed = xv * inv * gamma[t];
+    out[h * dv + t] = normed * silu(z[h * dv + t]);
+}
+
+void launch_bf16_to_f32(const void* d_in_bf16, float* d_out, int n, cudaStream_t stream) {
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    bf16_to_f32_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(d_in_bf16), d_out, n);
+}
+void launch_sigmoid_inplace(float* d_x, int n, cudaStream_t stream) {
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    sigmoid_inplace_kernel<<<blocks, threads, 0, stream>>>(d_x, n);
+}
+void launch_ssm_split_norm_broadcast(const float* d_qkv, float* d_q_out, float* d_k_out,
+                                     float* d_v_out, int num_key_heads, int num_value_heads,
+                                     int head_dim, cudaStream_t stream) {
+    split_norm_broadcast_kernel<<<num_value_heads, head_dim, 0, stream>>>(
+        d_qkv, d_q_out, d_k_out, d_v_out, num_key_heads, num_value_heads, head_dim);
+}
+void launch_gated_rmsnorm_per_head(const float* d_x, const float* d_z, const float* d_gamma,
+                                   float* d_out, int num_heads, int dv, float eps,
+                                   cudaStream_t stream) {
+    gated_rmsnorm_per_head_kernel<<<num_heads, dv, 0, stream>>>(d_x, d_z, d_gamma, d_out, dv, eps);
 }
 
 }} // namespace blackwell::ssm

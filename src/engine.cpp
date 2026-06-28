@@ -10,6 +10,7 @@
 #include "kernels/attention.cuh"
 #include "kernels/swiglu.cuh"
 #include "kernels/sampling.cuh"
+#include "kernels/ssm_kernels.cuh"
 #include "kv_cache/continuous_kv_manager.h"
 #include "kv_cache/paged_kv_manager.h"
 #include <cstdlib>
@@ -109,9 +110,22 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
         const auto& L = m_config.linear;
         const size_t conv_dim = 2 * L.num_key_heads * L.key_head_dim
                                   + L.num_value_heads * L.value_head_dim;
-        const size_t v_dim    = L.num_value_heads * L.value_head_dim;
-        CUDA_CHECK(cudaMalloc(&d_ssm_qkv, conv_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_z,   v_dim    * sizeof(float)));
+        const size_t v_dim    = L.num_value_heads * L.value_head_dim;   // H * Dv
+        const size_t H        = L.num_value_heads;
+        CUDA_CHECK(cudaMalloc(&d_ssm_qkv,      conv_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_qkv_conv, conv_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_z,        v_dim    * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_q,        v_dim    * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_k,        v_dim    * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_v,        v_dim    * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_core,     v_dim    * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_o,        v_dim    * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_a,        H        * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ssm_b,        H        * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_dt_bias_f32,  H        * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_A_log_f32,    H        * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_norm_f32,     L.value_head_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_conv_w_f32,   conv_dim * L.conv_kernel_dim * sizeof(float)));
     }
 }
 
@@ -119,7 +133,10 @@ BlackwellEngine::Impl::~Impl() {
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
     cudaFree(d_Attn_out); cudaFree(d_Gate); cudaFree(d_Up); cudaFree(d_Swiglu_out);
     cudaFree(d_logits); cudaFree(d_next_token);
-    cudaFree(d_ssm_qkv); cudaFree(d_ssm_z);
+    cudaFree(d_ssm_qkv); cudaFree(d_ssm_z); cudaFree(d_ssm_qkv_conv);
+    cudaFree(d_ssm_q); cudaFree(d_ssm_k); cudaFree(d_ssm_v);
+    cudaFree(d_ssm_a); cudaFree(d_ssm_b); cudaFree(d_ssm_core); cudaFree(d_ssm_o);
+    cudaFree(d_dt_bias_f32); cudaFree(d_A_log_f32); cudaFree(d_norm_f32); cudaFree(d_conv_w_f32);
 }
 
 // ============================================================================
@@ -159,9 +176,9 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
     std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "input_layernorm.weight");
     if (half_weights_are_fp16(m_config)) {
-        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     } else {
-        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     }
 }
 
@@ -247,47 +264,53 @@ void BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
     // forks (ModelCapabilities::supports_cow_branching == false).
     float* d_state = ssm_state->rec_state(0, li);
     float* d_conv  = ssm_state->conv_state(0, li);
-    (void)d_state; (void)d_conv; (void)pos;
+    (void)pos;   // recurrence is position-implicit (state carries history)
 
     const auto& L = m_config.linear;
-    const size_t conv_dim = 2 * L.num_key_heads * L.key_head_dim
-                              + L.num_value_heads * L.value_head_dim;   // q|k|v
-    const size_t v_dim    = L.num_value_heads * L.value_head_dim;       // gate width
+    const int Kh = (int)L.num_key_heads, Hh = (int)L.num_value_heads;
+    const int Dk = (int)L.key_head_dim,  Dv = (int)L.value_head_dim, Kw = (int)L.conv_kernel_dim;
+    const size_t conv_dim = 2 * (size_t)Kh * Dk + (size_t)Hh * Dv;     // q|k|v
+    const size_t v_dim    = (size_t)Hh * Dv;                            // H * Dv
 
     // 1. input RMSNorm (bf16 weight; this checkpoint's norms are bf16) -> d_X_norm.
     launch_rmsnorm_kernel(d_X_accum, d_X_norm,
                           arena.get_weight_ptr(base + "input_layernorm.weight"),
-                          1, m_config.hidden_dim, m_config.rms_norm_eps);
+                          1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
 
-    // 2. Quantized (symmetric int4) in-projections feed the SSM. These connect the
-    //    loaded weight_packed/weight_scale tensors to the path via the now-real
-    //    COMPRESSED_TENSORS_INT4 GEMV (validated self-consistent in
-    //    test_sym_int4_gemv.cu):
-    //      qkv = in_proj_qkv(x_norm)  [conv_dim]
-    //      z   = in_proj_z(x_norm)    [v_dim]   (output gate)
+    // 2. in-projections. qkv/z are symmetric int4 (dispatcher); a/b are bf16 GEMVs
+    //    (per-head dt / beta sources). a feeds dt = softplus(a + dt_bias);
+    //    b feeds beta = sigmoid(b).
     dispatcher.forward(la + "in_proj_qkv", d_X_norm, d_ssm_qkv, conv_dim, m_config.hidden_dim);
     dispatcher.forward(la + "in_proj_z",   d_X_norm, d_ssm_z,   v_dim,    m_config.hidden_dim);
+    launch_bf16_gemv_kernel(arena.get_weight_ptr(la + "in_proj_a.weight"), d_X_norm, d_ssm_a, Hh, m_config.hidden_dim);
+    launch_bf16_gemv_kernel(arena.get_weight_ptr(la + "in_proj_b.weight"), d_X_norm, d_ssm_b, Hh, m_config.hidden_dim);
+    blackwell::ssm::launch_sigmoid_inplace(d_ssm_b, Hh);              // b -> beta
 
-    // 3-6. Remaining GatedDeltaNet assembly (kernels themselves validated standalone
-    // in test_ssm_kernels.cu):
-    //   - causal_conv1d_update over qkv  (conv1d.weight is bf16 [conv_dim,1,K] -> needs
-    //     a bf16 conv variant or a converted copy);
-    //   - bf16 GEMVs in_proj_a / in_proj_b -> per-head dt / beta sources, with
-    //     dt = softplus(a + dt_bias), beta = sigmoid(b);
-    //   - split qkv into q,k,v (GQA broadcast num_key_heads -> num_value_heads),
-    //     L2-normalize k per head (stability precondition, see ssm_kernels.cuh);
-    //   - launch_selective_scan_update(... d_state ...);
-    //   - per-head RMSNorm(o, linear_attn.norm[Dv]) with the z gate, then
-    //     out_proj (int4) accumulating into d_X_accum.
-    // These steps need bf16 helper kernels and the exact HF gate/split/normalize
-    // ordering, which is unverified without golden dumps. We stop here so the SSM
-    // layer fails precisely rather than emitting unverified logits; the int4
-    // in_proj path above is exercised on the real weights.
-    throw std::runtime_error(
-        "BlackwellEngine: SSM layer " + std::to_string(layer_idx) +
-        " int4 in_proj wired and exercised; GatedDeltaNet assembly (bf16 conv1d + "
-        "a/b gates + delta scan + output norm/gate + out_proj) pending HF-reference "
-        "reconciliation and golden-dump verification.");
+    // 3. causal depthwise conv1d (SiLU) over the full qkv channels, advancing this
+    //    layer's ring buffer. conv1d.weight is bf16 [conv_dim,1,Kw] == [conv_dim,Kw].
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "conv1d.weight"),
+                                       d_conv_w_f32, (int)conv_dim * Kw);
+    blackwell::ssm::launch_causal_conv1d_update(d_ssm_qkv, d_conv, d_conv_w_f32, /*bias=*/nullptr,
+                                                d_ssm_qkv_conv, (int)conv_dim, Kw, /*silu=*/true);
+
+    // 4. split conv'd qkv -> per-head q,k,v; L2-normalize q,k; GQA-broadcast Kh->Hh.
+    blackwell::ssm::launch_ssm_split_norm_broadcast(d_ssm_qkv_conv, d_ssm_q, d_ssm_k, d_ssm_v,
+                                                    Kh, Hh, Dk);
+
+    // 5. GatedDeltaNet recurrent write/read into this layer's state.
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "dt_bias"), d_dt_bias_f32, Hh);
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "A_log"),   d_A_log_f32,   Hh);
+    blackwell::ssm::launch_selective_scan_update(d_ssm_q, d_ssm_k, d_ssm_v, /*z=*/nullptr,
+                                 d_ssm_a, d_dt_bias_f32, d_A_log_f32, d_ssm_b,
+                                 d_state, d_ssm_core, Hh, Dk, Dv, /*gate_silu=*/false);
+
+    // 6. per-head gated RMSNorm: o = rmsnorm(core * silu(z)) * norm.weight[Dv].
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "norm.weight"), d_norm_f32, Dv);
+    blackwell::ssm::launch_gated_rmsnorm_per_head(d_ssm_core, d_ssm_z, d_norm_f32, d_ssm_o,
+                                                  Hh, Dv, m_config.rms_norm_eps);
+
+    // 7. out_proj (symmetric int4), accumulating into the residual stream.
+    dispatcher.forward(la + "out_proj", d_ssm_o, nullptr, m_config.hidden_dim, v_dim, d_X_accum);
 }
 
 // ============================================================================
@@ -298,9 +321,9 @@ void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
     std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "post_attention_layernorm.weight");
     if (half_weights_are_fp16(m_config)) {
-        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     } else {
-        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     }
 }
 
@@ -331,9 +354,9 @@ void BlackwellEngine::Impl::step_final_ops() {
     const void* d_w = arena.get_weight_ptr(m_config.weight_prefix + "norm.weight");
     const bool fp16_w = half_weights_are_fp16(m_config);
     if (fp16_w) {
-        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+        launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     } else {
-        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps);
+        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     }
 
     // Tied checkpoints omit lm_head.weight entirely; the output head shares the

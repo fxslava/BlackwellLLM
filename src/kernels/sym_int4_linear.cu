@@ -25,8 +25,10 @@ __global__ void sym_int4_gemv_kernel(const int32_t* __restrict__ packed,
         const int in_base = p * 8;
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
-            int nib = (w >> (4 * t)) & 0xF;
-            if (nib > 7) nib -= 16;                       // sign-extend 4-bit -> [-8,7]
+            // compressed-tensors stores the signed value q in [-8,7] as the unsigned
+            // nibble q+8; recover it by subtracting the 2^(bits-1) offset (NOT a
+            // two's-complement sign-extend).
+            const int nib = (int)((w >> (4 * t)) & 0xF) - 8;
             const int in_idx = in_base + t;
             const float scale = __bfloat162float(srow[in_idx / group_size]);
             acc += x[in_idx] * (float)nib * scale;

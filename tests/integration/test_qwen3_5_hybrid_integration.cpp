@@ -193,3 +193,87 @@ TEST(Qwen35Hybrid, SingleStepLogitParity) {
     std::cout << "[qwen3.5-hybrid] single-step logit cosine = " << cos << "\n";
     EXPECT_GT(cos, kParityThreshold);
 }
+
+// ---------------------------------------------------------------------------
+// Isolated GatedDeltaNet parity for linear layer 0. This is the achievable
+// correctness gate for the SSM assembly: the full-logit test above is blocked by
+// the (unimplemented) head_dim-256 full-attention layers, but layer 0 is linear
+// and its input is exactly the decode token's embedding. We feed the golden
+// embedding, run step_linear_attention(0), and compare the mixer output to the HF
+// reference linear_attn_out_layer0.bin (and the post-step state to the dump).
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, LinearLayer0Parity) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+    if (!file_exists(dumps_dir() + "/linear_attn_out_layer0.bin"))
+        GTEST_SKIP() << "golden dumps absent in " << dumps_dir();
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), 512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction failed: " << e.what();
+    }
+    BlackwellEngine::Impl* impl = engine->get_impl();
+    const ModelConfig& cfg = impl->m_config;
+    ASSERT_EQ(impl->m_linear_layer_index[0], 0) << "layer 0 must be a linear layer";
+
+    const int H = (int)cfg.linear.num_value_heads;
+    const int Dk = (int)cfg.linear.key_head_dim, Dv = (int)cfg.linear.value_head_dim;
+    const size_t hidden = cfg.hidden_dim;
+
+    // Seed the residual stream with the golden token embedding.
+    std::vector<float> embed = load_golden_dump("input_embedding.bin", hidden);
+    CUDA_CHECK(cudaMemcpy(impl->d_X_accum, embed.data(), hidden * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    impl->ssm_state->reset(0);   // zero recurrent + conv state (first token)
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Run the GatedDeltaNet decode step for layer 0.
+    impl->step_linear_attention(0, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // ---- STAGE-BY-STAGE diagnostics vs HF captures (l0_*.bin) ----------------
+    auto stage = [&](const char* name, const float* dptr, size_t n, const std::string& dump) {
+        if (!file_exists(dumps_dir() + "/" + dump)) { std::cout << "  (skip " << dump << ")\n"; return; }
+        std::vector<float> mine(n);
+        CUDA_CHECK(cudaMemcpy(mine.data(), dptr, n * sizeof(float), cudaMemcpyDeviceToHost));
+        std::vector<float> ref = load_golden_dump(dump, n);
+        std::cout << "  [stage] " << name << " cos=" << cosine_similarity(ref, mine) << "\n";
+    };
+    const size_t conv_dim = 2*(size_t)cfg.linear.num_key_heads*Dk + (size_t)H*Dv;
+    stage("mixer_in (post input_layernorm)", impl->d_X_norm,      hidden,   "l0_mixer_in.bin");
+    stage("qkv_proj (in_proj_qkv int4)",     impl->d_ssm_qkv,     conv_dim, "l0_qkv_proj.bin");
+    stage("beta (sigmoid in_proj_b)",        impl->d_ssm_b,       H,        "l0_beta.bin");
+    stage("core (scan output, pre-gate)",    impl->d_ssm_core,    (size_t)H*Dv, "l0_core.bin");
+    stage("gated (RMSNormGated output)",     impl->d_ssm_o,       (size_t)H*Dv, "l0_gated.bin");
+
+    // Mixer output = (residual after) - (embedding before).
+    std::vector<float> after(hidden);
+    CUDA_CHECK(cudaMemcpy(after.data(), impl->d_X_accum, hidden * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    std::vector<float> mixer(hidden);
+    for (size_t i = 0; i < hidden; ++i) mixer[i] = after[i] - embed[i];
+
+    std::vector<float> golden = load_golden_dump("linear_attn_out_layer0.bin", hidden);
+    const double mix_cos = cosine_similarity(golden, mixer);
+    std::cout << "[qwen3.5-hybrid] layer0 mixer-output cosine = " << mix_cos << "\n";
+
+    // Diagnostic: post-step recurrent state vs the dump (layout-sensitive; treated
+    // as a hint, not the parity gate).
+    if (file_exists(dumps_dir() + "/expected_ssm_state.bin")) {
+        const size_t rec = (size_t)H * Dk * Dv;
+        std::vector<float> S(rec);
+        CUDA_CHECK(cudaMemcpy(S.data(), impl->ssm_state->rec_state(0, 0),
+                              rec * sizeof(float), cudaMemcpyDeviceToHost));
+        std::ifstream f(dumps_dir() + "/expected_ssm_state.bin", std::ios::binary);
+        std::vector<float> Sg(rec);
+        f.read(reinterpret_cast<char*>(Sg.data()), rec * sizeof(float));  // layer 0 == first block
+        std::cout << "[qwen3.5-hybrid] layer0 recurrent-state cosine = "
+                  << cosine_similarity(Sg, S) << "\n";
+    }
+
+    EXPECT_GT(mix_cos, kParityThreshold);
+}

@@ -64,7 +64,8 @@ int main() {
                 if (q < -8) q = -8; if (q > 7) q = 7;          // clamp to int4 range
                 const int in_idx = g * GS + j;
                 const int p = in_idx / 8, t = in_idx % 8;      // word + nibble slot
-                packed[(size_t)o * words + p] |= (uint32_t)(q & 0xF) << (4 * t);
+                // compressed-tensors convention: store q+8 as the unsigned nibble.
+                packed[(size_t)o * words + p] |= (uint32_t)((q + 8) & 0xF) << (4 * t);
                 y_ref[o] += x[in_idx] * (float)q * sbf;          // CPU dequant-matmul
             }
         }

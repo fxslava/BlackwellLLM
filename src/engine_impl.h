@@ -29,10 +29,19 @@ struct BlackwellEngine::Impl {
     // layer is full attention), which is how SsmStatePool addresses per-layer state.
     std::unique_ptr<blackwell::ssm::SsmStatePool> ssm_state;
     std::vector<int> m_linear_layer_index;
-    // Scratch for the linear-attention projections (hybrid models only):
-    // d_ssm_qkv holds in_proj_qkv output (conv_dim), d_ssm_z the gate (v_dim).
+    // Scratch for the linear-attention (GatedDeltaNet) decode step (hybrid only).
+    // d_ssm_qkv: in_proj_qkv out (conv_dim); d_ssm_qkv_conv: post-conv1d; q/k/v:
+    // per-value-head split (H*head_dim); z: gate (v_dim); a/b: per-head dt/beta
+    // sources (H); core: scan output; o: gated-normed output. The *_f32 buffers
+    // hold per-layer bf16 params cast to fp32 for the fp32 kernels.
     float* d_ssm_qkv = nullptr;
     float* d_ssm_z   = nullptr;
+    float* d_ssm_qkv_conv = nullptr;
+    float* d_ssm_q = nullptr, *d_ssm_k = nullptr, *d_ssm_v = nullptr;
+    float* d_ssm_a = nullptr, *d_ssm_b = nullptr;
+    float* d_ssm_core = nullptr, *d_ssm_o = nullptr;
+    float* d_dt_bias_f32 = nullptr, *d_A_log_f32 = nullptr;
+    float* d_norm_f32 = nullptr, *d_conv_w_f32 = nullptr;
 
     float *d_X_accum = nullptr;
     float *d_X_norm = nullptr;

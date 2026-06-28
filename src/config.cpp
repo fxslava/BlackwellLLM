@@ -100,6 +100,10 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
     // dimensions were read from, so the two always agree.
     cfg.weight_prefix = j.contains("text_config") ? "model.language_model." : "model.";
 
+    // Qwen3.5 uses zero-centered (1+weight) RMSNorm on its plain norms (NOT the
+    // gated SSM norm). Key on the text model_type so other families keep plain weight.
+    cfg.norm_add_unit_offset = (t.value("model_type", std::string()) == "qwen3_5_text");
+
     // RoPE. Qwen3.5 wraps the parameters in a "rope_parameters" object and applies a
     // PARTIAL rotary (only head_dim * partial_rotary_factor channels are rotated).
     // Flat checkpoints expose a top-level "rope_theta" and rotate the full head.

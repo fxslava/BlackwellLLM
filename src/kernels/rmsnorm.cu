@@ -92,7 +92,8 @@ __global__ void rmsnorm_half_weight_kernel(const float* __restrict__ input,
                                            float* __restrict__ output,
                                            const WT* __restrict__ weight,
                                            size_t hidden_dim,
-                                           float eps)
+                                           float eps,
+                                           bool add_unit_offset)
 {
     size_t row_offset = blockIdx.x * hidden_dim;
     const float* cur_input = input + row_offset;
@@ -117,16 +118,19 @@ __global__ void rmsnorm_half_weight_kernel(const float* __restrict__ input,
 
     float rsqrt = s_rsqrt;
     for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
-        // 🎯 Золотая семантика PyTorch (LlamaRMSNorm):
-        // 1. Умножение на rsqrt
         float norm_val = cur_input[idx] * rsqrt;
-        // 2. Приведение к целевому типу (hidden_states.to(input_dtype))
-        float norm_latched = rms_latch(norm_val, static_cast<WT*>(nullptr));
-        // 3. Умножение на веса слоя
-        float mul_val = norm_latched * rms_to_fp32(weight[idx]);
-
-        // Гарантируем, что lm_head получит побитово идентичный half-буфер
-        cur_output[idx] = rms_latch(mul_val, static_cast<WT*>(nullptr));
+        if (add_unit_offset) {
+            // Qwen3_5RMSNorm: (x * (1 + w)).to(dtype) -- multiply in fp32, latch once
+            // at the end (zero-centered weight). See modeling_qwen3_5.Qwen3_5RMSNorm.
+            float mul_val = norm_val * (1.0f + rms_to_fp32(weight[idx]));
+            cur_output[idx] = rms_latch(mul_val, static_cast<WT*>(nullptr));
+        } else {
+            // Llama / Qwen2.5 semantics: x.to(dtype) * w (latch the normalized input
+            // BEFORE multiplying the weight).
+            float norm_latched = rms_latch(norm_val, static_cast<WT*>(nullptr));
+            float mul_val = norm_latched * rms_to_fp32(weight[idx]);
+            cur_output[idx] = rms_latch(mul_val, static_cast<WT*>(nullptr));
+        }
     }
 }
 
@@ -147,10 +151,11 @@ void launch_rmsnorm_kernel(const float* d_input,
                            const void* d_weight,
                            size_t seq_len,
                            size_t hidden_dim,
-                           float eps)
+                           float eps,
+                           bool add_unit_offset)
 {
     const __nv_bfloat16* bf16_w = reinterpret_cast<const __nv_bfloat16*>(d_weight);
-    rmsnorm_half_weight_kernel<__nv_bfloat16><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, bf16_w, hidden_dim, eps);
+    rmsnorm_half_weight_kernel<__nv_bfloat16><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, bf16_w, hidden_dim, eps, add_unit_offset);
 }
 
 void launch_rmsnorm_fp16_kernel(const float* d_input,
@@ -158,8 +163,9 @@ void launch_rmsnorm_fp16_kernel(const float* d_input,
                                 const void* d_weight,
                                 size_t seq_len,
                                 size_t hidden_dim,
-                                float eps)
+                                float eps,
+                                bool add_unit_offset)
 {
     const __half* fp16_w = reinterpret_cast<const __half*>(d_weight);
-    rmsnorm_half_weight_kernel<__half><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, fp16_w, hidden_dim, eps);
+    rmsnorm_half_weight_kernel<__half><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, fp16_w, hidden_dim, eps, add_unit_offset);
 }

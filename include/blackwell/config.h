@@ -33,6 +33,9 @@ struct ModelConfig {
 
     bool has_qkv_bias;
     bool tie_word_embeddings;
+    // Qwen3.5 plain RMSNorm is zero-centered: output = x_norm * (1 + weight), with
+    // the weight multiply done in fp32 (Gemma-style). Qwen2.5/Llama use plain weight.
+    bool norm_add_unit_offset;
     bool has_qk_norm;             // full-attention layers carry per-head q_norm/k_norm (Qwen3 family)
     bool attn_output_gate;        // gated attention output (Qwen3.5)
 
