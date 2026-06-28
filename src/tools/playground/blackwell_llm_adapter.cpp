@@ -241,9 +241,23 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
     // engine treats forward(token, pos) as position-addressed, so reprefilling
     // from 0 truncates+rewrites this sequence; slots past the new length are
     // never attended to.
-    const bool append = cached.size() <= prompt.size() &&
+    // Incremental KV reuse (APPEND only the new tail) is safe only when the engine
+    // can rewind to an arbitrary prefix. Hybrid linear-attention (SSM) models cannot:
+    // their recurrent state advances with every forward() with no rewind, and the
+    // stop-token handling below even forwards an eos that is never committed to
+    // `cached`, so the resident SSM state and `cached` drift apart. For those models
+    // we DISABLE the optimization -- always zero the recurrent state and reprefill
+    // the whole prompt from pos 0 -- which is the only way to keep the SSM state in
+    // lockstep with the prompt (otherwise the model collapses into repetition).
+    // Dense models keep the fast incremental path; reset_state() is a no-op for them.
+    const bool incremental_safe = !engine_->get_capabilities().requires_ssm_subsystem;
+    const bool append = incremental_safe &&
+                        cached.size() <= prompt.size() &&
                         std::equal(cached.begin(), cached.end(), prompt.begin());
-    if (!append) cached.clear();  // RESET
+    if (!append) {
+        cached.clear();                 // RESET (reprefill the whole prompt from pos 0)
+        engine_->reset_state(seq_id);   // zero recurrent SSM state (no-op if dense)
+    }
 
     int pos = static_cast<int>(cached.size());  // APPEND: start past the reused prefix
     int next = -1;

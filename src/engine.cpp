@@ -486,6 +486,24 @@ void BlackwellEngine::rewind(int seq_id, int pos) {
     pImpl->kv_mgr->rewind(seq_id, pos);
 }
 
+void BlackwellEngine::reset_state(int seq_id) {
+    auto* impl = pImpl.get();
+    // Attention KV (continuous / paged / the dedicated full-attention cache) is
+    // POSITION-ADDRESSED: re-decoding from pos 0 overwrites stale slots, so it
+    // self-heals on reprefill and needs nothing here. The recurrent linear-
+    // attention (SSM) state is the exception -- it accumulates with every forward()
+    // and cannot be rewound -- so it must be zeroed explicitly on a sequence
+    // restart. Dense models have no SSM state: this is then a no-op.
+    if (!impl->ssm_state) return;
+    if (seq_id != 0)
+        throw std::runtime_error(
+            "BlackwellEngine::reset_state: hybrid SSM models are single-sequence "
+            "(seq_id must be 0)");
+    // reset() is stream-0 (the compute stream) ordered, so it composes with the
+    // subsequent decode kernels without an extra device sync.
+    impl->ssm_state->reset(seq_id);
+}
+
 // ============================================================================
 // Shared decoder pipeline: embedding -> N transformer layers -> final norm/head.
 // Leaves the logits for token `pos` in impl->d_logits.

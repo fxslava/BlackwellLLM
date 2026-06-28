@@ -205,6 +205,160 @@ TEST(Qwen35Hybrid, SingleStepLogitParity) {
 }
 
 // ---------------------------------------------------------------------------
+// MULTI-token decode parity (pos > 0). The single-step test above runs only at
+// pos 0, where RoPE is the identity -- so it cannot catch a positional-encoding
+// regression in the full-attention layers. Here we feed a real token sequence one
+// token at a time (pos 0,1,2,...) from a fresh recurrent state and compare the
+// per-position logits against an HF causal forward of the same sequence. This is
+// the gate that proves partial-RoPE + the recurrent SSM stay faithful for pos>0
+// (the autoregressive path the chat loop actually drives).
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, MultiStepDecodeParity) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+    if (!file_exists(dumps_dir() + "/multistep_logits.bin"))
+        GTEST_SKIP() << "multi-step dumps absent in " << dumps_dir()
+                     << " (run generate_qwen35_multistep.py).";
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), 512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction pending: " << e.what();
+    }
+    BlackwellEngine::Impl* impl = engine->get_impl();
+    const ModelConfig& cfg = impl->m_config;
+
+    // Token ids (int32) the HF reference was run on; count == file size / 4.
+    std::vector<int> tokens;
+    {
+        std::ifstream f(dumps_dir() + "/multistep_tokens.bin", std::ios::binary | std::ios::ate);
+        ASSERT_TRUE(f.good());
+        const std::streamsize bytes = f.tellg();
+        f.seekg(0);
+        std::vector<int32_t> raw(bytes / sizeof(int32_t));
+        f.read(reinterpret_cast<char*>(raw.data()), bytes);
+        tokens.assign(raw.begin(), raw.end());
+    }
+    const int N = (int)tokens.size();
+    ASSERT_GT(N, 1) << "need a multi-token sequence to exercise pos>0";
+
+    // HF per-position reference logits [N, vocab].
+    std::vector<float> ref = load_golden_dump("multistep_logits.bin", (size_t)N * cfg.vocab_size);
+
+    // Fresh autoregressive run from an empty recurrent state.
+    if (impl->ssm_state) impl->ssm_state->reset(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto argmax = [](const float* v, size_t n) {
+        return (int)(std::max_element(v, v + n) - v);
+    };
+
+    int argmax_matches = 0;
+    double min_cos = 1.0;
+    std::vector<float> mine(cfg.vocab_size);
+    for (int pos = 0; pos < N; ++pos) {
+        (void)engine->forward(tokens[pos], pos);   // logits for predicting pos+1
+        CUDA_CHECK(cudaMemcpy(mine.data(), impl->d_logits,
+                              cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        const float* rp = ref.data() + (size_t)pos * cfg.vocab_size;
+        std::vector<float> refv(rp, rp + cfg.vocab_size);
+        const double cos = cosine_similarity(refv, mine);
+        const int a_mine = argmax(mine.data(), cfg.vocab_size);
+        const int a_ref  = argmax(rp, cfg.vocab_size);
+        if (a_mine == a_ref) ++argmax_matches;
+        min_cos = std::min(min_cos, cos);
+        std::cout << "  [pos " << pos << "] cos=" << cos
+                  << "  argmax engine=" << a_mine << " ref=" << a_ref
+                  << (a_mine == a_ref ? "" : "  <-- MISMATCH") << "\n";
+    }
+    std::cout << "[qwen3.5-hybrid] multi-step min cosine = " << min_cos
+              << ", argmax matches = " << argmax_matches << "/" << N << "\n";
+
+    // Every position must stay in parity; a positional-encoding regression in the
+    // full-attention layers shows up as cosine DECAY as pos grows (the real failure
+    // mode), so the per-position cosine floor is the load-bearing assertion. Argmax
+    // is a secondary check: near-tied top-2 logits (cos ~0.9999) can flip on bf16
+    // rounding without any bug, so we tolerate a couple while still catching a
+    // genuine collapse (which flips many).
+    EXPECT_GT(min_cos, kParityThreshold);
+    EXPECT_GE(argmax_matches, N - 2);
+}
+
+// ---------------------------------------------------------------------------
+// Regression: reset_state() must zero the recurrent SSM state so a restarted
+// sequence does not decode on top of the previous one. This is the actual root
+// cause of the playground's cross-turn repetition: the KV caches are position-
+// addressed and self-heal on reprefill, but the SSM state has no rewind. We
+// pollute the recurrent state with a few decode steps, then decode token B at
+// pos 0 with and without reset_state(), and compare both to the clean reference.
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, ResetStateClearsRecurrentPollution) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+    if (!file_exists(dumps_dir() + "/multistep_logits.bin"))
+        GTEST_SKIP() << "multi-step dumps absent (run generate_qwen35_multistep.py).";
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), 512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction pending: " << e.what();
+    }
+    BlackwellEngine::Impl* impl = engine->get_impl();
+    const ModelConfig& cfg = impl->m_config;
+
+    std::vector<int> tokens;
+    {
+        std::ifstream f(dumps_dir() + "/multistep_tokens.bin", std::ios::binary | std::ios::ate);
+        ASSERT_TRUE(f.good());
+        const std::streamsize bytes = f.tellg();
+        f.seekg(0);
+        std::vector<int32_t> raw(bytes / sizeof(int32_t));
+        f.read(reinterpret_cast<char*>(raw.data()), bytes);
+        tokens.assign(raw.begin(), raw.end());
+    }
+    ASSERT_GT((int)tokens.size(), 4);
+
+    // Reference: clean decode of token B == tokens[0] at pos 0 (== the first row of
+    // the multi-step reference).
+    std::vector<float> ref = load_golden_dump("multistep_logits.bin", cfg.vocab_size);
+
+    auto decode_B_logits = [&](void) {
+        std::vector<float> v(cfg.vocab_size);
+        (void)engine->forward(tokens[0], /*pos=*/0);
+        CUDA_CHECK(cudaMemcpy(v.data(), impl->d_logits, cfg.vocab_size * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        return v;
+    };
+
+    // POLLUTE: advance the recurrent state with a few unrelated decode steps.
+    if (impl->ssm_state) impl->ssm_state->reset(0);
+    for (int p = 0; p < 4; ++p) (void)engine->forward(tokens[p + 1], p);
+
+    // Decode B at pos 0 WITHOUT resetting -> recurrent state is stale.
+    const std::vector<float> polluted = decode_B_logits();
+    const double cos_polluted = cosine_similarity(ref, polluted);
+
+    // Now reset the recurrent state and decode B again from a clean history.
+    engine->reset_state(0);
+    const std::vector<float> clean = decode_B_logits();
+    const double cos_clean = cosine_similarity(ref, clean);
+
+    std::cout << "[qwen3.5-hybrid] reset_state: cos(polluted)=" << cos_polluted
+              << "  cos(reset)=" << cos_clean << "\n";
+
+    // The reset run must match the clean reference; the polluted run must be visibly
+    // worse (proving the recurrent state actually leaked across the restart).
+    EXPECT_GT(cos_clean, kParityThreshold);
+    EXPECT_LT(cos_polluted, cos_clean);
+}
+
+// ---------------------------------------------------------------------------
 // Isolated GatedDeltaNet parity for linear layer 0. This is the achievable
 // correctness gate for the SSM assembly: the full-logit test above is blocked by
 // the (unimplemented) head_dim-256 full-attention layers, but layer 0 is linear

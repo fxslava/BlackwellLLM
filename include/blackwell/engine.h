@@ -60,6 +60,16 @@ public:
     void fork(int parent_id, int child_id);
     void rewind(int seq_id, int pos);
 
+    // Restart a sequence: zero the recurrent linear-attention (SSM) state so the
+    // next decode begins from an empty history. The attention KV caches are
+    // position-addressed (re-decoding from pos 0 overwrites stale slots), but the
+    // SSM state accumulates with every forward() and has no rewind -- so a hybrid
+    // model MUST call this before reprefilling a fresh/divergent prompt, or the new
+    // sequence decodes on top of the previous conversation's recurrent state
+    // (collapse / repetition). No-op for dense (non-SSM) models. Hybrid models are
+    // single-sequence, so seq_id must be 0 for them.
+    void reset_state(int seq_id = 0);
+
     // Capabilities of the loaded model. fork()/rewind() throw std::runtime_error
     // when supports_cow_branching is false (hybrid SSM models, or Continuous mode).
     ModelCapabilities get_capabilities() const;
