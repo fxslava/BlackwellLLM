@@ -8,6 +8,7 @@
 #include "kernels/bias.cuh"
 #include "kernels/rope.cuh"
 #include "kernels/attention.cuh"
+#include "kernels/full_attention.cuh"
 #include "kernels/swiglu.cuh"
 #include "kernels/sampling.cuh"
 #include "kernels/ssm_kernels.cuh"
@@ -127,6 +128,29 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, size_t max_seq_len, s
         CUDA_CHECK(cudaMalloc(&d_norm_f32,     L.value_head_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_conv_w_f32,   conv_dim * L.conv_kernel_dim * sizeof(float)));
     }
+
+    // Qwen3.5 hybrid gated full-attention layers (head_dim 256). These cannot use
+    // the shared 128-wide attention/KV path, so map absolute layer -> full ordinal
+    // and give them a dedicated continuous FP32 KV cache. attn_output_gate flags
+    // this architecture; Qwen2.5/Llama keep it false and the generic path.
+    m_full_layer_index.assign(m_config.num_layers, -1);
+    if (m_config.attn_output_gate && m_caps.num_full_attention_layers > 0) {
+        int ord = 0;
+        for (size_t i = 0; i < m_config.num_layers; ++i) {
+            const bool is_full = m_config.layer_types.empty() ||
+                                 m_config.layer_types[i] == AttnKind::Full;
+            if (is_full) m_full_layer_index[i] = ord++;
+        }
+        const size_t kv_dim = m_config.num_key_value_heads * m_config.head_dim;
+        m_full_kv_layer_stride = kv_dim * arena.get_max_seq_len();
+        const size_t total = (size_t)m_caps.num_full_attention_layers * m_full_kv_layer_stride;
+        CUDA_CHECK(cudaMalloc(&d_QG,    m_config.num_attention_heads * m_config.head_dim * 2 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_gate,  m_config.num_attention_heads * m_config.head_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_full_k_cache, total * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_full_v_cache, total * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_full_k_cache, 0, total * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_full_v_cache, 0, total * sizeof(float)));
+    }
 }
 
 BlackwellEngine::Impl::~Impl() {
@@ -137,6 +161,7 @@ BlackwellEngine::Impl::~Impl() {
     cudaFree(d_ssm_q); cudaFree(d_ssm_k); cudaFree(d_ssm_v);
     cudaFree(d_ssm_a); cudaFree(d_ssm_b); cudaFree(d_ssm_core); cudaFree(d_ssm_o);
     cudaFree(d_dt_bias_f32); cudaFree(d_A_log_f32); cudaFree(d_norm_f32); cudaFree(d_conv_w_f32);
+    cudaFree(d_QG); cudaFree(d_gate); cudaFree(d_full_k_cache); cudaFree(d_full_v_cache);
 }
 
 // ============================================================================
@@ -314,6 +339,64 @@ void BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
 }
 
 // ============================================================================
+// STAGE 2c: Qwen3.5 hybrid gated FULL-attention layer (head_dim 256). Periodic
+// softmax-attention layers of the hybrid stack. The generic step_attention_* path
+// cannot serve them: q_proj emits a per-head [query|gate] pair (2*head_dim) and
+// head_dim 256 exceeds the shared attention/KV kernel's 128-wide block. This is an
+// unoptimized "make it work" path over a dedicated continuous FP32 KV cache.
+// ============================================================================
+void BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos) {
+    arena.ensure_layer_ready(layer_idx);
+    const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
+    const std::string sa   = base + "self_attn.";
+
+    const int Hq = (int)m_config.num_attention_heads;   // 16
+    const int Hkv = (int)m_config.num_key_value_heads;  // 4
+    const int Dh = (int)m_config.head_dim;              // 256
+    const int rot = (int)m_config.rotary_dim;           // 64 (partial)
+    const size_t q_dim  = (size_t)Hq * Dh;
+    const size_t kv_dim = (size_t)Hkv * Dh;
+
+    // 1. input RMSNorm (Gemma-style 1+weight, bf16 weight) -> d_X_norm.
+    launch_rmsnorm_kernel(d_X_accum, d_X_norm,
+                          arena.get_weight_ptr(base + "input_layernorm.weight"),
+                          1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+
+    // 2. projections. q_proj emits [Hq, 2*Dh] (query|gate); k/v emit [Hkv, Dh].
+    dispatcher.forward(sa + "q_proj", d_X_norm, d_QG, q_dim * 2, m_config.hidden_dim);
+    dispatcher.forward(sa + "k_proj", d_X_norm, d_K,  kv_dim,    m_config.hidden_dim);
+    dispatcher.forward(sa + "v_proj", d_X_norm, d_V,  kv_dim,    m_config.hidden_dim);
+
+    // 3. de-interleave the per-head query|gate pair.
+    launch_qg_split(d_QG, d_Q, d_gate, Hq, Dh);
+
+    // 4. per-head q_norm / k_norm (RMSNorm over head_dim, same 1+weight offset).
+    launch_rmsnorm_kernel(d_Q, d_Q, arena.get_weight_ptr(sa + "q_norm.weight"),
+                          Hq, Dh, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+    launch_rmsnorm_kernel(d_K, d_K, arena.get_weight_ptr(sa + "k_norm.weight"),
+                          Hkv, Dh, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+
+    // 5. partial rotate_half RoPE on Q and K (identity at pos 0). NOTE: the config
+    //    requests interleaved M-RoPE, which this 1D kernel does not implement, so
+    //    positions >= 1 are NOT faithful (already warned at config load).
+    launch_rope_partial_inplace(d_Q, pos, Hq,  Dh, rot, m_config.rope_theta);
+    launch_rope_partial_inplace(d_K, pos, Hkv, Dh, rot, m_config.rope_theta);
+
+    // 6. append K/V into this full-attn layer's dedicated cache, then decode.
+    const int fo = m_full_layer_index[layer_idx];
+    float* d_k_cache = d_full_k_cache + (size_t)fo * m_full_kv_layer_stride;
+    float* d_v_cache = d_full_v_cache + (size_t)fo * m_full_kv_layer_stride;
+    const int msl = (int)arena.get_max_seq_len();
+    launch_kv_append(d_K, d_V, d_k_cache, d_v_cache, pos, Hkv, Dh, msl);
+    launch_full_attention_decode(d_Q, d_k_cache, d_v_cache, d_Attn_out, pos,
+                                 Hq, Hkv, Dh, msl);
+
+    // 7. gate the context: attn_out *= sigmoid(gate), then o_proj into residual.
+    launch_gate_sigmoid_mul(d_Attn_out, d_gate, (int)q_dim);
+    dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, m_config.hidden_dim, q_dim, d_X_accum);
+}
+
+// ============================================================================
 // STAGE 3: Granular MLP
 // ============================================================================
 void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
@@ -445,6 +528,9 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
 
         if (is_linear) {
             impl->step_linear_attention(i, pos);
+        } else if (impl->m_config.attn_output_gate) {
+            // Qwen3.5 hybrid: gated head_dim-256 full-attention (dedicated path).
+            impl->step_full_attention(i, pos);
         } else {
             impl->step_attention_norm(i);
             impl->step_attention_qkv_projections(i);

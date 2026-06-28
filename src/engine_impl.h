@@ -50,6 +50,17 @@ struct BlackwellEngine::Impl {
     float *d_logits = nullptr;
     int *d_next_token = nullptr;
 
+    // Qwen3.5 hybrid FULL-attention scratch + cache (allocated only when the model
+    // uses gated head_dim-256 attention, i.e. m_config.attn_output_gate). These
+    // layers cannot use the shared 128-wide attention/KV path, so they keep a
+    // dedicated continuous FP32 KV cache indexed by m_full_layer_index. d_QG holds
+    // the [num_heads, 2*head_dim] q_proj output (query|gate); d_gate is the split
+    // gate half. Hybrid models never branch, so a single continuous cache suffices.
+    std::vector<int> m_full_layer_index;   // absolute layer -> full-attn ordinal (-1 if linear)
+    float *d_QG = nullptr, *d_gate = nullptr;
+    float *d_full_k_cache = nullptr, *d_full_v_cache = nullptr;
+    size_t m_full_kv_layer_stride = 0;     // floats per layer in each of K/V cache
+
     Impl(const std::string& index_path, size_t max_seq_len, size_t num_gpu_layers,
          BlackwellEngine::KVCacheMode kv_mode);
     ~Impl();
@@ -62,6 +73,9 @@ struct BlackwellEngine::Impl {
     // Linear-attention (SSM) layer: bypasses the KV cache, evolves the recurrent
     // state in SsmStatePool via the conv1d + GatedDeltaNet kernels.
     void step_linear_attention(int layer_idx, int pos);
+    // Qwen3.5 hybrid gated full-attention layer (head_dim 256, q_proj query|gate,
+    // q_norm/k_norm, partial RoPE). Uses the dedicated full-attn KV cache.
+    void step_full_attention(int layer_idx, int pos);
     void step_mlp_norm(int layer_idx);
     void step_mlp_projections(int layer_idx);
     void step_mlp_out(int layer_idx);

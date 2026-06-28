@@ -35,6 +35,7 @@
 //   linear_attn_out_layer{li}.bin [H*Dv]               GatedDeltaNet output o.
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -192,6 +193,15 @@ TEST(Qwen35Hybrid, SingleStepLogitParity) {
     const double cos = cosine_similarity(expected, logits);
     std::cout << "[qwen3.5-hybrid] single-step logit cosine = " << cos << "\n";
     EXPECT_GT(cos, kParityThreshold);
+
+    // Top-1 token must match the HF reference. The two leading logits sit ~0.06
+    // apart, so this guards against a high-cosine result that still flips argmax.
+    auto argmax = [](const std::vector<float>& v) {
+        return (int)(std::max_element(v.begin(), v.end()) - v.begin());
+    };
+    const int mine = argmax(logits), ref = argmax(expected);
+    std::cout << "[qwen3.5-hybrid] top-1 token: engine=" << mine << " ref=" << ref << "\n";
+    EXPECT_EQ(mine, ref);
 }
 
 // ---------------------------------------------------------------------------
