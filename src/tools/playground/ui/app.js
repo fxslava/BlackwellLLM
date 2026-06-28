@@ -126,6 +126,22 @@ function highlightInline(text){
   out += esc(text.slice(last));
   return out;
 }
+// Render-pipeline variant: colour ONLY our known ReAct tags
+// (<tool_call>/<arg>/<finish>/<think>) and escape everything else as plain text.
+// This is the highlighter that runs over markdown code blocks + inline code, so
+// C++ includes (<stdio.h>) and CUDA launch syntax (<<<1, n>>>) are left intact
+// instead of being mis-wrapped as tag-unknown. (The EDITOR overlay deliberately
+// keeps the greedy highlightInline above, so typed hallucinated tags still flag
+// red -- see the textarea placeholder.) Derived from KNOWN_TAGS so the two stay
+// in sync; \b after the name keeps <finished>/<argument> from matching.
+const REACT_TAG_RE = new RegExp("</?(?:" + [...KNOWN_TAGS].join("|") + ")\\b[^>]*>", "gi");
+function highlightKnownTags(text){
+  let out = "", last = 0, m;
+  REACT_TAG_RE.lastIndex = 0;
+  while((m = REACT_TAG_RE.exec(text))){ out += esc(text.slice(last,m.index)); out += hlTag(m[0]); last = m.index+m[0].length; }
+  out += esc(text.slice(last));
+  return out;
+}
 // Editor overlay variant: trailing newline keeps the last line's height.
 function highlight(text){ return highlightInline(text) + "\n"; }
 function syncHL(){ hl.innerHTML = highlight(input.value); hl.parentElement.scrollTop = input.scrollTop; }
@@ -135,11 +151,13 @@ input.addEventListener("scroll", () => { hl.parentElement.scrollTop = input.scro
 /* ---------- Markdown + dual highlighter pipeline (renderer-level) -------------
    Two highlighters, applied to DISJOINT content so they never conflict:
      * highlight.js  -> fenced code blocks in a real programming language
-                        (cpp, c, python, ...). Colourises the source.
-     * XML highlighter (highlightInline) -> prose / raw-HTML tokens, inline code,
-                        and xml/text/unlabelled blocks. Colours <tool_call> etc.
+                        (cpp, c, python, cuda->cpp, ...). Colourises the source.
+     * known-ReAct-tag highlighter (highlightKnownTags) -> prose / raw-HTML tokens,
+                        inline code, and xml/text/unlabelled blocks. Colours ONLY
+                        <tool_call>/<arg>/<finish>/<think>; all other angle-bracket
+                        text (C++ <stdio.h>, CUDA <<<...>>>) is left literal.
    Each markdown token is routed to exactly ONE of them in the renderer, so the
-   XML highlighter never runs over hljs output (and vice-versa), and marked's
+   tag highlighter never runs over hljs output (and vice-versa), and marked's
    <pre>/<code> structure is always well-formed by construction. */
 let markedReady = false;
 function tokenText(t){
@@ -163,29 +181,36 @@ if (window.marked && typeof marked.use === "function") {
         const text = tokenText(token);
         const rawLang = (token && typeof token === "object" && token.lang) ? token.lang : infostring;
         const lang = firstWord(rawLang).toLowerCase();
+        // highlight.js has no 'cuda'/'cu' grammar; CUDA is a C++ superset, so alias
+        // it to cpp (the displayed language- class keeps the original label).
+        const hlLang = (lang === "cuda" || lang === "cu") ? "cpp" : lang;
         // Real source language -> highlight.js. We deliberately do NOT also run the
         // XML highlighter here: inside a ```cpp/```python fence the text is source
         // code, and our protocol tags only live in prose / xml-or-text blocks.
-        if (lang && lang !== "xml" && lang !== "text" && hljsHas(lang)) {
+        if (hlLang && hlLang !== "xml" && hlLang !== "text" && hljsHas(hlLang)) {
           try {
-            const out = hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
+            const out = hljs.highlight(text, { language: hlLang, ignoreIllegals: true }).value;
             return '<pre><code class="hljs language-' + esc(lang) + '">' + out + '</code></pre>';
           } catch (e) { /* fall through to XML highlighter */ }
         }
-        // xml / text / unlabelled / unknown language -> XML tag highlighter.
+        // xml / text / unlabelled / unknown language -> known-ReAct-tag highlighter
+        // ONLY, so an unhighlighted code fence (e.g. ```c with a <stdio.h> include)
+        // keeps its angle-bracket syntax instead of being mangled into fake tags.
         const cls = lang ? ' language-' + esc(lang) : '';
-        return '<pre><code class="xmlhl' + cls + '">' + highlightInline(text) + '</code></pre>';
+        return '<pre><code class="xmlhl' + cls + '">' + highlightKnownTags(text) + '</code></pre>';
       },
-      // Inline `code` -> XML highlighter (tool names, tags typed inline).
+      // Inline `code` -> known-ReAct-tag highlighter (tool names, tags typed
+      // inline). Known-only so inline code like `<stdio.h>` stays literal.
       codespan(token){
-        return '<code>' + highlightInline(tokenText(token)) + '</code>';
+        return '<code>' + highlightKnownTags(tokenText(token)) + '</code>';
       },
       // Raw HTML the model emitted -- e.g. our XML tags. Escape + highlight so the
       // tags are VISIBLE and coloured rather than injected as (invisible) live DOM.
       // Multi-line blocks (a standalone <tool_call>...) become a monospaced card.
+      // Known-only highlighting so stray non-protocol angle brackets stay literal.
       html(token){
         const raw = tokenText(token);
-        const inner = highlightInline(raw);
+        const inner = highlightKnownTags(raw);
         return raw.indexOf("\n") >= 0 ? '<div class="xmlblock">' + inner + '</div>' : inner;
       }
     }
@@ -197,7 +222,7 @@ function renderMarkdown(content){
     try { return marked.parse(content); }
     catch (e) { /* fall through to plain rendering */ }
   }
-  return '<pre class="plain">' + highlightInline(content) + '</pre>';
+  return '<pre class="plain">' + highlightKnownTags(content) + '</pre>';
 }
 
 /* ---------- reasoning (<think>) blocks: DeepSeek-style collapsible cards -------
