@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <fstream>
 #include <string>
 
@@ -38,11 +39,12 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
     --ok:#4ade80; --field:#14151a;
   }
   *{ box-sizing:border-box; }
-  html,body{ margin:0; height:100%; }
+  html,body{ margin:0; }
   body{
     background:var(--bg); color:var(--fg);
     font-family:'Segoe UI',system-ui,-apple-system,sans-serif; font-size:13px;
     padding:20px; -webkit-user-select:none; user-select:none;
+    overflow:hidden;  /* body itself never scrolls; the host fits the window to content */
   }
   h1{ font-size:18px; margin:0; font-weight:650; letter-spacing:.2px; }
   .subtitle{ color:var(--muted); font-size:12px; margin:2px 0 18px; }
@@ -208,10 +210,11 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
   const bridge = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
 
   // Ask the host to size its window to the content so there are no scrollbars.
-  // The +2 guards against sub-pixel DPI rounding reintroducing a vertical bar.
+  // Measure body (content) height, not documentElement (which is clamped to the
+  // viewport and would never let the window shrink). +2 guards DPI rounding.
   function reportSize(){
     try {
-      const h = Math.ceil(document.documentElement.scrollHeight) + 2;
+      const h = Math.ceil(document.body.scrollHeight) + 2;
       if (bridge) bridge.postMessage({ type:'resize', height:h });
     } catch (err) { /* ignore */ }
   }
@@ -298,6 +301,7 @@ private:
     void PushConfigToJs();
     void ResizeToClient();
     void ResizeToContentHeight(int cssHeight);  // fit the window to the page (no scrollbars)
+    void FitWindowToContent();                  // measure the page via ExecuteScript, then fit
     void ReportWebViewUnavailable();
     bool WriteHtmlFile(std::wstring& outUrl);  // returns a file:// URL to the UI
     void BrowseForModelFolder();               // native folder picker -> JS
@@ -381,6 +385,7 @@ void SettingsWindow::OnControllerCreated(ICoreWebView2Controller* controller) {
                 }
                 if (ok) {
                     PushConfigToJs();
+                    FitWindowToContent();
                 } else {
                     COREWEBVIEW2_WEB_ERROR_STATUS status =
                         COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
@@ -504,6 +509,27 @@ void SettingsWindow::ResizeToClient() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     controller_->put_Bounds(rc);
+}
+
+void SettingsWindow::FitWindowToContent() {
+    if (!webview_) {
+        return;
+    }
+    // Measure the laid-out page height directly from C++ (no dependency on a JS
+    // postMessage round-trip firing). scrollHeight comes back as a JSON number.
+    webview_->ExecuteScript(
+        L"document.body.scrollHeight",
+        Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+            [this](HRESULT error, LPCWSTR resultJson) -> HRESULT {
+                if (SUCCEEDED(error) && resultJson) {
+                    const int cssHeight = _wtoi(resultJson);
+                    if (cssHeight > 0) {
+                        ResizeToContentHeight(cssHeight + 2);  // +2: DPI rounding guard
+                    }
+                }
+                return S_OK;
+            })
+            .Get());
 }
 
 void SettingsWindow::ResizeToContentHeight(int cssHeight) {
