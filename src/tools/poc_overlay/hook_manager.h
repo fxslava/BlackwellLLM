@@ -1,0 +1,84 @@
+#pragma once
+#include <windows.h>
+
+#include <functional>
+#include <string>
+
+// A commit/trigger shortcut expressed the same way the Win32 msctls_hotkey32
+// control reports it: `modifiers` is a HOTKEYF_* bitmask (HOTKEYF_CONTROL /
+// HOTKEYF_ALT / HOTKEYF_SHIFT), `vk` is a virtual-key code. A vk of 0 means
+// "unbound" and is never matched.
+struct Shortcut {
+    UINT modifiers = 0;  // HOTKEYF_* bitmask
+    UINT vk = 0;         // virtual-key code
+};
+
+// A lightweight input TRIGGER (not a source of truth).
+//
+// In the UIA-driven architecture the actual typed text is read back from the
+// focused OS control by CaretTracker; this hook's only jobs are:
+//
+//   * Notice that the text field probably changed (any printable key, Enter,
+//     or Backspace) and fire onTrigger so CaretTracker re-polls UIA.
+//   * Maintain a small FALLBACK buffer -- the exact characters the user typed,
+//     translated with ToUnicodeEx against the *foreground* window's keyboard
+//     layout -- for apps (e.g. Telegram/Qt) that expose no usable UIA text or
+//     value pattern. onTrigger carries this buffer so CaretTracker can use it
+//     when UIA comes back empty.
+//   * Detect the configurable commit shortcut and a few clear context-breakers
+//     (caret navigation, Ctrl/Alt/Win chords, mouse clicks) to hide the overlay.
+//
+// The hook no longer tracks caret motion, selection, or editing state in
+// detail -- UIA is authoritative for the displayed string.
+//
+// All state is touched only on the thread that installs the hooks: low-level
+// hook procs run in the context of the installing (UI) thread as it pumps
+// messages, and SetCommitShortcut is likewise called from that thread, so no
+// locking is required.
+class HookManager {
+public:
+    using TextCallback = std::function<void(const std::wstring& fallbackText)>;
+    // `wordBoundary` is true when the keystroke that fired the trigger closed a
+    // word (Space / punctuation / Enter). It rides along so the resolved-text
+    // consumer can gate "run inference now" separately from mere repositioning.
+    using TriggerCallback = std::function<void(const std::wstring& fallbackText, bool wordBoundary)>;
+    using VoidCallback = std::function<void()>;
+
+    struct Callbacks {
+        // "The field changed -- go poll UIA." Carries the current fallback buffer
+        // and whether this keystroke was a word boundary.
+        TriggerCallback onTrigger;
+        // Commit shortcut fired. Carries a snapshot of the fallback buffer.
+        TextCallback onCommit;
+        // Input flow broken (navigation / chord / mouse) -- hide the overlay.
+        VoidCallback onReset;
+    };
+
+    static HookManager& Instance();
+
+    bool Install(Callbacks callbacks);
+    void Uninstall();
+
+    void SetCommitShortcut(const Shortcut& shortcut) { commitShortcut_ = shortcut; }
+    Shortcut GetCommitShortcut() const { return commitShortcut_; }
+
+private:
+    HookManager() = default;
+    ~HookManager();
+    HookManager(const HookManager&) = delete;
+    HookManager& operator=(const HookManager&) = delete;
+
+    static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
+
+    // Returns true if the key event was consumed and must NOT reach the focused
+    // application -- currently only the commit shortcut.
+    bool HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info);
+    void ResetFallback();
+
+    HHOOK keyboardHook_ = nullptr;
+    HHOOK mouseHook_ = nullptr;
+    Callbacks callbacks_;
+    std::wstring fallbackBuffer_;
+    Shortcut commitShortcut_;
+};

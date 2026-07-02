@@ -1,0 +1,220 @@
+#include "hook_manager.h"
+
+#include <commctrl.h>  // HOTKEYF_* modifier flags
+
+#include <cwctype>
+
+namespace {
+// SetWindowsHookEx requires raw function pointers, so the singleton instance
+// is stashed here for the static callbacks to route through.
+HookManager* g_instance = nullptr;
+
+// True while any Ctrl/Alt/Win key is physically down. Shift is intentionally
+// excluded -- it is a normal part of typing capitals and shifted punctuation.
+// NOTE: AltGr surfaces as Ctrl+Alt on many layouts, so AltGr-produced glyphs
+// are treated as a chord (context break) -- an accepted PoC limitation; UIA
+// still reports such characters correctly when it is the source of truth.
+bool IsChordModifierHeld() {
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_MENU) & 0x8000) ||
+           (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
+}
+
+// Standalone modifier/lock keydowns: neither typing nor a context break.
+bool IsModifierKey(DWORD vk) {
+    switch (vk) {
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        case VK_MENU: case VK_LMENU: case VK_RMENU:
+        case VK_LWIN: case VK_RWIN:
+        case VK_CAPITAL: case VK_NUMLOCK: case VK_SCROLL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Caret navigation / focus-changing keys. In the UIA model these no longer need
+// per-key bookkeeping; they simply break the continuous-input flow so we hide
+// the overlay and drop the fallback buffer.
+bool IsContextBreakKey(DWORD vk) {
+    switch (vk) {
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+        case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+        case VK_DELETE: case VK_INSERT:
+        case VK_ESCAPE: case VK_TAB:
+        case VK_APPS: case VK_SNAPSHOT: case VK_PAUSE:
+            return true;
+        default:
+            return vk >= VK_F1 && vk <= VK_F24;  // function keys
+    }
+}
+
+// Exact match of the currently-held modifiers against a shortcut's HOTKEYF_*
+// mask (so e.g. Ctrl+Shift+Enter does not fire a Ctrl+Enter binding).
+bool ModifiersMatch(UINT hotkeyFlags) {
+    const bool wantCtrl = (hotkeyFlags & HOTKEYF_CONTROL) != 0;
+    const bool wantAlt = (hotkeyFlags & HOTKEYF_ALT) != 0;
+    const bool wantShift = (hotkeyFlags & HOTKEYF_SHIFT) != 0;
+    const bool haveCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool haveAlt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    const bool haveShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    return wantCtrl == haveCtrl && wantAlt == haveAlt && wantShift == haveShift;
+}
+}  // namespace
+
+HookManager& HookManager::Instance() {
+    static HookManager instance;
+    return instance;
+}
+
+HookManager::~HookManager() {
+    Uninstall();
+}
+
+bool HookManager::Install(Callbacks callbacks) {
+    callbacks_ = std::move(callbacks);
+    fallbackBuffer_.clear();
+    g_instance = this;
+
+    const HINSTANCE module = GetModuleHandleW(nullptr);
+    keyboardHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &HookManager::LowLevelKeyboardProc, module, 0);
+    mouseHook_ = SetWindowsHookExW(WH_MOUSE_LL, &HookManager::LowLevelMouseProc, module, 0);
+
+    if (!keyboardHook_ || !mouseHook_) {
+        Uninstall();
+        return false;
+    }
+    return true;
+}
+
+void HookManager::Uninstall() {
+    if (keyboardHook_) {
+        UnhookWindowsHookEx(keyboardHook_);
+        keyboardHook_ = nullptr;
+    }
+    if (mouseHook_) {
+        UnhookWindowsHookEx(mouseHook_);
+        mouseHook_ = nullptr;
+    }
+    g_instance = nullptr;
+}
+
+void HookManager::ResetFallback() {
+    fallbackBuffer_.clear();
+    if (callbacks_.onReset) {
+        callbacks_.onReset();
+    }
+}
+
+LRESULT CALLBACK HookManager::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && g_instance) {
+        const auto* info = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (g_instance->HandleKeyEvent(wParam, *info)) {
+            return 1;  // consume the commit shortcut so the app never sees it
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK HookManager::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && g_instance) {
+        // A click can reposition the caret anywhere, breaking the input flow.
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN ||
+            wParam == WM_XBUTTONDOWN) {
+            g_instance->ResetFallback();
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
+    if (wParam != WM_KEYDOWN && wParam != WM_SYSKEYDOWN) {
+        return false;
+    }
+
+    const DWORD vk = info.vkCode;
+
+    // Configurable commit/trigger shortcut. Checked first so its modifier combo
+    // isn't mistaken for a context-breaking chord.
+    const Shortcut commit = commitShortcut_;
+    if (commit.vk != 0 && vk == commit.vk && ModifiersMatch(commit.modifiers)) {
+        std::wstring snapshot = fallbackBuffer_;
+        fallbackBuffer_.clear();
+        if (callbacks_.onCommit) {
+            callbacks_.onCommit(snapshot);
+        }
+        return true;  // consume
+    }
+
+    if (IsModifierKey(vk)) {
+        return false;  // lone Shift/Ctrl/... press
+    }
+    if (IsChordModifierHeld()) {
+        ResetFallback();  // Ctrl+A, Ctrl+V, Alt+Tab, ...
+        return false;
+    }
+    if (IsContextBreakKey(vk)) {
+        ResetFallback();  // arrows / Home / End / Esc / Tab / ...
+        return false;
+    }
+
+    // Backspace: nudge the fallback and re-poll. UIA is authoritative, so even
+    // if our fallback is now empty the actual field may still hold text. Never a
+    // word boundary -- deleting must not trigger inference.
+    if (vk == VK_BACK) {
+        if (!fallbackBuffer_.empty()) {
+            fallbackBuffer_.pop_back();
+        }
+        if (callbacks_.onTrigger) {
+            callbacks_.onTrigger(fallbackBuffer_, /*wordBoundary=*/false);
+        }
+        return false;
+    }
+
+    // Translate the raw virtual key to Unicode using the FOREGROUND window's
+    // keyboard layout (not our own thread's), so the fallback buffer stays
+    // correct across layouts. ToUnicodeEx is allocation-free and safe to call
+    // from inside a low-level hook.
+    const DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    const HKL layout = GetKeyboardLayout(fgThread);
+    BYTE keyState[256] = {};
+    if (!GetKeyboardState(keyState)) {
+        return false;
+    }
+
+    wchar_t chars[8] = {};
+    const int result = ToUnicodeEx(vk, info.scanCode, keyState, chars, 8, 0, layout);
+    if (result <= 0) {
+        return false;  // dead key / no printable character
+    }
+
+    bool typed = false;
+    bool wordBoundary = false;
+    for (int i = 0; i < result; ++i) {
+        const wchar_t c = chars[i];
+        if (std::iswcntrl(c)) {
+            // Enter inserts a newline in multiline fields -- mirror it into the
+            // fallback (overlay renders '\n' as a line break) and treat it as a
+            // word boundary; drop other control characters.
+            if (vk == VK_RETURN) {
+                fallbackBuffer_.push_back(L'\n');
+                typed = true;
+                wordBoundary = true;
+            }
+            continue;
+        }
+        fallbackBuffer_.push_back(c);
+        typed = true;
+        if (c == L' ' || std::iswpunct(c)) {
+            wordBoundary = true;
+        }
+    }
+
+    // Any printable keystroke (alphanumeric / space / punctuation / newline) is
+    // a trigger: tell CaretTracker to re-read the real text from UIA. Separators
+    // additionally flag a word boundary for the inference-gating consumer.
+    if (typed && callbacks_.onTrigger) {
+        callbacks_.onTrigger(fallbackBuffer_, wordBoundary);
+    }
+    return false;
+}

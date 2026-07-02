@@ -187,3 +187,14 @@ option(BUILD_AGENT_PLAYGROUND "Build the GUI Agent Simulator / Prompt Playground
 if(BUILD_AGENT_PLAYGROUND AND BUILD_AGENT_ORCHESTRATOR AND BUILD_AGENT_CORE AND BUILD_AGENT_ENV)
     add_subdirectory(tools/playground)
 endif()
+
+# ==============================================================================
+# 6. POC: input-hook / UIA-caret / D2D-overlay OS pipeline
+# ==============================================================================
+# Isolated feasibility PoC for the overlay-translator UI pipeline. No CUDA, no
+# blackwell_core, no tokenizer -- just Win32 + COM + UI Automation + Direct2D.
+# See src/tools/poc_overlay/CMakeLists.txt.
+option(BUILD_POC_OVERLAY "Build the input-hook/UIA-caret/D2D-overlay OS pipeline PoC" ON)
+if(BUILD_POC_OVERLAY AND WIN32)
+    add_subdirectory(tools/poc_overlay)
+endif()
