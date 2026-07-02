@@ -98,32 +98,50 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
+    // Mock "translation" applied at commit: locale-aware UPPERCASE. std::towupper
+    // mishandles Cyrillic and other scripts, so use the Win32 CharUpperBuffW,
+    // which upper-cases the whole buffer per the current locale's rules. Runs on
+    // the CaretTracker STA thread against the freshly re-resolved source text.
+    auto commitTransform = [](const std::wstring& source) -> std::wstring {
+        std::wstring upper = source;
+        if (!upper.empty()) {
+            CharUpperBuffW(&upper[0], static_cast<DWORD>(upper.size()));
+        }
+        LogMock(L"CommitTranslation", upper);  // later -> real translation
+        return upper;
+    };
+    // Brackets the injection window on the hook so it flags synthetic input.
+    auto injectionGuard = [](bool active) { HookManager::Instance().SetInjecting(active); };
+
     // CaretTracker resolves the authoritative text + caret position on ITS OWN
-    // (COM/UIA STA) thread. The callback runs on that thread and must not touch
-    // the overlay directly -- PostUpdate() marshals the result back to the
-    // overlay window's owning (UI) thread via PostMessage.
-    CaretTracker caretTracker([&overlay](const CaretUpdate& update) {
-        if (update.caretFound) {
-            overlay.PostUpdate(update.text, update.caretScreenPos);
-        }
-        // Word boundary -> mock "OnWordComplete" on the authoritative UIA text.
-        // This is the gate where the full buffer will later be sent to inference.
-        if (update.wordBoundary && !update.text.empty()) {
-            LogMock(L"OnWordComplete", update.text);
-        }
-    });
+    // (COM/UIA STA) thread, and also performs the commit replacement there (so the
+    // UIA interfaces never cross apartments). The update callback runs on that
+    // thread and must not touch the overlay directly -- PostUpdate() marshals the
+    // result back to the overlay window's owning (UI) thread via PostMessage.
+    CaretTracker caretTracker(
+        [&](const CaretUpdate& update) {
+            if (update.caretFound) {
+                overlay.PostUpdate(update.text, update.caretScreenPos);
+            }
+            // Word boundary -> mock "OnWordComplete" on the authoritative UIA text;
+            // the gate where the full buffer will later be sent to inference.
+            if (update.wordBoundary && !update.text.empty()) {
+                LogMock(L"OnWordComplete", update.text);
+            }
+        },
+        commitTransform, injectionGuard);
 
     // The hook callbacks run inline in the global hook chain on THIS thread and
-    // must stay fast. onTrigger only hands the fallback buffer to the caret
-    // tracker's queue (an O(1) lock + condvar notify) -- the actual text read
-    // (UIA round-trip) and D2D paint happen off this call stack entirely.
+    // must stay fast. They only hand work to the caret tracker's queue (an O(1)
+    // lock + condvar notify) -- the UIA round-trip, D2D paint, and the whole
+    // 3-tier replacement happen off this call stack entirely.
     HookManager::Callbacks callbacks;
     callbacks.onTrigger = [&caretTracker](const std::wstring& fallbackText, bool wordBoundary) {
         caretTracker.RequestUpdate(fallbackText, wordBoundary);  // "field changed -> poll UIA"
     };
-    callbacks.onCommit = [&overlay](const std::wstring& text) {
-        LogMock(L"CommitTranslation", text);  // shortcut: later -> commit translation
+    callbacks.onCommit = [&](const std::wstring& fallbackText) {
         overlay.Hide();
+        caretTracker.RequestCommit(fallbackText);  // re-resolve + replace on the STA thread
     };
     callbacks.onReset = [&overlay]() { overlay.Hide(); };
 

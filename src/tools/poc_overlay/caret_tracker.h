@@ -37,8 +37,15 @@ struct CaretUpdate {
 class CaretTracker {
 public:
     using UpdateCallback = std::function<void(const CaretUpdate&)>;
+    // Mock "translation" applied to the source text at commit time, on the STA
+    // thread (so it runs against the freshly re-resolved authoritative text).
+    using TransformCallback = std::function<std::wstring(const std::wstring&)>;
+    // Brackets the text-injection window (true=begin, false=end) so the keyboard
+    // hook can flag that synthetic input is in flight. Wired to HookManager.
+    using InjectionGuard = std::function<void(bool)>;
 
-    explicit CaretTracker(UpdateCallback callback);
+    CaretTracker(UpdateCallback callback, TransformCallback commitTransform,
+                 InjectionGuard injectionGuard);
     ~CaretTracker();
 
     // `fallbackText` is used only if UIA yields no text. `wordBoundary` marks a
@@ -47,6 +54,11 @@ public:
     // (the pending flag is sticky until consumed).
     void RequestUpdate(std::wstring fallbackText, bool wordBoundary);
 
+    // Commit shortcut fired: re-resolve the current text on the STA thread and
+    // replace it (transform -> TextInjector 3-tier). `fallbackText` is the hook's
+    // typed buffer, used for the Tier-3 length when no UIA is available.
+    void RequestCommit(std::wstring fallbackText);
+
 private:
     void ThreadMain();
     // Reads the authoritative text + caret position for the focused control.
@@ -54,14 +66,21 @@ private:
     // placed); update.text is set to the UIA text when available, otherwise to
     // `fallbackText`.
     bool Resolve(IUIAutomation* automation, const std::wstring& fallbackText, CaretUpdate& update);
+    // Runs the commit replacement on the STA thread (gathers UIA context here so
+    // the interfaces stay in their owning apartment).
+    void PerformCommit(IUIAutomation* automation, const std::wstring& fallbackText);
 
     UpdateCallback callback_;
+    TransformCallback transform_;
+    InjectionGuard injectionGuard_;
     std::thread thread_;
 
     std::mutex mutex_;
     std::condition_variable cv_;
     std::wstring pendingFallback_;
     bool pendingWordBoundary_ = false;
+    bool pendingCommit_ = false;
+    std::wstring pendingCommitFallback_;
     bool hasPending_ = false;
     std::atomic<bool> stop_{false};
 };

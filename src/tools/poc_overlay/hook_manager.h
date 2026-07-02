@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 
+#include <atomic>
 #include <functional>
 #include <string>
 
@@ -62,6 +63,12 @@ public:
     void SetCommitShortcut(const Shortcut& shortcut) { commitShortcut_ = shortcut; }
     Shortcut GetCommitShortcut() const { return commitShortcut_; }
 
+    // Guards a text-injection window: while set (and, more robustly, for any event
+    // carrying TextInjector::kInjectedSignature), the keyboard hook passes input
+    // straight through without treating it as user typing. Set it around a
+    // TextInjector::Replace() call so we never re-trigger on our own keystrokes.
+    void SetInjecting(bool injecting) { injecting_.store(injecting, std::memory_order_relaxed); }
+
 private:
     HookManager() = default;
     ~HookManager();
@@ -81,4 +88,5 @@ private:
     Callbacks callbacks_;
     std::wstring fallbackBuffer_;
     Shortcut commitShortcut_;
+    std::atomic<bool> injecting_{false};
 };

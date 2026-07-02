@@ -4,6 +4,8 @@
 #include <UIAutomation.h>
 #include <wrl/client.h>
 
+#include "text_injector.h"
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -42,8 +44,11 @@ bool CaretPointFromRange(IUIAutomationTextRange* range, POINT& out) {
 
 // Primary path: read the active line up to the caret via TextPattern, and the
 // caret's screen point. Returns true only if the text was successfully read.
+// When `outRange` is provided it also receives the [line-start .. caret] range,
+// so the commit path can Select() the exact text it is about to replace.
 bool ReadTextPattern(IUIAutomationElement* focused, std::wstring& outText, POINT& outCaret,
-                     bool& outCaretFound) {
+                     bool& outCaretFound,
+                     ComPtr<IUIAutomationTextRange>* outRange = nullptr) {
     ComPtr<IUnknown> patternUnknown;
     if (FAILED(focused->GetCurrentPattern(UIA_TextPatternId, &patternUnknown)) || !patternUnknown) {
         return false;
@@ -95,7 +100,21 @@ bool ReadTextPattern(IUIAutomationElement* focused, std::wstring& outText, POINT
     }
     outText.assign(bstr, SysStringLen(bstr));
     SysFreeString(bstr);
+    if (outRange) {
+        *outRange = upToCaret;  // hand the exact range to the commit path
+    }
     return true;
+}
+
+// Fetches the focused element's ValuePattern, if any (Tier 1 candidate).
+ComPtr<IUIAutomationValuePattern> GetValuePattern(IUIAutomationElement* focused) {
+    ComPtr<IUIAutomationValuePattern> valuePattern;
+    ComPtr<IUnknown> patternUnknown;
+    if (SUCCEEDED(focused->GetCurrentPattern(UIA_ValuePatternId, &patternUnknown)) &&
+        patternUnknown) {
+        patternUnknown.As(&valuePattern);
+    }
+    return valuePattern;
 }
 
 // Secondary path: whole-control value via ValuePattern (no caret offset).
@@ -119,7 +138,11 @@ bool ReadValuePattern(IUIAutomationElement* focused, std::wstring& outText) {
 
 }  // namespace
 
-CaretTracker::CaretTracker(UpdateCallback callback) : callback_(std::move(callback)) {
+CaretTracker::CaretTracker(UpdateCallback callback, TransformCallback commitTransform,
+                           InjectionGuard injectionGuard)
+    : callback_(std::move(callback)),
+      transform_(std::move(commitTransform)),
+      injectionGuard_(std::move(injectionGuard)) {
     thread_ = std::thread(&CaretTracker::ThreadMain, this);
 }
 
@@ -147,6 +170,17 @@ void CaretTracker::RequestUpdate(std::wstring fallbackText, bool wordBoundary) {
     cv_.notify_all();
 }
 
+void CaretTracker::RequestCommit(std::wstring fallbackText) {
+    // Also O(1) and hook-safe: hand the commit to the STA worker, where the UIA
+    // interfaces live and where the (blocking, clipboard-sleeping) replacement
+    // can run without stalling the UI thread.
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingCommit_ = true;
+    pendingCommitFallback_ = std::move(fallbackText);
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
 void CaretTracker::ThreadMain() {
     // UI Automation client calls require an STA on the calling thread. This
     // worker exists solely to own that apartment so the UIA text/caret round-trip
@@ -160,16 +194,32 @@ void CaretTracker::ThreadMain() {
     while (true) {
         std::wstring fallback;
         bool wordBoundary = false;
+        bool doCommit = false;
+        std::wstring commitFallback;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] { return hasPending_ || stop_; });
             if (stop_) {
                 break;
             }
+            if (pendingCommit_) {
+                doCommit = true;
+                commitFallback = std::move(pendingCommitFallback_);
+                pendingCommit_ = false;
+            }
             fallback = std::move(pendingFallback_);
             wordBoundary = pendingWordBoundary_;
             pendingWordBoundary_ = false;
             hasPending_ = false;
+        }
+
+        // A commit replaces the text and hides the overlay, so it supersedes any
+        // coalesced display update in the same wake-up.
+        if (doCommit) {
+            if (SUCCEEDED(hrAutomation)) {
+                PerformCommit(automation.Get(), commitFallback);
+            }
+            continue;
         }
 
         CaretUpdate update;
@@ -230,4 +280,53 @@ bool CaretTracker::Resolve(IUIAutomation* automation, const std::wstring& fallba
         update.text = fallbackText;
     }
     return update.caretFound;
+}
+
+void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& fallbackText) {
+    // Flag the injection window so the keyboard hook treats the upcoming
+    // synthetic input as ours (belt-and-suspenders alongside the dwExtraInfo tag).
+    if (injectionGuard_) {
+        injectionGuard_(true);
+    }
+
+    // Gather the UIA context HERE, on the STA thread, so the interfaces we pass to
+    // TextInjector stay in their owning apartment. Re-resolving (rather than
+    // reusing a cached range) keeps us in sync with the field's current state.
+    ComPtr<IUIAutomationTextRange> range;
+    ComPtr<IUIAutomationValuePattern> valuePattern;
+    std::wstring source;
+
+    ComPtr<IUIAutomationElement> focused;
+    if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused) {
+        POINT caretIgnored{};
+        bool caretFoundIgnored = false;
+        std::wstring text;
+        if (ReadTextPattern(focused.Get(), text, caretIgnored, caretFoundIgnored, &range)) {
+            source = text;  // authoritative line-up-to-caret
+        }
+        valuePattern = GetValuePattern(focused.Get());
+        if (source.empty() && valuePattern) {
+            BSTR value = nullptr;
+            if (SUCCEEDED(valuePattern->get_CurrentValue(&value)) && value) {
+                source.assign(value, SysStringLen(value));
+                SysFreeString(value);
+            }
+        }
+    }
+
+    if (source.empty()) {
+        source = fallbackText;  // UIA-opaque app -> Tier 3 uses the typed buffer
+        range.Reset();          // no valid UIA range to Select() in that case
+    }
+
+    TextInjector::Request request;
+    request.valuePattern = valuePattern.Get();
+    request.selectionRange = range.Get();
+    request.source = source;
+    request.replacement = transform_ ? transform_(source) : source;
+    TextInjector::Replace(request);
+
+    if (injectionGuard_) {
+        injectionGuard_(false);
+    }
 }

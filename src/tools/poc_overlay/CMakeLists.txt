@@ -16,6 +16,7 @@ add_executable(poc_overlay WIN32
     overlay_window.cpp
     tray_icon.cpp
     settings_dialog.cpp
+    text_injector.cpp
 )
 
 # The whole PoC calls the explicit *W (wide) Win32 APIs directly, but

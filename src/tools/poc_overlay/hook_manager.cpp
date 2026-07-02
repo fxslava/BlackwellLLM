@@ -4,6 +4,8 @@
 
 #include <cwctype>
 
+#include "text_injector.h"  // TextInjector::kInjectedSignature
+
 namespace {
 // SetWindowsHookEx requires raw function pointers, so the singleton instance
 // is stashed here for the static callbacks to route through.
@@ -109,7 +111,14 @@ void HookManager::ResetFallback() {
 LRESULT CALLBACK HookManager::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && g_instance) {
         const auto* info = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-        if (g_instance->HandleKeyEvent(wParam, *info)) {
+        // Pass our own injected keystrokes straight through: recognized by the
+        // dwExtraInfo tag (robust) and, belt-and-suspenders, the injecting_ flag.
+        // TextInjector::Replace runs on this same (UI) thread, so the synthetic
+        // events re-enter here while injecting_ is still set.
+        const bool ownInjection =
+            info->dwExtraInfo == TextInjector::kInjectedSignature ||
+            g_instance->injecting_.load(std::memory_order_relaxed);
+        if (!ownInjection && g_instance->HandleKeyEvent(wParam, *info)) {
             return 1;  // consume the commit shortcut so the app never sees it
         }
     }
