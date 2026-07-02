@@ -7,12 +7,17 @@
 #include "hook_manager.h"  // Shortcut
 
 // Persisted application configuration. Shortcuts use the same HOTKEYF_* / vk
-// encoding as everything else in this PoC (see Shortcut).
+// encoding as everything else in this PoC (see Shortcut). The inference fields
+// mirror the playground server's generation settings.
 struct Config {
-    Shortcut activationShortcut{HOTKEYF_CONTROL | HOTKEYF_SHIFT, VK_SPACE};
-    Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};
-    std::wstring modelPath;
-    int contextSize = 4096;
+    Shortcut activationShortcut{HOTKEYF_CONTROL | HOTKEYF_SHIFT, 'T'};  // Ctrl+Shift+T
+    Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};                // Ctrl+Enter
+
+    std::wstring modelPath;    // weights directory / file
+    int contextSize = 4096;    // KV-cache / context window (tokens)
+    float temperature = 0.7f;  // sampling temperature   [0.0 .. 2.0]
+    float topP = 0.95f;        // nucleus sampling cutoff [0.0 .. 1.0]
+    int maxTokens = 1024;      // max tokens to generate
 };
 
 namespace ConfigStore {

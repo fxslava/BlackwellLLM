@@ -17,126 +17,217 @@ namespace {
 constexpr wchar_t kClassName[] = L"BlackwellPocSettingsWindow";
 HWND g_openWindow = nullptr;  // single-instance guard
 
-// Modern settings UI. Shortcut fields are "key capture" boxes: click, press the
-// combo, and JS records the modifiers + Windows virtual-key (event.keyCode maps
-// to VK_* for the keys we care about). ASCII-only so it is safe to embed as a
-// wide raw string literal regardless of source encoding.
-constexpr wchar_t kHtml[] = LR"HTML(<!doctype html>
-<html><head><meta charset="utf-8"><style>
-  :root{color-scheme:dark;}
-  *{box-sizing:border-box;}
-  body{font-family:'Segoe UI',system-ui,sans-serif;background:#1e1e22;color:#eaeaea;margin:0;padding:22px;}
-  h1{font-size:17px;margin:0 0 4px;}
-  p.sub{margin:0 0 18px;color:#8a9099;font-size:12px;}
-  .card{background:#26262c;border:1px solid #34343c;border-radius:10px;padding:16px;margin-bottom:14px;}
-  .card h2{font-size:13px;margin:0 0 12px;color:#c7ccd1;font-weight:600;}
-  label{display:block;font-size:12px;color:#9aa0a6;margin:10px 0 6px;}
-  label:first-child{margin-top:0;}
-  input[type=text],input[type=number]{width:100%;background:#17171b;border:1px solid #3a3a42;border-radius:6px;color:#eaeaea;padding:8px 10px;font-size:13px;}
-  .capture{width:100%;background:#17171b;border:1px solid #3a3a42;border-radius:6px;color:#eaeaea;padding:9px 10px;font-size:13px;cursor:pointer;user-select:none;}
-  .capture:focus,.capture.active{outline:none;border-color:#4c8bf5;box-shadow:0 0 0 2px rgba(76,139,245,.28);}
-  .row{display:flex;gap:12px;}
-  .row>div{flex:1;}
-  .bar{display:flex;align-items:center;margin-top:4px;}
-  button{background:#4c8bf5;border:none;border-radius:6px;color:#fff;padding:10px 20px;font-size:13px;font-weight:600;cursor:pointer;}
-  button:hover{background:#3f7ae0;}
-  #status{margin-left:14px;font-size:12px;color:#57d97e;opacity:0;transition:opacity .2s;}
-  #status.show{opacity:1;}
-</style></head>
+// Settings UI. Stored as a NARROW UTF-8 raw string literal (R"HTML(...)HTML") so
+// there is zero backslash/quote escaping to get wrong, then converted to UTF-16
+// for NavigateToString. The hotkey fields are readonly <input> boxes that capture
+// keydown and record { modifiers, vk } (event.keyCode maps to Windows VK_*). All
+// IPC handlers are wrapped in try/catch so a single bad message can't blank the UI.
+constexpr char kHtml[] = R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#191a1f; --card:#232530; --card2:#1d1f27; --line:#33363f;
+    --fg:#e9eaee; --muted:#9aa0ad; --accent:#5b8cff; --accent2:#3f6fe0;
+    --ok:#4ade80; --field:#14151a;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; }
+  body{
+    background:var(--bg); color:var(--fg);
+    font-family:'Segoe UI',system-ui,-apple-system,sans-serif; font-size:13px;
+    padding:20px; -webkit-user-select:none; user-select:none;
+  }
+  h1{ font-size:18px; margin:0; font-weight:650; letter-spacing:.2px; }
+  .subtitle{ color:var(--muted); font-size:12px; margin:2px 0 18px; }
+  .card{ background:var(--card); border:1px solid var(--line);
+    border-radius:12px; padding:16px 16px 18px; margin-bottom:14px; }
+  .card > h2{ font-size:12px; text-transform:uppercase; letter-spacing:.6px;
+    color:var(--muted); margin:0 0 14px; font-weight:600; }
+  .field{ margin-bottom:12px; }
+  .field:last-child{ margin-bottom:0; }
+  label{ display:block; color:var(--muted); font-size:11.5px; margin-bottom:6px; }
+  input{
+    width:100%; background:var(--field); color:var(--fg);
+    border:1px solid var(--line); border-radius:8px; padding:9px 11px;
+    font-size:13px; font-family:inherit; outline:none; transition:border-color .12s, box-shadow .12s;
+  }
+  input:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.22); }
+  input[readonly]{ cursor:pointer; }
+  input[readonly]:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.28); }
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .footer{ display:flex; align-items:center; gap:14px; margin-top:4px; }
+  button{
+    background:var(--accent); color:#fff; border:none; border-radius:8px;
+    padding:10px 22px; font-size:13px; font-weight:600; cursor:pointer;
+    font-family:inherit; transition:background .12s;
+  }
+  button:hover{ background:var(--accent2); }
+  button:active{ transform:translateY(1px); }
+  #toast{ color:var(--ok); font-size:12.5px; font-weight:600; opacity:0;
+    transform:translateX(-6px); transition:opacity .2s, transform .2s; }
+  #toast.show{ opacity:1; transform:translateX(0); }
+  .hint{ color:var(--muted); font-size:11px; margin-top:6px; }
+</style>
+</head>
 <body>
   <h1>Blackwell Overlay</h1>
-  <p class="sub">Live translation assistant settings</p>
+  <div class="subtitle">Live translation assistant &mdash; settings</div>
 
   <div class="card">
     <h2>Shortcuts</h2>
-    <label>Activation shortcut (toggle assistant on/off)</label>
-    <div class="capture" id="capActivation" tabindex="0">Click, then press keys</div>
-    <label>Commit shortcut (replace typed text with translation)</label>
-    <div class="capture" id="capCommit" tabindex="0">Click, then press keys</div>
+    <div class="field">
+      <label for="activation">Activation shortcut (toggle assistant on / off)</label>
+      <input type="text" id="activation" readonly placeholder="Click, then press keys">
+    </div>
+    <div class="field">
+      <label for="commit">Commit shortcut (replace typed text with translation)</label>
+      <input type="text" id="commit" readonly placeholder="Click, then press keys">
+    </div>
   </div>
 
   <div class="card">
-    <h2>Model configuration</h2>
-    <label>Model path</label>
-    <input type="text" id="modelPath" placeholder="C:\models\model.gguf" spellcheck="false">
-    <div class="row">
-      <div>
-        <label>Context size (tokens)</label>
+    <h2>Model &amp; inference</h2>
+    <div class="field">
+      <label for="modelPath">Model path (weights directory)</label>
+      <input type="text" id="modelPath" spellcheck="false" placeholder="C:\models\my-model">
+    </div>
+    <div class="grid">
+      <div class="field">
+        <label for="contextSize">Context size (tokens)</label>
         <input type="number" id="contextSize" min="512" max="1048576" step="512">
+      </div>
+      <div class="field">
+        <label for="maxTokens">Max tokens</label>
+        <input type="number" id="maxTokens" min="1" max="1048576" step="1">
+      </div>
+      <div class="field">
+        <label for="temperature">Temperature (0.0 &ndash; 2.0)</label>
+        <input type="number" id="temperature" min="0" max="2" step="0.1">
+      </div>
+      <div class="field">
+        <label for="topP">Top P (0.0 &ndash; 1.0)</label>
+        <input type="number" id="topP" min="0" max="1" step="0.05">
       </div>
     </div>
   </div>
 
-  <div class="bar">
-    <button id="save">Save</button>
-    <span id="status">Saved</span>
+  <div class="footer">
+    <button id="save" type="button">Save</button>
+    <span id="toast">Saved</span>
   </div>
 
 <script>
+  "use strict";
   const HK = { SHIFT:1, CONTROL:2, ALT:4 };
-  const state = { activation:{modifiers:0,vk:0}, commit:{modifiers:0,vk:0} };
+  const MOD_VK = [16, 17, 18, 91, 92]; // Shift/Ctrl/Alt/Win left+right
 
-  function keyName(vk){
-    const m = {8:'Backspace',9:'Tab',13:'Enter',27:'Esc',32:'Space',
-               37:'Left',38:'Up',39:'Right',40:'Down',46:'Delete'};
-    if (m[vk]) return m[vk];
-    if (vk>=65 && vk<=90) return String.fromCharCode(vk);
-    if (vk>=48 && vk<=57) return String.fromCharCode(vk);
-    if (vk>=112 && vk<=123) return 'F'+(vk-111);
-    return 'VK'+vk;
+  const state = {
+    activation: { modifiers:0, vk:0 },
+    commit:     { modifiers:0, vk:0 }
+  };
+
+  function modsFromEvent(e){
+    return (e.ctrlKey ? HK.CONTROL : 0)
+         | (e.shiftKey ? HK.SHIFT : 0)
+         | (e.altKey ? HK.ALT : 0);
   }
+
+  function vkName(vk){
+    const map = {
+      8:'Backspace', 9:'Tab', 13:'Enter', 27:'Esc', 32:'Space',
+      33:'PageUp', 34:'PageDown', 35:'End', 36:'Home',
+      37:'Left', 38:'Up', 39:'Right', 40:'Down', 45:'Insert', 46:'Delete',
+      186:';', 187:'=', 188:',', 189:'-', 190:'.', 191:'/', 192:'`',
+      219:'[', 220:'\\', 221:']', 222:"'"
+    };
+    if (map[vk]) return map[vk];
+    if (vk >= 65 && vk <= 90) return String.fromCharCode(vk);       // A-Z
+    if (vk >= 48 && vk <= 57) return String.fromCharCode(vk);       // 0-9
+    if (vk >= 96 && vk <= 105) return 'Num' + (vk - 96);            // numpad 0-9
+    if (vk >= 112 && vk <= 123) return 'F' + (vk - 111);            // F1-F12
+    return 'Key' + vk;
+  }
+
   function label(sc){
-    if (!sc.vk) return 'Click, then press keys';
-    const p = [];
-    if (sc.modifiers & HK.CONTROL) p.push('Ctrl');
-    if (sc.modifiers & HK.ALT)     p.push('Alt');
-    if (sc.modifiers & HK.SHIFT)   p.push('Shift');
-    p.push(keyName(sc.vk));
-    return p.join(' + ');
+    if (!sc || !sc.vk) return '';
+    const parts = [];
+    if (sc.modifiers & HK.CONTROL) parts.push('Ctrl');
+    if (sc.modifiers & HK.SHIFT)   parts.push('Shift');
+    if (sc.modifiers & HK.ALT)     parts.push('Alt');
+    parts.push(vkName(sc.vk));
+    return parts.join(' + ');
   }
-  function bindCapture(id, key){
+
+  function bindHotkey(id, key){
     const el = document.getElementById(id);
-    el.addEventListener('click', () => { el.classList.add('active'); el.focus(); });
-    el.addEventListener('blur',  () => el.classList.remove('active'));
-    el.addEventListener('keydown', e => {
+    el.addEventListener('keydown', function(e){
       e.preventDefault();
-      if ([16,17,18,91,92].includes(e.keyCode)) return;  // lone modifier
-      state[key] = {
-        modifiers:(e.ctrlKey?HK.CONTROL:0)|(e.altKey?HK.ALT:0)|(e.shiftKey?HK.SHIFT:0),
-        vk:e.keyCode
-      };
-      el.textContent = label(state[key]);
-      el.blur();
+      e.stopPropagation();
+      if (MOD_VK.indexOf(e.keyCode) !== -1) return;  // wait for a real key
+      state[key] = { modifiers: modsFromEvent(e), vk: e.keyCode };
+      el.value = label(state[key]);
     });
   }
-  bindCapture('capActivation','activation');
-  bindCapture('capCommit','commit');
+  bindHotkey('activation', 'activation');
+  bindHotkey('commit', 'commit');
 
-  window.chrome.webview.addEventListener('message', e => {
-    const d = e.data;
-    if (d.type === 'load') {
-      state.activation = d.activation; state.commit = d.commit;
-      document.getElementById('capActivation').textContent = label(state.activation);
-      document.getElementById('capCommit').textContent = label(state.commit);
-      document.getElementById('modelPath').value = d.modelPath || '';
-      document.getElementById('contextSize').value = d.contextSize || 4096;
-    } else if (d.type === 'saved') {
-      const s = document.getElementById('status');
-      s.classList.add('show');
-      setTimeout(() => s.classList.remove('show'), 1500);
+  function applyConfig(cfg){
+    state.activation = cfg.activation || { modifiers:0, vk:0 };
+    state.commit     = cfg.commit     || { modifiers:0, vk:0 };
+    document.getElementById('activation').value  = label(state.activation);
+    document.getElementById('commit').value      = label(state.commit);
+    document.getElementById('modelPath').value   = cfg.modelPath || '';
+    document.getElementById('contextSize').value = cfg.contextSize != null ? cfg.contextSize : 4096;
+    document.getElementById('temperature').value = cfg.temperature != null ? cfg.temperature : 0.7;
+    document.getElementById('topP').value        = cfg.topP != null ? cfg.topP : 0.95;
+    document.getElementById('maxTokens').value   = cfg.maxTokens != null ? cfg.maxTokens : 1024;
+  }
+
+  function showToast(){
+    const t = document.getElementById('toast');
+    t.classList.add('show');
+    setTimeout(function(){ t.classList.remove('show'); }, 1600);
+  }
+
+  const bridge = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
+
+  if (bridge){
+    bridge.addEventListener('message', function(event){
+      try {
+        const msg = event.data;
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'load')  applyConfig(msg);
+        else if (msg.type === 'saved') showToast();
+      } catch (err) {
+        console.error('settings: failed to handle host message', err);
+      }
+    });
+  }
+
+  document.getElementById('save').addEventListener('click', function(){
+    try {
+      const payload = {
+        type: 'save',
+        activation: state.activation,
+        commit: state.commit,
+        modelPath: document.getElementById('modelPath').value,
+        contextSize: parseInt(document.getElementById('contextSize').value, 10) || 4096,
+        temperature: parseFloat(document.getElementById('temperature').value) || 0.0,
+        topP: parseFloat(document.getElementById('topP').value) || 0.0,
+        maxTokens: parseInt(document.getElementById('maxTokens').value, 10) || 1024
+      };
+      if (bridge) bridge.postMessage(payload);
+    } catch (err) {
+      console.error('settings: failed to post save message', err);
     }
   });
-
-  document.getElementById('save').addEventListener('click', () => {
-    window.chrome.webview.postMessage({
-      type:'save',
-      activation: state.activation,
-      commit: state.commit,
-      modelPath: document.getElementById('modelPath').value,
-      contextSize: parseInt(document.getElementById('contextSize').value, 10) || 4096
-    });
-  });
-</script></body></html>)HTML";
+</script>
+</body>
+</html>)HTML";
 
 // Owns the settings window + its WebView2. Heap-allocated; self-deletes on
 // WM_NCDESTROY.
@@ -148,7 +239,7 @@ public:
     bool Create(HWND owner, HINSTANCE hInstance) {
         hwnd_ = CreateWindowExW(0, kClassName, L"Blackwell PoC - Settings",
                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                 CW_USEDEFAULT, CW_USEDEFAULT, 560, 520, owner, nullptr, hInstance,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, 580, 560, owner, nullptr, hInstance,
                                  this);
         if (!hwnd_) {
             return false;
@@ -213,19 +304,15 @@ void SettingsWindow::CreateWebView() {
     }
 }
 
-void SettingsWindow::ReportWebViewUnavailable() {
-    MessageBoxW(hwnd_,
-                L"Could not initialize WebView2.\n\nInstall the Microsoft Edge WebView2 Runtime "
-                L"and reopen Settings.",
-                L"Settings", MB_ICONWARNING | MB_OK);
-    DestroyWindow(hwnd_);
-}
-
 void SettingsWindow::OnControllerCreated(ICoreWebView2Controller* controller) {
     controller_ = controller;
     controller_->get_CoreWebView2(&webview_);
-    ResizeToClient();
+    if (!webview_) {
+        ReportWebViewUnavailable();
+        return;
+    }
 
+    // Register handlers BEFORE navigating so NavigationCompleted / messages fire.
     EventRegistrationToken token{};
     webview_->add_WebMessageReceived(
         Callback<ICoreWebView2WebMessageReceivedEventHandler>(
@@ -250,9 +337,12 @@ void SettingsWindow::OnControllerCreated(ICoreWebView2Controller* controller) {
             .Get(),
         &token);
 
-    webview_->NavigateToString(kHtml);
+    ResizeToClient();
     ShowWindow(hwnd_, SW_SHOW);
     SetForegroundWindow(hwnd_);
+
+    // NavigateToString wants UTF-16; the HTML lives as a UTF-8 raw literal.
+    webview_->NavigateToString(FromUtf8(kHtml).c_str());
 }
 
 void SettingsWindow::PushConfigToJs() {
@@ -264,6 +354,9 @@ void SettingsWindow::PushConfigToJs() {
                    {"vk", config_.commitShortcut.vk}};
     j["modelPath"] = ToUtf8(config_.modelPath);
     j["contextSize"] = config_.contextSize;
+    j["temperature"] = config_.temperature;
+    j["topP"] = config_.topP;
+    j["maxTokens"] = config_.maxTokens;
     if (webview_) {
         webview_->PostWebMessageAsJson(FromUtf8(j.dump()).c_str());
     }
@@ -285,6 +378,9 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
         }
         config_.modelPath = FromUtf8(j.value("modelPath", std::string()));
         config_.contextSize = j.value("contextSize", config_.contextSize);
+        config_.temperature = j.value("temperature", config_.temperature);
+        config_.topP = j.value("topP", config_.topP);
+        config_.maxTokens = j.value("maxTokens", config_.maxTokens);
 
         ConfigStore::Save(config_);  // persist to config.json
         if (onApply_) {
@@ -294,7 +390,7 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
             webview_->PostWebMessageAsJson(LR"({"type":"saved"})");
         }
     } catch (const std::exception&) {
-        // Ignore malformed messages.
+        // Ignore malformed messages rather than crash the UI thread.
     }
 }
 
@@ -305,6 +401,14 @@ void SettingsWindow::ResizeToClient() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     controller_->put_Bounds(rc);
+}
+
+void SettingsWindow::ReportWebViewUnavailable() {
+    MessageBoxW(hwnd_,
+                L"Could not initialize WebView2.\n\nInstall the Microsoft Edge WebView2 Runtime "
+                L"and reopen Settings.",
+                L"Settings", MB_ICONWARNING | MB_OK);
+    DestroyWindow(hwnd_);
 }
 
 LRESULT CALLBACK SettingsWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {

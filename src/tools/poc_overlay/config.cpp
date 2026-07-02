@@ -46,6 +46,9 @@ Config ConfigStore::Load() {
         ReadShortcut(j, "commitShortcut", config.commitShortcut);
         config.modelPath = FromUtf8(j.value("modelPath", std::string()));
         config.contextSize = j.value("contextSize", config.contextSize);
+        config.temperature = j.value("temperature", config.temperature);
+        config.topP = j.value("topP", config.topP);
+        config.maxTokens = j.value("maxTokens", config.maxTokens);
     } catch (const std::exception&) {
         // Malformed file -> fall back to whatever defaults survived.
     }
@@ -58,6 +61,9 @@ bool ConfigStore::Save(const Config& config) {
     j["commitShortcut"] = WriteShortcut(config.commitShortcut);
     j["modelPath"] = ToUtf8(config.modelPath);
     j["contextSize"] = config.contextSize;
+    j["temperature"] = config.temperature;
+    j["topP"] = config.topP;
+    j["maxTokens"] = config.maxTokens;
 
     std::ofstream out(DefaultPath());
     if (!out) {
