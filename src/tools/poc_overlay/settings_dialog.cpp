@@ -1,11 +1,13 @@
 #include "settings_dialog.h"
 
 #include <objbase.h>
+#include <shlobj.h>  // SHCreateDirectoryExW
 #include <wrl.h>
 #include <WebView2.h>
 
 #include <nlohmann/json.hpp>
 
+#include <fstream>
 #include <string>
 
 using Microsoft::WRL::Callback;
@@ -245,6 +247,10 @@ public:
             return false;
         }
         g_openWindow = hwnd_;
+        // Show the host frame immediately so the WebView2 attaches to a window
+        // that already has a real (non-zero) client area.
+        ShowWindow(hwnd_, SW_SHOW);
+        UpdateWindow(hwnd_);
         CreateWebView();
         return true;
     }
@@ -258,6 +264,7 @@ private:
     void PushConfigToJs();
     void ResizeToClient();
     void ReportWebViewUnavailable();
+    bool WriteHtmlFile(std::wstring& outUrl);  // returns a file:// URL to the UI
 
     HWND hwnd_ = nullptr;
     ComPtr<ICoreWebView2Controller> controller_;
@@ -327,22 +334,72 @@ void SettingsWindow::OnControllerCreated(ICoreWebView2Controller* controller) {
             .Get(),
         &token);
 
-    // Push the current config once the page's script is ready to receive it.
+    // Push the config when the page loads; surface a concrete error if the
+    // navigation fails instead of leaving a silent blank page.
     webview_->add_NavigationCompleted(
         Callback<ICoreWebView2NavigationCompletedEventHandler>(
-            [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
-                PushConfigToJs();
+            [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                BOOL ok = FALSE;
+                if (args) {
+                    args->get_IsSuccess(&ok);
+                }
+                if (ok) {
+                    PushConfigToJs();
+                } else {
+                    COREWEBVIEW2_WEB_ERROR_STATUS status =
+                        COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                    if (args) {
+                        args->get_WebErrorStatus(&status);
+                    }
+                    wchar_t msg[160];
+                    wsprintfW(msg,
+                              L"WebView2 failed to load the settings page (error status %d).",
+                              static_cast<int>(status));
+                    MessageBoxW(hwnd_, msg, L"Settings", MB_ICONWARNING | MB_OK);
+                }
                 return S_OK;
             })
             .Get(),
         &token);
 
+    controller_->put_IsVisible(TRUE);
     ResizeToClient();
-    ShowWindow(hwnd_, SW_SHOW);
     SetForegroundWindow(hwnd_);
 
-    // NavigateToString wants UTF-16; the HTML lives as a UTF-8 raw literal.
-    webview_->NavigateToString(FromUtf8(kHtml).c_str());
+    // Prefer navigating to a real file (most reliable, and you can open the same
+    // file in a browser to confirm the HTML renders). Fall back to NavigateToString.
+    std::wstring url;
+    if (WriteHtmlFile(url)) {
+        webview_->Navigate(url.c_str());
+    } else {
+        webview_->NavigateToString(FromUtf8(kHtml).c_str());
+    }
+}
+
+bool SettingsWindow::WriteHtmlFile(std::wstring& outUrl) {
+    wchar_t local[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) == 0) {
+        return false;
+    }
+    const std::wstring dir = std::wstring(local) + L"\\BlackwellPocOverlay";
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);  // ok if it already exists
+
+    const std::wstring path = dir + L"\\settings.html";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out.write(kHtml, static_cast<std::streamsize>(sizeof(kHtml) - 1));  // raw UTF-8 bytes
+    out.close();
+
+    std::wstring url = L"file:///" + path;
+    for (wchar_t& c : url) {
+        if (c == L'\\') {
+            c = L'/';
+        }
+    }
+    outUrl = url;
+    return true;
 }
 
 void SettingsWindow::PushConfigToJs() {
