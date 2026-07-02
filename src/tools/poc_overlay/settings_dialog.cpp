@@ -1,7 +1,8 @@
 #include "settings_dialog.h"
 
 #include <objbase.h>
-#include <shlobj.h>  // SHCreateDirectoryExW
+#include <shlobj.h>     // SHCreateDirectoryExW
+#include <shobjidl.h>   // IFileDialog folder picker
 #include <wrl.h>
 #include <WebView2.h>
 
@@ -73,6 +74,12 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
     transform:translateX(-6px); transition:opacity .2s, transform .2s; }
   #toast.show{ opacity:1; transform:translateX(0); }
   .hint{ color:var(--muted); font-size:11px; margin-top:6px; }
+  .pathrow{ display:flex; gap:8px; align-items:stretch; }
+  .pathrow input{ flex:1 1 auto; min-width:0; }
+  button.secondary{ background:#2b2e39; color:var(--fg); border:1px solid var(--line);
+    padding:9px 14px; font-weight:600; white-space:nowrap; flex:0 0 auto; }
+  button.secondary:hover{ background:#333747; }
+  html,body{ overflow-x:hidden; }
 </style>
 </head>
 <body>
@@ -95,7 +102,10 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
     <h2>Model &amp; inference</h2>
     <div class="field">
       <label for="modelPath">Model path (weights directory)</label>
-      <input type="text" id="modelPath" spellcheck="false" placeholder="C:\models\my-model">
+      <div class="pathrow">
+        <input type="text" id="modelPath" spellcheck="false" placeholder="C:\models\my-model">
+        <button type="button" id="browse" class="secondary">Browse&hellip;</button>
+      </div>
     </div>
     <div class="grid">
       <div class="field">
@@ -197,18 +207,40 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
 
   const bridge = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
 
+  // Ask the host to size its window to the content so there are no scrollbars.
+  // The +2 guards against sub-pixel DPI rounding reintroducing a vertical bar.
+  function reportSize(){
+    try {
+      const h = Math.ceil(document.documentElement.scrollHeight) + 2;
+      if (bridge) bridge.postMessage({ type:'resize', height:h });
+    } catch (err) { /* ignore */ }
+  }
+
   if (bridge){
     bridge.addEventListener('message', function(event){
       try {
         const msg = event.data;
         if (!msg || typeof msg !== 'object') return;
-        if (msg.type === 'load')  applyConfig(msg);
-        else if (msg.type === 'saved') showToast();
+        if (msg.type === 'load') {
+          applyConfig(msg);
+          reportSize();
+        } else if (msg.type === 'modelPath') {
+          if (msg.path) document.getElementById('modelPath').value = msg.path;
+        } else if (msg.type === 'saved') {
+          showToast();
+        }
       } catch (err) {
         console.error('settings: failed to handle host message', err);
       }
     });
   }
+
+  document.getElementById('browse').addEventListener('click', function(){
+    try { if (bridge) bridge.postMessage({ type:'browse' }); }
+    catch (err) { console.error('settings: failed to request folder picker', err); }
+  });
+
+  window.addEventListener('load', reportSize);
 
   document.getElementById('save').addEventListener('click', function(){
     try {
@@ -239,9 +271,11 @@ public:
         : config_(std::move(config)), onApply_(std::move(onApply)) {}
 
     bool Create(HWND owner, HINSTANCE hInstance) {
+        // Initial size is a close guess; the page reports its real height on load
+        // and ResizeToContentHeight() fits the window exactly (no scrollbars).
         hwnd_ = CreateWindowExW(0, kClassName, L"Blackwell PoC - Settings",
                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                 CW_USEDEFAULT, CW_USEDEFAULT, 580, 560, owner, nullptr, hInstance,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, 580, 660, owner, nullptr, hInstance,
                                  this);
         if (!hwnd_) {
             return false;
@@ -263,8 +297,10 @@ private:
     void OnWebMessage(const std::wstring& messageJson);
     void PushConfigToJs();
     void ResizeToClient();
+    void ResizeToContentHeight(int cssHeight);  // fit the window to the page (no scrollbars)
     void ReportWebViewUnavailable();
     bool WriteHtmlFile(std::wstring& outUrl);  // returns a file:// URL to the UI
+    void BrowseForModelFolder();               // native folder picker -> JS
 
     HWND hwnd_ = nullptr;
     ComPtr<ICoreWebView2Controller> controller_;
@@ -422,7 +458,17 @@ void SettingsWindow::PushConfigToJs() {
 void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
     try {
         const json j = json::parse(ToUtf8(messageJson));
-        if (j.value("type", std::string()) != "save") {
+        const std::string type = j.value("type", std::string());
+
+        if (type == "resize") {
+            ResizeToContentHeight(j.value("height", 0));
+            return;
+        }
+        if (type == "browse") {
+            BrowseForModelFolder();
+            return;
+        }
+        if (type != "save") {
             return;
         }
         if (j.contains("activation")) {
@@ -458,6 +504,57 @@ void SettingsWindow::ResizeToClient() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     controller_->put_Bounds(rc);
+}
+
+void SettingsWindow::ResizeToContentHeight(int cssHeight) {
+    if (cssHeight <= 0) {
+        return;
+    }
+    // The page reports its height in CSS pixels; WebView2 maps 1 CSS px to
+    // dpi/96 physical px, so scale to physical to get an exact, scrollbar-free fit.
+    const UINT dpi = GetDpiForWindow(hwnd_);
+    const int clientHeight = MulDiv(cssHeight, static_cast<int>(dpi), 96);
+
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const int clientWidth = client.right - client.left;
+
+    RECT rect{0, 0, clientWidth, clientHeight};
+    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE));
+    const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_EXSTYLE));
+    AdjustWindowRectExForDpi(&rect, style, FALSE, exStyle, dpi);
+
+    SetWindowPos(hwnd_, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ResizeToClient();  // WM_SIZE also does this, but keep the WebView in lockstep
+}
+
+void SettingsWindow::BrowseForModelFolder() {
+    ComPtr<IFileDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog)))) {
+        return;
+    }
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    if (FAILED(dialog->Show(hwnd_))) {
+        return;  // user cancelled
+    }
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(&item)) || !item) {
+        return;
+    }
+    PWSTR path = nullptr;
+    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+        json out;
+        out["type"] = "modelPath";
+        out["path"] = ToUtf8(path);
+        if (webview_) {
+            webview_->PostWebMessageAsJson(FromUtf8(out.dump()).c_str());
+        }
+        CoTaskMemFree(path);
+    }
 }
 
 void SettingsWindow::ReportWebViewUnavailable() {
