@@ -1,12 +1,17 @@
 #pragma once
 #include <windows.h>
 
-#include "hook_manager.h"  // Shortcut
+#include <functional>
 
-// Shows a modal Win32 settings dialog letting the user rebind the commit/trigger
-// shortcut via a standard msctls_hotkey32 control. The dialog is built from an
-// in-memory DLGTEMPLATE (no .rc resource is compiled for this PoC).
+#include "config.h"
+
+// Opens the WebView2-based settings window. It is modeless -- pumped by the main
+// message loop -- and single-instance (a second call just refocuses the existing
+// window). `current` seeds the form. `onApply` is invoked on the UI thread each
+// time the user saves, with the just-persisted Config, so the caller can rebind
+// hotkeys / model settings in memory immediately.
 //
-// `shortcut` is used to seed the control and, on OK, is overwritten with the new
-// binding. Returns true if the user accepted (OK), false on Cancel/close.
-bool ShowSettingsDialog(HWND owner, HINSTANCE hInstance, Shortcut& shortcut);
+// Requires the Microsoft Edge WebView2 Runtime to be installed; if it is missing
+// the function shows a message box and returns without opening a window.
+void ShowSettingsWindow(HWND owner, HINSTANCE hInstance, const Config& current,
+                        std::function<void(const Config&)> onApply);

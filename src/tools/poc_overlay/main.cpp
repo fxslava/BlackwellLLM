@@ -17,12 +17,12 @@
 // A system tray icon provides the only way to exit (no visible window/taskbar
 // entry otherwise).
 #include <windows.h>
-#include <commctrl.h>  // HOTKEYF_* for the default shortcut
 #include <objbase.h>
 
 #include <string>
 
 #include "caret_tracker.h"
+#include "config.h"
 #include "hook_manager.h"
 #include "overlay_window.h"
 #include "settings_dialog.h"
@@ -32,11 +32,23 @@ namespace {
 
 constexpr UINT kTrayIconId = 1;
 
+// The live, in-memory application config. Loaded at startup and rewritten by the
+// settings window; only ever touched on the UI thread.
+Config g_config;
+
 // Mock stand-ins for the eventual inference calls -- surfaced via
 // OutputDebugString so the pipeline can be observed under a debugger / DebugView
 // without any UI of their own.
 void LogMock(const wchar_t* tag, const std::wstring& text) {
     OutputDebugStringW((std::wstring(L"[poc_overlay] ") + tag + L": \"" + text + L"\"\n").c_str());
+}
+
+// Pushes a config into the running app: rebinds hotkeys in memory immediately.
+// (Model path / context size will be handed to the inference engine here later.)
+void ApplyConfig(const Config& config) {
+    g_config = config;
+    HookManager::Instance().SetCommitShortcut(config.commitShortcut);
+    HookManager::Instance().SetActivationShortcut(config.activationShortcut);
 }
 
 LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -49,12 +61,10 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             switch (trayIcon->HandleMessage(wParam, lParam)) {
                 case TrayCommand::ShowSettings: {
-                    Shortcut current = HookManager::Instance().GetCommitShortcut();
                     const HINSTANCE hInst =
                         reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-                    if (ShowSettingsDialog(hwnd, hInst, current)) {
-                        HookManager::Instance().SetCommitShortcut(current);
-                    }
+                    ShowSettingsWindow(hwnd, hInst, g_config,
+                                       [](const Config& c) { ApplyConfig(c); });
                     break;
                 }
                 case TrayCommand::Exit:
@@ -152,9 +162,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
-    // Default commit/trigger shortcut: Ctrl+Enter. Rebindable via the tray
-    // "Settings..." dialog.
-    HookManager::Instance().SetCommitShortcut(Shortcut{HOTKEYF_CONTROL, VK_RETURN});
+    // Load persisted settings (config.json next to the exe) and bind the
+    // activation/commit shortcuts. The WebView2 settings window rewrites this
+    // file and calls ApplyConfig() to rebind live.
+    g_config = ConfigStore::Load();
+    ApplyConfig(g_config);
 
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = &ControllerWndProc;

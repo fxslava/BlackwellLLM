@@ -63,6 +63,11 @@ public:
     void SetCommitShortcut(const Shortcut& shortcut) { commitShortcut_ = shortcut; }
     Shortcut GetCommitShortcut() const { return commitShortcut_; }
 
+    // Toggles the whole assistant on/off. While disabled the hook ignores all
+    // input except the activation shortcut itself.
+    void SetActivationShortcut(const Shortcut& shortcut) { activationShortcut_ = shortcut; }
+    Shortcut GetActivationShortcut() const { return activationShortcut_; }
+
     // Guards a text-injection window: while set (and, more robustly, for any event
     // carrying TextInjector::kInjectedSignature), the keyboard hook passes input
     // straight through without treating it as user typing. Set it around a
@@ -88,5 +93,7 @@ private:
     Callbacks callbacks_;
     std::wstring fallbackBuffer_;
     Shortcut commitShortcut_;
+    Shortcut activationShortcut_;
+    bool enabled_ = true;  // toggled by the activation shortcut
     std::atomic<bool> injecting_{false};
 };

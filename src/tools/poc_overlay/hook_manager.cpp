@@ -51,6 +51,15 @@ bool IsContextBreakKey(DWORD vk) {
     }
 }
 
+// True when the foreground window belongs to our own process (e.g. the WebView2
+// settings window). We must not treat typing there as user input into a target
+// app, or the overlay/commit would fire against our own UI.
+bool ForegroundIsOwnProcess() {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    return pid == GetCurrentProcessId();
+}
+
 // Exact match of the currently-held modifiers against a shortcut's HOTKEYF_*
 // mask (so e.g. Ctrl+Shift+Enter does not fire a Ctrl+Enter binding).
 bool ModifiersMatch(UINT hotkeyFlags) {
@@ -142,6 +151,23 @@ bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
     }
 
     const DWORD vk = info.vkCode;
+
+    // Never react to typing in our own windows (e.g. the settings UI).
+    if (ForegroundIsOwnProcess()) {
+        return false;
+    }
+
+    // Activation shortcut: toggle the whole assistant on/off.
+    const Shortcut activation = activationShortcut_;
+    if (activation.vk != 0 && vk == activation.vk && ModifiersMatch(activation.modifiers)) {
+        enabled_ = !enabled_;
+        ResetFallback();  // hide overlay + drop buffer whichever way we toggled
+        return true;      // consume
+    }
+    // While disabled, swallow nothing but do nothing -- only the toggle above works.
+    if (!enabled_) {
+        return false;
+    }
 
     // Configurable commit/trigger shortcut. Checked first so its modifier combo
     // isn't mistaken for a context-breaking chord.

@@ -69,11 +69,22 @@ private:
     // Runs the commit replacement on the STA thread (gathers UIA context here so
     // the interfaces stay in their owning apartment).
     void PerformCommit(IUIAutomation* automation, const std::wstring& fallbackText);
+    // Given the full UIA text before the caret, returns just the segment typed
+    // since the last commit (the part the overlay should show). Resets the commit
+    // boundary if the text no longer starts with the committed prefix.
+    std::wstring StripCommittedPrefix(const std::wstring& fullText);
 
     UpdateCallback callback_;
     TransformCallback transform_;
     InjectionGuard injectionGuard_;
     std::thread thread_;
+
+    // State split: `committedPrefix_` is the text already committed/translated and
+    // still sitting in the field, so the overlay hides it and tracks only the new
+    // segment. `inferenceContext_` keeps the full ORIGINAL history for the AI.
+    // Both are touched only on the worker thread.
+    std::wstring committedPrefix_;
+    std::wstring inferenceContext_;
 
     std::mutex mutex_;
     std::condition_variable cv_;

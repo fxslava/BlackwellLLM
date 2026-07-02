@@ -57,6 +57,18 @@ void SendShiftLeft(size_t count) {
     SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT));
 }
 
+// Ctrl+End -- moves the caret to the very end of the control. Used after a Tier-1
+// SetValue, which otherwise leaves the caret parked at the start of the field.
+void SendCaretToEnd() {
+    std::vector<INPUT> events;
+    AppendModifierRelease(events);
+    AppendKey(events, VK_CONTROL, /*keyUp=*/false);
+    AppendKey(events, VK_END, /*keyUp=*/false, /*extended=*/true);
+    AppendKey(events, VK_END, /*keyUp=*/true, /*extended=*/true);
+    AppendKey(events, VK_CONTROL, /*keyUp=*/true);
+    SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT));
+}
+
 // ---- Clipboard helpers ------------------------------------------------------
 
 bool OpenClipboardWithRetry() {
@@ -150,6 +162,10 @@ Tier Replace(const Request& request) {
                     const HRESULT hr = request.valuePattern->SetValue(replacement);
                     SysFreeString(replacement);
                     if (SUCCEEDED(hr)) {
+                        // SetValue drops the caret at the field start -- move it to
+                        // the end of the new text so the user keeps typing there.
+                        Sleep(kSelectSettleMs);
+                        SendCaretToEnd();
                         return Tier::ValuePattern;
                     }
                 }

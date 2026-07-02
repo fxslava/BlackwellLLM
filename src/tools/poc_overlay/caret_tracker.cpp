@@ -80,15 +80,15 @@ bool ReadTextPattern(IUIAutomationElement* focused, std::wstring& outText, POINT
                                TextPatternRangeEndpoint_End);
     outCaretFound = CaretPointFromRange(caret.Get(), outCaret);
 
-    // Build a range spanning [start of current line .. caret] and read its text.
-    ComPtr<IUIAutomationTextRange> line;
-    if (FAILED(caret->Clone(&line)) || !line) {
+    // Build a range spanning [start of DOCUMENT .. caret] and read its text. Using
+    // the whole document (not just the current line) means multiline input is
+    // captured in full -- both for display and for commit.
+    ComPtr<IUIAutomationTextRange> document;
+    if (FAILED(textPattern->get_DocumentRange(&document)) || !document) {
         return false;
     }
-    line->ExpandToEnclosingUnit(TextUnit_Line);
-
     ComPtr<IUIAutomationTextRange> upToCaret;
-    if (FAILED(line->Clone(&upToCaret)) || !upToCaret) {
+    if (FAILED(document->Clone(&upToCaret)) || !upToCaret) {
         return false;
     }
     upToCaret->MoveEndpointByRange(TextPatternRangeEndpoint_End, caret.Get(),
@@ -254,13 +254,14 @@ bool CaretTracker::Resolve(IUIAutomation* automation, const std::wstring& fallba
         return false;  // no focus -> no anchor
     }
 
-    // (1) Primary: TextPattern line-up-to-caret. This also yields the caret point.
-    bool haveText = ReadTextPattern(focused.Get(), update.text, update.caretScreenPos,
-                                    update.caretFound);
+    // (1) Primary: TextPattern document-up-to-caret. This also yields the caret.
+    std::wstring uiaText;
+    bool haveText =
+        ReadTextPattern(focused.Get(), uiaText, update.caretScreenPos, update.caretFound);
 
     // (1) Secondary: ValuePattern whole-control value.
     if (!haveText) {
-        haveText = ReadValuePattern(focused.Get(), update.text);
+        haveText = ReadValuePattern(focused.Get(), uiaText);
     }
 
     // Caret position fallback: some providers (or the ValuePattern path) give no
@@ -275,11 +276,27 @@ bool CaretTracker::Resolve(IUIAutomation* automation, const std::wstring& fallba
         }
     }
 
-    // (2) Text fallback: the hook's ToUnicodeEx buffer, for UIA-opaque apps.
-    if (!haveText) {
+    if (haveText) {
+        // Show only what was typed since the last commit; the committed text stays
+        // hidden (but lives on in inferenceContext_).
+        update.text = StripCommittedPrefix(uiaText);
+    } else {
+        // (2) UIA-opaque app: the hook's ToUnicodeEx buffer already resets on
+        // commit, so it is the current segment as-is.
         update.text = fallbackText;
     }
     return update.caretFound;
+}
+
+std::wstring CaretTracker::StripCommittedPrefix(const std::wstring& fullText) {
+    if (!committedPrefix_.empty() && fullText.rfind(committedPrefix_, 0) == 0) {
+        return fullText.substr(committedPrefix_.size());
+    }
+    // The field no longer begins with what we committed (user edited into it, or
+    // focus moved elsewhere) -- drop the boundary and its history.
+    committedPrefix_.clear();
+    inferenceContext_.clear();
+    return fullText;
 }
 
 void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& fallbackText) {
@@ -294,7 +311,8 @@ void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& 
     // reusing a cached range) keeps us in sync with the field's current state.
     ComPtr<IUIAutomationTextRange> range;
     ComPtr<IUIAutomationValuePattern> valuePattern;
-    std::wstring source;
+    std::wstring fullText;
+    bool fromUia = false;
 
     ComPtr<IUIAutomationElement> focused;
     if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused) {
@@ -302,29 +320,65 @@ void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& 
         bool caretFoundIgnored = false;
         std::wstring text;
         if (ReadTextPattern(focused.Get(), text, caretIgnored, caretFoundIgnored, &range)) {
-            source = text;  // authoritative line-up-to-caret
+            fullText = text;  // entire document up to the caret (all lines)
+            fromUia = true;
         }
         valuePattern = GetValuePattern(focused.Get());
-        if (source.empty() && valuePattern) {
+        if (!fromUia && valuePattern) {
             BSTR value = nullptr;
             if (SUCCEEDED(valuePattern->get_CurrentValue(&value)) && value) {
-                source.assign(value, SysStringLen(value));
+                fullText.assign(value, SysStringLen(value));
                 SysFreeString(value);
+                fromUia = true;
             }
         }
     }
 
-    if (source.empty()) {
-        source = fallbackText;  // UIA-opaque app -> Tier 3 uses the typed buffer
-        range.Reset();          // no valid UIA range to Select() in that case
+    // Work out the segment typed since the last commit -- that is what we replace,
+    // preserving any already-committed prefix.
+    std::wstring segment;
+    bool haveBoundary = false;
+    if (fromUia) {
+        if (!committedPrefix_.empty() && fullText.rfind(committedPrefix_, 0) == 0) {
+            segment = fullText.substr(committedPrefix_.size());
+            haveBoundary = true;
+        } else {
+            committedPrefix_.clear();
+            inferenceContext_.clear();
+            segment = fullText;
+        }
+    } else {
+        segment = fallbackText;  // UIA-opaque: the hook buffer is the current segment
     }
 
-    TextInjector::Request request;
-    request.valuePattern = valuePattern.Get();
-    request.selectionRange = range.Get();
-    request.source = source;
-    request.replacement = transform_ ? transform_(source) : source;
-    TextInjector::Replace(request);
+    if (!segment.empty()) {
+        const std::wstring target = transform_ ? transform_(segment) : segment;
+
+        TextInjector::Request request;
+        request.source = segment;
+        request.replacement = target;
+        if (fromUia) {
+            // Narrow the range to just the new segment [prefix-end .. caret] so the
+            // earlier committed prefix is preserved by Tier 2.
+            if (haveBoundary && range) {
+                int moved = 0;
+                range->MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character,
+                                          static_cast<int>(committedPrefix_.size()), &moved);
+            }
+            request.selectionRange = range.Get();
+            // SetValue replaces the WHOLE value, so only offer it when nothing is
+            // preserved ahead of the segment.
+            request.valuePattern = haveBoundary ? nullptr : valuePattern.Get();
+        }
+
+        const TextInjector::Tier tier = TextInjector::Replace(request);
+        if (tier != TextInjector::Tier::None && fromUia) {
+            committedPrefix_ += target;    // field now holds prefix + translated segment
+            inferenceContext_ += segment;  // AI history retains the ORIGINAL text
+            OutputDebugStringW(
+                (L"[poc_overlay] InferenceContext: \"" + inferenceContext_ + L"\"\n").c_str());
+        }
+    }
 
     if (injectionGuard_) {
         injectionGuard_(false);
