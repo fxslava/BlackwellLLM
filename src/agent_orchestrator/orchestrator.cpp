@@ -36,9 +36,21 @@ std::string AgentOrchestrator::render_transcript() const {
     return out;
 }
 
+void AgentOrchestrator::seed_history(std::vector<Message> past_context) {
+    history_ = std::move(past_context);
+    // A seed that carries its own leading System turn wins over the config
+    // prompt; anything else leaves injection to run(), which puts the config
+    // prompt at the front so seeded turns always sit behind it.
+    system_injected_ =
+        !history_.empty() && history_.front().role == Message::Role::System;
+}
+
 RunResult AgentOrchestrator::run(const std::string& user_prompt) {
     if (!system_injected_ && !config_.system_prompt.empty()) {
-        history_.push_back({Message::Role::System, config_.system_prompt});
+        // Insert at the FRONT, not the back: seed_history() may already have
+        // populated the transcript, and the system prompt must precede it.
+        history_.insert(history_.begin(),
+                        {Message::Role::System, config_.system_prompt});
     }
     // Mark as injected regardless, so an empty system prompt is not retried and
     // a non-empty one is never duplicated across multi-turn run() calls.
@@ -67,6 +79,23 @@ RunResult AgentOrchestrator::run(const std::string& user_prompt) {
             // usable string (a tool result or an "ERROR: ..." the model can fix).
             const std::string observation = tools_.dispatch(action.tool);
             history_.push_back({Message::Role::Observation, observation});
+
+            // Act-then-finish: honor a <finish> in the remainder of this SAME
+            // completion, so "one tool call, then finish" costs one generation.
+            // Only when the finish is the remainder's EARLIEST action, though:
+            // a second <tool_call> ahead of it is a protocol violation under
+            // the one-tool-per-iteration contract, so it is not dispatched and
+            // the finish behind it is not trusted either -- the model gets the
+            // observation and must produce a fresh turn. The re-parse is as
+            // crash-proof as the first pass (same parser), and <think> spans in
+            // the remainder still neutralize rehearsed tags.
+            const ParsedAction tail =
+                ToolParser::parse(std::string_view(raw).substr(action.end));
+            if (tail.kind == ActionKind::Finish) {
+                result.finished = true;
+                result.answer = tail.finish_text;
+                return result;
+            }
             continue;
         }
 

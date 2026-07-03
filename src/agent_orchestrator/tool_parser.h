@@ -45,6 +45,12 @@ struct ParsedAction {
     ActionKind kind = ActionKind::None;
     ToolInvocation tool;       // valid iff kind == ToolCall
     std::string finish_text;   // valid iff kind == Finish (trimmed)
+    // One past the action element's last byte in the parsed text (just after
+    // "</tool_call>", "/>", or "</finish>"; text.size() for an unterminated
+    // <finish>). 0 when kind == None. Lets the orchestrator re-parse the
+    // remainder of the SAME completion, so a turn that acts and then finishes
+    // ("act-then-finish") settles in one generation.
+    size_t end = 0;
 };
 
 class ToolParser {

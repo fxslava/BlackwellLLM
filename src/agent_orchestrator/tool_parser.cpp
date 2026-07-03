@@ -127,7 +127,10 @@ std::optional<ParsedAction> try_tool_call(std::string_view text, size_t pos) {
     action.tool.name = *name;
 
     // Self-closing form: <tool_call name="x"/> -- valid, simply no body/args.
-    if (open_end > pos && text[open_end - 1] == '/') return action;
+    if (open_end > pos && text[open_end - 1] == '/') {
+        action.end = open_end + 1;
+        return action;
+    }
 
     size_t close = text.find("</tool_call>", open_end + 1);
     if (close == kNpos) return std::nullopt;  // truncated -> not yet actionable
@@ -135,6 +138,7 @@ std::optional<ParsedAction> try_tool_call(std::string_view text, size_t pos) {
     std::string_view body = text.substr(open_end + 1, close - (open_end + 1));
     action.tool.body = std::string(body);
     parse_args(body, action.tool.args);
+    action.end = close + 12;  // strlen("</tool_call>")
     return action;
 }
 
@@ -147,11 +151,15 @@ std::optional<ParsedAction> try_finish(std::string_view text, size_t pos) {
     ParsedAction action;
     action.kind = ActionKind::Finish;
 
-    if (open_end > pos && text[open_end - 1] == '/') return action;  // <finish/>
+    if (open_end > pos && text[open_end - 1] == '/') {  // <finish/>
+        action.end = open_end + 1;
+        return action;
+    }
 
     size_t close = text.find("</finish>", open_end + 1);
     size_t body_end = (close == kNpos) ? text.size() : close;
     action.finish_text = trim(text.substr(open_end + 1, body_end - (open_end + 1)));
+    action.end = (close == kNpos) ? text.size() : close + 9;  // strlen("</finish>")
     return action;
 }
 

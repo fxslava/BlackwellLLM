@@ -138,6 +138,39 @@ TEST(ToolParser, CrashProofOnGarbage) {
 }
 
 // ---------------------------------------------------------------------------
+// ToolParser -- action end offsets (act-then-finish support)
+// ---------------------------------------------------------------------------
+
+TEST(ToolParser, ReportsEndOffsetForToolCall) {
+    const std::string text =
+        "x<tool_call name=\"t\"><arg name=\"a\">1</arg></tool_call>tail";
+    auto a = ToolParser::parse(text);
+    ASSERT_EQ(a.kind, ActionKind::ToolCall);
+    EXPECT_EQ(text.substr(a.end), "tail");
+}
+
+TEST(ToolParser, ReportsEndOffsetForSelfClosingToolCall) {
+    const std::string text = "<tool_call name=\"t\"/><finish>done</finish>";
+    auto a = ToolParser::parse(text);
+    ASSERT_EQ(a.kind, ActionKind::ToolCall);
+    EXPECT_EQ(text.substr(a.end), "<finish>done</finish>");
+}
+
+TEST(ToolParser, ReportsEndOffsetForFinish) {
+    const std::string text = "<finish>ok</finish>rest";
+    auto a = ToolParser::parse(text);
+    ASSERT_EQ(a.kind, ActionKind::Finish);
+    EXPECT_EQ(text.substr(a.end), "rest");
+}
+
+TEST(ToolParser, EndOffsetOfUnterminatedFinishIsTextSize) {
+    const std::string text = "<finish>never closed";
+    auto a = ToolParser::parse(text);
+    ASSERT_EQ(a.kind, ActionKind::Finish);
+    EXPECT_EQ(a.end, text.size());
+}
+
+// ---------------------------------------------------------------------------
 // ToolParser -- reasoning-model <think> chain-of-thought handling
 // ---------------------------------------------------------------------------
 
@@ -350,6 +383,172 @@ TEST(AgentOrchestrator, ReasoningModelToolCallAfterThink) {
     EXPECT_TRUE(r.finished);
     EXPECT_EQ(seen_path, "a.txt");  // the REAL tool call, not the rehearsed "bogus"
     EXPECT_EQ(r.answer, "file read");
+}
+
+// ---------------------------------------------------------------------------
+// AgentOrchestrator -- act-then-finish (one tool call + finish, one generation)
+// ---------------------------------------------------------------------------
+
+TEST(AgentOrchestrator, ActThenFinishSettlesInOneGeneration) {
+    // The strict 1-step translator turn: one tool call AND the finish in the
+    // same completion. The tool must be dispatched, its observation recorded,
+    // and the loop must terminate cleanly WITHOUT a second generate().
+    MockLLM llm({
+        "<tool_call name=\"translate_text\"><arg name=\"text\">hola mundo</arg></tool_call>\n"
+        "<finish>hola mundo</finish>",
+    });
+
+    ToolRegistry reg;
+    std::string delivered;
+    reg.register_tool("translate_text", "captures the translation",
+                      [&](const ToolInvocation& c) {
+                          delivered = c.args.count("text") ? c.args.at("text") : "";
+                          return "delivered";
+                      });
+
+    AgentOrchestrator orch(llm, reg);
+    RunResult r = orch.run("translate: hello world");
+
+    EXPECT_EQ(delivered, "hola mundo");
+    EXPECT_TRUE(r.finished);
+    EXPECT_FALSE(r.max_iterations_hit);
+    EXPECT_EQ(r.iterations, 1);
+    EXPECT_EQ(r.answer, "hola mundo");
+    EXPECT_TRUE(history_has(orch.history(), Message::Role::Observation, "delivered"));
+    ASSERT_EQ(llm.prompts.size(), 1u);  // exactly one generation pass
+}
+
+TEST(AgentOrchestrator, ActThenFinishWorksWithSelfClosingToolCall) {
+    MockLLM llm({"<tool_call name=\"noop\"/> <finish>done</finish>"});
+    ToolRegistry reg;
+    reg.register_tool("noop", "", [](const ToolInvocation&) { return "ok"; });
+    AgentOrchestrator orch(llm, reg);
+    RunResult r = orch.run("go");
+
+    EXPECT_TRUE(r.finished);
+    EXPECT_EQ(r.iterations, 1);
+    EXPECT_EQ(r.answer, "done");
+}
+
+TEST(AgentOrchestrator, RehearsedFinishInRemainderThinkIsNotHonored) {
+    // The finish after the tool call sits inside a <think> span: inert, so the
+    // loop must take a second generation for the real finish.
+    MockLLM llm({
+        "<tool_call name=\"noop\"/><think>maybe <finish>nope</finish>?</think>",
+        "<finish>real</finish>",
+    });
+    ToolRegistry reg;
+    reg.register_tool("noop", "", [](const ToolInvocation&) { return "ok"; });
+    AgentOrchestrator orch(llm, reg);
+    RunResult r = orch.run("go");
+
+    EXPECT_TRUE(r.finished);
+    EXPECT_EQ(r.iterations, 2);
+    EXPECT_EQ(r.answer, "real");
+}
+
+TEST(AgentOrchestrator, SecondToolCallInRemainderIsNotDispatchedAndBlocksFinish) {
+    // One tool call per iteration, strictly: tool #2 in the same turn is never
+    // dispatched, and the finish hiding behind it is not trusted either.
+    MockLLM llm({
+        "<tool_call name=\"a\"/><tool_call name=\"b\"/><finish>sneaky</finish>",
+        "<finish>clean</finish>",
+    });
+    ToolRegistry reg;
+    int a_calls = 0, b_calls = 0;
+    reg.register_tool("a", "", [&](const ToolInvocation&) { ++a_calls; return "ok"; });
+    reg.register_tool("b", "", [&](const ToolInvocation&) { ++b_calls; return "ok"; });
+    AgentOrchestrator orch(llm, reg);
+    RunResult r = orch.run("go");
+
+    EXPECT_EQ(a_calls, 1);
+    EXPECT_EQ(b_calls, 0);
+    EXPECT_TRUE(r.finished);
+    EXPECT_EQ(r.iterations, 2);
+    EXPECT_EQ(r.answer, "clean");
+}
+
+TEST(AgentOrchestrator, ActThenFinishAtIterationCapStillFinishesCleanly) {
+    // max_iterations = 1 (the strict preview budget): a well-behaved
+    // act-then-finish turn must end with finished=true, not the cap.
+    MockLLM llm({"<tool_call name=\"noop\"/><finish>fits the budget</finish>"});
+    ToolRegistry reg;
+    reg.register_tool("noop", "", [](const ToolInvocation&) { return "ok"; });
+    OrchestratorConfig cfg;
+    cfg.max_iterations = 1;
+    AgentOrchestrator orch(llm, reg, cfg);
+    RunResult r = orch.run("go");
+
+    EXPECT_TRUE(r.finished);
+    EXPECT_FALSE(r.max_iterations_hit);
+    EXPECT_EQ(r.answer, "fits the budget");
+}
+
+// ---------------------------------------------------------------------------
+// AgentOrchestrator -- seed_history (durable context injection)
+// ---------------------------------------------------------------------------
+
+TEST(AgentOrchestrator, SeedHistoryKeepsSystemPromptFirst) {
+    MockLLM llm({"<finish>ok</finish>"});
+    ToolRegistry reg;
+    OrchestratorConfig cfg;
+    cfg.system_prompt = "SYSPROMPT";
+    AgentOrchestrator orch(llm, reg, cfg);
+
+    orch.seed_history({
+        {Message::Role::User, "prior source"},
+        {Message::Role::Assistant, "prior translation"},
+    });
+    RunResult r = orch.run("new text");
+    EXPECT_TRUE(r.finished);
+
+    // The config system prompt was inserted at the FRONT, ahead of the seed.
+    const auto& h = orch.history();
+    ASSERT_GE(h.size(), 4u);
+    EXPECT_EQ(h[0].role, Message::Role::System);
+    EXPECT_EQ(h[0].content, "SYSPROMPT");
+    EXPECT_EQ(h[1].content, "prior source");
+
+    // And the rendered transcript preserves that order end to end.
+    ASSERT_EQ(llm.prompts.size(), 1u);
+    const std::string& t = llm.prompts[0];
+    EXPECT_LT(t.find("SYSPROMPT"), t.find("prior source"));
+    EXPECT_LT(t.find("prior source"), t.find("prior translation"));
+    EXPECT_LT(t.find("prior translation"), t.find("new text"));
+}
+
+TEST(AgentOrchestrator, SeededSystemTurnSuppressesConfigPrompt) {
+    MockLLM llm({"<finish>ok</finish>"});
+    ToolRegistry reg;
+    OrchestratorConfig cfg;
+    cfg.system_prompt = "CONFIG-PROMPT";
+    AgentOrchestrator orch(llm, reg, cfg);
+
+    orch.seed_history({
+        {Message::Role::System, "CUSTOM-PROMPT"},
+        {Message::Role::User, "prior"},
+    });
+    orch.run("go");
+
+    int system_count = 0;
+    for (const auto& m : orch.history())
+        if (m.role == Message::Role::System) ++system_count;
+    EXPECT_EQ(system_count, 1);
+    EXPECT_EQ(orch.history()[0].content, "CUSTOM-PROMPT");
+}
+
+TEST(AgentOrchestrator, SeedHistoryReplacesExistingHistory) {
+    MockLLM llm({"<finish>a</finish>", "<finish>b</finish>"});
+    ToolRegistry reg;
+    AgentOrchestrator orch(llm, reg);
+
+    orch.run("first conversation");
+    orch.seed_history({{Message::Role::User, "seeded"}});
+    orch.run("second conversation");
+
+    EXPECT_FALSE(history_has(orch.history(), Message::Role::User, "first conversation"));
+    EXPECT_TRUE(history_has(orch.history(), Message::Role::User, "seeded"));
+    EXPECT_TRUE(history_has(orch.history(), Message::Role::User, "second conversation"));
 }
 
 TEST(AgentOrchestrator, MaxIterationsSafeguard) {

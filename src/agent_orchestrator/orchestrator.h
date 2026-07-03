@@ -20,6 +20,12 @@
 //     <finish> and never converges.
 //   * The loop is exception-safe end to end: parsing never throws and dispatch
 //     never throws, so a run can only end by <finish> or by hitting the cap.
+//   * Act-then-finish: a completion that issues a <tool_call> AND a <finish>
+//     settles in ONE iteration -- the tool is dispatched, its observation is
+//     appended, and the remainder of the same completion is re-parsed for the
+//     <finish>. Containment stays strict: at most one tool call per iteration
+//     is ever dispatched (a second <tool_call> in the remainder is ignored and
+//     also shadows any <finish> behind it, forcing a fresh generation).
 #ifndef BLACKWELL_AGENT_ORCH_ORCHESTRATOR_H
 #define BLACKWELL_AGENT_ORCH_ORCHESTRATOR_H
 
@@ -61,6 +67,15 @@ public:
     // iteration cap. History is preserved across calls so run() can be used for
     // multi-turn conversations; call reset() to start fresh.
     RunResult run(const std::string& user_prompt);
+
+    // Replace the transcript with previously-committed turns before run(), so a
+    // fresh orchestrator can carry durable context (e.g. the TranslationAgent's
+    // committed source/translation pairs) without inlining it into the system
+    // prompt. run() will still inject config_.system_prompt at the FRONT of the
+    // transcript -- unless the seed itself starts with a System turn, which
+    // takes precedence and suppresses the config prompt. Discards any existing
+    // history; call before the first run() of the conversation.
+    void seed_history(std::vector<Message> past_context);
 
     const std::vector<Message>& history() const { return history_; }
     void reset() { history_.clear(); system_injected_ = false; }
