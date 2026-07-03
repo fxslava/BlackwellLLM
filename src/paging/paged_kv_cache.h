@@ -202,6 +202,72 @@ public:
     PageId block_page(SeqId s, int b) const { return m_seqs.at(s).pages.at(b); }
     int    page_ref_count(PageId p)   const { return m_alloc.ref_count(p); }
 
+    // -- prefix-cache / serialization plumbing -------------------------------
+    // Used by RadixTreeIndex, KVBranchSerializer and PrefixCacheManager
+    // (src/paging/radix_tree.h, kv_branch_serializer.h, prefix_cache_manager.h).
+    // The tree and the serializer hold page references OUTSIDE any sequence via
+    // retain/release; a page stays allocated while EITHER a block table or the
+    // radix tree points at it — same ref_count, one owner rule.
+    int    num_layers()   const { return m_num_layers; }
+    int    num_kv_heads() const { return m_num_kv_heads; }
+    int    head_dim()     const { return m_head_dim; }
+    int    total_pages()  const { return m_total_pages; }
+    size_t page_elems()   const { return per_page_elems(); }   // per layer, K or V
+
+    // New sequence whose leading blocks are pre-populated shared pages (radix
+    // prefix hit or a deserialized branch). Increfs every page — the sequence
+    // owns its reference exactly as if it had been fork()ed. `length` must be
+    // <= pages.size() * PAGE_SIZE; appends past it CoW shared pages as usual.
+    SeqId create_sequence_with_pages(const std::vector<PageId>& pages, int length) {
+        SeqId id = create_sequence();
+        BlockTable& bt = seq(id);
+        bt.pages  = pages;
+        bt.length = length;
+        for (PageId p : bt.pages) m_alloc.incref(p);
+        return id;
+    }
+
+    // Raw page ownership for non-sequence holders (deserializer fills a page
+    // before any block table exists). allocate_raw_page returns ref==1 owned by
+    // the caller; balance with release_page (or transfer via retain elsewhere).
+    PageId allocate_raw_page()      { return m_alloc.allocate(); }
+    void   retain_page(PageId p)    { m_alloc.incref(p); }
+    void   release_page(PageId p)   { m_alloc.decref(p); }
+
+    // Copy ONE layer's K/V of one physical page to/from host memory (h_k / h_v
+    // hold page_elems() kv_t each). Resident layers move device<->host on
+    // `stream` (use pinned buffers + sync before touching the bytes); offloaded
+    // layers hit the pinned host mirror synchronously — the mirror IS the truth
+    // for them, no staging slab round-trip.
+    void read_page(int layer, PageId p, kv_t* h_k, kv_t* h_v,
+                   cudaStream_t stream = 0) const {
+        const size_t pp = per_page_elems(), bytes = pp * sizeof(kv_t);
+        const size_t off = (size_t)p * pp;
+        if (layer_is_offloaded(layer)) {
+            std::memcpy(h_k, host_k_base(layer) + off, bytes);
+            std::memcpy(h_v, host_v_base(layer) + off, bytes);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(h_k, layer_k_pool(layer) + off, bytes,
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_v, layer_v_pool(layer) + off, bytes,
+                                       cudaMemcpyDeviceToHost, stream));
+        }
+    }
+    void write_page(int layer, PageId p, const kv_t* h_k, const kv_t* h_v,
+                    cudaStream_t stream = 0) {
+        const size_t pp = per_page_elems(), bytes = pp * sizeof(kv_t);
+        const size_t off = (size_t)p * pp;
+        if (layer_is_offloaded(layer)) {
+            std::memcpy(host_k_base(layer) + off, h_k, bytes);
+            std::memcpy(host_v_base(layer) + off, h_v, bytes);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(layer_k_pool(layer) + off, h_k, bytes,
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(layer_v_pool(layer) + off, h_v, bytes,
+                                       cudaMemcpyHostToDevice, stream));
+        }
+    }
+
     // -- device views handed to the kernel launchers ------------------------
 
     // Upload this sequence's block table; returns a device pointer valid until
