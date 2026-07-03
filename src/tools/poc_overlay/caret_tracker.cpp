@@ -285,6 +285,9 @@ bool CaretTracker::Resolve(IUIAutomation* automation, const std::wstring& fallba
         // commit, so it is the current segment as-is.
         update.text = fallbackText;
     }
+    // Snapshot AFTER StripCommittedPrefix, which clears the context when the
+    // commit boundary broke -- the consumer must see the same decision.
+    update.inferenceContext = inferenceContext_;
     return update.caretFound;
 }
 
@@ -352,7 +355,8 @@ void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& 
     }
 
     if (!segment.empty()) {
-        const std::wstring target = transform_ ? transform_(segment) : segment;
+        const std::wstring target =
+            transform_ ? transform_(segment, inferenceContext_) : segment;
 
         TextInjector::Request request;
         request.source = segment;

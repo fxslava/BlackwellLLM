@@ -16,6 +16,11 @@ struct CaretUpdate {
     POINT caretScreenPos{};  // the caret point (left/top of the caret rect), screen coords
     bool caretFound = false;
     bool wordBoundary = false;  // the triggering keystroke closed a word (gates inference)
+    // Snapshot of the ORIGINAL (pre-translation) text committed earlier in this
+    // field -- the durable context the TranslationService seeds into the
+    // orchestrator. Empty until the first commit, cleared when the commit
+    // boundary breaks (user edited into the committed prefix / focus moved).
+    std::wstring inferenceContext;
 };
 
 // Owns a dedicated COM/UI-Automation STA worker thread and is the SINGLE SOURCE
@@ -37,9 +42,13 @@ struct CaretUpdate {
 class CaretTracker {
 public:
     using UpdateCallback = std::function<void(const CaretUpdate&)>;
-    // Mock "translation" applied to the source text at commit time, on the STA
-    // thread (so it runs against the freshly re-resolved authoritative text).
-    using TransformCallback = std::function<std::wstring(const std::wstring&)>;
+    // Translation applied to the new segment at commit time, on the STA thread
+    // (so it runs against the freshly re-resolved authoritative text). The
+    // second argument is the accumulated inferenceContext_ -- the ORIGINAL text
+    // of everything committed earlier in this field -- for consistency-aware
+    // translation. May block (bounded); the overlay is hidden during commits.
+    using TransformCallback =
+        std::function<std::wstring(const std::wstring& segment, const std::wstring& context)>;
     // Brackets the text-injection window (true=begin, false=end) so the keyboard
     // hook can flag that synthetic input is in flight. Wired to HookManager.
     using InjectionGuard = std::function<void(bool)>;

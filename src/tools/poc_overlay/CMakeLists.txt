@@ -1,13 +1,15 @@
 # ==============================================================================
-# poc_overlay: standalone PoC proving out the OS-level pipeline a live overlay
-# translator needs:
+# poc_overlay: the live overlay translator -- the full pipeline:
 #   WH_KEYBOARD_LL hook (producer) -> UI Automation caret lookup (COM thread)
+#   -> TranslationService (BlackwellEngine on its own worker thread, driven by
+#      the 1-step AgentOrchestrator ReAct loops)
 #   -> transparent Direct2D overlay window (consumer) -> SendInput/UIA text
 #   replacement, with a WebView2 (Chromium) settings window.
 #
-# Deliberately has ZERO dependency on blackwell_core / CUDA / the tokenizer --
-# this only exercises Win32/COM/UIA/Direct2D/WebView2 plumbing, so it builds and
-# runs standalone without touching the inference engine at all.
+# This target now links the REAL inference stack (blackwell_core + CUDA +
+# agent_orchestrator), mirroring agent_playground. The BlackwellLLMAdapter is
+# compiled in from the playground directory until it moves to a shared library
+# target (it has no playground-specific dependencies).
 # ==============================================================================
 
 add_executable(poc_overlay WIN32
@@ -19,6 +21,15 @@ add_executable(poc_overlay WIN32
     settings_dialog.cpp
     text_injector.cpp
     config.cpp
+    translation_service.cpp
+    ../playground/blackwell_llm_adapter.cpp
+)
+
+target_compile_features(poc_overlay PRIVATE cxx_std_20)
+
+target_include_directories(poc_overlay PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator  # orchestrator headers
+    ${CMAKE_CURRENT_SOURCE_DIR}/../playground             # blackwell_llm_adapter.h
 )
 
 # The whole PoC calls the explicit *W (wide) Win32 APIs directly, but
@@ -61,4 +72,18 @@ target_link_libraries(poc_overlay PRIVATE
     version            # required by the WebView2 static loader
     nlohmann_json::nlohmann_json                       # config.json + WebView2 IPC
     ${WV2_DIR}/build/native/x64/WebView2LoaderStatic.lib
+    blackwell_core       # CUDA engine + tokenizer (PUBLIC-propagates include/ + kernels)
+    agent_orchestrator   # AgentOrchestrator / ToolParser / ToolRegistry
 )
+
+# When the core lib was built with DirectStorage, the engine needs the DS runtime
+# DLLs next to the executable (same block as agent_playground; DS_BIN_DIR is set
+# in src/CMakeLists.txt and inherited here).
+if(USE_DIRECT_STORAGE AND WIN32)
+    add_custom_command(TARGET poc_overlay POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${DS_BIN_DIR}/dstorage.dll"
+        "${DS_BIN_DIR}/dstoragecore.dll"
+        $<TARGET_FILE_DIR:poc_overlay>
+        COMMENT "Copying DirectStorage runtime DLLs next to poc_overlay.exe")
+endif()

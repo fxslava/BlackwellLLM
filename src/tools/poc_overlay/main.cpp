@@ -1,15 +1,19 @@
-// poc_overlay: standalone PoC for the OS-level pipeline behind a live overlay
-// translator -- NO inference/translation logic here, on purpose. It proves out
-// a "UIA-driven single source of truth" pipeline:
+// poc_overlay: the live overlay translator -- the full pipeline from OS input
+// capture to real BlackwellEngine inference and back into the focused control:
 //
 //   [UI thread]      WH_KEYBOARD_LL hook (lightweight TRIGGER + fallback buffer)
 //                        |  RequestUpdate(fallbackText)     [condvar signal]
 //                        v
 //   [COM/UIA thread]  CaretTracker: reads the REAL text from the focused control
-//                      (IUIAutomationTextPattern line-up-to-caret, or
-//                      IUIAutomationValuePattern), plus the caret rectangle. Only
-//                      UIA-opaque apps fall back to the hook's typed buffer.
+//                      (IUIAutomationTextPattern document-up-to-caret, or
+//                      IUIAutomationValuePattern), plus the caret rectangle.
 //                        |  PostUpdate(text, caretPos)      [PostMessage]
+//                        |  word boundary -> RequestPreview [condvar signal]
+//                        |  Ctrl+Enter    -> TranslateBlocking (bounded wait)
+//                        v
+//   [agent worker]    TranslationService: BlackwellLLMAdapter (CUDA engine +
+//                      tokenizer) driven by the 1-step AgentOrchestrator loops.
+//                        |  PostTranslation(text)           [PostMessage]
 //                        v
 //   [UI thread]       OverlayWindow: layered, click-through, D2D-rendered popup
 //                      whose string END anchors just above the caret.
@@ -19,6 +23,7 @@
 #include <windows.h>
 #include <objbase.h>
 
+#include <chrono>
 #include <string>
 
 #include "caret_tracker.h"
@@ -26,22 +31,20 @@
 #include "hook_manager.h"
 #include "overlay_window.h"
 #include "settings_dialog.h"
+#include "translation_service.h"
 #include "tray_icon.h"
 
 namespace {
 
 constexpr UINT kTrayIconId = 1;
 
+// How long a Ctrl+Enter commit may block the CaretTracker STA thread waiting
+// for the engine before falling back to injecting the source unchanged.
+constexpr std::chrono::seconds kCommitTimeout{5};
+
 // The live, in-memory application config. Loaded at startup and rewritten by the
 // settings window; only ever touched on the UI thread.
 Config g_config;
-
-// Mock stand-ins for the eventual inference calls -- surfaced via
-// OutputDebugString so the pipeline can be observed under a debugger / DebugView
-// without any UI of their own.
-void LogMock(const wchar_t* tag, const std::wstring& text) {
-    OutputDebugStringW((std::wstring(L"[poc_overlay] ") + tag + L": \"" + text + L"\"\n").c_str());
-}
 
 // Pushes a config into the running app: rebinds hotkeys in memory immediately.
 // (Model path / context size will be handed to the inference engine here later.)
@@ -108,17 +111,42 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
-    // Mock "translation" applied at commit: locale-aware UPPERCASE. std::towupper
-    // mishandles Cyrillic and other scripts, so use the Win32 CharUpperBuffW,
-    // which upper-cases the whole buffer per the current locale's rules. Runs on
-    // the CaretTracker STA thread against the freshly re-resolved source text.
-    auto commitTransform = [](const std::wstring& source) -> std::wstring {
-        std::wstring upper = source;
-        if (!upper.empty()) {
-            CharUpperBuffW(&upper[0], static_cast<DWORD>(upper.size()));
-        }
-        LogMock(L"CommitTranslation", upper);  // later -> real translation
-        return upper;
+    // Config must be loaded BEFORE the TranslationService: it carries the model
+    // directory and the sampling parameters the engine is constructed with.
+    // (A model-path change in the settings window currently requires a restart;
+    // the engine is built once, on the service's worker thread.)
+    g_config = ConfigStore::Load();
+    ApplyConfig(g_config);
+
+    // The inference stack. Constructed FIRST so it is destroyed LAST: the
+    // CaretTracker STA thread calls into it, so the service must outlive the
+    // tracker. Engine construction (DirectStorage weight streaming) happens on
+    // the service's own worker thread -- this constructor is instant.
+    TranslationService::Settings svcSettings;
+    svcSettings.modelDir = g_config.modelPath;
+    svcSettings.promptCacheDir = g_config.modelPath.empty()
+                                     ? std::wstring()
+                                     : g_config.modelPath + L"\\prompt_cache";
+    svcSettings.maxSeqLen = static_cast<size_t>(g_config.contextSize);
+    svcSettings.temperature = g_config.temperature;
+    svcSettings.topP = g_config.topP;
+    svcSettings.commitMaxNewTokens = g_config.maxTokens;
+    TranslationService translator(
+        std::move(svcSettings),
+        // PreviewSink: runs on the agent worker thread; PostTranslation is
+        // PostMessage-based, so forwarding straight through is thread-safe.
+        [&overlay](std::uint64_t /*gen*/, const std::wstring& text, bool /*done*/) {
+            overlay.PostTranslation(text);
+        });
+
+    // Real translation applied at commit: blocks the STA thread (bounded by
+    // kCommitTimeout) while the agent worker runs the 2-iteration commit loop.
+    // On timeout / engine error the segment is injected unchanged -- Ctrl+Enter
+    // must never destroy what the user typed.
+    auto commitTransform = [&translator](const std::wstring& segment,
+                                         const std::wstring& context) -> std::wstring {
+        return translator.TranslateBlocking(segment, context, kCommitTimeout)
+            .value_or(segment);
     };
     // Brackets the injection window on the hook so it flags synthetic input.
     auto injectionGuard = [](bool active) { HookManager::Instance().SetInjecting(active); };
@@ -133,10 +161,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             if (update.caretFound) {
                 overlay.PostUpdate(update.text, update.caretScreenPos);
             }
-            // Word boundary -> mock "OnWordComplete" on the authoritative UIA text;
-            // the gate where the full buffer will later be sent to inference.
+            // Word boundary on the authoritative UIA text: the preview gate.
+            // Latest-wins coalescing + the generation counter inside the
+            // service make bursts of boundaries cheap and self-cancelling.
             if (update.wordBoundary && !update.text.empty()) {
-                LogMock(L"OnWordComplete", update.text);
+                translator.RequestPreview(update.text, update.inferenceContext);
             }
         },
         commitTransform, injectionGuard);
@@ -153,7 +182,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         overlay.Hide();
         caretTracker.RequestCommit(fallbackText);  // re-resolve + replace on the STA thread
     };
-    callbacks.onReset = [&overlay]() { overlay.Hide(); };
+    callbacks.onReset = [&]() {
+        overlay.Hide();
+        translator.CancelPending();  // focus/caret moved: a preview result could
+                                     // never be shown, so stop paying for it
+    };
 
     const bool hookInstalled = HookManager::Instance().Install(std::move(callbacks));
     if (!hookInstalled) {
@@ -161,12 +194,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                     MB_ICONERROR);
         return 1;
     }
-
-    // Load persisted settings (config.json next to the exe) and bind the
-    // activation/commit shortcuts. The WebView2 settings window rewrites this
-    // file and calls ApplyConfig() to rebind live.
-    g_config = ConfigStore::Load();
-    ApplyConfig(g_config);
 
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = &ControllerWndProc;

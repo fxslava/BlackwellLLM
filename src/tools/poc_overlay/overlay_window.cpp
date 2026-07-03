@@ -99,6 +99,13 @@ void OverlayWindow::PostUpdate(const std::wstring& text, POINT caretScreenPos) {
     }
 }
 
+void OverlayWindow::PostTranslation(const std::wstring& text) {
+    auto* payload = new Payload{text, POINT{}};  // pos unused: anchored to lastAnchor_
+    if (!PostMessageW(hwnd_, kMsgTranslate, 0, reinterpret_cast<LPARAM>(payload))) {
+        delete payload;  // window gone / queue full -- drop the update
+    }
+}
+
 void OverlayWindow::Hide() {
     ShowWindow(hwnd_, SW_HIDE);
 }
@@ -184,7 +191,17 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         std::unique_ptr<Payload> payload(reinterpret_cast<Payload*>(lParam));
         auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self) {
+            self->lastAnchor_ = payload->pos;  // remember where translations anchor
+            self->hasAnchor_ = true;
             self->Repaint(payload->text, payload->pos);
+        }
+        return 0;
+    }
+    if (msg == kMsgTranslate) {
+        std::unique_ptr<Payload> payload(reinterpret_cast<Payload*>(lParam));
+        auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self && self->hasAnchor_) {
+            self->Repaint(payload->text, self->lastAnchor_);
         }
         return 0;
     }

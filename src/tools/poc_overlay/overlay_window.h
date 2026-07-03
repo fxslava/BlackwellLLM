@@ -35,6 +35,12 @@ public:
     // `caretScreenPos` is the caret point the string's end is anchored above.
     void PostUpdate(const std::wstring& text, POINT caretScreenPos);
 
+    // Thread-safe (same PostMessage marshaling): show `text` -- a streamed
+    // translation from the agent worker -- anchored at the caret position of
+    // the most recent PostUpdate. Dropped if no update has arrived yet (there
+    // is nowhere to anchor). This is the sink end of the preview pipeline.
+    void PostTranslation(const std::wstring& text);
+
     void Hide();
 
 private:
@@ -44,6 +50,7 @@ private:
     };
 
     static constexpr UINT kMsgUpdate = WM_APP + 1;
+    static constexpr UINT kMsgTranslate = WM_APP + 2;
     // The backing DIB is allocated once at this maximum size; each frame only
     // blits the content-sized sub-rect from its top-left corner.
     static constexpr int kMaxWidth = 720;
@@ -59,6 +66,12 @@ private:
     void Repaint(const std::wstring& text, POINT caretScreenPos);
 
     HWND hwnd_ = nullptr;
+
+    // Caret anchor of the most recent kMsgUpdate. Written and read ONLY inside
+    // WndProc (the window's owning thread), so no synchronization is needed;
+    // kMsgTranslate repaints translated text at this remembered position.
+    POINT lastAnchor_{};
+    bool hasAnchor_ = false;
 
     Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
     Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory_;
