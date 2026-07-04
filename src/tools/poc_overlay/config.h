@@ -6,6 +6,28 @@
 
 #include "hook_manager.h"  // Shortcut
 
+// How far back from the caret the live capture area extends. Boundaries nest:
+// a newline always ends the capture; Sentence additionally stops at . ! ?;
+// Clause additionally stops at , ; : (so Clause is the tightest capture).
+enum class CaptureGranularity { Clause, Sentence, Paragraph };
+
+inline const char* ToString(CaptureGranularity g) {
+    switch (g) {
+        case CaptureGranularity::Clause:    return "clause";
+        case CaptureGranularity::Sentence:  return "sentence";
+        case CaptureGranularity::Paragraph: return "paragraph";
+    }
+    return "sentence";
+}
+
+inline CaptureGranularity CaptureGranularityFromString(const std::string& s,
+                                                       CaptureGranularity fallback) {
+    if (s == "clause") return CaptureGranularity::Clause;
+    if (s == "sentence") return CaptureGranularity::Sentence;
+    if (s == "paragraph") return CaptureGranularity::Paragraph;
+    return fallback;
+}
+
 // Persisted application configuration. Shortcuts use the same HOTKEYF_* / vk
 // encoding as everything else in this PoC (see Shortcut). The inference fields
 // mirror the playground server's generation settings.
@@ -18,11 +40,27 @@ struct Config {
     float temperature = 0.7f;  // sampling temperature   [0.0 .. 2.0]
     float topP = 0.95f;        // nucleus sampling cutoff [0.0 .. 1.0]
     int maxTokens = 1024;      // max tokens to generate
+
+    // Capture / debounce UX (the stateful overlay pipeline).
+    CaptureGranularity captureGranularity = CaptureGranularity::Sentence;
+    int idleTimerMs = 700;  // typing-idle debounce before preview inference starts
+
+    // Tiered KV prefix-cache memory budget (engine RuntimeConfig knobs; one
+    // block = one KV page = 16 tokens across all layers).
+    int vramCacheBlocks = 1024;    // device-pool floor kept for cached prefixes
+    int ramTierBlocks = 2048;      // pinned host-RAM demotion tier capacity
+    bool diskSpillEnabled = true;  // NVMe spill tier on/off
+    int diskSpillBlocks = 8192;    // spill file capacity, in blocks
+    std::wstring spillFilePath;    // empty = ConfigStore::DefaultSpillPath()
 };
 
 namespace ConfigStore {
 // <exe directory>\config.json
 std::wstring DefaultPath();
+// %LOCALAPPDATA%\Blackwell\spill.bkv -- the default NVMe spill-tier backing
+// file (used when Config::spillFilePath is empty). The directory is created
+// on demand by the caller that opens the file.
+std::wstring DefaultSpillPath();
 // Loads config.json; returns defaults if it is missing or malformed.
 Config Load();
 // Rewrites config.json. Returns false on I/O failure.

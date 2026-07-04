@@ -92,16 +92,9 @@ bool OverlayWindow::InitBackingBitmap() {
     return true;
 }
 
-void OverlayWindow::PostUpdate(const std::wstring& text, POINT caretScreenPos) {
-    auto* payload = new Payload{text, caretScreenPos};
-    if (!PostMessageW(hwnd_, kMsgUpdate, 0, reinterpret_cast<LPARAM>(payload))) {
-        delete payload;  // window gone / queue full -- drop the update
-    }
-}
-
-void OverlayWindow::PostTranslation(const std::wstring& text) {
-    auto* payload = new Payload{text, POINT{}};  // pos unused: anchored to lastAnchor_
-    if (!PostMessageW(hwnd_, kMsgTranslate, 0, reinterpret_cast<LPARAM>(payload))) {
+void OverlayWindow::PostState(const OverlaySnapshot& state) {
+    auto* payload = new OverlaySnapshot(state);
+    if (!PostMessageW(hwnd_, kMsgState, 0, reinterpret_cast<LPARAM>(payload))) {
         delete payload;  // window gone / queue full -- drop the update
     }
 }
@@ -110,13 +103,41 @@ void OverlayWindow::Hide() {
     ShowWindow(hwnd_, SW_HIDE);
 }
 
-void OverlayWindow::Repaint(const std::wstring& text, POINT caretScreenPos) {
-    // Nothing to show (e.g. the field was cleared) -- hide rather than flash an
-    // empty pill.
-    if (text.empty()) {
+void OverlayWindow::Repaint(const OverlaySnapshot& state) {
+    // Compose the display string + the style split point for this phase.
+    // `dimLen` characters from the start render dimmed+italic (the captured
+    // source); everything after renders in the phase's foreground color.
+    std::wstring text;
+    size_t dimLen = 0;
+    D2D1_COLOR_F fgColor = D2D1::ColorF(D2D1::ColorF::White);
+    switch (state.phase) {
+        case OverlayPhase::Typing:
+            text = state.source;
+            dimLen = text.size();  // everything dimmed: "this is the capture"
+            break;
+        case OverlayPhase::Translating:
+            // Dimmed source, then the streamed partial (or an ellipsis while
+            // the first tokens are in flight) in the accent color.
+            text = state.source + L"\n" +
+                   (state.translation.empty() ? std::wstring(1, L'\x2026')  // "..." spinner
+                                              : state.translation);
+            dimLen = state.source.size();
+            fgColor = D2D1::ColorF(0.55f, 0.75f, 1.0f);  // accent: in progress
+            break;
+        case OverlayPhase::Ready:
+            text = state.translation;  // full-brightness: Ctrl+Enter commits this
+            break;
+        case OverlayPhase::Hidden:
+            break;
+    }
+
+    // Nothing to show (hidden phase, cleared field, or no caret to anchor to)
+    // -- hide rather than flash an empty pill.
+    if (text.empty() || state.phase == OverlayPhase::Hidden || !state.anchorValid) {
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
+    const POINT caretScreenPos = state.anchor;
 
     // Measure the text to size the pill to its content (supports multiple lines).
     const float maxTextW = static_cast<float>(kMaxWidth - 2 * kPadX);
@@ -126,6 +147,11 @@ void OverlayWindow::Repaint(const std::wstring& text, POINT caretScreenPos) {
                                                 textFormat_.Get(), maxTextW, maxTextH,
                                                 layout.GetAddressOf()))) {
         return;
+    }
+    // Captured-source range: italic (the brush split happens at draw time).
+    if (dimLen > 0) {
+        layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC,
+                             DWRITE_TEXT_RANGE{0, static_cast<UINT32>(dimLen)});
     }
     DWRITE_TEXT_METRICS metrics{};
     layout->GetMetrics(&metrics);
@@ -155,18 +181,27 @@ void OverlayWindow::Repaint(const std::wstring& text, POINT caretScreenPos) {
     ComPtr<ID2D1SolidColorBrush> bgBrush;
     renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.05f, 0.05f, 0.05f, 0.78f),
                                           bgBrush.GetAddressOf());
-    ComPtr<ID2D1SolidColorBrush> textBrush;
-    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), textBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> fgBrush;
+    renderTarget_->CreateSolidColorBrush(fgColor, fgBrush.GetAddressOf());
+    // Dimmed brush for the captured-source range (visually distinct from the
+    // translation so the user always knows what is captured vs. produced).
+    ComPtr<ID2D1SolidColorBrush> dimBrush;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.72f, 0.74f, 0.78f, 0.85f),
+                                          dimBrush.GetAddressOf());
+    if (dimLen > 0 && dimBrush) {
+        layout->SetDrawingEffect(dimBrush.Get(),
+                                 DWRITE_TEXT_RANGE{0, static_cast<UINT32>(dimLen)});
+    }
 
     const D2D1_ROUNDED_RECT bg = D2D1::RoundedRect(
         D2D1::RectF(0.0f, 0.0f, static_cast<float>(boxW), static_cast<float>(boxH)), 8.0f, 8.0f);
     if (bgBrush) {
         renderTarget_->FillRoundedRectangle(bg, bgBrush.Get());
     }
-    if (textBrush) {
+    if (fgBrush) {
         renderTarget_->DrawTextLayout(D2D1::Point2F(static_cast<float>(kPadX),
                                                      static_cast<float>(kPadY)),
-                                       layout.Get(), textBrush.Get());
+                                       layout.Get(), fgBrush.Get());
     }
     renderTarget_->EndDraw();
 
@@ -187,21 +222,11 @@ void OverlayWindow::Repaint(const std::wstring& text, POINT caretScreenPos) {
 }
 
 LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == kMsgUpdate) {
-        std::unique_ptr<Payload> payload(reinterpret_cast<Payload*>(lParam));
+    if (msg == kMsgState) {
+        std::unique_ptr<OverlaySnapshot> payload(reinterpret_cast<OverlaySnapshot*>(lParam));
         auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self) {
-            self->lastAnchor_ = payload->pos;  // remember where translations anchor
-            self->hasAnchor_ = true;
-            self->Repaint(payload->text, payload->pos);
-        }
-        return 0;
-    }
-    if (msg == kMsgTranslate) {
-        std::unique_ptr<Payload> payload(reinterpret_cast<Payload*>(lParam));
-        auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        if (self && self->hasAnchor_) {
-            self->Repaint(payload->text, self->lastAnchor_);
+            self->Repaint(*payload);
         }
         return 0;
     }

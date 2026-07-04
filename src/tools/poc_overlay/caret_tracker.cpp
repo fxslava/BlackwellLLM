@@ -4,6 +4,8 @@
 #include <UIAutomation.h>
 #include <wrl/client.h>
 
+#include <cwctype>
+
 #include "text_injector.h"
 
 using Microsoft::WRL::ComPtr;
@@ -42,9 +44,9 @@ bool CaretPointFromRange(IUIAutomationTextRange* range, POINT& out) {
     return found;
 }
 
-// Primary path: read the active line up to the caret via TextPattern, and the
+// Primary path: read the document up to the caret via TextPattern, and the
 // caret's screen point. Returns true only if the text was successfully read.
-// When `outRange` is provided it also receives the [line-start .. caret] range,
+// When `outRange` is provided it also receives the [doc-start .. caret] range,
 // so the commit path can Select() the exact text it is about to replace.
 bool ReadTextPattern(IUIAutomationElement* focused, std::wstring& outText, POINT& outCaret,
                      bool& outCaretFound,
@@ -136,13 +138,51 @@ bool ReadValuePattern(IUIAutomationElement* focused, std::wstring& outText) {
     return true;
 }
 
+// True if `c` ends the capture area under granularity `g`. Boundaries nest:
+// newlines always break; Sentence adds . ! ?; Clause additionally , ; :.
+bool IsBoundaryChar(wchar_t c, CaptureGranularity g) {
+    if (c == L'\n' || c == L'\r') return true;
+    if (g == CaptureGranularity::Paragraph) return false;
+    if (c == L'.' || c == L'!' || c == L'?') return true;
+    if (g == CaptureGranularity::Sentence) return false;
+    return c == L',' || c == L';' || c == L':';
+}
+
 }  // namespace
 
-CaretTracker::CaretTracker(UpdateCallback callback, TransformCallback commitTransform,
-                           InjectionGuard injectionGuard)
-    : callback_(std::move(callback)),
-      transform_(std::move(commitTransform)),
-      injectionGuard_(std::move(injectionGuard)) {
+std::wstring CaretTracker::ExtractCapture(const std::wstring& segment,
+                                          CaptureGranularity granularity) {
+    // Skip the trailing run of whitespace + boundary characters first: the
+    // terminator the user JUST typed belongs to the clause being captured, not
+    // to a (still empty) next one. "hello world," must capture "hello world,",
+    // not "".
+    size_t scanEnd = segment.size();
+    while (scanEnd > 0 && (std::iswspace(segment[scanEnd - 1]) ||
+                           IsBoundaryChar(segment[scanEnd - 1], granularity))) {
+        --scanEnd;
+    }
+    if (scanEnd == 0) {
+        return {};  // nothing but separators -> nothing worth capturing
+    }
+
+    // Walk back to the previous boundary, then left-trim the separator gap.
+    size_t begin = scanEnd;
+    while (begin > 0 && !IsBoundaryChar(segment[begin - 1], granularity)) {
+        --begin;
+    }
+    while (begin < segment.size() && std::iswspace(segment[begin])) {
+        ++begin;
+    }
+    // Capture runs to the REAL end (trailing punctuation/whitespace included),
+    // so the commit-time ends_with verification is exact.
+    return segment.substr(begin);
+}
+
+CaretTracker::CaretTracker(Callbacks callbacks, CaptureGranularity granularity,
+                           int idleTimerMs)
+    : callbacks_(std::move(callbacks)),
+      granularity_(static_cast<int>(granularity)),
+      idleTimerMs_(idleTimerMs > 0 ? idleTimerMs : 1) {
     thread_ = std::thread(&CaretTracker::ThreadMain, this);
 }
 
@@ -158,25 +198,39 @@ CaretTracker::~CaretTracker() {
     }
 }
 
-void CaretTracker::RequestUpdate(std::wstring fallbackText, bool wordBoundary) {
+void CaretTracker::RequestUpdate(std::wstring fallbackText, bool /*wordBoundary*/) {
     // Called from the keyboard hook -- must stay O(1) and never touch COM/UIA.
     // Overwrites the pending text with the latest state so a burst of keystrokes
-    // costs a single UIA round-trip, but OR-accumulates the word-boundary flag so
-    // a separator coalesced behind a later keystroke is not lost.
+    // costs a single UIA round-trip (and a single idle-timer reset).
     std::lock_guard<std::mutex> lock(mutex_);
     pendingFallback_ = std::move(fallbackText);
-    pendingWordBoundary_ = pendingWordBoundary_ || wordBoundary;
+    hasPendingUpdate_ = true;
     hasPending_ = true;
     cv_.notify_all();
 }
 
-void CaretTracker::RequestCommit(std::wstring fallbackText) {
-    // Also O(1) and hook-safe: hand the commit to the STA worker, where the UIA
-    // interfaces live and where the (blocking, clipboard-sleeping) replacement
-    // can run without stalling the UI thread.
+void CaretTracker::RequestCommit(std::wstring /*fallbackText*/) {
+    // O(1) and hook-safe. The commit consumes the state machine's OWN snapshot
+    // (source_raw / translation_raw); it no longer needs the hook buffer.
     std::lock_guard<std::mutex> lock(mutex_);
     pendingCommit_ = true;
-    pendingCommitFallback_ = std::move(fallbackText);
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
+void CaretTracker::RequestReset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingReset_ = true;
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
+void CaretTracker::OnPreviewResult(std::wstring text, bool done) {
+    // Called from the TranslationService worker thread: marshal into this
+    // worker's serialized event loop. Latest-wins is correct here too -- a
+    // newer partial supersedes an older one, and a final overwrites partials.
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingTranslation_.emplace(std::move(text), done);
     hasPending_ = true;
     cv_.notify_all();
 }
@@ -193,47 +247,71 @@ void CaretTracker::ThreadMain() {
 
     while (true) {
         std::wstring fallback;
-        bool wordBoundary = false;
+        bool haveUpdate = false;
         bool doCommit = false;
-        std::wstring commitFallback;
+        bool doReset = false;
+        bool timerFired = false;
+        std::optional<std::pair<std::wstring, bool>> translation;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return hasPending_ || stop_; });
-            if (stop_) {
+            const auto pred = [this] {
+                return hasPending_ || stop_.load(std::memory_order_relaxed);
+            };
+            // The idle debounce IS this wait deadline: no separate timer thread,
+            // no async callback -- expiry is just another event in the one
+            // serialized loop, so it can never race a keystroke or a commit.
+            if (idleArmed_) {
+                if (!cv_.wait_until(lock, idleDeadline_, pred)) {
+                    timerFired = true;
+                }
+            } else {
+                cv_.wait(lock, pred);
+            }
+            if (stop_.load(std::memory_order_relaxed)) {
                 break;
+            }
+            if (pendingReset_) {
+                doReset = true;
+                pendingReset_ = false;
             }
             if (pendingCommit_) {
                 doCommit = true;
-                commitFallback = std::move(pendingCommitFallback_);
                 pendingCommit_ = false;
             }
-            fallback = std::move(pendingFallback_);
-            wordBoundary = pendingWordBoundary_;
-            pendingWordBoundary_ = false;
+            if (hasPendingUpdate_) {
+                haveUpdate = true;
+                fallback = std::move(pendingFallback_);
+                hasPendingUpdate_ = false;
+            }
+            translation.swap(pendingTranslation_);
             hasPending_ = false;
         }
 
-        // A commit replaces the text and hides the overlay, so it supersedes any
-        // coalesced display update in the same wake-up.
+        if (timerFired) {
+            idleArmed_ = false;  // consumed; HandleKeystroke re-arms as needed
+        }
+        if (doReset) {
+            ResetToIdle();
+            continue;
+        }
+        // A commit consumes the snapshot and hides the overlay, so it supersedes
+        // any coalesced keystroke/translation event in the same wake-up.
         if (doCommit) {
             if (SUCCEEDED(hrAutomation)) {
-                PerformCommit(automation.Get(), commitFallback);
+                HandleCommit(automation.Get());
             }
             continue;
         }
-
-        CaretUpdate update;
-        if (SUCCEEDED(hrAutomation)) {
-            Resolve(automation.Get(), fallback, update);
-        } else {
-            update.text = fallback;  // UIA unavailable -- nothing to anchor to
+        if (haveUpdate && SUCCEEDED(hrAutomation)) {
+            HandleKeystroke(automation.Get(), fallback);
         }
-        // Stamp the boundary flag onto the resolved (authoritative) text so the
-        // consumer can gate inference on the real string, not the fallback.
-        update.wordBoundary = wordBoundary;
-
-        if (callback_) {
-            callback_(update);
+        if (translation) {
+            HandleTranslation(translation->first, translation->second);
+        }
+        // A keystroke in the same wake-up already re-armed the timer; only a
+        // "pure" expiry starts inference.
+        if (timerFired && !haveUpdate) {
+            HandleIdleExpired();
         }
     }
 
@@ -243,75 +321,91 @@ void CaretTracker::ThreadMain() {
     }
 }
 
-bool CaretTracker::Resolve(IUIAutomation* automation, const std::wstring& fallbackText,
-                           CaretUpdate& update) {
-    update.text.clear();
-    update.caretFound = false;
+// ---------------------------------------------------------------------------
+// State-machine event handlers (worker thread only)
+// ---------------------------------------------------------------------------
 
-    ComPtr<IUIAutomationElement> focused;
-    if (FAILED(automation->GetFocusedElement(&focused)) || !focused) {
-        update.text = fallbackText;
-        return false;  // no focus -> no anchor
-    }
-
-    // (1) Primary: TextPattern document-up-to-caret. This also yields the caret.
-    std::wstring uiaText;
-    bool haveText =
-        ReadTextPattern(focused.Get(), uiaText, update.caretScreenPos, update.caretFound);
-
-    // (1) Secondary: ValuePattern whole-control value.
-    if (!haveText) {
-        haveText = ReadValuePattern(focused.Get(), uiaText);
-    }
-
-    // Caret position fallback: some providers (or the ValuePattern path) give no
-    // caret rect -- anchor to the focused element's top-left instead.
-    if (!update.caretFound) {
-        RECT rect{};
-        if (SUCCEEDED(focused->get_CurrentBoundingRectangle(&rect)) &&
-            (rect.right > rect.left || rect.bottom > rect.top)) {
-            update.caretScreenPos.x = rect.left;
-            update.caretScreenPos.y = rect.top;
-            update.caretFound = true;
+void CaretTracker::HandleKeystroke(IUIAutomation* automation, const std::wstring& fallback) {
+    // INTERRUPT: any keystroke during Translating/Ready invalidates the
+    // translation -- cancel the in-flight decode and clear what was shown.
+    if (phase_ == Phase::Translating || phase_ == Phase::Ready) {
+        if (callbacks_.cancelPreview) {
+            callbacks_.cancelPreview();
         }
     }
+    translationPartial_.clear();
+    translationRaw_.clear();
 
-    if (haveText) {
-        // Show only what was typed since the last commit; the committed text stays
-        // hidden (but lives on in inferenceContext_).
-        update.text = StripCommittedPrefix(uiaText);
+    std::wstring segment;
+    bool fromUia = false;
+    const bool resolved = ResolveSegment(automation, fallback, segment, fromUia);
+
+    const auto granularity =
+        static_cast<CaptureGranularity>(granularity_.load(std::memory_order_relaxed));
+    sourceRaw_ = resolved ? ExtractCapture(segment, granularity) : std::wstring();
+
+    if (sourceRaw_.empty() || !anchorValid_) {
+        phase_ = Phase::Idle;  // nothing captured (or nowhere to anchor)
+        idleArmed_ = false;
+        Render();
+        return;
+    }
+
+    phase_ = Phase::Typing;
+    idleArmed_ = true;
+    idleDeadline_ = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(idleTimerMs_.load(std::memory_order_relaxed));
+    Render();
+}
+
+void CaretTracker::HandleIdleExpired() {
+    if (phase_ != Phase::Typing || sourceRaw_.empty()) {
+        return;  // expiry raced a state change; nothing to translate
+    }
+    phase_ = Phase::Translating;
+    translationPartial_.clear();
+    if (callbacks_.requestPreview) {
+        callbacks_.requestPreview(sourceRaw_, inferenceContext_);
+    }
+    Render();
+}
+
+void CaretTracker::HandleTranslation(const std::wstring& text, bool done) {
+    if (phase_ != Phase::Translating) {
+        return;  // stale delivery: the user typed (or committed) meanwhile
+    }
+    if (!done) {
+        translationPartial_ = text;  // streamed partial
+    } else if (!text.empty()) {
+        translationRaw_ = text;
+        translationPartial_.clear();
+        phase_ = Phase::Ready;
     } else {
-        // (2) UIA-opaque app: the hook's ToUnicodeEx buffer already resets on
-        // commit, so it is the current segment as-is.
-        update.text = fallbackText;
+        // Empty final = the run failed / was dropped. Fall back to Typing
+        // WITHOUT re-arming the timer -- retrying on a persistent failure
+        // would spin; the next keystroke re-enters the normal flow.
+        phase_ = Phase::Typing;
+        translationPartial_.clear();
     }
-    // Snapshot AFTER StripCommittedPrefix, which clears the context when the
-    // commit boundary broke -- the consumer must see the same decision.
-    update.inferenceContext = inferenceContext_;
-    return update.caretFound;
+    Render();
 }
 
-std::wstring CaretTracker::StripCommittedPrefix(const std::wstring& fullText) {
-    if (!committedPrefix_.empty() && fullText.rfind(committedPrefix_, 0) == 0) {
-        return fullText.substr(committedPrefix_.size());
+void CaretTracker::HandleCommit(IUIAutomation* automation) {
+    // Surgical commit is valid ONLY from Ready: there must be a finished
+    // translation on screen. In any other state Ctrl+Enter is a no-op (the
+    // overlay already shows what stage we are in).
+    if (phase_ != Phase::Ready || sourceRaw_.empty() || translationRaw_.empty()) {
+        return;
     }
-    // The field no longer begins with what we committed (user edited into it, or
-    // focus moved elsewhere) -- drop the boundary and its history.
-    committedPrefix_.clear();
-    inferenceContext_.clear();
-    return fullText;
-}
 
-void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& fallbackText) {
     // Flag the injection window so the keyboard hook treats the upcoming
     // synthetic input as ours (belt-and-suspenders alongside the dwExtraInfo tag).
-    if (injectionGuard_) {
-        injectionGuard_(true);
+    if (callbacks_.injectionGuard) {
+        callbacks_.injectionGuard(true);
     }
 
-    // Gather the UIA context HERE, on the STA thread, so the interfaces we pass to
-    // TextInjector stay in their owning apartment. Re-resolving (rather than
-    // reusing a cached range) keeps us in sync with the field's current state.
+    // Gather the UIA context HERE, freshly, so the interfaces stay in their
+    // owning apartment and we verify against the field's CURRENT state.
     ComPtr<IUIAutomationTextRange> range;
     ComPtr<IUIAutomationValuePattern> valuePattern;
     std::wstring fullText;
@@ -337,54 +431,167 @@ void CaretTracker::PerformCommit(IUIAutomation* automation, const std::wstring& 
         }
     }
 
-    // Work out the segment typed since the last commit -- that is what we replace,
-    // preserving any already-committed prefix.
-    std::wstring segment;
-    bool haveBoundary = false;
+    bool injected = false;
     if (fromUia) {
-        if (!committedPrefix_.empty() && fullText.rfind(committedPrefix_, 0) == 0) {
-            segment = fullText.substr(committedPrefix_.size());
-            haveBoundary = true;
-        } else {
-            committedPrefix_.clear();
-            inferenceContext_.clear();
-            segment = fullText;
+        // The snapshot must still match reality. Typing would have reset the
+        // state machine, but the field can change under us regardless (focus
+        // swaps, IME composition, another process) -- verify, never guess.
+        if (fullText.ends_with(sourceRaw_)) {
+            TextInjector::Request request;
+            request.source = sourceRaw_;
+            request.replacement = translationRaw_;
+            if (range) {
+                // Narrow [doc-start .. caret] to exactly the captured source:
+                // everything before it is preserved by Tier 2's range select.
+                int moved = 0;
+                range->MoveEndpointByUnit(
+                    TextPatternRangeEndpoint_Start, TextUnit_Character,
+                    static_cast<int>(fullText.size() - sourceRaw_.size()), &moved);
+                request.selectionRange = range.Get();
+            }
+            // SetValue replaces the WHOLE control value, so only offer Tier 1
+            // when the capture IS the whole value.
+            request.valuePattern =
+                (fullText == sourceRaw_) ? valuePattern.Get() : nullptr;
+            injected = TextInjector::Replace(request) != TextInjector::Tier::None;
+            if (injected) {
+                // The field now holds prefix + translation; hide all of it from
+                // future captures.
+                committedPrefix_ =
+                    fullText.substr(0, fullText.size() - sourceRaw_.size()) +
+                    translationRaw_;
+            }
         }
     } else {
-        segment = fallbackText;  // UIA-opaque: the hook buffer is the current segment
-    }
-
-    if (!segment.empty()) {
-        const std::wstring target =
-            transform_ ? transform_(segment, inferenceContext_) : segment;
-
+        // UIA-opaque control (e.g. Telegram/Qt): no authoritative text to
+        // verify or track a prefix against; Tier 3 selects source.size() chars
+        // by keystroke and pastes over them.
         TextInjector::Request request;
-        request.source = segment;
-        request.replacement = target;
-        if (fromUia) {
-            // Narrow the range to just the new segment [prefix-end .. caret] so the
-            // earlier committed prefix is preserved by Tier 2.
-            if (haveBoundary && range) {
-                int moved = 0;
-                range->MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character,
-                                          static_cast<int>(committedPrefix_.size()), &moved);
-            }
-            request.selectionRange = range.Get();
-            // SetValue replaces the WHOLE value, so only offer it when nothing is
-            // preserved ahead of the segment.
-            request.valuePattern = haveBoundary ? nullptr : valuePattern.Get();
-        }
+        request.source = sourceRaw_;
+        request.replacement = translationRaw_;
+        injected = TextInjector::Replace(request) != TextInjector::Tier::None;
+    }
 
-        const TextInjector::Tier tier = TextInjector::Replace(request);
-        if (tier != TextInjector::Tier::None && fromUia) {
-            committedPrefix_ += target;    // field now holds prefix + translated segment
-            inferenceContext_ += segment;  // AI history retains the ORIGINAL text
-            OutputDebugStringW(
-                (L"[poc_overlay] InferenceContext: \"" + inferenceContext_ + L"\"\n").c_str());
+    if (injected) {
+        // The AI history keeps the ORIGINAL text (what the user actually wrote).
+        if (!inferenceContext_.empty()) {
+            inferenceContext_ += L' ';
+        }
+        inferenceContext_ += sourceRaw_;
+        OutputDebugStringW(
+            (L"[poc_overlay] InferenceContext: \"" + inferenceContext_ + L"\"\n").c_str());
+    }
+
+    if (callbacks_.injectionGuard) {
+        callbacks_.injectionGuard(false);
+    }
+
+    // Injected or aborted-stale, this interaction is over; the next keystroke
+    // starts a fresh capture.
+    phase_ = Phase::Idle;
+    sourceRaw_.clear();
+    translationRaw_.clear();
+    translationPartial_.clear();
+    idleArmed_ = false;
+    Render();
+}
+
+void CaretTracker::ResetToIdle() {
+    if (phase_ == Phase::Translating && callbacks_.cancelPreview) {
+        callbacks_.cancelPreview();
+    }
+    phase_ = Phase::Idle;
+    sourceRaw_.clear();
+    translationRaw_.clear();
+    translationPartial_.clear();
+    idleArmed_ = false;
+    Render();
+}
+
+void CaretTracker::Render() const {
+    if (!callbacks_.render) {
+        return;
+    }
+    OverlaySnapshot snapshot;
+    snapshot.anchor = anchor_;
+    snapshot.anchorValid = anchorValid_;
+    switch (phase_) {
+        case Phase::Idle:
+            snapshot.phase = OverlayPhase::Hidden;
+            break;
+        case Phase::Typing:
+            snapshot.phase = OverlayPhase::Typing;
+            snapshot.source = sourceRaw_;
+            break;
+        case Phase::Translating:
+            snapshot.phase = OverlayPhase::Translating;
+            snapshot.source = sourceRaw_;
+            snapshot.translation = translationPartial_;
+            break;
+        case Phase::Ready:
+            snapshot.phase = OverlayPhase::Ready;
+            snapshot.translation = translationRaw_;
+            break;
+    }
+    callbacks_.render(snapshot);
+}
+
+// ---------------------------------------------------------------------------
+// Text resolution
+// ---------------------------------------------------------------------------
+
+bool CaretTracker::ResolveSegment(IUIAutomation* automation, const std::wstring& fallbackText,
+                                  std::wstring& segment, bool& fromUia) {
+    anchorValid_ = false;
+    fromUia = false;
+
+    ComPtr<IUIAutomationElement> focused;
+    if (FAILED(automation->GetFocusedElement(&focused)) || !focused) {
+        segment = fallbackText;  // no focus -> no anchor; caller idles
+        return !segment.empty();
+    }
+
+    // (1) Primary: TextPattern document-up-to-caret. This also yields the caret.
+    std::wstring uiaText;
+    bool haveText = ReadTextPattern(focused.Get(), uiaText, anchor_, anchorValid_);
+
+    // (1) Secondary: ValuePattern whole-control value.
+    if (!haveText) {
+        haveText = ReadValuePattern(focused.Get(), uiaText);
+    }
+
+    // Caret position fallback: some providers (or the ValuePattern path) give no
+    // caret rect -- anchor to the focused element's top-left instead.
+    if (!anchorValid_) {
+        RECT rect{};
+        if (SUCCEEDED(focused->get_CurrentBoundingRectangle(&rect)) &&
+            (rect.right > rect.left || rect.bottom > rect.top)) {
+            anchor_.x = rect.left;
+            anchor_.y = rect.top;
+            anchorValid_ = true;
         }
     }
 
-    if (injectionGuard_) {
-        injectionGuard_(false);
+    if (haveText) {
+        // Track only what was typed since the last commit; the committed text
+        // stays hidden (but lives on in inferenceContext_).
+        segment = StripCommittedPrefix(uiaText);
+        fromUia = true;
+    } else {
+        // (2) UIA-opaque app: the hook's ToUnicodeEx buffer is the current
+        // segment as-is.
+        segment = fallbackText;
     }
+    return true;
+}
+
+std::wstring CaretTracker::StripCommittedPrefix(const std::wstring& fullText) {
+    if (!committedPrefix_.empty() && fullText.rfind(committedPrefix_, 0) == 0) {
+        return fullText.substr(committedPrefix_.size());
+    }
+    // The field no longer begins with what we committed (user edited into it, or
+    // focus moved elsewhere) -- drop the boundary and its history.
+    committedPrefix_.clear();
+    inferenceContext_.clear();
+    return fullText;
 }

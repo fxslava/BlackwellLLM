@@ -55,12 +55,12 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
   .field{ margin-bottom:12px; }
   .field:last-child{ margin-bottom:0; }
   label{ display:block; color:var(--muted); font-size:11.5px; margin-bottom:6px; }
-  input{
+  input, select{
     width:100%; background:var(--field); color:var(--fg);
     border:1px solid var(--line); border-radius:8px; padding:9px 11px;
     font-size:13px; font-family:inherit; outline:none; transition:border-color .12s, box-shadow .12s;
   }
-  input:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.22); }
+  input:focus, select:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.22); }
   input[readonly]{ cursor:pointer; }
   input[readonly]:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.28); }
   .grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
@@ -81,6 +81,10 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
   button.secondary{ background:#2b2e39; color:var(--fg); border:1px solid var(--line);
     padding:9px 14px; font-weight:600; white-space:nowrap; flex:0 0 auto; }
   button.secondary:hover{ background:#333747; }
+  label.check{ display:flex; align-items:center; gap:8px; color:var(--fg);
+    font-size:13px; cursor:pointer; margin:0; padding:9px 0; }
+  label.check input[type="checkbox"]{ width:auto; accent-color:var(--accent);
+    width:16px; height:16px; margin:0; }
   html,body{ overflow-x:hidden; }
 </style>
 </head>
@@ -127,6 +131,55 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
         <input type="number" id="topP" min="0" max="1" step="0.05">
       </div>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Capture &amp; timing</h2>
+    <div class="grid">
+      <div class="field">
+        <label for="granularity">Capture granularity (how far back from the caret)</label>
+        <select id="granularity">
+          <option value="clause">Clause &mdash; stops at , ; :</option>
+          <option value="sentence">Sentence &mdash; stops at . ? !</option>
+          <option value="paragraph">Paragraph &mdash; stops at newline</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="idleTimerMs">Idle timer (ms before translation starts)</label>
+        <input type="number" id="idleTimerMs" min="100" max="10000" step="50">
+      </div>
+    </div>
+    <div class="hint">While you type, the captured area shows dimmed in the overlay.
+      Pause for the idle delay to translate it; Ctrl+Enter replaces it with the translation.</div>
+  </div>
+
+  <div class="card">
+    <h2>Memory budget &mdash; prefix cache</h2>
+    <div class="grid">
+      <div class="field">
+        <label for="vramCacheBlocks">VRAM cache blocks (16 tokens each)</label>
+        <input type="number" id="vramCacheBlocks" min="0" max="1048576" step="64">
+      </div>
+      <div class="field">
+        <label for="ramTierBlocks">RAM tier blocks (pinned host memory)</label>
+        <input type="number" id="ramTierBlocks" min="0" max="1048576" step="64">
+      </div>
+      <div class="field">
+        <label for="diskSpillBlocks">Disk spill blocks</label>
+        <input type="number" id="diskSpillBlocks" min="0" max="16777216" step="256">
+      </div>
+      <div class="field">
+        <label for="diskSpillEnabled" style="margin-bottom:10px">Disk spill tier</label>
+        <label class="check"><input type="checkbox" id="diskSpillEnabled"> Enable NVMe spill</label>
+      </div>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label for="spillFilePath">Spill file path</label>
+      <input type="text" id="spillFilePath" spellcheck="false"
+             placeholder="C:\Users\...\AppData\Local\Blackwell\spill.bkv">
+    </div>
+    <div class="hint">Cold translation-context pages demote VRAM &rarr; pinned RAM &rarr; disk
+      instead of being recomputed. Changing these requires an app restart (engine rebuild).</div>
   </div>
 
   <div class="footer">
@@ -199,6 +252,13 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
     document.getElementById('temperature').value = cfg.temperature != null ? cfg.temperature : 0.7;
     document.getElementById('topP').value        = cfg.topP != null ? cfg.topP : 0.95;
     document.getElementById('maxTokens').value   = cfg.maxTokens != null ? cfg.maxTokens : 1024;
+    document.getElementById('granularity').value = cfg.captureGranularity || 'sentence';
+    document.getElementById('idleTimerMs').value = cfg.idleTimerMs != null ? cfg.idleTimerMs : 700;
+    document.getElementById('vramCacheBlocks').value  = cfg.vramCacheBlocks != null ? cfg.vramCacheBlocks : 1024;
+    document.getElementById('ramTierBlocks').value    = cfg.ramTierBlocks != null ? cfg.ramTierBlocks : 2048;
+    document.getElementById('diskSpillEnabled').checked = cfg.diskSpillEnabled !== false;
+    document.getElementById('diskSpillBlocks').value  = cfg.diskSpillBlocks != null ? cfg.diskSpillBlocks : 8192;
+    document.getElementById('spillFilePath').value    = cfg.spillFilePath || '';
   }
 
   function showToast(){
@@ -255,7 +315,14 @@ constexpr char kHtml[] = R"HTML(<!doctype html>
         contextSize: parseInt(document.getElementById('contextSize').value, 10) || 4096,
         temperature: parseFloat(document.getElementById('temperature').value) || 0.0,
         topP: parseFloat(document.getElementById('topP').value) || 0.0,
-        maxTokens: parseInt(document.getElementById('maxTokens').value, 10) || 1024
+        maxTokens: parseInt(document.getElementById('maxTokens').value, 10) || 1024,
+        captureGranularity: document.getElementById('granularity').value,
+        idleTimerMs: parseInt(document.getElementById('idleTimerMs').value, 10) || 700,
+        vramCacheBlocks: parseInt(document.getElementById('vramCacheBlocks').value, 10) || 0,
+        ramTierBlocks: parseInt(document.getElementById('ramTierBlocks').value, 10) || 0,
+        diskSpillEnabled: document.getElementById('diskSpillEnabled').checked,
+        diskSpillBlocks: parseInt(document.getElementById('diskSpillBlocks').value, 10) || 0,
+        spillFilePath: document.getElementById('spillFilePath').value
       };
       if (bridge) bridge.postMessage(payload);
     } catch (err) {
@@ -455,6 +522,16 @@ void SettingsWindow::PushConfigToJs() {
     j["temperature"] = config_.temperature;
     j["topP"] = config_.topP;
     j["maxTokens"] = config_.maxTokens;
+    j["captureGranularity"] = ToString(config_.captureGranularity);
+    j["idleTimerMs"] = config_.idleTimerMs;
+    j["vramCacheBlocks"] = config_.vramCacheBlocks;
+    j["ramTierBlocks"] = config_.ramTierBlocks;
+    j["diskSpillEnabled"] = config_.diskSpillEnabled;
+    j["diskSpillBlocks"] = config_.diskSpillBlocks;
+    // Show the resolved default so the user sees where the file actually goes.
+    j["spillFilePath"] = ToUtf8(config_.spillFilePath.empty()
+                                    ? ConfigStore::DefaultSpillPath()
+                                    : config_.spillFilePath);
     if (webview_) {
         webview_->PostWebMessageAsJson(FromUtf8(j.dump()).c_str());
     }
@@ -489,6 +566,18 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
         config_.temperature = j.value("temperature", config_.temperature);
         config_.topP = j.value("topP", config_.topP);
         config_.maxTokens = j.value("maxTokens", config_.maxTokens);
+        config_.captureGranularity = CaptureGranularityFromString(
+            j.value("captureGranularity", std::string()), config_.captureGranularity);
+        config_.idleTimerMs = j.value("idleTimerMs", config_.idleTimerMs);
+        if (config_.idleTimerMs < 100) config_.idleTimerMs = 100;
+        config_.vramCacheBlocks = j.value("vramCacheBlocks", config_.vramCacheBlocks);
+        config_.ramTierBlocks = j.value("ramTierBlocks", config_.ramTierBlocks);
+        config_.diskSpillEnabled = j.value("diskSpillEnabled", config_.diskSpillEnabled);
+        config_.diskSpillBlocks = j.value("diskSpillBlocks", config_.diskSpillBlocks);
+        config_.spillFilePath = FromUtf8(j.value("spillFilePath", std::string()));
+        if (config_.vramCacheBlocks < 0) config_.vramCacheBlocks = 0;
+        if (config_.ramTierBlocks < 0) config_.ramTierBlocks = 0;
+        if (config_.diskSpillBlocks < 0) config_.diskSpillBlocks = 0;
 
         ConfigStore::Save(config_);  // persist to config.json
         if (onApply_) {

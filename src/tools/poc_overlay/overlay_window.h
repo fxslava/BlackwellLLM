@@ -6,12 +6,23 @@
 
 #include <string>
 
+#include "overlay_state.h"
+
 // A transparent, click-through, never-activated overlay that renders one or
 // more lines of text so that the END of the string (its bottom-right corner)
 // sits just above a given screen point (the caret), mimicking inline
 // autocomplete / Copilot-style suggestions. The box is sized to its content on
 // every update and the text is right/bottom-aligned within it, so the last
 // glyph lands directly above the caret and multi-line strings stack upward.
+//
+// The overlay is a dumb renderer for the CaretTracker state machine: it paints
+// whatever the latest OverlaySnapshot says --
+//   Typing       captured source text, dimmed + italic (what WILL be sent)
+//   Translating  dimmed source, then the streamed partial translation (or an
+//                ellipsis while the first tokens are still in flight) in the
+//                accent color
+//   Ready        the final translation, full-brightness (Ctrl+Enter commits)
+//   Hidden       no pill
 //
 // Rendering path: an ID2D1DCRenderTarget is bound to a top-down 32bpp DIB (via
 // BindDC) and painted with a transparent clear color plus premultiplied alpha.
@@ -30,27 +41,15 @@ public:
 
     bool Create(HINSTANCE hInstance);
 
-    // Thread-safe: marshals the update to the overlay's own window via
-    // PostMessage so the D2D repaint always happens on the HWND's owning thread.
-    // `caretScreenPos` is the caret point the string's end is anchored above.
-    void PostUpdate(const std::wstring& text, POINT caretScreenPos);
-
-    // Thread-safe (same PostMessage marshaling): show `text` -- a streamed
-    // translation from the agent worker -- anchored at the caret position of
-    // the most recent PostUpdate. Dropped if no update has arrived yet (there
-    // is nowhere to anchor). This is the sink end of the preview pipeline.
-    void PostTranslation(const std::wstring& text);
+    // Thread-safe: marshals the snapshot to the overlay's own window via
+    // PostMessage so the D2D repaint always happens on the HWND's owning
+    // thread. Called from the CaretTracker STA thread on every state change.
+    void PostState(const OverlaySnapshot& state);
 
     void Hide();
 
 private:
-    struct Payload {
-        std::wstring text;
-        POINT pos;
-    };
-
-    static constexpr UINT kMsgUpdate = WM_APP + 1;
-    static constexpr UINT kMsgTranslate = WM_APP + 2;
+    static constexpr UINT kMsgState = WM_APP + 1;
     // The backing DIB is allocated once at this maximum size; each frame only
     // blits the content-sized sub-rect from its top-left corner.
     static constexpr int kMaxWidth = 720;
@@ -63,15 +62,9 @@ private:
 
     bool InitDirect2D();
     bool InitBackingBitmap();
-    void Repaint(const std::wstring& text, POINT caretScreenPos);
+    void Repaint(const OverlaySnapshot& state);
 
     HWND hwnd_ = nullptr;
-
-    // Caret anchor of the most recent kMsgUpdate. Written and read ONLY inside
-    // WndProc (the window's owning thread), so no synchronization is needed;
-    // kMsgTranslate repaints translated text at this remembered position.
-    POINT lastAnchor_{};
-    bool hasAnchor_ = false;
 
     Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
     Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory_;

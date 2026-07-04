@@ -1,7 +1,13 @@
 #include "translation_service.h"
 
+// windows.h's min/max macros would shred the std::min/std::max calls inside
+// the paging substrate headers included below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>  // OutputDebugStringW
 
+#include <filesystem>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -12,21 +18,16 @@
 #include "tool_parser.h"            // agent::orch::ToolInvocation
 
 // ---------------------------------------------------------------------------
-// AOT prompt-cache warm start (system_prompt.bkv) -- integration status.
+// AOT prompt-cache warm start (system_prompt.bkv).
 //
-// The paging substrate is complete and tested standalone (src/paging/:
-// PrefixCacheManager, TieredMemoryPager, AOTCacheWarmer, .bkv serializer), but
-// BlackwellEngine does not yet EXPORT an accessor to the PrefixCacheManager
-// that owns its live paged KV pools, and the production IPrefillDriver binding
-// (tokenizer + chunked prefill sweep) has not landed. Until that seam exists,
-// warm-starting from a foreign PrefixCacheManager would build KV pages the
-// engine's attention kernels never read -- worse than useless.
-//
-// So the warm start compiles only under BLACKWELL_ENGINE_HAS_PREFIX_CACHE
-// (define it when the engine grows `paging::PrefixCacheManager& prefix_cache()`),
-// and today degrades to a logged no-op: the system prompt is deliberately tiny
-// (~90 tokens) and gets prefilled once per cold start through the adapter's
-// own KV-reuse path instead.
+// The engine now exports its prefix-cache substrate (BlackwellEngine::
+// has_prefix_cache() / prefix_cache() / prefill_driver(), composed in
+// engine.cpp over the PagedKVManager's own SequenceManager), so warm-started
+// .bkv pages are the very pages the paged-flash attention kernels read.
+// BLACKWELL_ENGINE_HAS_PREFIX_CACHE is defined by this target's CMakeLists;
+// the compile-time gate remains so the file still builds against an older
+// engine checkout. At runtime the substrate exists only for Paged-mode dense
+// uniform full-attention models -- has_prefix_cache() is the authority.
 // ---------------------------------------------------------------------------
 #if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
 #include "../../paging/aot_cache_warmer.h"
@@ -58,31 +59,6 @@ std::string BuildPreviewPrompt(const std::string& lang) {
            "Assistant: <finish>Hello world</finish>\n";
 }
 
-// Commit protocol (§2.3): same skeleton plus ONE optional glossary round-trip.
-// The act-then-finish orchestrator upgrade lets a well-behaved model put the
-// tool call and the <finish> in a single completion; a lookup that genuinely
-// needs its observation costs the second (and last) iteration.
-std::string BuildCommitPrompt(const std::string& lang) {
-    return "You are a translation agent. Translate the user's message into " + lang +
-           ".\n"
-           "\n"
-           "You may check ONE domain term first:\n"
-           "<tool_call name=\"glossary_lookup\"><arg name=\"term\">TERM</arg></tool_call>\n"
-           "The result arrives as an OBSERVATION message.\n"
-           "\n"
-           "Then reply with exactly one tag and nothing else:\n"
-           "<finish>TRANSLATION</finish>\n"
-           "\n"
-           "Rules:\n"
-           "- At most one tool call, and only if a term's established translation matters.\n"
-           "- If no lookup is needed, output <finish>TRANSLATION</finish> immediately.\n"
-           "- Keep numbers, names, code identifiers, URLs and emoji unchanged.\n"
-           "\n"
-           "Example:\n"
-           "User: Bonjour le monde\n"
-           "Assistant: <finish>Hello world</finish>\n";
-}
-
 // Chop a trailing INCOMPLETE UTF-8 sequence so a mid-codepoint streaming
 // boundary never flashes U+FFFD in the overlay. (The dropped bytes reappear
 // with the next delta.)
@@ -105,27 +81,10 @@ void TrimIncompleteUtf8(std::string& s) {
 
 }  // namespace
 
-TranslationService::TranslationService(Settings settings, PreviewSink previewSink)
+TranslationService::TranslationService(Settings settings)
     : settings_(std::move(settings)),
-      previewSink_(std::move(previewSink)),
-      previewPrompt_(BuildPreviewPrompt(settings_.targetLang)),
-      commitPrompt_(BuildCommitPrompt(settings_.targetLang)) {
-    // Prototype glossary: no store yet, but the tool is REAL -- registered,
-    // dispatchable, and the first production validation of a ReAct tool
-    // round-trip. Failure mode is text, per the dispatcher contract.
-    tools_.register_tool(
-        "glossary_lookup",
-        "Look up the pinned translation for a domain term. Args: term.",
-        [](const agent::orch::ToolInvocation& call) -> std::string {
-            const auto it = call.args.find("term");
-            if (it == call.args.end() || it->second.empty()) {
-                return "ERROR: glossary_lookup needs <arg name=\"term\">TERM</arg>.";
-            }
-            return "No glossary entry for '" + it->second +
-                   "'. Use your best judgment and keep it consistent with the "
-                   "context.";
-        });
-    // Decoy from the assessment (F-2 insurance): a model that hallucinates a
+      previewPrompt_(BuildPreviewPrompt(settings_.targetLang)) {
+    // F-2 insurance from the assessment: a model that hallucinates a
     // translate_text tool gets steered back onto the <finish> protocol instead
     // of an opaque "tool not found".
     tools_.register_tool(
@@ -139,6 +98,10 @@ TranslationService::TranslationService(Settings settings, PreviewSink previewSin
 }
 
 TranslationService::~TranslationService() {
+    Shutdown();
+}
+
+void TranslationService::Shutdown() {
     stop_.store(true, std::memory_order_relaxed);
     currentGen_.fetch_add(1, std::memory_order_relaxed);  // abort in-flight decode
     {
@@ -146,19 +109,30 @@ TranslationService::~TranslationService() {
     }  // pairs the flag with the cv (no wakeup may fall between check and wait)
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
-    // Unblock a TranslateBlocking() caller that is still waiting: the worker
-    // has exited, so its promise will never be fulfilled otherwise.
+}
+
+void TranslationService::SetPreviewSink(PreviewSink sink) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (pendingCommit_ && pendingCommit_->reply) {
-        pendingCommit_->reply->set_value(std::nullopt);
+    previewSink_ = std::move(sink);
+}
+
+void TranslationService::DeliverToSink(std::uint64_t gen, const std::wstring& text,
+                                       bool done) {
+    PreviewSink sink;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink = previewSink_;  // copy under the lock; call outside it
     }
+    if (sink) sink(gen, text, done);
 }
 
 void TranslationService::RequestPreview(std::wstring segment,
                                         std::wstring inferenceContext) {
-    if (state() == State::Error || segment.empty()) return;
+    if (stop_.load(std::memory_order_relaxed) || state() == State::Error ||
+        segment.empty()) {
+        return;
+    }
     Job job;
-    job.kind = JobKind::Preview;
     job.segment = std::move(segment);
     job.context = std::move(inferenceContext);
     job.gen = currentGen_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -167,38 +141,6 @@ void TranslationService::RequestPreview(std::wstring segment,
         pendingPreview_ = std::move(job);  // latest wins; older slot content dies
     }
     cv_.notify_all();
-}
-
-std::optional<std::wstring> TranslationService::TranslateBlocking(
-    const std::wstring& segment, const std::wstring& inferenceContext,
-    std::chrono::milliseconds timeout) {
-    if (state() == State::Error || segment.empty()) return std::nullopt;
-
-    Job job;
-    job.kind = JobKind::Commit;
-    job.segment = segment;
-    job.context = inferenceContext;
-    // Bumping the generation aborts any in-flight preview decode -- the commit
-    // is about to replace that text anyway, and it frees the engine sooner.
-    job.gen = currentGen_.fetch_add(1, std::memory_order_relaxed) + 1;
-    job.reply = std::make_shared<std::promise<std::optional<std::wstring>>>();
-    auto future = job.reply->get_future();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (pendingCommit_) return std::nullopt;  // re-entrant commit: refuse
-        pendingPreview_.reset();                  // superseded by the commit
-        pendingCommit_ = std::move(job);
-    }
-    cv_.notify_all();
-
-    // Bounded wait on the STA thread (see header for why this is acceptable in
-    // the prototype). On timeout the worker keeps decoding; its late result is
-    // published into an abandoned shared state and simply evaporates.
-    if (future.wait_for(timeout) != std::future_status::ready) {
-        Log(L"commit translation timed out; injecting source unchanged");
-        return std::nullopt;
-    }
-    return future.get();
 }
 
 void TranslationService::CancelPending() {
@@ -215,40 +157,29 @@ void TranslationService::ThreadMain() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] {
-                return stop_.load(std::memory_order_relaxed) || pendingCommit_ ||
-                       pendingPreview_;
+                return stop_.load(std::memory_order_relaxed) || pendingPreview_;
             });
             if (stop_.load(std::memory_order_relaxed)) break;
-            if (pendingCommit_) {
-                job = std::move(*pendingCommit_);
-                pendingCommit_.reset();
-            } else {
-                job = std::move(*pendingPreview_);
-                pendingPreview_.reset();
-            }
+            job = std::move(*pendingPreview_);
+            pendingPreview_.reset();
         }
 
-        if (state() == State::Error) {
-            if (job.reply) job.reply->set_value(std::nullopt);
-            continue;
-        }
+        if (state() == State::Error) continue;
 
-        // A preview that was superseded while queued is dead on arrival; skip
-        // the prefill instead of letting the stream callback cancel it later.
-        if (job.kind == JobKind::Preview &&
-            job.gen != currentGen_.load(std::memory_order_relaxed)) {
-            continue;
-        }
+        // Superseded while queued: dead on arrival; skip the prefill instead of
+        // letting the stream callback cancel it mid-decode.
+        if (job.gen != currentGen_.load(std::memory_order_relaxed)) continue;
 
         state_.store(State::Generating, std::memory_order_relaxed);
-        std::optional<std::wstring> result = RunTranslation(job);
+        const std::optional<std::wstring> result = RunTranslation(job);
         state_.store(State::Ready, std::memory_order_relaxed);
 
-        if (job.kind == JobKind::Commit) {
-            job.reply->set_value(std::move(result));
-        } else if (result && previewSink_ &&
-                   job.gen == currentGen_.load(std::memory_order_relaxed)) {
-            previewSink_(job.gen, *result, /*done=*/true);
+        // ALWAYS close the request out (empty text = failed/dropped) so the
+        // consumer's state machine can leave its loading state -- but only if
+        // this job is still the current one; a superseded job's slot in the
+        // consumer was already taken over by its successor.
+        if (job.gen == currentGen_.load(std::memory_order_relaxed)) {
+            DeliverToSink(job.gen, result.value_or(std::wstring()), /*done=*/true);
         }
     }
 }
@@ -261,12 +192,31 @@ void TranslationService::LoadEngine() {
     }
     try {
         Log(L"loading model from " + settings_.modelDir + L" ...");
-        // Continuous KV mode for the dense-model prototype. The .bkv/prefix-
-        // cache path will require use_paged_attention=true once the engine
-        // exports its paging substrate -- flip it together with the warm start.
+        // Paged KV mode: required by the prefix-cache substrate (radix-tree
+        // prefix reuse + tiered demotion). The tier budget comes straight from
+        // the user's settings; the engine validates it (a non-empty spill path
+        // is required whenever the disk tier is on).
+        blackwell::RuntimeOverrides overrides;
+        overrides.kv_vram_cache_pages = settings_.vramCacheBlocks;
+        overrides.kv_ram_slots = settings_.ramTierBlocks;
+        overrides.kv_disk_slots =
+            settings_.diskSpillEnabled ? settings_.diskSpillBlocks : 0;
+        if (settings_.diskSpillEnabled) {
+            overrides.kv_spill_path = ToUtf8(settings_.spillFilePath);
+            // The tier backend opens (doesn't create) the directory; make sure
+            // %LOCALAPPDATA%\Blackwell (or wherever the user pointed) exists.
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(settings_.spillFilePath).parent_path(), ec);
+            if (ec) {
+                Log(L"warning: could not create the spill directory (" +
+                    settings_.spillFilePath + L"); the engine will report the error");
+            }
+        }
         adapter_ = std::make_unique<playground::BlackwellLLMAdapter>(
             ToUtf8(settings_.modelDir), settings_.maxSeqLen,
-            /*use_paged_attention=*/false);
+            /*use_paged_attention=*/true,
+            /*num_gpu_layers=*/static_cast<size_t>(-1), overrides);
         WarmStartPromptCache();
         state_.store(State::Ready, std::memory_order_relaxed);
         Log(L"model ready");
@@ -284,12 +234,20 @@ void TranslationService::LoadEngine() {
 void TranslationService::WarmStartPromptCache() {
     if (settings_.promptCacheDir.empty()) return;
 #if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
+    // Runtime capability gate: Paged-mode dense uniform full-attention models
+    // only. Hybrid SSM / gated-attention checkpoints have no prefix cache and
+    // must not be treated as an error -- they just prefill normally.
+    if (!adapter_->engine().has_prefix_cache()) {
+        Log(L"prompt cache warm start skipped: the loaded model has no prefix-"
+            L"cache substrate (hybrid SSM / gated attention / non-paged mode)");
+        return;
+    }
     // Deploy-side Text-to-Cache: restore the AOT-compiled prompt library
     // (system_prompt.bkv and friends) with LoadPolicy::ColdRam -- every branch
     // sits in pinned RAM from startup and page-faults into VRAM on its first
     // acquire, so warm start costs no VRAM until a prompt is actually used.
     try {
-        auto& pc = adapter_->engine().prefix_cache();  // the engine seam
+        auto& pc = adapter_->engine().prefix_cache();
         const int tokens = blackwell::paging::AOTCacheWarmer::warm_start(
             pc, ToUtf8(settings_.promptCacheDir),
             blackwell::paging::PrefixCacheManager::LoadPolicy::ColdRam);
@@ -302,39 +260,35 @@ void TranslationService::WarmStartPromptCache() {
             FromUtf8(e.what()));
     }
 #else
-    Log(L"prompt cache warm start SKIPPED: this engine build does not export "
-        L"its PrefixCacheManager yet (BLACKWELL_ENGINE_HAS_PREFIX_CACHE unset); "
-        L"the system prompt will be prefilled once per cold start instead");
+    Log(L"prompt cache warm start SKIPPED: built without "
+        L"BLACKWELL_ENGINE_HAS_PREFIX_CACHE; the system prompt will be "
+        L"prefilled once per cold start instead");
 #endif
 }
 
 std::optional<std::wstring> TranslationService::RunTranslation(const Job& job) {
     using namespace agent::orch;
-    const bool isPreview = (job.kind == JobKind::Preview);
 
     playground::BlackwellLLMAdapter::Params params;
     params.temperature = settings_.temperature;
     params.top_p = settings_.topP;
-    params.max_new_tokens =
-        isPreview ? settings_.previewMaxNewTokens : settings_.commitMaxNewTokens;
+    params.max_new_tokens = settings_.previewMaxNewTokens;
     adapter_->set_params(params);
 
     // The stream callback is the cancellation AND streaming plane in one:
-    //   * stale generation (a newer request arrived)  -> cooperative abort;
-    //   * service shutdown                            -> cooperative abort;
-    //   * "</finish>" fully streamed                  -> hard stop at the
+    //   * stale generation (a newer request / an interrupt) -> cooperative abort;
+    //   * service shutdown                                  -> cooperative abort;
+    //   * "</finish>" fully streamed                        -> hard stop at the
     //     protocol boundary (the adapter's checkpoint-level stop strings are
     //     fixed; this is the supported way to cut decode at our tag);
-    //   * preview only: push the partial translation to the sink live.
+    //   * push the growing partial translation to the sink live.
     std::string acc;
     std::wstring lastPosted;
     adapter_->set_stream_callback([&, this](const std::string& delta) -> bool {
         if (stop_.load(std::memory_order_relaxed)) return false;
-        if (isPreview && job.gen != currentGen_.load(std::memory_order_relaxed)) {
-            return false;
-        }
+        if (job.gen != currentGen_.load(std::memory_order_relaxed)) return false;
         acc += delta;
-        if (isPreview) StreamPreviewPartial(acc, job.gen, lastPosted);
+        StreamPreviewPartial(acc, job.gen, lastPosted);
         return acc.find("</finish>") == std::string::npos;
     });
     // The callback captures locals of THIS frame; never let it outlive them.
@@ -344,8 +298,8 @@ std::optional<std::wstring> TranslationService::RunTranslation(const Job& job) {
     } guard{*adapter_};
 
     OrchestratorConfig cfg;
-    cfg.max_iterations = isPreview ? 1 : 2;
-    cfg.system_prompt = isPreview ? previewPrompt_ : commitPrompt_;
+    cfg.max_iterations = 1;  // the strict 1-step preview budget
+    cfg.system_prompt = previewPrompt_;
 
     // Fresh orchestrator per request (transcripts are per-run state); the KV
     // cache lives one level down in the adapter and survives across runs.
@@ -362,15 +316,12 @@ std::optional<std::wstring> TranslationService::RunTranslation(const Job& job) {
 
     if (r.finished && !r.answer.empty()) return FromUtf8(r.answer);
 
-    // Cap exit (F-2 gate): never surface protocol markup. A nudged pure-prose
-    // preview is still a usable best effort; a commit must be clean or nothing,
-    // because its output is injected into the user's document.
-    if (isPreview && !r.finished && !r.answer.empty() &&
-        r.answer.find('<') == std::string::npos) {
+    // Cap exit (F-2 gate): never surface protocol markup. Nudged pure prose is
+    // still a usable best effort for a preview.
+    if (!r.finished && !r.answer.empty() && r.answer.find('<') == std::string::npos) {
         return FromUtf8(r.answer);
     }
-    Log(isPreview ? L"preview run did not finish cleanly; dropped"
-                  : L"commit run did not finish cleanly; injecting source unchanged");
+    Log(L"preview run did not finish cleanly; dropped");
     return std::nullopt;
 }
 
@@ -398,7 +349,7 @@ void TranslationService::StreamPreviewPartial(const std::string& acc,
     }
 
     std::wstring text = FromUtf8(body);
-    if (text.empty() || text == lastPosted || !previewSink_) return;
+    if (text.empty() || text == lastPosted) return;
     lastPosted = std::move(text);
-    previewSink_(gen, lastPosted, /*done=*/false);
+    DeliverToSink(gen, lastPosted, /*done=*/false);
 }

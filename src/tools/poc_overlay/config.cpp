@@ -33,6 +33,14 @@ std::wstring ConfigStore::DefaultPath() {
     return path;
 }
 
+std::wstring ConfigStore::DefaultSpillPath() {
+    wchar_t local[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) == 0) {
+        return L"spill.bkv";  // last resort: next to the current directory
+    }
+    return std::wstring(local) + L"\\Blackwell\\spill.bkv";
+}
+
 Config ConfigStore::Load() {
     Config config;
     std::ifstream in(DefaultPath());  // MSVC ifstream accepts a wide path
@@ -49,6 +57,18 @@ Config ConfigStore::Load() {
         config.temperature = j.value("temperature", config.temperature);
         config.topP = j.value("topP", config.topP);
         config.maxTokens = j.value("maxTokens", config.maxTokens);
+        config.captureGranularity = CaptureGranularityFromString(
+            j.value("captureGranularity", std::string()), config.captureGranularity);
+        config.idleTimerMs = j.value("idleTimerMs", config.idleTimerMs);
+        if (config.idleTimerMs < 100) config.idleTimerMs = 100;  // sane floor
+        config.vramCacheBlocks = j.value("vramCacheBlocks", config.vramCacheBlocks);
+        config.ramTierBlocks = j.value("ramTierBlocks", config.ramTierBlocks);
+        config.diskSpillEnabled = j.value("diskSpillEnabled", config.diskSpillEnabled);
+        config.diskSpillBlocks = j.value("diskSpillBlocks", config.diskSpillBlocks);
+        config.spillFilePath = FromUtf8(j.value("spillFilePath", std::string()));
+        if (config.vramCacheBlocks < 0) config.vramCacheBlocks = 0;
+        if (config.ramTierBlocks < 0) config.ramTierBlocks = 0;
+        if (config.diskSpillBlocks < 0) config.diskSpillBlocks = 0;
     } catch (const std::exception&) {
         // Malformed file -> fall back to whatever defaults survived.
     }
@@ -64,6 +84,13 @@ bool ConfigStore::Save(const Config& config) {
     j["temperature"] = config.temperature;
     j["topP"] = config.topP;
     j["maxTokens"] = config.maxTokens;
+    j["captureGranularity"] = ToString(config.captureGranularity);
+    j["idleTimerMs"] = config.idleTimerMs;
+    j["vramCacheBlocks"] = config.vramCacheBlocks;
+    j["ramTierBlocks"] = config.ramTierBlocks;
+    j["diskSpillEnabled"] = config.diskSpillEnabled;
+    j["diskSpillBlocks"] = config.diskSpillBlocks;
+    j["spillFilePath"] = ToUtf8(config.spillFilePath);
 
     std::ofstream out(DefaultPath());
     if (!out) {

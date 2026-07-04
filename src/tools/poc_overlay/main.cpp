@@ -1,19 +1,27 @@
-// poc_overlay: the live overlay translator -- the full pipeline from OS input
-// capture to real BlackwellEngine inference and back into the focused control:
+// poc_overlay: the live overlay translator -- a stateful, debounce-driven
+// pipeline from OS input capture to real BlackwellEngine inference and back
+// into the focused control:
 //
 //   [UI thread]      WH_KEYBOARD_LL hook (lightweight TRIGGER + fallback buffer)
 //                        |  RequestUpdate(fallbackText)     [condvar signal]
 //                        v
 //   [COM/UIA thread]  CaretTracker: reads the REAL text from the focused control
 //                      (IUIAutomationTextPattern document-up-to-caret, or
-//                      IUIAutomationValuePattern), plus the caret rectangle.
-//                        |  PostUpdate(text, caretPos)      [PostMessage]
-//                        |  word boundary -> RequestPreview [condvar signal]
-//                        |  Ctrl+Enter    -> TranslateBlocking (bounded wait)
+//                      IUIAutomationValuePattern) and runs the interaction
+//                      state machine:
+//                        Typing      capture area (granularity-bounded) shown
+//                                    dimmed in the overlay; idle timer re-arms
+//                                    on every keystroke
+//                        Translating idle timer expired -> RequestPreview();
+//                                    overlay shows a loading/streaming state
+//                        Ready       translation shown; Ctrl+Enter surgically
+//                                    replaces source_raw via TextInjector --
+//                                    HOST-SIDE ONLY, no inference on commit
+//                        |  PostState(snapshot)             [PostMessage]
 //                        v
 //   [agent worker]    TranslationService: BlackwellLLMAdapter (CUDA engine +
-//                      tokenizer) driven by the 1-step AgentOrchestrator loops.
-//                        |  PostTranslation(text)           [PostMessage]
+//                      tokenizer) driven by the strict 1-step orchestrator loop.
+//                        |  OnPreviewResult(text, done)     [condvar signal]
 //                        v
 //   [UI thread]       OverlayWindow: layered, click-through, D2D-rendered popup
 //                      whose string END anchors just above the caret.
@@ -23,7 +31,6 @@
 #include <windows.h>
 #include <objbase.h>
 
-#include <chrono>
 #include <string>
 
 #include "caret_tracker.h"
@@ -38,20 +45,24 @@ namespace {
 
 constexpr UINT kTrayIconId = 1;
 
-// How long a Ctrl+Enter commit may block the CaretTracker STA thread waiting
-// for the engine before falling back to injecting the source unchanged.
-constexpr std::chrono::seconds kCommitTimeout{5};
-
 // The live, in-memory application config. Loaded at startup and rewritten by the
 // settings window; only ever touched on the UI thread.
 Config g_config;
 
-// Pushes a config into the running app: rebinds hotkeys in memory immediately.
-// (Model path / context size will be handed to the inference engine here later.)
+// The tracker owns the capture/debounce settings; the settings window pushes
+// changes into it live via ApplyConfig (model path still needs a restart).
+CaretTracker* g_caretTracker = nullptr;
+
+// Pushes a config into the running app: rebinds hotkeys and capture settings
+// in memory immediately. (Model path / context size are engine-construction
+// parameters and require a restart.)
 void ApplyConfig(const Config& config) {
     g_config = config;
     HookManager::Instance().SetCommitShortcut(config.commitShortcut);
     HookManager::Instance().SetActivationShortcut(config.activationShortcut);
+    if (g_caretTracker) {
+        g_caretTracker->SetCaptureSettings(config.captureGranularity, config.idleTimerMs);
+    }
 }
 
 LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -113,15 +124,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     // Config must be loaded BEFORE the TranslationService: it carries the model
     // directory and the sampling parameters the engine is constructed with.
-    // (A model-path change in the settings window currently requires a restart;
-    // the engine is built once, on the service's worker thread.)
     g_config = ConfigStore::Load();
     ApplyConfig(g_config);
 
-    // The inference stack. Constructed FIRST so it is destroyed LAST: the
-    // CaretTracker STA thread calls into it, so the service must outlive the
-    // tracker. Engine construction (DirectStorage weight streaming) happens on
-    // the service's own worker thread -- this constructor is instant.
+    // The inference stack. Engine construction (DirectStorage weight streaming)
+    // happens on the service's own worker thread -- this constructor is instant.
+    // The preview sink is late-bound below, once the CaretTracker exists.
     TranslationService::Settings svcSettings;
     svcSettings.modelDir = g_config.modelPath;
     svcSettings.promptCacheDir = g_config.modelPath.empty()
@@ -130,45 +138,45 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     svcSettings.maxSeqLen = static_cast<size_t>(g_config.contextSize);
     svcSettings.temperature = g_config.temperature;
     svcSettings.topP = g_config.topP;
-    svcSettings.commitMaxNewTokens = g_config.maxTokens;
-    TranslationService translator(
-        std::move(svcSettings),
-        // PreviewSink: runs on the agent worker thread; PostTranslation is
-        // PostMessage-based, so forwarding straight through is thread-safe.
-        [&overlay](std::uint64_t /*gen*/, const std::wstring& text, bool /*done*/) {
-            overlay.PostTranslation(text);
-        });
+    // Tiered KV prefix-cache budget -> engine RuntimeConfig knobs. An empty
+    // spill path resolves to %LOCALAPPDATA%\Blackwell\spill.bkv.
+    svcSettings.vramCacheBlocks = g_config.vramCacheBlocks;
+    svcSettings.ramTierBlocks = g_config.ramTierBlocks;
+    svcSettings.diskSpillEnabled = g_config.diskSpillEnabled;
+    svcSettings.diskSpillBlocks = g_config.diskSpillBlocks;
+    svcSettings.spillFilePath = g_config.spillFilePath.empty()
+                                    ? ConfigStore::DefaultSpillPath()
+                                    : g_config.spillFilePath;
+    TranslationService translator(std::move(svcSettings));
 
-    // Real translation applied at commit: blocks the STA thread (bounded by
-    // kCommitTimeout) while the agent worker runs the 2-iteration commit loop.
-    // On timeout / engine error the segment is injected unchanged -- Ctrl+Enter
-    // must never destroy what the user typed.
-    auto commitTransform = [&translator](const std::wstring& segment,
-                                         const std::wstring& context) -> std::wstring {
-        return translator.TranslateBlocking(segment, context, kCommitTimeout)
-            .value_or(segment);
+    // CaretTracker owns the interaction state machine on ITS OWN (COM/UIA STA)
+    // thread: capture extraction, the idle-timer debounce, and the surgical
+    // commit (so the UIA interfaces never cross apartments). All callbacks fire
+    // on that thread and only enqueue.
+    CaretTracker::Callbacks trackerCallbacks;
+    trackerCallbacks.render = [&overlay](const OverlaySnapshot& snapshot) {
+        overlay.PostState(snapshot);  // PostMessage-marshaled to the UI thread
     };
-    // Brackets the injection window on the hook so it flags synthetic input.
-    auto injectionGuard = [](bool active) { HookManager::Instance().SetInjecting(active); };
+    trackerCallbacks.requestPreview = [&translator](const std::wstring& source,
+                                                    const std::wstring& context) {
+        translator.RequestPreview(source, context);
+    };
+    trackerCallbacks.cancelPreview = [&translator]() { translator.CancelPending(); };
+    trackerCallbacks.injectionGuard = [](bool active) {
+        HookManager::Instance().SetInjecting(active);
+    };
+    CaretTracker caretTracker(std::move(trackerCallbacks), g_config.captureGranularity,
+                              g_config.idleTimerMs);
+    g_caretTracker = &caretTracker;
 
-    // CaretTracker resolves the authoritative text + caret position on ITS OWN
-    // (COM/UIA STA) thread, and also performs the commit replacement there (so the
-    // UIA interfaces never cross apartments). The update callback runs on that
-    // thread and must not touch the overlay directly -- PostUpdate() marshals the
-    // result back to the overlay window's owning (UI) thread via PostMessage.
-    CaretTracker caretTracker(
-        [&](const CaretUpdate& update) {
-            if (update.caretFound) {
-                overlay.PostUpdate(update.text, update.caretScreenPos);
-            }
-            // Word boundary on the authoritative UIA text: the preview gate.
-            // Latest-wins coalescing + the generation counter inside the
-            // service make bursts of boundaries cheap and self-cancelling.
-            if (update.wordBoundary && !update.text.empty()) {
-                translator.RequestPreview(update.text, update.inferenceContext);
-            }
-        },
-        commitTransform, injectionGuard);
+    // Late-bound sink: translation deltas/finals flow back into the tracker's
+    // state machine (thread-safe enqueue), which decides what the overlay shows.
+    // The service's generation counter already suppresses most stale deliveries;
+    // the tracker's phase check catches the rest.
+    translator.SetPreviewSink(
+        [&caretTracker](std::uint64_t /*gen*/, const std::wstring& text, bool done) {
+            caretTracker.OnPreviewResult(text, done);
+        });
 
     // The hook callbacks run inline in the global hook chain on THIS thread and
     // must stay fast. They only hand work to the caret tracker's queue (an O(1)
@@ -176,16 +184,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // 3-tier replacement happen off this call stack entirely.
     HookManager::Callbacks callbacks;
     callbacks.onTrigger = [&caretTracker](const std::wstring& fallbackText, bool wordBoundary) {
-        caretTracker.RequestUpdate(fallbackText, wordBoundary);  // "field changed -> poll UIA"
+        // Every keystroke: re-capture, re-arm the idle timer, interrupt any
+        // in-flight/displayed translation (State 2/3 -> State 1).
+        caretTracker.RequestUpdate(fallbackText, wordBoundary);
     };
-    callbacks.onCommit = [&](const std::wstring& fallbackText) {
-        overlay.Hide();
-        caretTracker.RequestCommit(fallbackText);  // re-resolve + replace on the STA thread
+    callbacks.onCommit = [&caretTracker](const std::wstring& fallbackText) {
+        // Surgical host-side replace of the Ready snapshot; a no-op unless the
+        // state machine is actually in Ready.
+        caretTracker.RequestCommit(fallbackText);
     };
     callbacks.onReset = [&]() {
-        overlay.Hide();
-        translator.CancelPending();  // focus/caret moved: a preview result could
-                                     // never be shown, so stop paying for it
+        overlay.Hide();               // snappy; the tracker's render confirms it
+        caretTracker.RequestReset();  // cancel + back to Idle
     };
 
     const bool hookInstalled = HookManager::Instance().Install(std::move(callbacks));
@@ -217,6 +227,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
 
     HookManager::Instance().Uninstall();
+    g_caretTracker = nullptr;
+
+    // Teardown ordering: join the service worker FIRST, so its sink can never
+    // fire into the CaretTracker while (or after) the tracker is destroyed
+    // during stack unwinding. After Shutdown(), the tracker's own teardown may
+    // still call RequestPreview/CancelPending -- both no-op against a stopped
+    // service that is destroyed later (declared earlier) in this scope.
+    translator.Shutdown();
+
     CoUninitialize();
     return static_cast<int>(msg.wParam);
 }

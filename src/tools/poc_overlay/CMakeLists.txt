@@ -27,9 +27,18 @@ add_executable(poc_overlay WIN32
 
 target_compile_features(poc_overlay PRIVATE cxx_std_20)
 
+# The prefix-cache substrate is exported by the engine (BlackwellEngine::
+# prefix_cache() / prefill_driver()), so translation_service.cpp warm-starts
+# the AOT prompt library (.bkv) for real. The paging headers it pulls include
+# <cuda_runtime.h>, hence the CUDAToolkit include dirs below.
+target_compile_definitions(poc_overlay PRIVATE BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
+
+find_package(CUDAToolkit REQUIRED)
+
 target_include_directories(poc_overlay PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator  # orchestrator headers
     ${CMAKE_CURRENT_SOURCE_DIR}/../playground             # blackwell_llm_adapter.h
+    ${CUDAToolkit_INCLUDE_DIRS}                           # paging headers -> cuda_runtime.h
 )
 
 # The whole PoC calls the explicit *W (wide) Win32 APIs directly, but
