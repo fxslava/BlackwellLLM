@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>  // OutputDebugStringW
 
+#include <algorithm>
 #include <filesystem>
 #include <string_view>
 #include <utility>
@@ -18,25 +19,51 @@
 #include "tool_parser.h"            // agent::orch::ToolInvocation
 
 // ---------------------------------------------------------------------------
-// AOT prompt-cache warm start (system_prompt.bkv).
+// JIT prompt cache (per-model .bkv, generated on the end user's machine).
 //
-// The engine now exports its prefix-cache substrate (BlackwellEngine::
-// has_prefix_cache() / prefix_cache() / prefill_driver(), composed in
-// engine.cpp over the PagedKVManager's own SequenceManager), so warm-started
-// .bkv pages are the very pages the paged-flash attention kernels read.
+// The user picks the checkpoint at runtime (Qwen / ALMA / Llama / ...), and KV
+// page geometry + token ids are strictly model-specific -- so pre-compiled
+// .bkv files cannot ship with the app. Instead the service self-bootstraps on
+// first run: it builds the WarmupSpec in C++ (the chat-template-rendered
+// system-prompt prefix), drives the engine's own EnginePrefillCoordinator
+// (the production IPrefillDriver, tokenizer already bound by the adapter)
+// through AOTCacheWarmer::compile(), and serializes the result to a directory
+// keyed by the substrate's model hash -- the same hash warm_start() validates
+// manifests against, so a cache can never be replayed onto the wrong model.
+// Subsequent runs find the manifest and go straight to the ColdRam warm start.
+//
 // BLACKWELL_ENGINE_HAS_PREFIX_CACHE is defined by this target's CMakeLists;
 // the compile-time gate remains so the file still builds against an older
 // engine checkout. At runtime the substrate exists only for Paged-mode dense
 // uniform full-attention models -- has_prefix_cache() is the authority.
 // ---------------------------------------------------------------------------
 #if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
-#include "../../paging/aot_cache_warmer.h"
+#include "../../engine_prefill_coordinator.h"  // EnginePrefillCoordinator (IPrefillDriver)
+#include "../../paging/aot_cache_warmer.h"     // AOTCacheWarmer (compile + warm_start)
+#include "../../paging/warmup_spec.h"          // WarmupSpec / WarmupNode (built in C++)
 #endif
 
 namespace {
 
 void Log(const std::wstring& message) {
     OutputDebugStringW((L"[translation_service] " + message + L"\n").c_str());
+}
+
+// %LOCALAPPDATA%\Blackwell\Cache -- the default per-model prompt-cache root.
+std::wstring DefaultPromptCacheRoot() {
+    wchar_t local[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) == 0) {
+        return L"BlackwellCache";  // last resort: relative to the working dir
+    }
+    return std::wstring(local) + L"\\Blackwell\\Cache";
+}
+
+// 16-digit lowercase hex of the substrate's model hash: the cache directory
+// name AND the value the .bkv manifest is validated against.
+std::wstring HashDirName(unsigned long long hash) {
+    wchar_t buf[17] = {};
+    swprintf(buf, 17, L"%016llx", hash);
+    return buf;
 }
 
 // The strict 1-step preview protocol (docs/REACT_1STEP_ASSESSMENT.md §2.2):
@@ -232,39 +259,165 @@ void TranslationService::LoadEngine() {
 }
 
 void TranslationService::WarmStartPromptCache() {
-    if (settings_.promptCacheDir.empty()) return;
 #if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
     // Runtime capability gate: Paged-mode dense uniform full-attention models
     // only. Hybrid SSM / gated-attention checkpoints have no prefix cache and
     // must not be treated as an error -- they just prefill normally.
     if (!adapter_->engine().has_prefix_cache()) {
-        Log(L"prompt cache warm start skipped: the loaded model has no prefix-"
-            L"cache substrate (hybrid SSM / gated attention / non-paged mode)");
+        Log(L"prompt cache skipped: the loaded model has no prefix-cache "
+            L"substrate (hybrid SSM / gated attention / non-paged mode)");
         return;
     }
-    // Deploy-side Text-to-Cache: restore the AOT-compiled prompt library
-    // (system_prompt.bkv and friends) with LoadPolicy::ColdRam -- every branch
-    // sits in pinned RAM from startup and page-faults into VRAM on its first
-    // acquire, so warm start costs no VRAM until a prompt is actually used.
+    // Everything below is best-effort by design: a cache failure of ANY kind
+    // must never block translation -- the prompt falls back to a one-time
+    // prefill through the ordinary decode path.
     try {
         auto& pc = adapter_->engine().prefix_cache();
-        const int tokens = blackwell::paging::AOTCacheWarmer::warm_start(
-            pc, ToUtf8(settings_.promptCacheDir),
-            blackwell::paging::PrefixCacheManager::LoadPolicy::ColdRam);
-        Log(L"prompt cache warm start: " + std::to_wstring(tokens) +
-            L" tokens now zero-prefill-servable from pinned RAM");
+
+        // (1) Model-specific cache directory. Keyed by the substrate's own
+        // model hash -- the exact value warm_start() validates the manifest
+        // against -- so switching checkpoints switches directories, and a
+        // cache can never be replayed onto a model with different geometry
+        // or token ids.
+        const std::wstring root = settings_.promptCacheRoot.empty()
+                                      ? DefaultPromptCacheRoot()
+                                      : settings_.promptCacheRoot;
+        const std::wstring dir = root + L"\\" + HashDirName(pc.model_hash());
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            Log(L"prompt cache disabled: cannot create " + dir);
+            return;
+        }
+
+        // (2) Conditional JIT generation. The manifest is the compile's last
+        // artifact (AOTCacheWarmer writes it after every .bkv), so its
+        // presence implies a complete cache; a torn earlier run left no
+        // manifest and recompiles here.
+        const bool have_cache = std::filesystem::exists(
+            std::filesystem::path(dir) / L"manifest.json");
+        if (!have_cache) {
+            Log(L"first-run optimization: compiling the prompt cache for this "
+                L"model into " + dir + L" ...");
+            if (!CompilePromptCache(dir)) {
+                return;  // nothing cacheable (reason already logged)
+            }
+        }
+
+        // (3) Cold load: every compiled branch goes to pinned RAM
+        // (LoadPolicy::ColdRam) and page-faults into VRAM on first acquire,
+        // so the warm start costs no VRAM until a prompt is actually used.
+        // A stale/corrupt directory (e.g. a page-size change across engine
+        // versions) is healed by one recompile-and-retry before giving up.
+        int tokens = 0;
+        try {
+            tokens = blackwell::paging::AOTCacheWarmer::warm_start(
+                pc, ToUtf8(dir),
+                blackwell::paging::PrefixCacheManager::LoadPolicy::ColdRam);
+        } catch (const std::exception& e) {
+            Log(L"prompt cache rejected (" + FromUtf8(e.what()) +
+                L"); recompiling once ...");
+            if (!CompilePromptCache(dir)) return;
+            tokens = blackwell::paging::AOTCacheWarmer::warm_start(
+                pc, ToUtf8(dir),
+                blackwell::paging::PrefixCacheManager::LoadPolicy::ColdRam);
+        }
+        Log(L"prompt cache ready: " + std::to_wstring(tokens) +
+            L" tokens zero-prefill-servable from pinned RAM");
     } catch (const std::exception& e) {
-        // Non-fatal by design: a missing/foreign .bkv directory must never
-        // block translation -- the prompt falls back to a one-time prefill.
-        Log(L"prompt cache warm start failed (falling back to cold prefill): " +
+        Log(L"prompt cache unavailable (falling back to cold prefill): " +
             FromUtf8(e.what()));
     }
 #else
-    Log(L"prompt cache warm start SKIPPED: built without "
-        L"BLACKWELL_ENGINE_HAS_PREFIX_CACHE; the system prompt will be "
-        L"prefilled once per cold start instead");
+    Log(L"prompt cache SKIPPED: built without BLACKWELL_ENGINE_HAS_PREFIX_CACHE; "
+        L"the system prompt will be prefilled once per cold start instead");
 #endif
 }
+
+#if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
+bool TranslationService::CompilePromptCache(const std::wstring& dir) {
+    using blackwell::paging::AOTCacheWarmer;
+    using blackwell::paging::WarmupNode;
+    using blackwell::paging::WarmupSpec;
+
+    // The cacheable text is the byte-exact serving prefix, not the raw prompt:
+    // radix-tree hits happen on token ids, and the serving path tokenizes the
+    // chat-template-RENDERED transcript. An unrendered/misaligned node would
+    // compile fine and then never match.
+    const std::string prefix = StableServingPrefix();
+    if (prefix.empty()) {
+        Log(L"prompt cache: no stable serving prefix could be derived for this "
+            L"chat template; skipping compilation");
+        return false;
+    }
+
+    // The WarmupSpec, constructed in C++ (no spec.json on disk). One root node
+    // today: the full system block -- role framing, translation rules and the
+    // <finish>/tool protocol instructions ride inside it. The tree shape is
+    // ready for children (e.g. per-target-language variants) as long as every
+    // child extends the parent at a BPE-safe seam.
+    WarmupSpec spec;
+    spec.name = "overlay-translator";
+    spec.emit_mode = WarmupSpec::EmitMode::All;
+    WarmupNode node;
+    node.id = "system_prompt";
+    node.text = prefix;
+    spec.roots.push_back(std::move(node));
+
+    // The engine's own prefill coordinator IS the production IPrefillDriver;
+    // the adapter bound the checkpoint's tokenizer to it at construction, so
+    // compile() tokenizes and prefills with exactly the serving stack.
+    AOTCacheWarmer::Options opt;
+    opt.out_dir = ToUtf8(dir);
+    // The serving path encodes the rendered prompt with add_special_tokens =
+    // false (the template's literal special-token strings carry the framing),
+    // so the compiled tokens must do the same or the very first token differs.
+    opt.add_bos = false;
+    AOTCacheWarmer warmer(adapter_->engine().prefix_cache(),
+                          adapter_->engine().prefill_driver());
+    const AOTCacheWarmer::Report rep = warmer.compile(spec, opt);
+
+    if (rep.files == 0) {
+        // Shorter than one KV page (16 tokens) -- legal, just not worth caching.
+        Log(L"prompt cache: the system prompt is shorter than one KV page; "
+            L"nothing was emitted");
+        return false;
+    }
+    Log(L"first-run optimization done: " + std::to_wstring(rep.files) +
+        L" branch(es), " + std::to_wstring(rep.prefilled_tokens) +
+        L" tokens prefilled once and serialized to .bkv");
+    return true;
+}
+
+std::string TranslationService::StableServingPrefix() const {
+    using Adapter = playground::BlackwellLLMAdapter;
+
+    // Render two otherwise-identical transcripts that diverge only in the user
+    // turn; their longest common prefix is everything the chat template emits
+    // before request-specific content -- template-agnostically.
+    const std::string head = "[SYSTEM]\n" + previewPrompt_ + "\n\n[USER]\n";
+    const std::string a =
+        Adapter::apply_chat_template(head + "A\n\n", adapter_->chat_template());
+    const std::string b =
+        Adapter::apply_chat_template(head + "B\n\n", adapter_->chat_template());
+    size_t n = 0;
+    const size_t limit = std::min(a.size(), b.size());
+    while (n < limit && a[n] == b[n]) ++n;
+    std::string common = a.substr(0, n);
+
+    // BPE seam safety: cut right after the template's end-of-turn marker. The
+    // marker is a special token -- a hard segmentation boundary -- so
+    // encode(prefix) is guaranteed to be a strict token-prefix of
+    // encode(full prompt). Cutting anywhere later (e.g. inside "<|im_start|>
+    // user\n") risks the tokenizer merging across the seam at serve time.
+    const std::string marker =
+        adapter_->chat_template() == Adapter::ChatTemplate::Llama3 ? "<|eot_id|>"
+                                                                   : "<|im_end|>";
+    const size_t end = common.rfind(marker);
+    if (end == std::string::npos) return {};  // template surprise: no safe cut
+    return common.substr(0, end + marker.size());
+}
+#endif  // BLACKWELL_ENGINE_HAS_PREFIX_CACHE
 
 std::optional<std::wstring> TranslationService::RunTranslation(const Job& job) {
     using namespace agent::orch;

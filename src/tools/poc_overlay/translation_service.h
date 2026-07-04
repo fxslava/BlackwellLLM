@@ -48,9 +48,12 @@ class BlackwellLLMAdapter;
 class TranslationService {
 public:
     struct Settings {
-        std::wstring modelDir;        // HuggingFace-layout checkpoint directory
-        std::wstring promptCacheDir;  // AOT-compiled .bkv directory (manifest.json +
-                                      // system_prompt.bkv); empty = skip warm start
+        std::wstring modelDir;  // HuggingFace-layout checkpoint directory
+        // Root of the per-model JIT prompt caches. The service derives
+        // <root>\<model-hash-hex>\ from the loaded checkpoint, compiles the
+        // .bkv prompt library there on first run, and warm-starts from it on
+        // every run. Empty = %LOCALAPPDATA%\Blackwell\Cache.
+        std::wstring promptCacheRoot;
         std::string targetLang = "English";
         size_t maxSeqLen = 4096;
         float temperature = 0.2f;  // low: translation wants determinism
@@ -113,8 +116,24 @@ private:
     };
 
     void ThreadMain();
-    void LoadEngine();            // worker: adapter construction (the slow call)
-    void WarmStartPromptCache();  // worker: .bkv cold-load, see .cpp for gating
+    void LoadEngine();  // worker: adapter construction (the slow call)
+
+    // --- JIT prompt cache (worker thread, inside LoadEngine) ------------------
+    // Because the user picks the checkpoint at runtime, .bkv files cannot ship
+    // with the app: KV page geometry and token ids are model-specific. Instead
+    // the service self-bootstraps: resolve <promptCacheRoot>\<model-hash>\,
+    // compile the WarmupSpec there on first run (CompilePromptCache), then
+    // cold-load it (warm_start, LoadPolicy::ColdRam). All three are no-ops /
+    // logged fallbacks when the loaded model has no prefix-cache substrate.
+    void WarmStartPromptCache();
+    // Compile the in-C++ WarmupSpec (the rendered system-prompt prefix) into
+    // <dir>. Returns false when there was nothing cacheable (e.g. the stable
+    // prefix is shorter than one KV page). Throws on engine/serializer errors.
+    bool CompilePromptCache(const std::wstring& dir);
+    // The byte-exact, BPE-seam-safe prefix of every serving prompt: the
+    // chat-template-rendered system block, cut right after the end-of-turn
+    // marker. Empty when no safe prefix could be derived.
+    std::string StableServingPrefix() const;
     // Worker: one strict 1-step orchestrator run. Returns the translation on a
     // clean finish (or salvageable nudged prose), nullopt otherwise.
     std::optional<std::wstring> RunTranslation(const Job& job);

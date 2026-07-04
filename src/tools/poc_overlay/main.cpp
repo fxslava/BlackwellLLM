@@ -132,9 +132,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // The preview sink is late-bound below, once the CaretTracker exists.
     TranslationService::Settings svcSettings;
     svcSettings.modelDir = g_config.modelPath;
-    svcSettings.promptCacheDir = g_config.modelPath.empty()
-                                     ? std::wstring()
-                                     : g_config.modelPath + L"\\prompt_cache";
+    // promptCacheRoot left empty -> %LOCALAPPDATA%\Blackwell\Cache. The service
+    // derives the per-model subdirectory from the loaded checkpoint's hash and
+    // JIT-compiles the .bkv prompt cache there on first run -- nothing is
+    // shipped with (or read from) the model directory itself.
     svcSettings.maxSeqLen = static_cast<size_t>(g_config.contextSize);
     svcSettings.temperature = g_config.temperature;
     svcSettings.topP = g_config.topP;
