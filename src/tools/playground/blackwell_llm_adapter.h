@@ -128,6 +128,14 @@ public:
     BlackwellEngine& engine() { return *engine_; }
     const BlackwellEngine& engine() const { return *engine_; }
 
+    // The owned tokenizer, for callers that drive the engine directly via
+    // engine().prefill_driver() (bypassing generate() entirely -- e.g.
+    // LiveTranslationTracker's speculative-prefill / decode loop) and need
+    // decode()/is_stop() without duplicating tokenizer setup. Same
+    // worker-thread ownership rules as generate().
+    blackwell::ITokenizer& tokenizer() { return *tokenizer_; }
+    const blackwell::ITokenizer& tokenizer() const { return *tokenizer_; }
+
     // Install a streaming callback that the ILLMGenerator entry point
     // (generate(transcript)) will forward tokens to. This is how the ReAct loop
     // streams: the orchestrator only ever calls the single-argument override, so

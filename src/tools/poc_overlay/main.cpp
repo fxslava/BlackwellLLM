@@ -11,16 +11,18 @@
 //                      state machine:
 //                        Typing      capture area (granularity-bounded) shown
 //                                    dimmed in the overlay; idle timer re-arms
-//                                    on every keystroke
-//                        Translating idle timer expired -> RequestPreview();
+//                                    AND a speculative background prefill
+//                                    fires (TrackUpdate) on every keystroke
+//                        Translating idle timer expired -> TriggerGeneration();
 //                                    overlay shows a loading/streaming state
 //                        Ready       translation shown; Ctrl+Enter surgically
 //                                    replaces source_raw via TextInjector --
 //                                    HOST-SIDE ONLY, no inference on commit
 //                        |  PostState(snapshot)             [PostMessage]
 //                        v
-//   [agent worker]    TranslationService: BlackwellLLMAdapter (CUDA engine +
-//                      tokenizer) driven by the strict 1-step orchestrator loop.
+//   [tracker thread]  LiveTranslationTracker (inside TranslationService): talks
+//                      DIRECTLY to BlackwellLLMAdapter / the engine's prefill
+//                      coordinator -- no AgentOrchestrator, no ReAct loop.
 //                        |  OnPreviewResult(text, done)     [condvar signal]
 //                        v
 //   [UI thread]       OverlayWindow: layered, click-through, D2D-rendered popup
@@ -158,11 +160,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     trackerCallbacks.render = [&overlay](const OverlaySnapshot& snapshot) {
         overlay.PostState(snapshot);  // PostMessage-marshaled to the UI thread
     };
-    trackerCallbacks.requestPreview = [&translator](const std::wstring& source,
-                                                    const std::wstring& context) {
-        translator.RequestPreview(source, context);
+    trackerCallbacks.trackUpdate = [&translator](const std::wstring& source,
+                                                 const std::wstring& context) {
+        translator.TrackUpdate(source, context);
     };
-    trackerCallbacks.cancelPreview = [&translator]() { translator.CancelPending(); };
+    trackerCallbacks.triggerGeneration = [&translator](const std::wstring& source,
+                                                       const std::wstring& context) {
+        translator.TriggerGeneration(source, context);
+    };
+    trackerCallbacks.cancelGeneration = [&translator]() { translator.Cancel(); };
     trackerCallbacks.injectionGuard = [](bool active) {
         HookManager::Instance().SetInjecting(active);
     };

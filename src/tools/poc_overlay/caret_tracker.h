@@ -23,7 +23,7 @@ struct IUIAutomationElement;
 //
 //        keystroke                     idle timer fires
 //   Idle ---------> Typing ----------------------------> Translating
-//    ^                ^  ^        (RequestPreview)            |
+//    ^                ^  ^       (TriggerGeneration)          |
 //    |                |  |                                    | stream done
 //    |     keystroke  |  +--- keystroke (cancel inference) ---+------+
 //    |                |                                       v      |
@@ -32,16 +32,20 @@ struct IUIAutomationElement;
 //
 //   Typing       every keystroke re-resolves the UIA text, re-extracts the
 //                capture area (backwards from the caret to the configured
-//                granularity boundary) and re-arms the idle deadline. The
-//                overlay shows the capture dimmed.
+//                granularity boundary), re-arms the idle deadline, AND fires
+//                a speculative background prefill (TrackUpdate) that warms
+//                the engine's radix tree for the growing capture -- so the
+//                Translating step below has (ideally) nothing left to
+//                prefill. The overlay shows the capture dimmed.
 //   Translating  the idle deadline expired: the capture (source_raw) went to
-//                the TranslationService. The overlay shows a loading state and
-//                the streamed partial as it arrives.
+//                LiveTranslationTracker via TriggerGeneration, bypassing
+//                AgentOrchestrator entirely. The overlay shows a loading
+//                state and the streamed partial as it arrives.
 //   Ready        the stream completed (translation_raw). Ctrl+Enter now
 //                performs a host-side surgical replace -- NO inference on the
 //                commit path.
 //   Interrupt    ANY keystroke in Translating/Ready cancels the in-flight
-//                request, clears the translation and returns to Typing.
+//                generation, clears the translation and returns to Typing.
 //
 // The debounce runs on this same worker thread as a cv_.wait_until deadline --
 // no extra timer thread, no detached std::async, no re-entrancy: timer expiry
@@ -57,13 +61,23 @@ public:
         // State changed -> repaint. Wire to OverlayWindow::PostState (PostMessage-
         // marshaled, safe from this thread).
         std::function<void(const OverlaySnapshot&)> render;
-        // Idle timer fired: run preview inference on `source` with the durable
-        // committed `context`. Wire to TranslationService::RequestPreview.
+        // EVERY keystroke while a capture area exists: fire-and-forget
+        // speculative background prefill of `source` (+ durable committed
+        // `context`) that warms the engine's radix tree token-by-token as the
+        // user types, so the debounce-triggered generation below has
+        // (ideally) nothing left to prefill. Wire to
+        // TranslationService::TrackUpdate -- bypasses AgentOrchestrator
+        // entirely, talks straight to the adapter/engine.
         std::function<void(const std::wstring& source, const std::wstring& context)>
-            requestPreview;
-        // Keystroke interrupted Translating/Ready: stop paying for the decode.
-        // Wire to TranslationService::CancelPending.
-        std::function<void()> cancelPreview;
+            trackUpdate;
+        // Idle timer fired: generate now on `source` with the durable
+        // committed `context`. Wire to TranslationService::TriggerGeneration.
+        std::function<void(const std::wstring& source, const std::wstring& context)>
+            triggerGeneration;
+        // Keystroke interrupted Translating/Ready, or a focus/caret reset:
+        // stop paying for any pending/in-flight decode. Wire to
+        // TranslationService::Cancel.
+        std::function<void()> cancelGeneration;
         // Brackets the text-injection window (true=begin, false=end) so the
         // keyboard hook can flag that synthetic input is in flight.
         std::function<void(bool)> injectionGuard;

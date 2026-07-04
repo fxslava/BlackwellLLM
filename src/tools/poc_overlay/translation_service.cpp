@@ -9,14 +9,11 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <string_view>
 #include <utility>
-#include <vector>
 
 #include "blackwell_llm_adapter.h"  // playground::BlackwellLLMAdapter
 #include "config.h"                 // ToUtf8 / FromUtf8
-#include "orchestrator.h"           // agent::orch::{AgentOrchestrator, Message, ...}
-#include "tool_parser.h"            // agent::orch::ToolInvocation
+#include "live_translation_tracker.h"
 
 // ---------------------------------------------------------------------------
 // JIT prompt cache (per-model .bkv, generated on the end user's machine).
@@ -68,7 +65,9 @@ std::wstring HashDirName(unsigned long long hash) {
 
 // The strict 1-step preview protocol (docs/REACT_1STEP_ASSESSMENT.md §2.2):
 // finish-only, no tool manifest, one anchoring example. Kept ASCII-only so the
-// source file needs no /utf-8 gymnastics.
+// source file needs no /utf-8 gymnastics. Shared verbatim by the JIT cache
+// compiler (StableServingPrefix) and LiveTranslationTracker (BuildTokens) --
+// both must address the identical radix-tree pages.
 std::string BuildPreviewPrompt(const std::string& lang) {
     return "You translate text into " + lang +
            ".\n"
@@ -86,41 +85,11 @@ std::string BuildPreviewPrompt(const std::string& lang) {
            "Assistant: <finish>Hello world</finish>\n";
 }
 
-// Chop a trailing INCOMPLETE UTF-8 sequence so a mid-codepoint streaming
-// boundary never flashes U+FFFD in the overlay. (The dropped bytes reappear
-// with the next delta.)
-void TrimIncompleteUtf8(std::string& s) {
-    size_t i = s.size();
-    size_t continuation = 0;
-    while (i > 0 && (static_cast<unsigned char>(s[i - 1]) & 0xC0) == 0x80 &&
-           continuation < 3) {
-        --i;
-        ++continuation;
-    }
-    if (i == 0) return;
-    const auto lead = static_cast<unsigned char>(s[i - 1]);
-    size_t expected = 1;
-    if (lead >= 0xF0) expected = 4;
-    else if (lead >= 0xE0) expected = 3;
-    else if (lead >= 0xC0) expected = 2;
-    if (expected > 1 && continuation + 1 < expected) s.resize(i - 1);
-}
-
 }  // namespace
 
 TranslationService::TranslationService(Settings settings)
     : settings_(std::move(settings)),
       previewPrompt_(BuildPreviewPrompt(settings_.targetLang)) {
-    // F-2 insurance from the assessment: a model that hallucinates a
-    // translate_text tool gets steered back onto the <finish> protocol instead
-    // of an opaque "tool not found".
-    tools_.register_tool(
-        "translate_text",
-        "Do not call this. Output the translation as <finish>TRANSLATION</finish>.",
-        [](const agent::orch::ToolInvocation&) -> std::string {
-            return "Output the translation as <finish>TRANSLATION</finish> now.";
-        });
-
     worker_ = std::thread(&TranslationService::ThreadMain, this);
 }
 
@@ -130,12 +99,13 @@ TranslationService::~TranslationService() {
 
 void TranslationService::Shutdown() {
     stop_.store(true, std::memory_order_relaxed);
-    currentGen_.fetch_add(1, std::memory_order_relaxed);  // abort in-flight decode
     {
         std::lock_guard<std::mutex> lock(mutex_);
-    }  // pairs the flag with the cv (no wakeup may fall between check and wait)
-    cv_.notify_all();
-    if (worker_.joinable()) worker_.join();
+        if (tracker_) tracker_->Cancel();  // unblock any in-flight decode promptly
+    }
+    if (worker_.joinable()) worker_.join();  // finishes LoadEngine (+ tracker handoff)
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracker_.reset();  // joins LiveTranslationTracker's own worker thread
 }
 
 void TranslationService::SetPreviewSink(PreviewSink sink) {
@@ -153,62 +123,50 @@ void TranslationService::DeliverToSink(std::uint64_t gen, const std::wstring& te
     if (sink) sink(gen, text, done);
 }
 
-void TranslationService::RequestPreview(std::wstring segment,
-                                        std::wstring inferenceContext) {
-    if (stop_.load(std::memory_order_relaxed) || state() == State::Error ||
-        segment.empty()) {
-        return;
-    }
-    Job job;
-    job.segment = std::move(segment);
-    job.context = std::move(inferenceContext);
-    job.gen = currentGen_.fetch_add(1, std::memory_order_relaxed) + 1;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pendingPreview_ = std::move(job);  // latest wins; older slot content dies
-    }
-    cv_.notify_all();
+void TranslationService::TrackUpdate(std::wstring segment, std::wstring inferenceContext) {
+    if (stop_.load(std::memory_order_relaxed) || segment.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tracker_) return;  // still loading (or failed) -- nothing to warm yet
+    tracker_->TrackUpdate(std::move(segment), std::move(inferenceContext));
 }
 
-void TranslationService::CancelPending() {
-    currentGen_.fetch_add(1, std::memory_order_relaxed);
+void TranslationService::TriggerGeneration(std::wstring segment,
+                                           std::wstring inferenceContext) {
+    if (stop_.load(std::memory_order_relaxed) || segment.empty()) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    pendingPreview_.reset();
+    if (!tracker_) return;
+    const std::uint64_t gen = requestSeq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    tracker_->TriggerGeneration(
+        std::move(segment), std::move(inferenceContext),
+        [this, gen](const std::wstring& text, bool done) { DeliverToSink(gen, text, done); });
+}
+
+void TranslationService::Cancel() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (tracker_) tracker_->Cancel();
 }
 
 void TranslationService::ThreadMain() {
     LoadEngine();
-
-    while (true) {
-        Job job;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] {
-                return stop_.load(std::memory_order_relaxed) || pendingPreview_;
-            });
-            if (stop_.load(std::memory_order_relaxed)) break;
-            job = std::move(*pendingPreview_);
-            pendingPreview_.reset();
-        }
-
-        if (state() == State::Error) continue;
-
-        // Superseded while queued: dead on arrival; skip the prefill instead of
-        // letting the stream callback cancel it mid-decode.
-        if (job.gen != currentGen_.load(std::memory_order_relaxed)) continue;
-
-        state_.store(State::Generating, std::memory_order_relaxed);
-        const std::optional<std::wstring> result = RunTranslation(job);
-        state_.store(State::Ready, std::memory_order_relaxed);
-
-        // ALWAYS close the request out (empty text = failed/dropped) so the
-        // consumer's state machine can leave its loading state -- but only if
-        // this job is still the current one; a superseded job's slot in the
-        // consumer was already taken over by its successor.
-        if (job.gen == currentGen_.load(std::memory_order_relaxed)) {
-            DeliverToSink(job.gen, result.value_or(std::wstring()), /*done=*/true);
-        }
+    if (state_.load(std::memory_order_relaxed) != State::Ready) {
+        return;  // failed / no model configured -- nothing left for this thread to do
     }
+
+    // LiveTranslationTracker owns the ONLY thread that touches the engine from
+    // here on. Construct it locally first (its constructor starts its own
+    // thread immediately) so a shutdown race can simply let it fall out of
+    // scope -- its destructor joins that thread before this function returns,
+    // so `tracker_` never gets published in a half-torn-down state.
+    auto tracker = std::make_unique<LiveTranslationTracker>(
+        *adapter_, previewPrompt_, settings_.previewMaxNewTokens, settings_.temperature,
+        settings_.topP);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!stop_.load(std::memory_order_relaxed)) {
+        tracker_ = std::move(tracker);
+    }
+    // else: Shutdown() raced construction -- `tracker` destructs here (still
+    // under the lock is fine; its destructor only joins its own thread, never
+    // touches mutex_), and tracker_ stays null.
 }
 
 void TranslationService::LoadEngine() {
@@ -262,7 +220,9 @@ void TranslationService::WarmStartPromptCache() {
 #if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
     // Runtime capability gate: Paged-mode dense uniform full-attention models
     // only. Hybrid SSM / gated-attention checkpoints have no prefix cache and
-    // must not be treated as an error -- they just prefill normally.
+    // must not be treated as an error -- they just prefill normally (and
+    // LiveTranslationTracker falls back to the adapter's ordinary generate()
+    // for them too -- see live_translation_tracker.cpp).
     if (!adapter_->engine().has_prefix_cache()) {
         Log(L"prompt cache skipped: the loaded model has no prefix-cache "
             L"substrate (hybrid SSM / gated attention / non-paged mode)");
@@ -341,9 +301,10 @@ bool TranslationService::CompilePromptCache(const std::wstring& dir) {
     using blackwell::paging::WarmupSpec;
 
     // The cacheable text is the byte-exact serving prefix, not the raw prompt:
-    // radix-tree hits happen on token ids, and the serving path tokenizes the
-    // chat-template-RENDERED transcript. An unrendered/misaligned node would
-    // compile fine and then never match.
+    // radix-tree hits happen on token ids, and the serving path (both the
+    // adapter's generate() and LiveTranslationTracker's BuildTokens) tokenizes
+    // the chat-template-RENDERED transcript. An unrendered/misaligned node
+    // would compile fine and then never match.
     const std::string prefix = StableServingPrefix();
     if (prefix.empty()) {
         Log(L"prompt cache: no stable serving prefix could be derived for this "
@@ -353,9 +314,9 @@ bool TranslationService::CompilePromptCache(const std::wstring& dir) {
 
     // The WarmupSpec, constructed in C++ (no spec.json on disk). One root node
     // today: the full system block -- role framing, translation rules and the
-    // <finish>/tool protocol instructions ride inside it. The tree shape is
-    // ready for children (e.g. per-target-language variants) as long as every
-    // child extends the parent at a BPE-safe seam.
+    // <finish> protocol instructions ride inside it. The tree shape is ready
+    // for children (e.g. per-target-language variants) as long as every child
+    // extends the parent at a BPE-safe seam.
     WarmupSpec spec;
     spec.name = "overlay-translator";
     spec.emit_mode = WarmupSpec::EmitMode::All;
@@ -418,91 +379,3 @@ std::string TranslationService::StableServingPrefix() const {
     return common.substr(0, end + marker.size());
 }
 #endif  // BLACKWELL_ENGINE_HAS_PREFIX_CACHE
-
-std::optional<std::wstring> TranslationService::RunTranslation(const Job& job) {
-    using namespace agent::orch;
-
-    playground::BlackwellLLMAdapter::Params params;
-    params.temperature = settings_.temperature;
-    params.top_p = settings_.topP;
-    params.max_new_tokens = settings_.previewMaxNewTokens;
-    adapter_->set_params(params);
-
-    // The stream callback is the cancellation AND streaming plane in one:
-    //   * stale generation (a newer request / an interrupt) -> cooperative abort;
-    //   * service shutdown                                  -> cooperative abort;
-    //   * "</finish>" fully streamed                        -> hard stop at the
-    //     protocol boundary (the adapter's checkpoint-level stop strings are
-    //     fixed; this is the supported way to cut decode at our tag);
-    //   * push the growing partial translation to the sink live.
-    std::string acc;
-    std::wstring lastPosted;
-    adapter_->set_stream_callback([&, this](const std::string& delta) -> bool {
-        if (stop_.load(std::memory_order_relaxed)) return false;
-        if (job.gen != currentGen_.load(std::memory_order_relaxed)) return false;
-        acc += delta;
-        StreamPreviewPartial(acc, job.gen, lastPosted);
-        return acc.find("</finish>") == std::string::npos;
-    });
-    // The callback captures locals of THIS frame; never let it outlive them.
-    struct CallbackGuard {
-        playground::BlackwellLLMAdapter& adapter;
-        ~CallbackGuard() { adapter.set_stream_callback(nullptr); }
-    } guard{*adapter_};
-
-    OrchestratorConfig cfg;
-    cfg.max_iterations = 1;  // the strict 1-step preview budget
-    cfg.system_prompt = previewPrompt_;
-
-    // Fresh orchestrator per request (transcripts are per-run state); the KV
-    // cache lives one level down in the adapter and survives across runs.
-    AgentOrchestrator orch(*adapter_, tools_, cfg);
-    if (!job.context.empty()) {
-        orch.seed_history({{Message::Role::User,
-                            "Text committed earlier in this field (already "
-                            "translated; keep the new translation consistent "
-                            "with it):\n" +
-                                ToUtf8(job.context)}});
-    }
-
-    const RunResult r = orch.run(ToUtf8(job.segment));
-
-    if (r.finished && !r.answer.empty()) return FromUtf8(r.answer);
-
-    // Cap exit (F-2 gate): never surface protocol markup. Nudged pure prose is
-    // still a usable best effort for a preview.
-    if (!r.finished && !r.answer.empty() && r.answer.find('<') == std::string::npos) {
-        return FromUtf8(r.answer);
-    }
-    Log(L"preview run did not finish cleanly; dropped");
-    return std::nullopt;
-}
-
-void TranslationService::StreamPreviewPartial(const std::string& acc,
-                                              std::uint64_t gen,
-                                              std::wstring& lastPosted) {
-    static constexpr std::string_view kOpen = "<finish>";
-    static constexpr std::string_view kClose = "</finish>";
-
-    const size_t open = acc.find(kOpen);
-    if (open == std::string::npos) return;  // tag not reached yet: nothing to show
-
-    std::string body = acc.substr(open + kOpen.size());
-    if (const size_t close = body.find(kClose); close != std::string::npos) {
-        body.erase(close);
-    } else {
-        // Trim a partially-streamed "</finis" tail so it never flashes onscreen.
-        if (const size_t lt = body.rfind('<'); lt != std::string::npos) {
-            const std::string_view tail = std::string_view(body).substr(lt);
-            if (tail.size() < kClose.size() && kClose.substr(0, tail.size()) == tail) {
-                body.erase(lt);
-            }
-        }
-        TrimIncompleteUtf8(body);
-    }
-
-    std::wstring text = FromUtf8(body);
-    if (text.empty() || text == lastPosted) return;
-    lastPosted = std::move(text);
-    DeliverToSink(gen, lastPosted, /*done=*/false);
-}

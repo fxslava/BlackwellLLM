@@ -22,6 +22,7 @@ add_executable(poc_overlay WIN32
     text_injector.cpp
     config.cpp
     translation_service.cpp
+    live_translation_tracker.cpp
     ../playground/blackwell_llm_adapter.cpp
 )
 

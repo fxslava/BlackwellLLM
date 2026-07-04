@@ -3,43 +3,44 @@
 // pattern (one worker thread owns the non-thread-safe engine; every public
 // entry point is an O(1) enqueue).
 //
-// Since the stateful-UX redesign this service is PREVIEW-ONLY: the debounced
-// idle timer in CaretTracker is the sole inference trigger, and Ctrl+Enter is
-// a pure host-side TextInjector replacement of the already-produced preview --
-// no ReAct loop, no engine call, no blocking on the commit path at all.
+// Since the LiveTranslationTracker pivot, this service does two things and no
+// more: (1) the slow, one-time model load + JIT prompt-cache bootstrap, and
+// (2) a thin, thread-safe forwarding shell around a LiveTranslationTracker,
+// which owns ALL further engine interaction on its own dedicated thread. There
+// is no AgentOrchestrator, no ToolRegistry, no ReAct loop anywhere in this
+// class anymore -- see live_translation_tracker.h for why and how.
 //
 // Threads, and what each is allowed to do:
 //
-//   [UI thread]    hooks + overlay. Never calls into this class directly.
-//   [STA thread]   CaretTracker. Calls RequestPreview() / CancelPending()
-//                  (both fire-and-forget).
-//   [agent worker] owned here. Constructs the BlackwellLLMAdapter (slow,
-//                  DirectStorage), runs every AgentOrchestrator loop, and is
-//                  the only thread that ever touches the engine.
+//   [UI thread]      hooks + overlay. Never calls into this class directly.
+//   [STA thread]     CaretTracker. Calls TrackUpdate() / TriggerGeneration() /
+//                    Cancel() (all fire-and-forget).
+//   [load thread]    owned here (worker_). Constructs the BlackwellLLMAdapter
+//                    (slow, DirectStorage) and JIT-bootstraps the prompt
+//                    cache, THEN constructs the LiveTranslationTracker and
+//                    exits -- its one job is the slow load, done off any
+//                    latency-sensitive thread.
+//   [tracker thread] owned by tracker_ (see live_translation_tracker.h). The
+//                    ONLY thread that touches the adapter/engine once the
+//                    tracker exists -- worker_ never does so again after
+//                    handing off.
 //
-// Preview requests coalesce latest-wins; a monotone generation counter makes
-// stale work self-cancel through the adapter's cooperative StreamCallback.
-// Results stream back through the PreviewSink ON THE WORKER THREAD -- the sink
-// must marshal (main.cpp forwards to CaretTracker::OnPreviewResult, which is a
-// lock+notify enqueue).
-//
-// ReAct budget (docs/REACT_1STEP_ASSESSMENT.md): the strict 1-iteration
-// finish-only protocol. Committed context is injected with
-// AgentOrchestrator::seed_history(), never inlined into the system prompt, so
-// the prompt stays byte-stable for KV prefix reuse.
+// TrackUpdate/TriggerGeneration/Cancel forward straight to tracker_ under
+// mutex_ (which also guards previewSink_ and is never held across engine
+// work, so it stays effectively uncontended). Results stream back through the
+// PreviewSink ON THE TRACKER'S THREAD -- the sink must marshal (main.cpp
+// forwards to CaretTracker::OnPreviewResult, which is a lock+notify enqueue).
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 
-#include "tool_registry.h"  // agent::orch::ToolRegistry (value member)
+class LiveTranslationTracker;
 
 namespace playground {
 class BlackwellLLMAdapter;
@@ -69,13 +70,13 @@ public:
         std::wstring spillFilePath;  // required when diskSpillEnabled
     };
 
-    enum class State { Loading, Ready, Generating, Error };
+    enum class State { Loading, Ready, Error };
 
-    // Runs ON THE WORKER THREAD for every streamed delta (done=false, growing
-    // text) and exactly once per request with done=true -- final translation,
-    // or EMPTY text when the run failed / was superseded, so the consumer's
-    // state machine can leave its loading state either way. Must only
-    // enqueue/marshal -- never touch a window or COM directly.
+    // Runs ON THE TRACKER'S THREAD for every streamed delta (done=false,
+    // growing text) and exactly once per TriggerGeneration with done=true --
+    // final translation, or EMPTY text when the run failed / was superseded,
+    // so the consumer's state machine can leave its loading state either way.
+    // Must only enqueue/marshal -- never touch a window or COM directly.
     using PreviewSink =
         std::function<void(std::uint64_t gen, const std::wstring& text, bool done)>;
 
@@ -89,36 +90,33 @@ public:
     // this service (the tracker's callbacks point back here). Thread-safe.
     void SetPreviewSink(PreviewSink sink);
 
-    // Debounce expired: translate `segment`. Coalescing latest-wins, O(1), any
-    // thread. Bumps the generation counter, which cooperatively aborts any
-    // in-flight decode. `inferenceContext` is CaretTracker's accumulated
-    // ORIGINAL (pre-translation) committed text, seeded into the orchestrator
-    // as a durable context turn.
-    void RequestPreview(std::wstring segment, std::wstring inferenceContext);
+    // Every keystroke: fire-and-forget speculative background prefill that
+    // warms the engine's radix tree for `segment` (+ durable `context`), so a
+    // subsequent TriggerGeneration() for the same text has (ideally) nothing
+    // left to prefill. A no-op until the model has finished loading.
+    void TrackUpdate(std::wstring segment, std::wstring inferenceContext);
 
-    // Keystroke/reset interrupt: drop any queued preview and cooperatively
-    // cancel the in-flight decode.
-    void CancelPending();
+    // Debounce fired: generate now. Streams through the bound PreviewSink.
+    void TriggerGeneration(std::wstring segment, std::wstring inferenceContext);
 
-    // Join the worker. Called explicitly from wWinMain BEFORE stack unwinding
-    // so the sink can never fire into an already-destroyed CaretTracker (the
-    // tracker is declared after -- and thus destroyed before -- this service).
+    // Keystroke/reset interrupt: drop any pending work and cooperatively
+    // abort an in-flight decode.
+    void Cancel();
+
+    // Join the worker (and, once constructed, the tracker's own thread).
+    // Called explicitly from wWinMain BEFORE stack unwinding so the sink can
+    // never fire into an already-destroyed CaretTracker (the tracker is
+    // declared after -- and thus destroyed before -- this service).
     // Idempotent; the destructor calls it too.
     void Shutdown();
 
     State state() const { return state_.load(std::memory_order_relaxed); }
 
 private:
-    struct Job {
-        std::wstring segment;
-        std::wstring context;
-        std::uint64_t gen = 0;
-    };
-
     void ThreadMain();
-    void LoadEngine();  // worker: adapter construction (the slow call)
+    void LoadEngine();  // load thread: adapter construction (the slow call)
 
-    // --- JIT prompt cache (worker thread, inside LoadEngine) ------------------
+    // --- JIT prompt cache (load thread, inside LoadEngine) --------------------
     // Because the user picks the checkpoint at runtime, .bkv files cannot ship
     // with the app: KV page geometry and token ids are model-specific. Instead
     // the service self-bootstraps: resolve <promptCacheRoot>\<model-hash>\,
@@ -132,34 +130,31 @@ private:
     bool CompilePromptCache(const std::wstring& dir);
     // The byte-exact, BPE-seam-safe prefix of every serving prompt: the
     // chat-template-rendered system block, cut right after the end-of-turn
-    // marker. Empty when no safe prefix could be derived.
+    // marker. Empty when no safe prefix could be derived. LiveTranslationTracker
+    // reconstructs the SAME transcript shape at request time (see BuildTokens);
+    // this is only the STATIC prefix used to seed the .bkv cache.
     std::string StableServingPrefix() const;
-    // Worker: one strict 1-step orchestrator run. Returns the translation on a
-    // clean finish (or salvageable nudged prose), nullopt otherwise.
-    std::optional<std::wstring> RunTranslation(const Job& job);
-    // Worker (inside the stream callback): extract the text between <finish>
-    // and the (possibly still streaming) </finish> from `acc` and push it to
-    // the sink if it changed.
-    void StreamPreviewPartial(const std::string& acc, std::uint64_t gen,
-                              std::wstring& lastPosted);
     void DeliverToSink(std::uint64_t gen, const std::wstring& text, bool done);
 
     Settings settings_;
 
-    // Byte-stable per session (KV prefix reuse); built once in the constructor.
+    // Byte-stable per session (KV prefix reuse); built once in the constructor,
+    // shared by StableServingPrefix() (JIT cache compile) and the tracker
+    // (live requests) so both address the same radix-tree pages.
     std::string previewPrompt_;
 
-    // Worker-owned after construction.
+    // Owned by the load thread until handed off; tracker_ then owns all
+    // further engine access on its own thread. Both guarded by mutex_ so
+    // TrackUpdate/TriggerGeneration/Cancel (called from CaretTracker's STA
+    // thread) never race the handoff.
     std::unique_ptr<playground::BlackwellLLMAdapter> adapter_;
-    agent::orch::ToolRegistry tools_;
+    std::unique_ptr<LiveTranslationTracker> tracker_;
 
     std::atomic<State> state_{State::Loading};
-    std::atomic<std::uint64_t> currentGen_{0};
+    std::atomic<std::uint64_t> requestSeq_{0};  // debug/log id surfaced to the sink
     std::atomic<bool> stop_{false};
 
     std::mutex mutex_;
-    std::condition_variable cv_;
-    PreviewSink previewSink_;            // guarded by mutex_ (late-bound)
-    std::optional<Job> pendingPreview_;  // latest-wins slot
-    std::thread worker_;
+    PreviewSink previewSink_;  // guarded by mutex_ (late-bound)
+    std::thread worker_;       // the one-shot load thread
 };

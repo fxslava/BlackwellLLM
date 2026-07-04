@@ -329,8 +329,8 @@ void CaretTracker::HandleKeystroke(IUIAutomation* automation, const std::wstring
     // INTERRUPT: any keystroke during Translating/Ready invalidates the
     // translation -- cancel the in-flight decode and clear what was shown.
     if (phase_ == Phase::Translating || phase_ == Phase::Ready) {
-        if (callbacks_.cancelPreview) {
-            callbacks_.cancelPreview();
+        if (callbacks_.cancelGeneration) {
+            callbacks_.cancelGeneration();
         }
     }
     translationPartial_.clear();
@@ -355,6 +355,13 @@ void CaretTracker::HandleKeystroke(IUIAutomation* automation, const std::wstring
     idleArmed_ = true;
     idleDeadline_ = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(idleTimerMs_.load(std::memory_order_relaxed));
+    // Speculative background prefill: warm the engine's radix tree token-by-
+    // token as the user types, so the debounce-triggered generation below has
+    // (ideally) nothing left to prefill. Fire-and-forget; LiveTranslationTracker
+    // owns its own thread and never blocks this call.
+    if (callbacks_.trackUpdate) {
+        callbacks_.trackUpdate(sourceRaw_, inferenceContext_);
+    }
     Render();
 }
 
@@ -364,8 +371,8 @@ void CaretTracker::HandleIdleExpired() {
     }
     phase_ = Phase::Translating;
     translationPartial_.clear();
-    if (callbacks_.requestPreview) {
-        callbacks_.requestPreview(sourceRaw_, inferenceContext_);
+    if (callbacks_.triggerGeneration) {
+        callbacks_.triggerGeneration(sourceRaw_, inferenceContext_);
     }
     Render();
 }
@@ -497,8 +504,11 @@ void CaretTracker::HandleCommit(IUIAutomation* automation) {
 }
 
 void CaretTracker::ResetToIdle() {
-    if (phase_ == Phase::Translating && callbacks_.cancelPreview) {
-        callbacks_.cancelPreview();
+    // Unconditional (not gated on phase): a queued-but-not-yet-started
+    // speculative TrackUpdate should also be dropped when focus/caret resets,
+    // not just an active Translating decode. Cheap and idempotent either way.
+    if (callbacks_.cancelGeneration) {
+        callbacks_.cancelGeneration();
     }
     phase_ = Phase::Idle;
     sourceRaw_.clear();
