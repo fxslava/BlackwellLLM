@@ -251,60 +251,123 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
 
     const size_t cap = max_seq_len_;
 
-    // Per-branch KV-reuse history (seq 0 = main). Every forward below targets this
-    // sequence, so parallel branches never clobber each other's KV cache.
-    std::vector<int>& cached = cached_prompt_by_seq_[seq_id];
-
-    // ---- Append-or-Reset prefix match (incremental KV reuse) -----------------
-    // `cached` mirrors the tokens currently resident in this sequence's KV cache
-    // (last turn's prompt + everything we then generated). If the whole of it is a
-    // prefix of the new prompt, the conversation only grew at the end, so we KEEP
-    // that KV and prefill ONLY the new tail -- O(new tokens) instead of O(N). Any
-    // divergence (an edited/deleted past turn, or a shorter prompt) means the
-    // cached KV is stale, so we RESET: clear it and reprefill from pos 0. The
-    // engine treats forward(token, pos) as position-addressed, so reprefilling
-    // from 0 truncates+rewrites this sequence; slots past the new length are
-    // never attended to.
-    // Incremental KV reuse (APPEND only the new tail) is safe only when the engine
-    // can rewind to an arbitrary prefix. Hybrid linear-attention (SSM) models cannot:
-    // their recurrent state advances with every forward() with no rewind, and the
-    // stop-token handling below even forwards an eos that is never committed to
-    // `cached`, so the resident SSM state and `cached` drift apart. For those models
-    // we DISABLE the optimization -- always zero the recurrent state and reprefill
-    // the whole prompt from pos 0 -- which is the only way to keep the SSM state in
-    // lockstep with the prompt (otherwise the model collapses into repetition).
-    // Dense models keep the fast incremental path; reset_state() is a no-op for them.
-    const bool incremental_safe = !engine_->get_capabilities().requires_ssm_subsystem;
-    const bool append = incremental_safe &&
-                        cached.size() <= prompt.size() &&
-                        std::equal(cached.begin(), cached.end(), prompt.begin());
-    if (!append) {
-        cached.clear();                 // RESET (reprefill the whole prompt from pos 0)
-        engine_->reset_state(seq_id);   // zero recurrent SSM state (no-op if dense)
-    }
-
-    int pos = static_cast<int>(cached.size());  // APPEND: start past the reused prefix
+    // ---- PROMPT PHASE: two paths, one postcondition ---------------------------
+    // On success: KV for prompt[0..N) is resident on `decode_seq`, `pos` == N,
+    // and `next` holds the first generated token id (sampled deterministically,
+    // matching what the final prefill forward used to yield).
+    int pos = 0;
     int next = -1;
+    int decode_seq = seq_id;                // which sequence the decode loop drives
+    std::vector<int>* history = nullptr;    // legacy KV mirror; null on path (a)
 
-    // Prefill only the tokens not already resident, deterministically (temperature
-    // 0): only the final forward of the prefill yields the first generated token.
-    for (size_t i = cached.size(); i < prompt.size(); ++i) {
-        if (static_cast<size_t>(pos) >= cap) {  // prompt overflows the window
-            cached.clear();                     // KV is now partial -> force a reset next call
-            return "";
+    // RAII for a coordinator prefill session: finish() unbinds + releases the
+    // sequence (unpin, unlock, destroy) on EVERY exit -- natural stop, stop
+    // string, cooperative abort, window overflow, or an exception from decode.
+    // The committed prompt pages survive in the radix tree; only the private
+    // generated tail dies with the sequence.
+    struct PrefillSession {
+        blackwell::EnginePrefillCoordinator* coord = nullptr;
+        blackwell::SeqId seq = -1;
+        ~PrefillSession() {
+            if (!coord) return;
+            try {
+                coord->finish(seq);
+            } catch (...) {
+                // Releasing a session must never mask the original error/return.
+            }
         }
-        next = engine_->forward(prompt[i], pos, 0.0f, 1.0f, seq_id);
-        ++pos;
-    }
-    cached = prompt;  // KV now holds exactly `prompt` at positions 0..N-1
+    } session;
 
-    // Regenerating an identical prompt forwarded nothing, leaving `next` unset;
-    // re-run the final token (same id, same slot -> idempotent) to recover the
-    // first-token logits.
-    if (next < 0) {
-        pos = static_cast<int>(prompt.size()) - 1;
-        next = engine_->forward(prompt.back(), pos, 0.0f, 1.0f, seq_id);
-        ++pos;
+    // Path (a): the engine's prefill coordinator (radix-tree prefix reuse).
+    // Main sequence only -- forked branches (seq_id != 0) keep the legacy CoW
+    // page-sharing semantics the playground's tree-search UI is built on.
+    // The tokens handed over are EXACTLY what the JIT cache compiler produced
+    // (chat template applied, add_special_tokens=false), so a warm-started
+    // .bkv system prompt is a guaranteed radix hit.
+    if (engine_->has_prefix_cache() && seq_id == 0) {
+        if (prompt.size() >= cap) return "";  // window overflow: same contract as (b)
+        try {
+            auto& coord = engine_->prefill_driver();
+            const blackwell::EnginePrefillCoordinator::Result r =
+                coord.prefill_prompt(prompt.data(), static_cast<int>(prompt.size()));
+            session.coord = &coord;
+            session.seq = r.engine_seq;
+            decode_seq = r.engine_seq;
+            pos = r.total_tokens;
+            // The logits for prompt[N-1] are already live; sample the first
+            // token from them (temperature 0 = deterministic, like the legacy
+            // prefill) instead of re-running the last token through forward().
+            next = coord.sample_last_logits(0.0f, 1.0f);
+        } catch (const std::exception&) {
+            // Failure contract: the coordinator unwound (no pins, no bindings,
+            // nothing committed). True OOM here means the budget ladder is
+            // drained -- degrade to the legacy prefill rather than failing the
+            // generation. session.coord is still null, so no double-release.
+            decode_seq = seq_id;
+            pos = 0;
+            next = -1;
+        }
+    }
+
+    // Path (b): the adapter's own append-or-reset incremental prefill.
+    if (!session.coord) {
+        // Per-branch KV-reuse history (seq 0 = main). Every forward below targets
+        // this sequence, so parallel branches never clobber each other's KV cache.
+        history = &cached_prompt_by_seq_[seq_id];
+        std::vector<int>& cached = *history;
+
+        // ---- Append-or-Reset prefix match (incremental KV reuse) -------------
+        // `cached` mirrors the tokens currently resident in this sequence's KV
+        // cache (last turn's prompt + everything we then generated). If the whole
+        // of it is a prefix of the new prompt, the conversation only grew at the
+        // end, so we KEEP that KV and prefill ONLY the new tail -- O(new tokens)
+        // instead of O(N). Any divergence (an edited/deleted past turn, or a
+        // shorter prompt) means the cached KV is stale, so we RESET: clear it and
+        // reprefill from pos 0. The engine treats forward(token, pos) as
+        // position-addressed, so reprefilling from 0 truncates+rewrites this
+        // sequence; slots past the new length are never attended to.
+        // Incremental KV reuse (APPEND only the new tail) is safe only when the
+        // engine can rewind to an arbitrary prefix. Hybrid linear-attention (SSM)
+        // models cannot: their recurrent state advances with every forward() with
+        // no rewind, and the stop-token handling below even forwards an eos that
+        // is never committed to `cached`, so the resident SSM state and `cached`
+        // drift apart. For those models we DISABLE the optimization -- always
+        // zero the recurrent state and reprefill the whole prompt from pos 0 --
+        // which is the only way to keep the SSM state in lockstep with the prompt
+        // (otherwise the model collapses into repetition). Dense models keep the
+        // fast incremental path; reset_state() is a no-op for them.
+        const bool incremental_safe =
+            !engine_->get_capabilities().requires_ssm_subsystem;
+        const bool append = incremental_safe &&
+                            cached.size() <= prompt.size() &&
+                            std::equal(cached.begin(), cached.end(), prompt.begin());
+        if (!append) {
+            cached.clear();                 // RESET (reprefill the whole prompt from pos 0)
+            engine_->reset_state(seq_id);   // zero recurrent SSM state (no-op if dense)
+        }
+
+        pos = static_cast<int>(cached.size());  // APPEND: start past the reused prefix
+
+        // Prefill only the tokens not already resident, deterministically
+        // (temperature 0): only the final forward yields the first generated token.
+        for (size_t i = cached.size(); i < prompt.size(); ++i) {
+            if (static_cast<size_t>(pos) >= cap) {  // prompt overflows the window
+                cached.clear();                     // KV is now partial -> force a reset next call
+                return "";
+            }
+            next = engine_->forward(prompt[i], pos, 0.0f, 1.0f, seq_id);
+            ++pos;
+        }
+        cached = prompt;  // KV now holds exactly `prompt` at positions 0..N-1
+
+        // Regenerating an identical prompt forwarded nothing, leaving `next`
+        // unset; re-run the final token (same id, same slot -> idempotent) to
+        // recover the first-token logits.
+        if (next < 0) {
+            pos = static_cast<int>(prompt.size()) - 1;
+            next = engine_->forward(prompt.back(), pos, 0.0f, 1.0f, seq_id);
+            ++pos;
+        }
     }
 
     // String-based stop detection (see below) is the safety net for the failure
@@ -321,11 +384,15 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
 
     while (static_cast<size_t>(pos) < cap && generated < params.max_new_tokens) {
         if (tokenizer_->is_stop(next)) {
-            // Real eos token: feed it so the cache reflects a closed turn, then halt.
-            // It is a stop, so it is NOT committed to `cached`; next turn the
-            // template re-emits the closing marker over this same slot.
-            engine_->forward(next, pos, 0.0f, 1.0f, seq_id);
-            ++pos;
+            // Real eos token. On the legacy path, feed it so the persistent KV
+            // reflects a closed turn (it is NOT committed to the history; next
+            // turn the template re-emits the closing marker over this same
+            // slot). On the coordinator path the sequence is released right
+            // after this call, so writing the eos would be wasted work.
+            if (history) {
+                engine_->forward(next, pos, 0.0f, 1.0f, decode_seq);
+                ++pos;
+            }
             break;
         }
 
@@ -369,10 +436,12 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
             }
         }
 
-        // Commit the confirmed token to the session history (mirrors the KV write
-        // below) so the next turn can append straight onto it, then advance.
-        cached.push_back(next);
-        next = engine_->forward(next, pos, params.temperature, params.top_p, seq_id);
+        // Legacy path: commit the confirmed token to the session history
+        // (mirrors the KV write below) so the next turn can append straight
+        // onto it. The coordinator path needs no mirror -- cross-turn reuse
+        // lives in the radix tree, keyed by the tokens themselves.
+        if (history) history->push_back(next);
+        next = engine_->forward(next, pos, params.temperature, params.top_p, decode_seq);
         ++pos;
         ++generated;
     }
@@ -392,6 +461,14 @@ void BlackwellLLMAdapter::fork_sequence(int parent_id, int child_id) {
     // writes (throws under the continuous cache). Seed the child's reuse history
     // from the parent so continuing the child from the fork point appends (reuse)
     // rather than reprefilling.
+    //
+    // Interplay with the prefix-cache path: when seq 0 is served by the prefill
+    // coordinator, its legacy history stays empty and its engine pages unwritten,
+    // so a fork from it starts cold -- the child's first generate() reprefills
+    // from pos 0 (correct, just without CoW sharing). Branches themselves
+    // (seq_id != 0) always run the legacy path, so fork-of-fork keeps full CoW
+    // semantics. Radix-tree hits still serve any branch's shared prompt prefix
+    // at the coordinator level when it later rejoins seq 0.
     engine_->fork(parent_id, child_id);
     cached_prompt_by_seq_[child_id] = cached_prompt_by_seq_[parent_id];
 }
