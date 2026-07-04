@@ -50,6 +50,7 @@ public:
 
 private:
     static constexpr UINT kMsgState = WM_APP + 1;
+    static constexpr UINT_PTR kFadeTimerId = 1;  // drives the CenterHud fade-out
     // The backing DIB is allocated once at this maximum size; each frame only
     // blits the content-sized sub-rect from its top-left corner.
     static constexpr int kMaxWidth = 720;
@@ -57,19 +58,40 @@ private:
     static constexpr int kPadX = 14;         // horizontal text inset within the pill
     static constexpr int kPadY = 8;          // vertical text inset within the pill
     static constexpr int kGapAboveCaret = 6; // px between the text bottom and the caret
+    static constexpr int kCursorOffsetX = 16; // selection popup offset from the cursor
+    static constexpr int kCursorOffsetY = 22;
+    // CenterHud fade: hold at full opacity, then fade to zero over these spans.
+    static constexpr UINT kFadeTimerMs = 30;
+    static constexpr ULONGLONG kHudHoldMs = 900;
+    static constexpr ULONGLONG kFadeDurationMs = 450;
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+    // How the pill's box is positioned relative to the snapshot's anchor.
+    enum class AnchorMode { CaretPill, CursorPopup, ScreenCenter };
 
     bool InitDirect2D();
     bool InitBackingBitmap();
     void Repaint(const OverlaySnapshot& state);
+    // Blits the current DIB sub-rect to the layered window at a constant alpha
+    // (255 = opaque). Reused by both the initial paint and each fade step.
+    void Blit(POINT dst, SIZE size, BYTE alpha);
+    void RunFadeStep();  // WM_TIMER: advance / finish the CenterHud fade
 
     HWND hwnd_ = nullptr;
 
     Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
     Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory_;
-    Microsoft::WRL::ComPtr<IDWriteTextFormat> textFormat_;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> textFormat_;    // caret pill (trailing/far)
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> hudFormat_;     // center banner (center/center)
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> popupFormat_;   // selection popup (leading/near)
     Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> renderTarget_;
+
+    // Cached blit geometry so the fade timer can re-blit without re-rendering.
+    POINT lastDst_{};
+    SIZE lastSize_{};
+    bool fadeActive_ = false;
+    ULONGLONG fadeStart_ = 0;
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;

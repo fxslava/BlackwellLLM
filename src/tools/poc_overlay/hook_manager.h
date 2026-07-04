@@ -44,6 +44,7 @@ public:
     // consumer can gate "run inference now" separately from mere repositioning.
     using TriggerCallback = std::function<void(const std::wstring& fallbackText, bool wordBoundary)>;
     using VoidCallback = std::function<void()>;
+    using ToggleCallback = std::function<void(bool active)>;
 
     struct Callbacks {
         // "The field changed -- go poll UIA." Carries the current fallback buffer
@@ -53,6 +54,11 @@ public:
         TextCallback onCommit;
         // Input flow broken (navigation / chord / mouse) -- hide the overlay.
         VoidCallback onReset;
+        // Master activation shortcut toggled Translation Mode on (true) / off.
+        ToggleCallback onActivationToggle;
+        // A left-mouse-button release: a text selection may now exist -- go check
+        // it via UIA. Only fired while Translation Mode is active.
+        VoidCallback onSelectionCandidate;
     };
 
     static HookManager& Instance();
@@ -94,6 +100,6 @@ private:
     std::wstring fallbackBuffer_;
     Shortcut commitShortcut_;
     Shortcut activationShortcut_;
-    bool enabled_ = true;  // toggled by the activation shortcut
+    bool enabled_ = false;  // Translation Mode: OFF until the master toggle fires
     std::atomic<bool> injecting_{false};
 };

@@ -98,8 +98,25 @@ public:
     void RequestCommit(std::wstring fallbackText);
 
     // Input flow broken (navigation / chord / mouse): cancel everything and
-    // return to Idle (overlay hidden).
+    // return to Idle (overlay hidden). A no-op against a CenterHud banner.
     void RequestReset();
+
+    // A left-mouse-button release fired while Translation Mode is active: check
+    // the UIA selection and, if a non-empty range is selected, translate it in
+    // the cursor-anchored SelectionPopup (immediate -- no debounce). O(1),
+    // fire-and-forget; ignored unless the tracker is Active.
+    void RequestSelectionCheck();
+
+    // Master Translation-Mode gate. When set false, cancels any in-flight
+    // generation and stops the tracker producing translations/renders (so a
+    // CenterHud banner owns the overlay). Typing/selection are only honored
+    // while Active. Marshals into the worker loop; O(1).
+    void SetActive(bool active);
+
+    // Show a large, screen-centered HUD banner (master-toggle feedback). `fade`
+    // = hold briefly, then dissolve and hide; !fade = persist until replaced
+    // (e.g. "Initializing..."). Marshals into the worker loop.
+    void ShowHud(std::wstring message, bool fade);
 
     // Translation stream delivery. THREAD-SAFE: called from the
     // TranslationService worker; marshals into this worker's event loop.
@@ -121,7 +138,10 @@ public:
                                        CaptureGranularity granularity);
 
 private:
-    enum class Phase { Idle, Typing, Translating, Ready };
+    // Idle/Typing/Translating/Ready are the caret-anchored typing pipeline;
+    // Hud is the master-toggle banner; SelTranslating/SelReady are the
+    // passive-selection popup (translating a mouse selection near the cursor).
+    enum class Phase { Idle, Typing, Translating, Ready, Hud, SelTranslating, SelReady };
 
     void ThreadMain();
     // Reads the authoritative text + caret position for the focused control.
@@ -136,6 +156,10 @@ private:
     void HandleIdleExpired();
     void HandleTranslation(const std::wstring& text, bool done);
     void HandleCommit(IUIAutomation* automation);
+    void HandleSelectionCheck(IUIAutomation* automation);   // mouse-up -> translate selection
+    void HandleSelectionCommit(IUIAutomation* automation);  // Ctrl+Enter over a selection
+    void HandleSetActive(bool active);
+    void HandleShowHud(const std::wstring& message, bool fade);
     void ResetToIdle();
     void Render() const;
 
@@ -147,10 +171,13 @@ private:
 
     // --- worker-thread-only state machine ------------------------------------
     Phase phase_ = Phase::Idle;
-    std::wstring sourceRaw_;           // current capture area (what inference sees)
-    std::wstring translationPartial_;  // streamed partial while Translating
-    std::wstring translationRaw_;      // final translation while Ready
-    POINT anchor_{};                   // caret point from the last resolve
+    bool active_ = false;              // Translation Mode gate (set via SetActive)
+    std::wstring sourceRaw_;           // current capture / selected text (what inference sees)
+    std::wstring translationPartial_;  // streamed partial while (Sel)Translating
+    std::wstring translationRaw_;      // final translation while (Sel)Ready
+    std::wstring hudMessage_;          // CenterHud banner text (Phase::Hud)
+    bool hudFade_ = false;             // CenterHud: auto-fade
+    POINT anchor_{};                   // caret point (Typing*) or cursor point (Sel*)
     bool anchorValid_ = false;
     bool idleArmed_ = false;
     std::chrono::steady_clock::time_point idleDeadline_{};
@@ -169,6 +196,9 @@ private:
     bool hasPendingUpdate_ = false;
     bool pendingCommit_ = false;
     bool pendingReset_ = false;
+    bool pendingSelectionCheck_ = false;
+    std::optional<bool> pendingActive_;                               // SetActive slot
+    std::optional<std::pair<std::wstring, bool>> pendingHud_;         // message, fade
     std::optional<std::pair<std::wstring, bool>> pendingTranslation_;  // text, done
     bool hasPending_ = false;
     std::atomic<bool> stop_{false};

@@ -135,11 +135,17 @@ LRESULT CALLBACK HookManager::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPA
 }
 
 LRESULT CALLBACK HookManager::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && g_instance) {
-        // A click can reposition the caret anywhere, breaking the input flow.
+    // Only track the mouse while Translation Mode is active, and never react to
+    // clicks in our own UI (settings window).
+    if (nCode == HC_ACTION && g_instance && g_instance->enabled_ && !ForegroundIsOwnProcess()) {
+        // A button press can reposition the caret / dismiss a live popup: break
+        // the input flow (cancels any in-flight generation, hides the overlay).
         if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN ||
             wParam == WM_XBUTTONDOWN) {
             g_instance->ResetFallback();
+        } else if (wParam == WM_LBUTTONUP && g_instance->callbacks_.onSelectionCandidate) {
+            // The user may have just finished a drag-selection -- go check UIA.
+            g_instance->callbacks_.onSelectionCandidate();
         }
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -157,12 +163,18 @@ bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
         return false;
     }
 
-    // Activation shortcut: toggle the whole assistant on/off.
+    // Master activation shortcut: toggle Translation Mode on/off. Works even
+    // while disabled (it is checked before the enabled_ gate below). We do NOT
+    // fire onReset here -- onActivationToggle owns the visual (the HUD banner),
+    // and an onReset would hide it.
     const Shortcut activation = activationShortcut_;
     if (activation.vk != 0 && vk == activation.vk && ModifiersMatch(activation.modifiers)) {
         enabled_ = !enabled_;
-        ResetFallback();  // hide overlay + drop buffer whichever way we toggled
-        return true;      // consume
+        fallbackBuffer_.clear();
+        if (callbacks_.onActivationToggle) {
+            callbacks_.onActivationToggle(enabled_);
+        }
+        return true;  // consume
     }
     // While disabled, swallow nothing but do nothing -- only the toggle above works.
     if (!enabled_) {

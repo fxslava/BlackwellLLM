@@ -46,6 +46,7 @@
 namespace {
 
 constexpr UINT kTrayIconId = 1;
+constexpr UINT_PTR kReadyTimerId = 1;  // polls engine readiness after Mode ON
 
 // The live, in-memory application config. Loaded at startup and rewritten by the
 // settings window; only ever touched on the UI thread.
@@ -54,6 +55,9 @@ Config g_config;
 // The tracker owns the capture/debounce settings; the settings window pushes
 // changes into it live via ApplyConfig (model path still needs a restart).
 CaretTracker* g_caretTracker = nullptr;
+// The inference service, for the readiness poll that drives the toggle HUD from
+// "Initializing..." to "ACTIVE". Only touched on the UI thread.
+TranslationService* g_translator = nullptr;
 
 // Pushes a config into the running app: rebinds hotkeys and capture settings
 // in memory immediately. (Model path / context size are engine-construction
@@ -91,6 +95,26 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             return 0;
         }
+        case WM_TIMER:
+            // Toggle ON started the engine warming up; poll for readiness and
+            // flip the HUD banner from "Initializing..." to "ACTIVE" (or an error).
+            if (wParam == kReadyTimerId && g_translator && g_caretTracker) {
+                switch (g_translator->state()) {
+                    case TranslationService::State::Ready:
+                        KillTimer(hwnd, kReadyTimerId);
+                        g_caretTracker->SetActive(true);
+                        g_caretTracker->ShowHud(L"Translation Mode: ACTIVE", /*fade=*/true);
+                        break;
+                    case TranslationService::State::Error:
+                        KillTimer(hwnd, kReadyTimerId);
+                        g_caretTracker->ShowHud(L"Engine unavailable - set the model path in Settings",
+                                                /*fade=*/true);
+                        break;
+                    case TranslationService::State::Loading:
+                        break;  // keep waiting
+                }
+            }
+            return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -151,6 +175,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                                     ? ConfigStore::DefaultSpillPath()
                                     : g_config.spillFilePath;
     TranslationService translator(std::move(svcSettings));
+    g_translator = &translator;  // for the readiness poll (WM_TIMER)
 
     // CaretTracker owns the interaction state machine on ITS OWN (COM/UIA STA)
     // thread: capture extraction, the idle-timer debounce, and the surgical
@@ -185,25 +210,61 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             caretTracker.OnPreviewResult(text, done);
         });
 
+    // Invisible controller window: owns the tray icon, receives its callback
+    // messages (WM_TRAYICON), and drives the engine-readiness poll timer. Created
+    // BEFORE the hooks so the master-toggle callback can arm its timer on it.
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = &ControllerWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"BlackwellPocOverlayController";
+    RegisterClassExW(&wc);
+
+    HWND controller = CreateWindowExW(0, wc.lpszClassName, L"poc_overlay controller", WS_OVERLAPPED,
+                                       0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
+
+    TrayIcon trayIcon(controller, kTrayIconId);
+    SetWindowLongPtrW(controller, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&trayIcon));
+    trayIcon.Create(L"Blackwell PoC: Translation Mode (Alt+Shift+T)");
+
     // The hook callbacks run inline in the global hook chain on THIS thread and
     // must stay fast. They only hand work to the caret tracker's queue (an O(1)
     // lock + condvar notify) -- the UIA round-trip, D2D paint, and the whole
     // 3-tier replacement happen off this call stack entirely.
     HookManager::Callbacks callbacks;
     callbacks.onTrigger = [&caretTracker](const std::wstring& fallbackText, bool wordBoundary) {
-        // Every keystroke: re-capture, re-arm the idle timer, interrupt any
-        // in-flight/displayed translation (State 2/3 -> State 1).
+        // Every keystroke (Mode ACTIVE only): re-capture, re-arm the idle timer,
+        // interrupt any in-flight/displayed translation (State 2/3 -> State 1).
         caretTracker.RequestUpdate(fallbackText, wordBoundary);
     };
     callbacks.onCommit = [&caretTracker](const std::wstring& fallbackText) {
-        // Surgical host-side replace of the Ready snapshot; a no-op unless the
-        // state machine is actually in Ready.
+        // Ctrl+Enter: surgical host-side replace of the Ready snapshot (typing OR
+        // selection popup); a no-op in any other state.
         caretTracker.RequestCommit(fallbackText);
     };
-    callbacks.onReset = [&]() {
-        overlay.Hide();               // snappy; the tracker's render confirms it
-        caretTracker.RequestReset();  // cancel + back to Idle
+    callbacks.onReset = [&caretTracker]() {
+        // Nav key / mouse-button-down: cancel + hide. The tracker renders the
+        // hide itself (and leaves a CenterHud banner alone) -- do NOT call
+        // overlay.Hide() here or a toggle banner would be wiped.
+        caretTracker.RequestReset();
     };
+    // Master toggle (Alt+Shift+T): show the HUD, warm the engine, gate tracking.
+    callbacks.onActivationToggle = [&caretTracker, &translator, controller](bool active) {
+        if (active) {
+            if (translator.state() == TranslationService::State::Ready) {
+                caretTracker.SetActive(true);
+                caretTracker.ShowHud(L"Translation Mode: ACTIVE", /*fade=*/true);
+            } else {
+                caretTracker.ShowHud(L"Initializing Translation Engine...", /*fade=*/false);
+                SetTimer(controller, kReadyTimerId, 150, nullptr);  // poll -> ACTIVE
+            }
+        } else {
+            KillTimer(controller, kReadyTimerId);
+            caretTracker.SetActive(false);
+            caretTracker.ShowHud(L"Translation Mode: OFF", /*fade=*/true);
+        }
+    };
+    // Left-button-up (Mode ACTIVE only): a selection may now exist -> translate it.
+    callbacks.onSelectionCandidate = [&caretTracker]() { caretTracker.RequestSelectionCheck(); };
 
     const bool hookInstalled = HookManager::Instance().Install(std::move(callbacks));
     if (!hookInstalled) {
@@ -211,21 +272,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                     MB_ICONERROR);
         return 1;
     }
-
-    WNDCLASSEXW wc{sizeof(wc)};
-    wc.lpfnWndProc = &ControllerWndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"BlackwellPocOverlayController";
-    RegisterClassExW(&wc);
-
-    // Invisible controller window: exists solely to own the tray icon and
-    // receive its callback messages (WM_TRAYICON).
-    HWND controller = CreateWindowExW(0, wc.lpszClassName, L"poc_overlay controller", WS_OVERLAPPED,
-                                       0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
-
-    TrayIcon trayIcon(controller, kTrayIconId);
-    SetWindowLongPtrW(controller, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&trayIcon));
-    trayIcon.Create(L"Blackwell PoC: Input Hook -> UIA Caret -> Overlay");
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -235,6 +281,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     HookManager::Instance().Uninstall();
     g_caretTracker = nullptr;
+    g_translator = nullptr;
 
     // Teardown ordering: join the service worker FIRST, so its sink can never
     // fire into the CaretTracker while (or after) the tracker is destroyed

@@ -6,6 +6,36 @@
 
 using Microsoft::WRL::ComPtr;
 
+namespace {
+const std::wstring kSpinner(1, L'\x2026');                       // "..." loading glyph
+const D2D1_COLOR_F kAccent = D2D1::ColorF(0.55f, 0.75f, 1.0f);   // in-progress color
+
+// Work area of the monitor currently under the mouse cursor (for centered HUDs).
+RECT WorkAreaUnderCursor() {
+    POINT c{};
+    GetCursorPos(&c);
+    HMONITOR mon = MonitorFromPoint(c, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{sizeof(mi)};
+    if (GetMonitorInfoW(mon, &mi)) {
+        return mi.rcWork;
+    }
+    return RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+}
+
+// Keep a box fully on the monitor nearest `anchor`.
+void ClampToMonitor(POINT& dst, int boxW, int boxH, POINT anchor) {
+    HMONITOR mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(mon, &mi)) {
+        return;
+    }
+    if (dst.x + boxW > mi.rcWork.right) dst.x = mi.rcWork.right - boxW;
+    if (dst.y + boxH > mi.rcWork.bottom) dst.y = mi.rcWork.bottom - boxH;
+    if (dst.x < mi.rcWork.left) dst.x = mi.rcWork.left;
+    if (dst.y < mi.rcWork.top) dst.y = mi.rcWork.top;
+}
+}  // namespace
+
 OverlayWindow::~OverlayWindow() {
     renderTarget_.Reset();
     if (dib_) {
@@ -63,6 +93,26 @@ bool OverlayWindow::InitDirect2D() {
     textFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
     textFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
 
+    // CenterHud banner: larger, centered on both axes.
+    if (FAILED(writeFactory_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                                30.0f, L"en-us", hudFormat_.GetAddressOf()))) {
+        return false;
+    }
+    hudFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    hudFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    hudFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+    // Selection popup: left/top-aligned, sits below-right of the cursor.
+    if (FAILED(writeFactory_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                                20.0f, L"en-us", popupFormat_.GetAddressOf()))) {
+        return false;
+    }
+    popupFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    popupFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    popupFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
     const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
@@ -104,48 +154,70 @@ void OverlayWindow::Hide() {
 }
 
 void OverlayWindow::Repaint(const OverlaySnapshot& state) {
-    // Compose the display string + the style split point for this phase.
-    // `dimLen` characters from the start render dimmed+italic (the captured
-    // source); everything after renders in the phase's foreground color.
+    // A fresh state supersedes any in-progress fade.
+    KillTimer(hwnd_, kFadeTimerId);
+    fadeActive_ = false;
+
+    // Compose the display string, the dim split point, the color, the text
+    // format, and how the box anchors -- all phase-driven.
     std::wstring text;
-    size_t dimLen = 0;
+    size_t dimLen = 0;  // leading chars rendered dimmed + italic (captured source)
     D2D1_COLOR_F fgColor = D2D1::ColorF(D2D1::ColorF::White);
+    IDWriteTextFormat* format = textFormat_.Get();
+    AnchorMode anchorMode = AnchorMode::CaretPill;
+    bool fade = false;
+
     switch (state.phase) {
+        case OverlayPhase::Hidden:
+            ShowWindow(hwnd_, SW_HIDE);
+            return;
         case OverlayPhase::Typing:
             text = state.source;
             dimLen = text.size();  // everything dimmed: "this is the capture"
             break;
         case OverlayPhase::Translating:
-            // Dimmed source, then the streamed partial (or an ellipsis while
-            // the first tokens are in flight) in the accent color.
-            text = state.source + L"\n" +
-                   (state.translation.empty() ? std::wstring(1, L'\x2026')  // "..." spinner
-                                              : state.translation);
+            // Dimmed source, then the streamed partial (or an ellipsis spinner
+            // while the first tokens are in flight) in the accent color.
+            text = state.source + L"\n" + (state.translation.empty() ? kSpinner : state.translation);
             dimLen = state.source.size();
-            fgColor = D2D1::ColorF(0.55f, 0.75f, 1.0f);  // accent: in progress
+            fgColor = kAccent;
             break;
         case OverlayPhase::Ready:
             text = state.translation;  // full-brightness: Ctrl+Enter commits this
             break;
-        case OverlayPhase::Hidden:
+        case OverlayPhase::CenterHud:
+            text = state.message;
+            format = hudFormat_.Get();
+            anchorMode = AnchorMode::ScreenCenter;
+            fade = state.fade;
+            break;
+        case OverlayPhase::SelectionTranslating:
+            // No source (the OS already highlights it) -- just the spinner/partial.
+            text = state.translation.empty() ? kSpinner : state.translation;
+            fgColor = kAccent;
+            format = popupFormat_.Get();
+            anchorMode = AnchorMode::CursorPopup;
+            break;
+        case OverlayPhase::SelectionReady:
+            text = state.translation;
+            format = popupFormat_.Get();
+            anchorMode = AnchorMode::CursorPopup;
             break;
     }
 
-    // Nothing to show (hidden phase, cleared field, or no caret to anchor to)
-    // -- hide rather than flash an empty pill.
-    if (text.empty() || state.phase == OverlayPhase::Hidden || !state.anchorValid) {
+    // Nothing to show (empty text, or a caret/cursor-anchored pill with no
+    // anchor) -- hide rather than flash an empty pill. Centered HUDs need no anchor.
+    if (text.empty() || (anchorMode != AnchorMode::ScreenCenter && !state.anchorValid)) {
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
-    const POINT caretScreenPos = state.anchor;
 
     // Measure the text to size the pill to its content (supports multiple lines).
     const float maxTextW = static_cast<float>(kMaxWidth - 2 * kPadX);
     const float maxTextH = static_cast<float>(kMaxHeight - 2 * kPadY);
     ComPtr<IDWriteTextLayout> layout;
     if (FAILED(writeFactory_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.length()),
-                                                textFormat_.Get(), maxTextW, maxTextH,
-                                                layout.GetAddressOf()))) {
+                                                format, maxTextW, maxTextH, layout.GetAddressOf()))) {
         return;
     }
     // Captured-source range: italic (the brush split happens at draw time).
@@ -161,8 +233,8 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     textW = std::clamp(textW, 1.0f, maxTextW);
     textH = std::clamp(textH, 1.0f, maxTextH);
 
-    // Pin the layout box to the measured content so TRAILING/FAR alignment hugs
-    // the pill's right/bottom inset (each line right-aligns under the caret).
+    // Pin the layout box to the measured content so alignment hugs the pill's
+    // inset (each line right-aligns under the caret; centered for the HUD).
     layout->SetMaxWidth(textW);
     layout->SetMaxHeight(textH);
 
@@ -179,7 +251,7 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     renderTarget_->Clear(D2D1::ColorF(0, 0, 0, 0));  // fully transparent background
 
     ComPtr<ID2D1SolidColorBrush> bgBrush;
-    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.05f, 0.05f, 0.05f, 0.78f),
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.05f, 0.05f, 0.05f, 0.82f),
                                           bgBrush.GetAddressOf());
     ComPtr<ID2D1SolidColorBrush> fgBrush;
     renderTarget_->CreateSolidColorBrush(fgColor, fgBrush.GetAddressOf());
@@ -205,20 +277,66 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     }
     renderTarget_->EndDraw();
 
-    // Anchor the string's END (bottom-right of the text, inset by the padding)
-    // to the caret: text right edge -> caret.x, text bottom -> kGapAboveCaret px
-    // above caret.y. The pill therefore floats up-and-to-the-left of the caret.
-    POINT dstPos{caretScreenPos.x - boxW + kPadX,
-                 caretScreenPos.y - kGapAboveCaret - boxH + kPadY};
-    SIZE size{boxW, boxH};
-    POINT srcPos{0, 0};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    // Position the box per anchor mode.
+    POINT dstPos{};
+    switch (anchorMode) {
+        case AnchorMode::CaretPill:
+            // Anchor the string's END (bottom-right, inset by the padding) to the
+            // caret: text right edge -> anchor.x, text bottom -> kGapAboveCaret px
+            // above anchor.y. Floats up-and-to-the-left of the caret.
+            dstPos = {state.anchor.x - boxW + kPadX, state.anchor.y - kGapAboveCaret - boxH + kPadY};
+            break;
+        case AnchorMode::CursorPopup:
+            // Below-and-right of the cursor/selection end, clamped on-screen.
+            dstPos = {state.anchor.x + kCursorOffsetX, state.anchor.y + kCursorOffsetY};
+            ClampToMonitor(dstPos, boxW, boxH, state.anchor);
+            break;
+        case AnchorMode::ScreenCenter: {
+            const RECT wa = WorkAreaUnderCursor();
+            dstPos = {wa.left + ((wa.right - wa.left) - boxW) / 2,
+                      wa.top + ((wa.bottom - wa.top) - boxH) / 3};  // upper third reads better
+            break;
+        }
+    }
 
-    HDC screenDC = GetDC(nullptr);
-    UpdateLayeredWindow(hwnd_, screenDC, &dstPos, &size, memDC_, &srcPos, 0, &blend, ULW_ALPHA);
-    ReleaseDC(nullptr, screenDC);
-
+    Blit(dstPos, SIZE{boxW, boxH}, 255);
+    lastDst_ = dstPos;
+    lastSize_ = SIZE{boxW, boxH};
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+
+    // CenterHud with fade: hold at full opacity, then dissolve away.
+    if (fade) {
+        fadeActive_ = true;
+        fadeStart_ = GetTickCount64();
+        SetTimer(hwnd_, kFadeTimerId, kFadeTimerMs, nullptr);
+    }
+}
+
+void OverlayWindow::Blit(POINT dst, SIZE size, BYTE alpha) {
+    POINT srcPos{0, 0};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    HDC screenDC = GetDC(nullptr);
+    UpdateLayeredWindow(hwnd_, screenDC, &dst, &size, memDC_, &srcPos, 0, &blend, ULW_ALPHA);
+    ReleaseDC(nullptr, screenDC);
+}
+
+void OverlayWindow::RunFadeStep() {
+    if (!fadeActive_) {
+        return;
+    }
+    const ULONGLONG elapsed = GetTickCount64() - fadeStart_;
+    if (elapsed < kHudHoldMs) {
+        return;  // still holding at full opacity
+    }
+    const ULONGLONG t = elapsed - kHudHoldMs;
+    if (t >= kFadeDurationMs) {
+        KillTimer(hwnd_, kFadeTimerId);
+        fadeActive_ = false;
+        ShowWindow(hwnd_, SW_HIDE);
+        return;
+    }
+    const BYTE alpha = static_cast<BYTE>(255 - (255 * t) / kFadeDurationMs);
+    Blit(lastDst_, lastSize_, alpha);
 }
 
 LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -227,6 +345,13 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self) {
             self->Repaint(*payload);
+        }
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == kFadeTimerId) {
+        auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self) {
+            self->RunFadeStep();
         }
         return 0;
     }

@@ -32,8 +32,8 @@ inline CaptureGranularity CaptureGranularityFromString(const std::string& s,
 // encoding as everything else in this PoC (see Shortcut). The inference fields
 // mirror the playground server's generation settings.
 struct Config {
-    Shortcut activationShortcut{HOTKEYF_CONTROL | HOTKEYF_SHIFT, 'T'};  // Ctrl+Shift+T
-    Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};                // Ctrl+Enter
+    Shortcut activationShortcut{HOTKEYF_ALT | HOTKEYF_SHIFT, 'T'};  // Alt+Shift+T (master toggle)
+    Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};            // Ctrl+Enter
 
     std::wstring modelPath;    // weights directory / file
     int contextSize = 4096;    // KV-cache / context window (tokens)

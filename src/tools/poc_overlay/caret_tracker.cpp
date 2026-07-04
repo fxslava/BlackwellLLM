@@ -138,6 +138,43 @@ bool ReadValuePattern(IUIAutomationElement* focused, std::wstring& outText) {
     return true;
 }
 
+// Reads the focused element's current UIA text SELECTION (the highlighted
+// range). Returns true -- filling `outRange` + `outText` -- only when a NON-empty
+// range is selected; a bare caret is a degenerate range whose GetText is empty,
+// which we reject (a plain click is not a translation request).
+bool ReadSelection(IUIAutomationElement* focused, ComPtr<IUIAutomationTextRange>& outRange,
+                   std::wstring& outText) {
+    ComPtr<IUnknown> patternUnknown;
+    if (FAILED(focused->GetCurrentPattern(UIA_TextPatternId, &patternUnknown)) || !patternUnknown) {
+        return false;
+    }
+    ComPtr<IUIAutomationTextPattern> textPattern;
+    if (FAILED(patternUnknown.As(&textPattern)) || !textPattern) {
+        return false;
+    }
+    ComPtr<IUIAutomationTextRangeArray> selection;
+    if (FAILED(textPattern->GetSelection(&selection)) || !selection) {
+        return false;
+    }
+    int rangeCount = 0;
+    selection->get_Length(&rangeCount);
+    if (rangeCount == 0) {
+        return false;
+    }
+    ComPtr<IUIAutomationTextRange> range;
+    if (FAILED(selection->GetElement(0, &range)) || !range) {
+        return false;
+    }
+    BSTR bstr = nullptr;
+    if (FAILED(range->GetText(-1, &bstr)) || !bstr) {
+        return false;
+    }
+    outText.assign(bstr, SysStringLen(bstr));
+    SysFreeString(bstr);
+    outRange = range;
+    return !outText.empty();
+}
+
 // True if `c` ends the capture area under granularity `g`. Boundaries nest:
 // newlines always break; Sentence adds . ! ?; Clause additionally , ; :.
 bool IsBoundaryChar(wchar_t c, CaptureGranularity g) {
@@ -225,6 +262,27 @@ void CaretTracker::RequestReset() {
     cv_.notify_all();
 }
 
+void CaretTracker::RequestSelectionCheck() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingSelectionCheck_ = true;
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
+void CaretTracker::SetActive(bool active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingActive_ = active;  // latest wins
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
+void CaretTracker::ShowHud(std::wstring message, bool fade) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingHud_.emplace(std::move(message), fade);  // latest wins
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
 void CaretTracker::OnPreviewResult(std::wstring text, bool done) {
     // Called from the TranslationService worker thread: marshal into this
     // worker's serialized event loop. Latest-wins is correct here too -- a
@@ -250,7 +308,10 @@ void CaretTracker::ThreadMain() {
         bool haveUpdate = false;
         bool doCommit = false;
         bool doReset = false;
+        bool doSelectionCheck = false;
         bool timerFired = false;
+        std::optional<bool> setActive;
+        std::optional<std::pair<std::wstring, bool>> hud;
         std::optional<std::pair<std::wstring, bool>> translation;
         {
             std::unique_lock<std::mutex> lock(mutex_);
@@ -278,11 +339,17 @@ void CaretTracker::ThreadMain() {
                 doCommit = true;
                 pendingCommit_ = false;
             }
+            if (pendingSelectionCheck_) {
+                doSelectionCheck = true;
+                pendingSelectionCheck_ = false;
+            }
             if (hasPendingUpdate_) {
                 haveUpdate = true;
                 fallback = std::move(pendingFallback_);
                 hasPendingUpdate_ = false;
             }
+            setActive.swap(pendingActive_);
+            hud.swap(pendingHud_);
             translation.swap(pendingTranslation_);
             hasPending_ = false;
         }
@@ -290,9 +357,18 @@ void CaretTracker::ThreadMain() {
         if (timerFired) {
             idleArmed_ = false;  // consumed; HandleKeystroke re-arms as needed
         }
+        // Master-mode + HUD events first: they set the gate / banner the rest
+        // of this wake-up's handlers respect.
+        if (setActive) {
+            HandleSetActive(*setActive);
+        }
+        if (hud) {
+            HandleShowHud(hud->first, hud->second);
+        }
+        // Reset is NOT terminal: a fast click coalesces mouse-down (reset) with
+        // mouse-up (selection check), and the check must still run after it.
         if (doReset) {
             ResetToIdle();
-            continue;
         }
         // A commit consumes the snapshot and hides the overlay, so it supersedes
         // any coalesced keystroke/translation event in the same wake-up.
@@ -302,7 +378,14 @@ void CaretTracker::ThreadMain() {
             }
             continue;
         }
-        if (haveUpdate && SUCCEEDED(hrAutomation)) {
+        // A selection is an explicit action superseding typing/timer this wake-up.
+        if (doSelectionCheck && active_ && SUCCEEDED(hrAutomation)) {
+            HandleSelectionCheck(automation.Get());
+            continue;
+        }
+        // Typing / debounce only while Translation Mode is active (so a HUD or an
+        // OFF state is never clobbered by stray input).
+        if (haveUpdate && active_ && SUCCEEDED(hrAutomation)) {
             HandleKeystroke(automation.Get(), fallback);
         }
         if (translation) {
@@ -326,9 +409,10 @@ void CaretTracker::ThreadMain() {
 // ---------------------------------------------------------------------------
 
 void CaretTracker::HandleKeystroke(IUIAutomation* automation, const std::wstring& fallback) {
-    // INTERRUPT: any keystroke during Translating/Ready invalidates the
-    // translation -- cancel the in-flight decode and clear what was shown.
-    if (phase_ == Phase::Translating || phase_ == Phase::Ready) {
+    // INTERRUPT: any keystroke during a translation phase (typing OR selection)
+    // invalidates it -- cancel the in-flight decode and clear what was shown.
+    if (phase_ == Phase::Translating || phase_ == Phase::Ready ||
+        phase_ == Phase::SelTranslating || phase_ == Phase::SelReady) {
         if (callbacks_.cancelGeneration) {
             callbacks_.cancelGeneration();
         }
@@ -378,26 +462,35 @@ void CaretTracker::HandleIdleExpired() {
 }
 
 void CaretTracker::HandleTranslation(const std::wstring& text, bool done) {
-    if (phase_ != Phase::Translating) {
-        return;  // stale delivery: the user typed (or committed) meanwhile
+    const bool typingFlow = (phase_ == Phase::Translating);
+    const bool selectionFlow = (phase_ == Phase::SelTranslating);
+    if (!typingFlow && !selectionFlow) {
+        return;  // stale delivery: the user typed / committed / reselected meanwhile
     }
     if (!done) {
         translationPartial_ = text;  // streamed partial
     } else if (!text.empty()) {
         translationRaw_ = text;
         translationPartial_.clear();
-        phase_ = Phase::Ready;
+        phase_ = typingFlow ? Phase::Ready : Phase::SelReady;
     } else {
-        // Empty final = the run failed / was dropped. Fall back to Typing
-        // WITHOUT re-arming the timer -- retrying on a persistent failure
-        // would spin; the next keystroke re-enters the normal flow.
-        phase_ = Phase::Typing;
+        // Empty final = the run failed / was dropped. The typing flow falls back
+        // to Typing (next keystroke retries); the selection flow just hides the
+        // popup (there is no debounce loop to fall back into). Neither re-arms.
         translationPartial_.clear();
+        phase_ = typingFlow ? Phase::Typing : Phase::Idle;
     }
     Render();
 }
 
 void CaretTracker::HandleCommit(IUIAutomation* automation) {
+    // Passive-selection commit: overwrite the still-highlighted selection with
+    // its translation. Separate path -- the OS already owns the range.
+    if (phase_ == Phase::SelReady) {
+        HandleSelectionCommit(automation);
+        return;
+    }
+
     // Surgical commit is valid ONLY from Ready: there must be a finished
     // translation on screen. In any other state Ctrl+Enter is a no-op (the
     // overlay already shows what stage we are in).
@@ -510,11 +603,131 @@ void CaretTracker::ResetToIdle() {
     if (callbacks_.cancelGeneration) {
         callbacks_.cancelGeneration();
     }
+    // A CenterHud banner owns the overlay and manages its own fade -- a stray
+    // click/nav-key must not hide it.
+    if (phase_ == Phase::Hud) {
+        return;
+    }
     phase_ = Phase::Idle;
     sourceRaw_.clear();
     translationRaw_.clear();
     translationPartial_.clear();
     idleArmed_ = false;
+    Render();
+}
+
+void CaretTracker::HandleSelectionCheck(IUIAutomation* automation) {
+    ComPtr<IUIAutomationElement> focused;
+    if (FAILED(automation->GetFocusedElement(&focused)) || !focused) {
+        return;  // no focus -> a bare click, nothing to translate
+    }
+    ComPtr<IUIAutomationTextRange> range;
+    std::wstring selected;
+    if (!ReadSelection(focused.Get(), range, selected)) {
+        return;  // just a click / caret move -- no highlighted text
+    }
+
+    // Supersede anything in flight (a prior popup or typing translation).
+    if (phase_ == Phase::Translating || phase_ == Phase::Ready ||
+        phase_ == Phase::SelTranslating || phase_ == Phase::SelReady) {
+        if (callbacks_.cancelGeneration) {
+            callbacks_.cancelGeneration();
+        }
+    }
+
+    // Anchor the popup at the mouse cursor -- the user just released it at the
+    // selection's active end.
+    GetCursorPos(&anchor_);
+    anchorValid_ = true;
+    sourceRaw_ = std::move(selected);
+    translationPartial_.clear();
+    translationRaw_.clear();
+    phase_ = Phase::SelTranslating;
+    idleArmed_ = false;
+
+    // A selection is an EXPLICIT request: warm the tree AND fire generation now
+    // (no debounce, unlike the typing flow).
+    if (callbacks_.trackUpdate) {
+        callbacks_.trackUpdate(sourceRaw_, inferenceContext_);
+    }
+    if (callbacks_.triggerGeneration) {
+        callbacks_.triggerGeneration(sourceRaw_, inferenceContext_);
+    }
+    Render();
+}
+
+void CaretTracker::HandleSelectionCommit(IUIAutomation* automation) {
+    if (sourceRaw_.empty() || translationRaw_.empty()) {
+        phase_ = Phase::Idle;
+        Render();
+        return;
+    }
+    if (callbacks_.injectionGuard) {
+        callbacks_.injectionGuard(true);
+    }
+
+    ComPtr<IUIAutomationElement> focused;
+    if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused) {
+        ComPtr<IUIAutomationTextRange> range;
+        std::wstring current;
+        // Re-query: the selection must still be the exact text we translated
+        // (the user may have clicked into it, collapsing the range).
+        if (ReadSelection(focused.Get(), range, current) && current == sourceRaw_) {
+            TextInjector::Request request;
+            request.source = sourceRaw_;
+            request.replacement = translationRaw_;
+            request.selectionRange = range.Get();  // Tier 2: Select() (idempotent) + paste
+            if (TextInjector::Replace(request) != TextInjector::Tier::None) {
+                if (!inferenceContext_.empty()) {
+                    inferenceContext_ += L' ';
+                }
+                inferenceContext_ += sourceRaw_;  // AI history keeps the original
+            }
+        }
+    }
+
+    if (callbacks_.injectionGuard) {
+        callbacks_.injectionGuard(false);
+    }
+
+    phase_ = Phase::Idle;
+    sourceRaw_.clear();
+    translationRaw_.clear();
+    translationPartial_.clear();
+    idleArmed_ = false;
+    Render();
+}
+
+void CaretTracker::HandleSetActive(bool active) {
+    active_ = active;
+    if (active) {
+        return;  // going active: wait for real input; the ACTIVE banner (if any) shows
+    }
+    // Leaving Translation Mode: stop paying for any in-flight decode and drop the
+    // tracking state. Clear the pill (Render) so nothing lingers; the OFF banner
+    // (ShowHud, issued right after by main) then takes over the overlay.
+    if (callbacks_.cancelGeneration) {
+        callbacks_.cancelGeneration();
+    }
+    if (phase_ != Phase::Hud) {
+        phase_ = Phase::Idle;
+        Render();
+    }
+    sourceRaw_.clear();
+    translationRaw_.clear();
+    translationPartial_.clear();
+    idleArmed_ = false;
+}
+
+void CaretTracker::HandleShowHud(const std::wstring& message, bool fade) {
+    phase_ = Phase::Hud;
+    hudMessage_ = message;
+    hudFade_ = fade;
+    idleArmed_ = false;
+    // A banner supersedes any tracking pill; drop stale capture/translation text.
+    sourceRaw_.clear();
+    translationPartial_.clear();
+    translationRaw_.clear();
     Render();
 }
 
@@ -540,6 +753,21 @@ void CaretTracker::Render() const {
             break;
         case Phase::Ready:
             snapshot.phase = OverlayPhase::Ready;
+            snapshot.translation = translationRaw_;
+            break;
+        case Phase::Hud:
+            snapshot.phase = OverlayPhase::CenterHud;
+            snapshot.message = hudMessage_;
+            snapshot.fade = hudFade_;
+            snapshot.anchorValid = true;  // centered; needs no caret/cursor anchor
+            break;
+        case Phase::SelTranslating:
+            // No source shown -- the OS already highlights it. Anchor = cursor.
+            snapshot.phase = OverlayPhase::SelectionTranslating;
+            snapshot.translation = translationPartial_;
+            break;
+        case Phase::SelReady:
+            snapshot.phase = OverlayPhase::SelectionReady;
             snapshot.translation = translationRaw_;
             break;
     }
