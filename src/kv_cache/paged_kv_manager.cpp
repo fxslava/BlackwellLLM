@@ -187,8 +187,36 @@ void PagedKVManager::fork(SeqId parent, SeqId child) {
     m_residency[child_internal] = SeqResidency::Resident;
 }
 
+int PagedKVManager::truncate_sequence(SeqId seq, size_t keep_tokens) {
+    const paging::SeqId internal = internal_id(seq);
+    ensure_resident(internal);
+
+    const int len = m_seqmgr->length(internal);
+    if (keep_tokens > static_cast<size_t>(len))
+        throw std::invalid_argument(
+            "PagedKVManager::truncate_sequence: keep_tokens " +
+            std::to_string(keep_tokens) + " exceeds sequence length " +
+            std::to_string(len) + " (truncation never grows a sequence)");
+
+    // The latched context (block table upload, seq_len, append slot) belongs
+    // to a layer sweep over the PRE-truncation state; drop it so a stale
+    // attention_decode cannot read pages this truncation is about to free.
+    if (m_active == internal) {
+        m_active      = -1;
+        m_block_table = nullptr;
+    }
+    return m_seqmgr->truncate(internal, static_cast<int>(keep_tokens));
+}
+
 void PagedKVManager::rewind(SeqId seq, int target_pos) {
-    m_seqmgr->rewind(internal_id(seq), target_pos);
+    const paging::SeqId internal = internal_id(seq);
+    if (m_active == internal) {
+        m_active      = -1;
+        m_block_table = nullptr;
+    }
+    // rewind keeps its historical lenient contract (target >= length no-ops),
+    // unlike truncate_sequence which rejects forward "truncation".
+    m_seqmgr->truncate(internal, target_pos);
 }
 
 } // namespace blackwell

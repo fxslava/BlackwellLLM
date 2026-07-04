@@ -49,6 +49,18 @@ public:
     void fork(SeqId parent, SeqId child) override;
     void rewind(SeqId seq, int target_pos) override;
 
+    // --- micro-rewind (Continuous Speculative Tracking) --------------------
+    // Truncate the sequence so exactly keep_tokens remain, freeing trailing
+    // physical pages back to the allocator when this block table held their
+    // last reference (fork-/tree-shared pages just lose this sequence's ref;
+    // the boundary page is CoW'd by the next append, so cached copies of the
+    // old tail are never overwritten). Invalidates the latched per-token
+    // context if it names this sequence — the staged block table / seq_len
+    // may reference pages the truncation frees. Returns the number of pages
+    // actually freed. keep_tokens == length is a no-op; keep_tokens > length
+    // throws std::invalid_argument (a tracker must never "truncate forward").
+    int truncate_sequence(SeqId seq, size_t keep_tokens);
+
     const char* name() const override { return "paged"; }
     bool supports_branching() const override { return true; }
 

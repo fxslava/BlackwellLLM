@@ -2,7 +2,7 @@
 #include "blackwell/engine.h"
 #include "kv_cache/ikv_cache_manager.h"      // blackwell::SeqId (engine ids)
 #include "paging/prefix_cache_manager.h"     // PrefixCacheManager, paging::SeqId/TokenId
-#include "paging/aot_cache_warmer.h"         // paging::IPrefillDriver
+#include "paging/prefill_driver.h"           // paging::IPrefillDriver
 
 #include <functional>
 #include <stdexcept>
@@ -109,6 +109,63 @@ public:
     // whatever tier the pager later decides. Idempotent per id; throws on ids
     // this coordinator never issued.
     void finish(SeqId engine_seq);
+
+    // -----------------------------------------------------------------------
+    // Continuous Speculative Tracking (micro-rewinds).
+    //
+    // BPE tokenizers re-segment as characters arrive ("t" -> "th" -> "the"
+    // produce different token boundaries each keystroke), so a live tracker
+    // cannot append — it must DIFF the fresh tokenization against what the KV
+    // cache holds, roll back to the divergence point, and recompute only the
+    // new suffix. EngineSequence is the session handle for that loop: it
+    // carries the host-side token mirror the diff runs against (the KV cache
+    // itself has no token identity — the mirror IS the source of truth for
+    // what each position holds).
+    //
+    // Policy: update_sequence does NOT commit to the radix tree. Keystroke
+    // states are transient — publishing every intermediate tokenization would
+    // fill the tree with pages that are superseded milliseconds later and
+    // survive as evictable-but-resident garbage. Call commit_sequence() at
+    // stable boundaries (debounce timeout, word break, request submit); the
+    // tree's duplicate-span dedup makes repeated commits of the same prefix
+    // free.
+    // -----------------------------------------------------------------------
+    struct EngineSequence {
+        SeqId engine_seq = -1;         // forward()'s seq_id while live
+        std::vector<TokenId> tokens;   // host mirror of the KV cache content
+        bool valid() const noexcept { return engine_seq != -1; }
+    };
+
+    struct UpdateStats {
+        int reused_tokens    = 0;  // longest common prefix kept in the KV cache
+        int truncated_tokens = 0;  // old tail rolled back
+        int computed_tokens  = 0;  // new suffix run through the forward pass
+        int freed_pages      = 0;  // physical pages the rollback returned
+    };
+
+    // prefill_prompt + a tracking handle (the initial prompt IS committed —
+    // it is the stable prefix the tracker diverges from).
+    EngineSequence begin_sequence(const std::vector<TokenId>& tokens,
+                                  cudaStream_t compute_stream = nullptr);
+
+    // Reconcile the live sequence with a fresh tokenization:
+    //   diff -> truncate_sequence(divergence point) -> budget -> delta compute.
+    // The last token ALWAYS re-runs (even on a pure append or an identical
+    // retokenization) so d_logits matches new_tokens on return, mirroring
+    // acquire()'s cached_tokens < n rule. On failure the sequence is rolled
+    // back to the common prefix and the mirror shrunk to match — the session
+    // stays coherent and usable. Throws std::invalid_argument on an empty /
+    // oversized tokenization or a dead handle.
+    UpdateStats update_sequence(EngineSequence& seq,
+                                const std::vector<TokenId>& new_tokens);
+
+    // Publish the sequence's CURRENT tokens to the radix tree (full pages
+    // only, exactly like prefill_prompt's COMMIT phase). Call at stable
+    // tracking boundaries.
+    void commit_sequence(const EngineSequence& seq);
+
+    // finish() for a tracking handle; poisons it against reuse.
+    void finish(EngineSequence& seq);
 
     // -----------------------------------------------------------------------
     // IPrefillDriver — the AOTCacheWarmer / warmup-CLI facet. The warmer owns

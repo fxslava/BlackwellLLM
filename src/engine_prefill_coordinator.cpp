@@ -3,6 +3,8 @@
 #include "kv_cache/paged_kv_manager.h"
 #include "kernels/sampling.cuh"
 
+#include <algorithm>
+
 namespace blackwell {
 
 namespace {
@@ -160,6 +162,104 @@ void EnginePrefillCoordinator::finish(SeqId engine_seq) {
     m_kv.unbind_external(engine_seq);
     m_pc.release(it->second);
     m_sessions.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// Continuous Speculative Tracking (micro-rewinds).
+// ---------------------------------------------------------------------------
+EnginePrefillCoordinator::EngineSequence
+EnginePrefillCoordinator::begin_sequence(const std::vector<TokenId>& tokens,
+                                         cudaStream_t compute_stream) {
+    const Result r =
+        prefill_prompt(tokens.data(), static_cast<int>(tokens.size()), compute_stream);
+    EngineSequence s;
+    s.engine_seq = r.engine_seq;
+    s.tokens     = tokens;
+    return s;
+}
+
+EnginePrefillCoordinator::UpdateStats
+EnginePrefillCoordinator::update_sequence(EngineSequence& seq,
+                                          const std::vector<TokenId>& new_tokens) {
+    if (!seq.valid() || !m_sessions.count(seq.engine_seq))
+        throw std::invalid_argument(
+            "EnginePrefillCoordinator::update_sequence: dead or foreign handle");
+    if (new_tokens.empty())
+        throw std::invalid_argument(
+            "EnginePrefillCoordinator::update_sequence: empty tokenization "
+            "(finish() the session instead)");
+    if (new_tokens.size() > m_impl.m_runtime.max_seq_len)
+        throw std::invalid_argument(
+            "EnginePrefillCoordinator::update_sequence: " +
+            std::to_string(new_tokens.size()) + " tokens exceeds max_seq_len " +
+            std::to_string(m_impl.m_runtime.max_seq_len));
+
+    const int old_n = static_cast<int>(seq.tokens.size());
+    const int new_n = static_cast<int>(new_tokens.size());
+
+    // (a)+(b) Divergence point: longest common prefix of the mirror and the
+    // fresh tokenization. Capped at new_n - 1 so the final token always
+    // re-runs — d_logits must describe new_tokens when we return, even on a
+    // pure retokenization-collapse where nothing structurally "new" follows.
+    int lcp = 0;
+    const int scan = std::min(old_n, new_n);
+    while (lcp < scan && seq.tokens[lcp] == new_tokens[lcp]) ++lcp;
+    const int keep = std::min(lcp, new_n - 1);
+
+    // (c) Roll the KV cache back to the divergence point. Pages private to
+    // this sequence (the typical just-typed tail) return to the allocator
+    // HERE, before the budget below counts free pages. Tree-/fork-shared
+    // pages only lose this sequence's reference; the shared boundary page is
+    // CoW'd by the first diverging append, so cached copies stay immutable.
+    UpdateStats st;
+    st.freed_pages = m_kv.truncate_sequence(seq.engine_seq, keep);
+
+    // Budget the suffix before writing anything: pages for the new blocks,
+    // plus one slack page for the boundary CoW when we truncated mid-page.
+    const int have_blocks = (keep + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+    const int want_blocks = (new_n + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+    const int needed = (want_blocks - have_blocks) + (keep % paging::PAGE_SIZE ? 1 : 0);
+    if (needed > 0 && !m_pc.ensure_free_pages(needed)) {
+        // The KV cache is already truncated to `keep`; shrink the mirror to
+        // match before throwing so the session stays coherent (tokens[0..keep)
+        // is a common prefix of old and new, so resize keeps the right ids).
+        seq.tokens.resize(keep);
+        throw std::runtime_error(
+            "EnginePrefillCoordinator::update_sequence: KV OOM — suffix needs " +
+            std::to_string(needed) + " free pages and the tree is drained");
+    }
+
+    // (d) Delta compute for the new suffix; logits for new_tokens.back().
+    try {
+        run_delta(seq.engine_seq, new_tokens.data(), new_n, keep,
+                  /*want_logits=*/true);
+    } catch (...) {
+        // Roll back to the common prefix and shrink the mirror to match: the
+        // KV cache and the handle agree again, the session remains usable.
+        m_kv.truncate_sequence(seq.engine_seq, keep);
+        seq.tokens.assign(new_tokens.begin(), new_tokens.begin() + keep);
+        throw;
+    }
+
+    seq.tokens           = new_tokens;
+    st.reused_tokens     = keep;
+    st.truncated_tokens  = old_n - keep;
+    st.computed_tokens   = new_n - keep;
+    return st;
+}
+
+void EnginePrefillCoordinator::commit_sequence(const EngineSequence& seq) {
+    auto it = m_sessions.find(seq.engine_seq);
+    if (!seq.valid() || it == m_sessions.end())
+        throw std::invalid_argument(
+            "EnginePrefillCoordinator::commit_sequence: dead or foreign handle");
+    m_pc.commit(it->second, seq.tokens.data(), static_cast<int>(seq.tokens.size()));
+}
+
+void EnginePrefillCoordinator::finish(EngineSequence& seq) {
+    finish(seq.engine_seq);
+    seq.engine_seq = -1;
+    seq.tokens.clear();
 }
 
 // ---------------------------------------------------------------------------

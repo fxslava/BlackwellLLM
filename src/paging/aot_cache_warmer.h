@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "prefix_cache_manager.h"
+#include "prefill_driver.h"
 #include "warmup_spec.h"
 
 // ============================================================================
@@ -34,28 +35,11 @@
 // dedup on load via the radix tree, exactly like overlapping commits.
 //
 // The engine is reached only through IPrefillDriver (mirrors ILLMGenerator in
-// the orchestrator): production binds tokenizer + the PagedKVManager prefill
-// sweep; tests inject a mock and never link CUDA.
+// the orchestrator; lives in prefill_driver.h so interface consumers skip this
+// header's json/filesystem deps): production binds tokenizer + the paged
+// prefill sweep; tests inject a mock and never link CUDA.
 // ----------------------------------------------------------------------------
 namespace blackwell { namespace paging {
-
-class IPrefillDriver {
-public:
-    virtual ~IPrefillDriver() = default;
-
-    // Tokenize a text segment. add_special is true only for the first segment
-    // of a root path (BOS etc.) — continuation segments must tokenize as
-    // continuations, or the child path's tokens would not extend the parent's.
-    virtual std::vector<TokenId> tokenize(const std::string& text,
-                                          bool add_special) = 0;
-
-    // Run the engine's chunked prefill for seq over positions
-    // [start_pos, num_tokens): prepare_prefill_step + per-layer
-    // attention_prefill, writing KV into the pages the PrefixCacheManager
-    // pre-seeded/reserved. `tokens` is the FULL path (indexable from 0).
-    virtual void prefill(SeqId seq, const TokenId* tokens, int num_tokens,
-                         int start_pos) = 0;
-};
 
 class AOTCacheWarmer {
 public:

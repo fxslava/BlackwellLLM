@@ -183,18 +183,32 @@ public:
         return child;
     }
 
-    // Roll back to target_len tokens; drop now-unreachable trailing pages.
-    void rewind(SeqId s, int target_len) {
+    // -- micro-rewind (Continuous Speculative Tracking) ----------------------
+    // Truncate the sequence's tail so exactly keep_tokens remain. Trailing
+    // pages whose LAST reference this block table held are returned to the
+    // free list; pages shared with a fork / the radix tree merely lose this
+    // sequence's reference and live on for the other holders. The boundary
+    // page may remain shared after truncation — the next append CoWs it
+    // (reserve_append_slot's existing rule), so a diverging re-append can
+    // never corrupt a cached or forked copy of the old tail.
+    // Returns the number of physical pages actually freed. keep_tokens >=
+    // length is a no-op returning 0: truncation never grows a sequence.
+    int truncate(SeqId s, int keep_tokens) {
         BlockTable& bt = seq(s);
-        if (target_len >= bt.length) return;
-        const int keep_blocks = (target_len + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (keep_tokens < 0) keep_tokens = 0;
+        if (keep_tokens >= bt.length) return 0;
+        const int keep_blocks = (keep_tokens + PAGE_SIZE - 1) / PAGE_SIZE;
+        int freed = 0;
         while ((int)bt.pages.size() > keep_blocks) {
-            m_alloc.decref(bt.pages.back());   // frees iff ref hits zero
+            if (m_alloc.decref(bt.pages.back())) ++freed;
             bt.pages.pop_back();
         }
-        bt.length = target_len;
-        // The boundary page may still be fork-shared; the next append CoWs it.
+        bt.length = keep_tokens;
+        return freed;
     }
+
+    // Roll back to target_len tokens; drop now-unreachable trailing pages.
+    void rewind(SeqId s, int target_len) { (void)truncate(s, target_len); }
 
     // -- introspection (read-only; tests / debugging) -----------------------
     int    length(SeqId s)            const { return m_seqs.at(s).length; }
