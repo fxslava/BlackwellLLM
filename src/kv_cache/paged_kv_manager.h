@@ -27,9 +27,13 @@ public:
     // VRAMArena applies, so paged mode matches continuous mode's VRAM ceiling.
     // branch_factor inflates the host-mirror page pool to leave headroom for
     // concurrent CoW fork branches (RuntimeConfig::paged_branch_factor).
+    // min_total_pages is a FLOOR on the pool (RuntimeConfig::kv_vram_cache_pages):
+    // pages beyond the sequence budget stay available to the prefix cache, so
+    // cached branches can remain VRAM-resident instead of being demoted the
+    // moment live sequences fill their share. 0 = sequence budget only.
     PagedKVManager(const ModelConfig& config, size_t max_seq_len,
                    size_t num_gpu_layers = static_cast<size_t>(-1),
-                   int branch_factor = 4);
+                   int branch_factor = 4, int min_total_pages = 0);
 
     void prepare_decode_step(SeqId seq, int pos) override;
     void prepare_prefill_step(SeqId seq, int start_pos, int num_tokens) override;
@@ -47,6 +51,25 @@ public:
 
     const char* name() const override { return "paged"; }
     bool supports_branching() const override { return true; }
+
+    // --- external sequence adoption (prefix-cache seam) -------------------
+    // PrefixCacheManager::acquire() creates sequences DIRECTLY in the
+    // SequenceManager (seeded with radix-tree prefix pages), bypassing this
+    // adapter's engine-id map. bind_external() grafts such an internal id into
+    // the map so the standard decode/prefill control plane can drive it, and
+    // returns the engine id to pass as forward()'s seq_id. Ids are allocated
+    // from a RESERVED NEGATIVE range (descending from -2) so they can never
+    // collide with caller-assigned fork ids, which must be >= 0.
+    // unbind_external() drops the mapping only — destroying the sequence
+    // remains PrefixCacheManager::release()'s job (it also unpins/unlocks).
+    SeqId bind_external(paging::SeqId internal);
+    void  unbind_external(SeqId engine_seq);
+
+    // The shared page pool + block tables. The prefix-cache substrate
+    // (TieredMemoryPager, PrefixCacheManager, KVBranchSerializer) MUST be built
+    // over this exact instance: its pages are the ones the attention kernels
+    // read and write.
+    paging::SequenceManager& sequence_manager() { return *m_seqmgr; }
 
 private:
     paging::SeqId internal_id(SeqId engine_seq) const;
@@ -68,6 +91,7 @@ private:
     std::unique_ptr<paging::SequenceManager> m_seqmgr;
     std::unordered_map<SeqId, paging::SeqId>     m_id_map;     // engine id -> internal id
     std::unordered_map<paging::SeqId, SeqResidency> m_residency;
+    SeqId m_next_external = -2;   // bind_external id source (reserved: < 0)
 
     // Cached geometry (avoids re-reading m_config on the hot path).
     int   m_num_q_heads;

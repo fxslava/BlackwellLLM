@@ -8,6 +8,11 @@
 
 #include <nlohmann/json.hpp>
 
+// Full definition of EnginePrefillCoordinator (engine.h only forward-declares
+// it) for prefill_driver().set_tokenizer(). Pulls the paging substrate headers,
+// which is why this target needs the CUDA include directories.
+#include "../../engine_prefill_coordinator.h"
+
 namespace playground {
 namespace {
 
@@ -189,7 +194,8 @@ void BlackwellLLMAdapter::load_chat_config() {
 }
 
 BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len,
-                                         bool use_paged_attention, size_t num_gpu_layers)
+                                         bool use_paged_attention, size_t num_gpu_layers,
+                                         const blackwell::RuntimeOverrides& overrides)
     : model_dir_(model_dir), max_seq_len_(max_seq_len),
       use_paged_attention_(use_paged_attention), num_gpu_layers_(num_gpu_layers) {
     // Tokenizer + chat-template config come from the checkpoint's JSON sidecars.
@@ -197,13 +203,31 @@ BlackwellLLMAdapter::BlackwellLLMAdapter(const std::string& model_dir, size_t ma
     load_chat_config();  // sets template_kind_, stop_strings_, max_stop_len_
     // The index file fully describes the weight shards; the engine streams them.
     const std::string index_path = model_dir + "/model.safetensors.index.json";
-    const auto kv_mode = use_paged_attention_ ? BlackwellEngine::KVCacheMode::Paged
-                                              : BlackwellEngine::KVCacheMode::Continuous;
+
+    // Merge the caller's low-level overrides (tiered KV sizing etc.) with the
+    // adapter's own explicit knobs -- which win, to keep one source of truth.
+    blackwell::InferenceConfig request;
+    request.max_context_length = max_seq_len_;
+    blackwell::RuntimeOverrides merged = overrides;
+    merged.kv_mode = use_paged_attention_ ? BlackwellEngine::KVCacheMode::Paged
+                                          : BlackwellEngine::KVCacheMode::Continuous;
     // num_gpu_layers_ drives the CPU/GPU weight split inside the engine (SIZE_MAX =
-    // everything resident in VRAM). The engine offloads the remainder to pinned
-    // host RAM regardless of the quant backend (AWQ packed / FP8 / bf16).
-    engine_ = std::make_unique<BlackwellEngine>(index_path, max_seq_len_,
-                                                num_gpu_layers_, kv_mode);
+    // everything resident in VRAM / env override). The engine offloads the
+    // remainder to pinned host RAM regardless of the quant backend.
+    merged.num_gpu_layers = num_gpu_layers_;
+    engine_ = std::make_unique<BlackwellEngine>(index_path, request, merged);
+
+    // Bind the tokenizer to the prefill driver (Paged dense models only), so
+    // the AOT warm-start / warmup-CLI facet can tokenize without owning a
+    // tokenizer of its own. TokenId is int32 == the tokenizer's int.
+    if (engine_->has_prefix_cache()) {
+        engine_->prefill_driver().set_tokenizer(
+            [this](const std::string& text, bool add_special) {
+                const std::vector<int> ids = tokenizer_->encode(text, add_special);
+                return std::vector<blackwell::EnginePrefillCoordinator::TokenId>(
+                    ids.begin(), ids.end());
+            });
+    }
 }
 
 BlackwellLLMAdapter::~BlackwellLLMAdapter() = default;

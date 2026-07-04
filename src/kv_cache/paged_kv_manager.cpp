@@ -1,13 +1,15 @@
 #include "kv_cache/paged_kv_manager.h"
 #include "kernels/rope.cuh"
 #include "kernels/paged_flash_attention.cuh"
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
 namespace blackwell {
 
 PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
-                               size_t num_gpu_layers, int branch_factor)
+                               size_t num_gpu_layers, int branch_factor,
+                               int min_total_pages)
     : m_config(config),
       m_num_q_heads(static_cast<int>(config.num_attention_heads)),
       m_num_kv_heads(static_cast<int>(config.num_key_value_heads)),
@@ -20,7 +22,9 @@ PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
     // Device-pool VRAM now scales with the RESIDENT layer count (offloaded layers
     // cost only host RAM + 2 staging slabs), so this factor inflates the host
     // mirror cheaply rather than VRAM.
-    const int total_pages = max_blocks * branch_factor;
+    // min_total_pages (RuntimeConfig::kv_vram_cache_pages) floors the pool so
+    // the prefix cache keeps VRAM residency headroom beyond the live sequences.
+    const int total_pages = std::max(max_blocks * branch_factor, min_total_pages);
 
     // Resolve the GPU/CPU split: clamp SIZE_MAX / oversize to "all resident".
     const int gpu_layers =
@@ -123,14 +127,22 @@ void PagedKVManager::attention_decode(int layer_idx, int pos,
     m_seqmgr->spill_out_page(layer_idx, m_append_page);
 }
 
+// Batched (BLOCK_M-tile) prefill needs multi-token activation buffers and a
+// Tensor-Core prefill kernel that do not exist yet. Prompt prefill runs through
+// EnginePrefillCoordinator (engine_prefill_coordinator.h), which sweeps the
+// uncached delta token-by-token over the standard decode path; when the batched
+// kernels land, the coordinator switches to these two calls and nothing above
+// it changes.
 void PagedKVManager::prepare_prefill_step(SeqId, int, int) {
     throw std::runtime_error(
-        "PagedKVManager: chunked prefill is not yet wired into the engine (decode path only)");
+        "PagedKVManager: batched prefill kernels are not implemented; drive prompts "
+        "through EnginePrefillCoordinator (per-token sweep) instead");
 }
 
 void PagedKVManager::attention_prefill(int, int, int, float*, float*, float*, float*) {
     throw std::runtime_error(
-        "PagedKVManager: chunked prefill is not yet wired into the engine (decode path only)");
+        "PagedKVManager: batched prefill kernels are not implemented; drive prompts "
+        "through EnginePrefillCoordinator (per-token sweep) instead");
 }
 
 void* PagedKVManager::get_layer_k_ptr(int layer_idx) {
@@ -140,7 +152,33 @@ void* PagedKVManager::get_layer_v_ptr(int layer_idx) {
     return static_cast<void*>(m_seqmgr->layer_v_pool(layer_idx));
 }
 
+SeqId PagedKVManager::bind_external(paging::SeqId internal) {
+    const SeqId engine_seq = m_next_external--;
+    m_id_map.emplace(engine_seq, internal);
+    m_residency[internal] = SeqResidency::Resident;
+    return engine_seq;
+}
+
+void PagedKVManager::unbind_external(SeqId engine_seq) {
+    auto it = m_id_map.find(engine_seq);
+    if (it == m_id_map.end())
+        throw std::runtime_error("PagedKVManager::unbind_external: unknown id " +
+                                 std::to_string(engine_seq));
+    // Invalidate the latched per-token context if it points at this sequence:
+    // its block table upload must not be consumed by a later layer sweep.
+    if (m_active == it->second) {
+        m_active      = -1;
+        m_block_table = nullptr;
+    }
+    m_residency.erase(it->second);
+    m_id_map.erase(it);
+}
+
 void PagedKVManager::fork(SeqId parent, SeqId child) {
+    if (child < 0)
+        throw std::runtime_error("PagedKVManager::fork: child sequence id " +
+                                 std::to_string(child) +
+                                 " is in the reserved external range (must be >= 0)");
     if (m_id_map.count(child))
         throw std::runtime_error("PagedKVManager::fork: child sequence id " +
                                  std::to_string(child) + " already exists");

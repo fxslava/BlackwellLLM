@@ -34,6 +34,7 @@ option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading 
 # ==============================================================================
 set(CORE_SOURCES
     engine.cpp
+    engine_prefill_coordinator.cpp
     runtime_config.cpp
     ops_dispatcher.cpp
     safetensors.cpp

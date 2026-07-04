@@ -35,8 +35,13 @@ add_executable(agent_playground
 
 target_compile_features(agent_playground PRIVATE cxx_std_20)
 
+# The adapter binds its tokenizer to the engine's prefill driver, which pulls
+# the paging substrate headers (and through them <cuda_runtime.h>).
+find_package(CUDAToolkit REQUIRED)
+
 target_include_directories(agent_playground PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator  # orchestrator headers
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 # blackwell_core PUBLIC-exposes the include/ dir (blackwell/*.h) and transitively

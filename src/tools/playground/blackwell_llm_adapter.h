@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "blackwell/engine.h"
+#include "blackwell/runtime_config.h"  // blackwell::RuntimeOverrides
 #include "blackwell/tokenizer.h"
 #include "llm_generator.h"  // agent::orch::ILLMGenerator
 
@@ -69,9 +70,15 @@ public:
     // the engine. SIZE_MAX (the default) keeps every layer on the GPU. The engine
     // performs the weight distribution itself, quant-agnostically (AWQ / FP8 /
     // bf16), so no backend-specific handling is needed in the adapter.
+    //
+    // overrides: optional low-level RuntimeConfig knobs (tiered KV prefix-cache
+    // sizing: kv_vram_cache_pages / kv_ram_slots / kv_disk_slots /
+    // kv_spill_path). kv_mode and num_gpu_layers inside it are IGNORED -- the
+    // explicit constructor arguments win, to keep one source of truth.
     explicit BlackwellLLMAdapter(const std::string& model_dir, size_t max_seq_len = 8192,
                                  bool use_paged_attention = false,
-                                 size_t num_gpu_layers = static_cast<size_t>(-1));
+                                 size_t num_gpu_layers = static_cast<size_t>(-1),
+                                 const blackwell::RuntimeOverrides& overrides = {});
     ~BlackwellLLMAdapter() override;
 
     BlackwellLLMAdapter(const BlackwellLLMAdapter&) = delete;
@@ -97,6 +104,14 @@ public:
 
     void set_params(const Params& p) { params_ = p; }
     const Params& params() const { return params_; }
+
+    // The owned engine, for capability probes and the prefix-cache substrate
+    // (engine().has_prefix_cache() / prefix_cache() / prefill_driver()). The
+    // adapter binds its tokenizer to the prefill driver at construction, so
+    // AOT warm-start and prefill_prompt() callers need no extra setup. Same
+    // worker-thread ownership rules as generate().
+    BlackwellEngine& engine() { return *engine_; }
+    const BlackwellEngine& engine() const { return *engine_; }
 
     // Install a streaming callback that the ILLMGenerator entry point
     // (generate(transcript)) will forward tokens to. This is how the ReAct loop

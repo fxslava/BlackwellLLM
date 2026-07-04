@@ -3,9 +3,22 @@
 #include <string>
 #include <memory>
 
-// Tier-2 request struct (blackwell/runtime_config.h). Forward-declared so the
-// public engine header stays light; engine.cpp pulls in the full definition.
-namespace blackwell { struct InferenceConfig; }
+// Tier-2 request / low-level override structs (blackwell/runtime_config.h).
+// Forward-declared so the public engine header stays light; engine.cpp pulls in
+// the full definitions.
+namespace blackwell {
+struct InferenceConfig;
+struct RuntimeOverrides;
+}
+
+// Prefix-cache substrate (Paged mode only). Forward-declared for the same
+// reason: callers of prefix_cache() / prefill_driver() include the real
+// headers (src/paging/prefix_cache_manager.h, src/engine_prefill_coordinator.h)
+// from the engine source tree, exactly as the AOT warmer tooling already does.
+namespace blackwell {
+class EnginePrefillCoordinator;
+namespace paging { class PrefixCacheManager; }
+}
 
 // Static description of what the *loaded* model supports, derived once from the
 // parsed ModelConfig at construction. The agent / playground queries this before
@@ -43,6 +56,13 @@ public:
     // point for the C-API / chat loop; the legacy constructor above maps its loose
     // args onto an InferenceConfig + low-level overrides internally.
     BlackwellEngine(const std::string& index_path, const blackwell::InferenceConfig& request);
+
+    // Tier-2 + explicit low-level overrides (the `-x264-params` seam): poke
+    // individual RuntimeConfig knobs -- kv_mode, num_gpu_layers, the tiered
+    // KV prefix-cache sizing (kv_vram_cache_pages / kv_ram_slots /
+    // kv_disk_slots / kv_spill_path) -- without restating the whole plan.
+    BlackwellEngine(const std::string& index_path, const blackwell::InferenceConfig& request,
+                    const blackwell::RuntimeOverrides& overrides);
     ~BlackwellEngine();
 
     // seq_id selects which sequence to decode (Paged mode; default 0). It is the
@@ -73,6 +93,23 @@ public:
     // Capabilities of the loaded model. fork()/rewind() throw std::runtime_error
     // when supports_cow_branching is false (hybrid SSM models, or Continuous mode).
     ModelCapabilities get_capabilities() const;
+
+    // ------------------------------------------------------------------------
+    // Prefix cache + prefill driver (Paged mode on dense uniform full-attention
+    // models only; hybrid SSM / gated full-attention state lives outside the
+    // paged pools, so those models never get a prefix cache).
+    //
+    //   prefill_driver().prefill_prompt(tokens, n) — radix-tree prefix reuse +
+    //     GPU forward pass over only the uncached suffix + commit back to the
+    //     tree; returns the seq_id to keep decoding with forward().
+    //   prefix_cache() — the raw substrate, for AOTCacheWarmer::warm_start()
+    //     (.bkv prompt libraries), dump()/load(), and introspection.
+    //
+    // Both throw std::runtime_error when has_prefix_cache() is false.
+    // ------------------------------------------------------------------------
+    bool has_prefix_cache() const noexcept;
+    blackwell::paging::PrefixCacheManager& prefix_cache();
+    blackwell::EnginePrefillCoordinator&   prefill_driver();
 
     Impl* get_impl() const { return pImpl.get(); }
 

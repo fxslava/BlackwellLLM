@@ -10,6 +10,19 @@
 #include <memory>
 #include <vector>
 
+// Prefix-cache substrate (Phase 3 wiring). Header-only classes; engine.cpp
+// includes the real headers — Impl only holds owning pointers, so forward
+// declarations keep this header light.
+namespace blackwell {
+class EnginePrefillCoordinator;
+namespace paging {
+class SmVramPool;
+class CudaTierBackend;
+class TieredMemoryPager;
+class PrefixCacheManager;
+} // namespace paging
+} // namespace blackwell
+
 struct BlackwellEngine::Impl {
     // Declaration order is the construction order. The tier-1 config, the derived
     // capabilities, and the validated tier-3 runtime plan must all precede `arena`
@@ -27,6 +40,18 @@ struct BlackwellEngine::Impl {
     // Declared after `arena` so it is destroyed before it -- the adapter holds a
     // reference into the arena. Defaults to the legacy continuous FP32 cache.
     std::unique_ptr<blackwell::IKVCacheManager> kv_mgr;
+
+    // Prefix-cache substrate over the paged pools (constructed ONLY for Paged
+    // mode on dense uniform full-attention models; all null otherwise — see the
+    // composition root in the ctor). Declaration order == dependency order, and
+    // everything sits after kv_mgr so destruction unwinds coordinator ->
+    // prefix cache -> pager -> backend/pool BEFORE the SequenceManager they all
+    // reference dies with kv_mgr.
+    std::unique_ptr<blackwell::paging::SmVramPool>        kv_vram_pool;
+    std::unique_ptr<blackwell::paging::CudaTierBackend>   kv_tier_backend;
+    std::unique_ptr<blackwell::paging::TieredMemoryPager> kv_pager;
+    std::unique_ptr<blackwell::paging::PrefixCacheManager> prefix_cache;
+    std::unique_ptr<blackwell::EnginePrefillCoordinator>   prefill;
 
     // Hybrid linear-attention (SSM) state. Allocated only for models with
     // AttnKind::Linear layers; null otherwise. m_linear_layer_index maps an
@@ -69,6 +94,12 @@ struct BlackwellEngine::Impl {
     Impl(const std::string& index_path, const blackwell::InferenceConfig& request,
          const blackwell::RuntimeOverrides& overrides);
     ~Impl();
+
+    // One full decoder pass for one token: embedding -> N transformer layers
+    // (per-token KV control plane latched via kv_mgr) -> optionally final norm
+    // + lm_head. want_logits=false is the prefill fast path: every non-final
+    // prompt token skips the vocab-size GEMV, since only its KV append matters.
+    void run_token(int token_id, int pos, int seq_id, bool want_logits = true);
 
     void step_embedding(int token_id);
     void step_attention_norm(int layer_idx);

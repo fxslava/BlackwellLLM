@@ -3,6 +3,7 @@
 #include "blackwell/engine.h"   // BlackwellEngine::KVCacheMode, ModelCapabilities
 #include <cstddef>
 #include <optional>
+#include <string>
 
 // ============================================================================
 // Three-tier configuration pipeline ("video-codec" model).
@@ -75,6 +76,26 @@ struct RuntimeConfig {
     // engine and the validator agree on the dispatch (and so the head_dim cap is
     // correctly waived for these models).
     bool uses_dedicated_full_attention = false;
+
+    // --- tiered KV prefix-cache substrate (Paged mode only; docs/TIERED_KV_AND_AOT.md §5.1) ---
+    // One page = paging::PAGE_SIZE (16) tokens of KV across all layers.
+    //
+    // Floor on the paged device pool, in pages. The pool is always at least the
+    // sequence budget (ceil(max_seq_len/PAGE_SIZE) * paged_branch_factor); raising
+    // this floor keeps that many cached prefix branches VRAM-resident beyond the
+    // live sequences' own needs. 0 = sequence budget only.
+    int kv_vram_cache_pages = 0;
+    // Pinned host-RAM demotion tier capacity, in pages. kMirrorDevicePool (the
+    // one deliberate late-bound value in this struct: the device-pool page count
+    // is only known once the KV manager exists) sizes it 1:1 with the device
+    // pool, i.e. a full VRAM's worth of cold branches can wait in RAM.
+    static constexpr int kMirrorDevicePool = -1;
+    int kv_ram_slots = kMirrorDevicePool;
+    // NVMe spill tier capacity, in pages. 0 = disk tier off (demotions stop at
+    // RAM; RAM pressure falls back to LRU tree eviction).
+    int kv_disk_slots = 0;
+    // Backing file for the spill tier. Must be non-empty iff kv_disk_slots > 0.
+    std::string kv_spill_path;
 };
 
 // Optional low-level overrides applied AFTER the automatic plan is derived but
@@ -84,6 +105,12 @@ struct RuntimeOverrides {
     std::optional<BlackwellEngine::KVCacheMode> kv_mode;
     std::optional<size_t> num_gpu_layers;     // kAllLayersResident forces all-resident
     std::optional<int>    paged_branch_factor;
+
+    // Tiered KV prefix-cache sizing (see the RuntimeConfig fields for semantics).
+    std::optional<int>         kv_vram_cache_pages;
+    std::optional<int>         kv_ram_slots;       // kMirrorDevicePool = mirror device pool
+    std::optional<int>         kv_disk_slots;      // 0 = disk tier off
+    std::optional<std::string> kv_spill_path;
 };
 
 // Hard kernel/hardware limits the validator asserts against. These mirror

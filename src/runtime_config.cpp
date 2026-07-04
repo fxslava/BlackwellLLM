@@ -105,6 +105,24 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
     // --- weight residency -----------------------------------------------------
     rt.num_gpu_layers = resolve_num_gpu_layers(overrides.num_gpu_layers);
 
+    // --- tiered KV prefix-cache sizing -----------------------------------------
+    rt.kv_vram_cache_pages = overrides.kv_vram_cache_pages.value_or(0);
+    rt.kv_ram_slots        = overrides.kv_ram_slots.value_or(RuntimeConfig::kMirrorDevicePool);
+    rt.kv_disk_slots       = overrides.kv_disk_slots.value_or(0);
+    rt.kv_spill_path       = overrides.kv_spill_path.value_or(std::string());
+
+    if (rt.kv_vram_cache_pages < 0)
+        throw std::invalid_argument("RuntimeConfig: kv_vram_cache_pages must be >= 0");
+    if (rt.kv_ram_slots < 0 && rt.kv_ram_slots != RuntimeConfig::kMirrorDevicePool)
+        throw std::invalid_argument(
+            "RuntimeConfig: kv_ram_slots must be >= 0 (or kMirrorDevicePool)");
+    if (rt.kv_disk_slots < 0)
+        throw std::invalid_argument("RuntimeConfig: kv_disk_slots must be >= 0");
+    if (rt.kv_disk_slots > 0 && rt.kv_spill_path.empty())
+        throw std::invalid_argument(
+            "RuntimeConfig: kv_disk_slots > 0 requires a non-empty kv_spill_path "
+            "(the NVMe spill tier needs a backing file)");
+
     return rt;
 }
 

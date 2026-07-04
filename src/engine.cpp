@@ -14,10 +14,31 @@
 #include "kernels/ssm_kernels.cuh"
 #include "kv_cache/continuous_kv_manager.h"
 #include "kv_cache/paged_kv_manager.h"
+#include "paging/cuda_tier_backend.h"      // SmVramPool, CudaTierBackend
+#include "paging/prefix_cache_manager.h"   // TieredMemoryPager, PrefixCacheManager
+#include "engine_prefill_coordinator.h"
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <stdexcept>
+
+// Stable identity of (checkpoint x KV geometry) for the prefix cache and the
+// .bkv serializer: a page written under one hash must never be grafted into an
+// engine whose pages mean something else. FNV-1a over the index path plus the
+// geometry fields that define a page record's byte layout. (A content digest of
+// the weights would be stronger; the path+geometry pair matches what the
+// warmup manifest / spill records actually need to agree on.)
+static uint64_t compute_kv_model_hash(const std::string& index_path, const ModelConfig& c) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    for (char ch : index_path) mix(static_cast<unsigned char>(ch));
+    mix(c.num_layers);
+    mix(c.num_key_value_heads);
+    mix(c.head_dim);
+    mix(c.hidden_dim);
+    mix(c.vocab_size);
+    return h;
+}
 
 // Initializer list mirrors the declaration order in engine_impl.h: members are
 // constructed in declaration order regardless of the list. The tier-3 RuntimeConfig
@@ -66,7 +87,8 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
         // arena reporting offloading active.
         kv_mgr = std::make_unique<blackwell::PagedKVManager>(m_config, m_runtime.max_seq_len,
                                                              arena.num_gpu_layers(),
-                                                             m_runtime.paged_branch_factor);
+                                                             m_runtime.paged_branch_factor,
+                                                             m_runtime.kv_vram_cache_pages);
     } else {
         kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(arena, m_config);
     }
@@ -76,6 +98,41 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     // recurrent SSM state we cannot snapshot. derive_capabilities() filled the rest.
     m_caps.supports_cow_branching =
         kv_mgr->supports_branching() && m_caps.num_linear_attention_layers == 0;
+
+    // ---- Prefix-cache substrate composition root (Phase 3 wiring) ----------
+    // SmVramPool -> CudaTierBackend -> TieredMemoryPager -> PrefixCacheManager
+    // -> EnginePrefillCoordinator, all over the PagedKVManager's OWN
+    // SequenceManager, so the pages the radix tree indexes are the very pages
+    // the paged-flash attention kernels read and write (zero-copy reuse).
+    // Restricted to dense uniform full-attention models: hybrid SSM state and
+    // the dedicated gated full-attention cache live outside the paged pools,
+    // so a radix "prefix hit" would silently skip state those models need.
+    if (m_runtime.kv_mode == BlackwellEngine::KVCacheMode::Paged &&
+        !m_caps.requires_ssm_subsystem && !m_config.attn_output_gate) {
+        auto& pkm = static_cast<blackwell::PagedKVManager&>(*kv_mgr);
+        auto& sm  = pkm.sequence_manager();
+
+        kv_vram_pool = std::make_unique<blackwell::paging::SmVramPool>(sm);
+
+        // Tier sizing from the resolved RuntimeConfig (docs/TIERED_KV_AND_AOT.md
+        // §5.1 knobs). kMirrorDevicePool is the one late-bound value: it becomes
+        // the actual device-pool page count, known only now.
+        blackwell::paging::TieredMemoryPager::Config pager_cfg;
+        pager_cfg.ram_slots =
+            (m_runtime.kv_ram_slots == blackwell::RuntimeConfig::kMirrorDevicePool)
+                ? sm.total_pages()
+                : m_runtime.kv_ram_slots;
+        pager_cfg.disk_slots = m_runtime.kv_disk_slots;
+
+        kv_tier_backend = std::make_unique<blackwell::paging::CudaTierBackend>(
+            sm, pager_cfg.ram_slots, pager_cfg.disk_slots, m_runtime.kv_spill_path);
+        kv_pager = std::make_unique<blackwell::paging::TieredMemoryPager>(
+            *kv_vram_pool, *kv_tier_backend, pager_cfg);
+        prefix_cache = std::make_unique<blackwell::paging::PrefixCacheManager>(
+            sm, *kv_pager, compute_kv_model_hash(index_path, m_config));
+        prefill = std::make_unique<blackwell::EnginePrefillCoordinator>(
+            *this, pkm, *prefix_cache);
+    }
 
     // Map absolute layer -> linear ordinal (-1 for full-attention layers), and
     // allocate the SSM recurrent state for hybrid models. No CoW => a single
@@ -455,6 +512,11 @@ BlackwellEngine::BlackwellEngine(const std::string& index_path, size_t max_seq_l
 BlackwellEngine::BlackwellEngine(const std::string& index_path, const blackwell::InferenceConfig& request)
     : pImpl(std::make_unique<Impl>(index_path, request, blackwell::RuntimeOverrides{})) {}
 
+// Tier-2 + explicit low-level overrides (kv_mode, offloading, tiered KV sizing).
+BlackwellEngine::BlackwellEngine(const std::string& index_path, const blackwell::InferenceConfig& request,
+                                 const blackwell::RuntimeOverrides& overrides)
+    : pImpl(std::make_unique<Impl>(index_path, request, overrides)) {}
+
 BlackwellEngine::~BlackwellEngine() = default;
 
 ModelCapabilities BlackwellEngine::get_capabilities() const {
@@ -506,9 +568,13 @@ void BlackwellEngine::reset_state(int seq_id) {
 
 // ============================================================================
 // Shared decoder pipeline: embedding -> N transformer layers -> final norm/head.
-// Leaves the logits for token `pos` in impl->d_logits.
+// With want_logits, leaves the logits for token `pos` in d_logits; without, the
+// pass ends after the last layer's MLP — the prefill sweep's fast path, where
+// only the KV appended along the way matters and the vocab-size lm_head GEMV
+// (the single largest GEMV in the model) is skipped per prompt token.
 // ============================================================================
-static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos, int seq_id) {
+void BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id, bool want_logits) {
+    auto* impl = this;
     const size_t max_seq_len = impl->arena.get_max_seq_len();
     if (pos < 0 || static_cast<size_t>(pos) >= max_seq_len)
         throw std::out_of_range(
@@ -557,7 +623,8 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
         impl->step_mlp_out(i);
     }
 
-    impl->step_final_ops();
+    if (want_logits)
+        impl->step_final_ops();
 }
 
 // ============================================================================
@@ -565,7 +632,7 @@ static void run_decoder_stack(BlackwellEngine::Impl* impl, int token_id, int pos
 // ============================================================================
 int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p, int seq_id) {
     auto* impl = pImpl.get();
-    run_decoder_stack(impl, token_id, pos, seq_id);
+    impl->run_token(token_id, pos, seq_id);
     return sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature, top_p);
 }
 
@@ -574,6 +641,34 @@ int BlackwellEngine::forward(int token_id, int pos, float temperature, float top
 // ============================================================================
 float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id, int seq_id) {
     auto* impl = pImpl.get();
-    run_decoder_stack(impl, token_id, pos, seq_id);
+    impl->run_token(token_id, pos, seq_id);
     return compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
+}
+
+// ============================================================================
+// Prefix-cache substrate accessors (Paged mode, dense models only).
+// ============================================================================
+bool BlackwellEngine::has_prefix_cache() const noexcept {
+    return pImpl->prefix_cache != nullptr;
+}
+
+static void require_prefix_cache(const BlackwellEngine::Impl* impl, const char* op) {
+    if (impl->prefix_cache) return;
+    throw std::runtime_error(
+        std::string("BlackwellEngine::") + op + ": no prefix cache on this engine (" +
+        (impl->m_runtime.kv_mode != BlackwellEngine::KVCacheMode::Paged
+             ? "construct with KVCacheMode::Paged"
+             : "hybrid SSM / gated full-attention models keep state outside the "
+               "paged pools and cannot serve cached prefixes") +
+        "). Check has_prefix_cache() first.");
+}
+
+blackwell::paging::PrefixCacheManager& BlackwellEngine::prefix_cache() {
+    require_prefix_cache(pImpl.get(), "prefix_cache");
+    return *pImpl->prefix_cache;
+}
+
+blackwell::EnginePrefillCoordinator& BlackwellEngine::prefill_driver() {
+    require_prefix_cache(pImpl.get(), "prefill_driver");
+    return *pImpl->prefill;
 }

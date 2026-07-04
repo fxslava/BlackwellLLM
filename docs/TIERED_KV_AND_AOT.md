@@ -115,14 +115,25 @@ through the radix tree exactly like overlapping commits.
 
 ## 5. Remaining integration work
 
-1. **Engine wiring** — unchanged from Phase 1's plan (`begin_sequence` /
-   `end_sequence` on `IKVCacheManager`), plus the composition root now
-   constructs `SmVramPool → CudaTierBackend → TieredMemoryPager →
-   PrefixCacheManager` from `RuntimeConfig` knobs (`kv_ram_slots`,
-   `kv_disk_slots`, `kv_spill_path`, `prefix_cache_dir`).
-2. **Production `IPrefillDriver`** — a ~50-line adapter over
-   `BPETokenizer` + the engine's prefill loop; then a `blackwell_warmup` CLI
-   target (`warmup.exe spec.json out_dir/`).
+1. **Engine wiring** — ✅ landed (Phase 3). `BlackwellEngine::Impl` is the
+   composition root: `SmVramPool → CudaTierBackend → TieredMemoryPager →
+   PrefixCacheManager → EnginePrefillCoordinator`, built over the
+   `PagedKVManager`'s own `SequenceManager` for Paged-mode dense models, and
+   exposed via `engine.prefix_cache()` / `engine.prefill_driver()`
+   (`has_prefix_cache()` gates). Sizing is currently derived (RAM tier mirrors
+   the device pool; disk tier off) — promoting it to `RuntimeConfig` knobs
+   (`kv_ram_slots`, `kv_disk_slots`, `kv_spill_path`, `prefix_cache_dir`)
+   remains open.
+2. **Production `IPrefillDriver`** — ✅ landed:
+   `EnginePrefillCoordinator` (`src/engine_prefill_coordinator.h`) implements
+   the acquire → budget → bind → compute → commit prompt state machine over
+   the per-token decode sweep (lm_head GEMV skipped for non-final prompt
+   tokens), and serves `AOTCacheWarmer` via the `IPrefillDriver` facet
+   (tokenizer injected with `set_tokenizer()`). Still open: the
+   `blackwell_warmup` CLI target (`warmup.exe spec.json out_dir/`) and the
+   batched Tensor-Core prefill kernels behind
+   `prepare_prefill_step`/`attention_prefill` (the coordinator's `run_delta`
+   is the single swap point).
 3. **GPU round-trip test** — standalone: build a branch, force it down to
    the spill file, fault it back, byte-compare via `read_page`; then the
    parity gate: logits after a disk-faulted prefix hit must equal a cold
