@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blackwell Overlay — Settings</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1>Blackwell Overlay</h1>
+    <p class="subtitle">Live translation assistant — settings</p>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab is-active" role="tab" data-tab="general" id="tab-general">General</button>
+    <button class="tab" role="tab" data-tab="pairs" id="tab-pairs">Language Pairs</button>
+    <button class="tab" role="tab" data-tab="shortcuts" id="tab-shortcuts">Shortcuts</button>
+  </nav>
+
+  <!-- ===================== GENERAL ===================== -->
+  <section class="panel is-active" id="panel-general" role="tabpanel" aria-labelledby="tab-general">
+    <div class="card">
+      <h2>Model &amp; inference</h2>
+      <div class="field">
+        <label for="modelPath">Model path (weights directory)</label>
+        <div class="pathrow">
+          <input type="text" id="modelPath" spellcheck="false" placeholder="C:\models\my-model">
+          <button type="button" id="browse" class="secondary">Browse…</button>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label for="contextSize">Context size (tokens)</label>
+          <input type="number" id="contextSize" min="512" max="1048576" step="512">
+        </div>
+        <div class="field">
+          <label for="maxTokens">Max tokens</label>
+          <input type="number" id="maxTokens" min="1" max="1048576" step="1">
+        </div>
+        <div class="field">
+          <label for="temperature">Temperature (0.0 – 2.0)</label>
+          <input type="number" id="temperature" min="0" max="2" step="0.1">
+        </div>
+        <div class="field">
+          <label for="topP">Top P (0.0 – 1.0)</label>
+          <input type="number" id="topP" min="0" max="1" step="0.05">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Capture &amp; timing</h2>
+      <div class="grid">
+        <div class="field">
+          <label for="granularity">Capture granularity (how far back from the caret)</label>
+          <select id="granularity">
+            <option value="clause">Clause — stops at , ; :</option>
+            <option value="sentence">Sentence — stops at . ? !</option>
+            <option value="paragraph">Paragraph — stops at newline</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="idleTimerMs">Idle timer (ms before translation starts)</label>
+          <input type="number" id="idleTimerMs" min="100" max="10000" step="50">
+        </div>
+      </div>
+      <p class="hint">While you type, the captured area shows dimmed in the overlay. Pause for the
+        idle delay to translate it; the commit shortcut replaces it with the translation.</p>
+    </div>
+
+    <div class="card">
+      <h2>Memory budget — prefix cache</h2>
+      <div class="grid">
+        <div class="field">
+          <label for="vramCacheBlocks">VRAM cache blocks (16 tokens each)</label>
+          <input type="number" id="vramCacheBlocks" min="0" max="1048576" step="64">
+        </div>
+        <div class="field">
+          <label for="ramTierBlocks">RAM tier blocks (pinned host memory)</label>
+          <input type="number" id="ramTierBlocks" min="0" max="1048576" step="64">
+        </div>
+        <div class="field">
+          <label for="diskSpillBlocks">Disk spill blocks</label>
+          <input type="number" id="diskSpillBlocks" min="0" max="16777216" step="256">
+        </div>
+        <div class="field">
+          <label for="diskSpillEnabled">Disk spill tier</label>
+          <label class="check"><input type="checkbox" id="diskSpillEnabled"> Enable NVMe spill</label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="spillFilePath">Spill file path</label>
+        <input type="text" id="spillFilePath" spellcheck="false"
+               placeholder="C:\Users\…\AppData\Local\Blackwell\spill.bkv">
+      </div>
+      <p class="hint">Cold translation-context pages demote VRAM → pinned RAM → disk instead of
+        being recomputed. Changing these requires an app restart (engine rebuild).</p>
+    </div>
+  </section>
+
+  <!-- ===================== LANGUAGE PAIRS ===================== -->
+  <section class="panel" id="panel-pairs" role="tabpanel" aria-labelledby="tab-pairs">
+    <div class="card">
+      <h2>Translation directions</h2>
+      <p class="hint" style="margin-top:0">The source language is auto-detected; each pair only sets
+        the <strong>target</strong>. Every pair gets a global <strong>Alt+&lt;N&gt;</strong> force
+        hotkey (Alt+1 = first pair) that pins that direction. Adding/removing pairs takes effect on
+        the next app start (the engine compiles one prompt-cache branch per pair).</p>
+
+      <div class="pairs-head">
+        <span class="pairs-col-label">Label (shown in overlay)</span>
+        <span class="pairs-col-target">Target language</span>
+        <span class="pairs-col-hotkey">Hotkey</span>
+        <span class="pairs-col-active">Default</span>
+        <span class="pairs-col-remove"></span>
+      </div>
+      <div id="pairsList"></div>
+
+      <button type="button" id="addPair" class="secondary" style="margin-top:12px">+ Add pair</button>
+    </div>
+  </section>
+
+  <!-- ===================== SHORTCUTS ===================== -->
+  <section class="panel" id="panel-shortcuts" role="tabpanel" aria-labelledby="tab-shortcuts">
+    <div class="card">
+      <h2>Global shortcuts</h2>
+      <div class="field">
+        <label for="activation">Activation (toggle assistant on / off)</label>
+        <input type="text" id="activation" readonly placeholder="Click, then press keys">
+      </div>
+      <div class="field">
+        <label for="commit">Commit (replace typed text with the translation)</label>
+        <input type="text" id="commit" readonly placeholder="Click, then press keys">
+      </div>
+      <div class="field">
+        <label for="cycle">Cycle language direction</label>
+        <input type="text" id="cycle" readonly placeholder="Click, then press keys">
+      </div>
+      <p class="hint">Force-override hotkeys <strong>Alt+1 … Alt+9</strong> are assigned
+        automatically to the language pairs above and pin a direction (the overlay header shows
+        <em>[Pinned]</em>). Clear a hotkey field with <strong>Backspace</strong> / <strong>Delete</strong>.</p>
+    </div>
+  </section>
+
+  <footer class="app-footer">
+    <button id="save" type="button">Save</button>
+    <span id="toast">Saved</span>
+  </footer>
+
+  <script src="settings.js"></script>
+</body>
+</html>

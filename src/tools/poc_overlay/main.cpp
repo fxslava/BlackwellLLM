@@ -55,6 +55,15 @@ constexpr UINT_PTR kReadyTimerId = 1;  // polls engine readiness after Mode ON
 // settings window; only ever touched on the UI thread.
 Config g_config;
 
+// Language pairs FROZEN at startup. Everything pair-derived -- the engine's .bkv
+// branches, the CaretTracker routing, the overlay dropdown labels, the Alt+<N>
+// hotkey bound, and the cycle/force HUDs -- is wired from this snapshot so it all
+// stays mutually consistent for the whole session. Editing pairs in Settings
+// persists to config.json and takes full effect on the next app start (the same
+// restart the engine already needs to recompile its per-branch prompt caches).
+std::vector<LanguagePair> g_sessionPairs;
+int g_sessionActive = 0;  // active index among g_sessionPairs (cycle/force)
+
 // The tracker owns the capture/debounce settings; the settings window pushes
 // changes into it live via ApplyConfig (model path still needs a restart).
 CaretTracker* g_caretTracker = nullptr;
@@ -188,6 +197,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_config = ConfigStore::Load();
     ApplyConfig(g_config);
 
+    // Freeze the pair set for the session: the engine branches below, the
+    // routing, the overlay labels, and the Alt+<N> hotkeys all wire from this.
+    g_sessionPairs = g_config.languagePairs;
+    g_sessionActive = (g_config.activeLanguage >= 0 &&
+                       g_config.activeLanguage < static_cast<int>(g_sessionPairs.size()))
+                          ? g_config.activeLanguage
+                          : 0;
+
     // The inference stack. Engine construction (DirectStorage weight streaming)
     // happens on the service's own worker thread -- this constructor is instant.
     // The preview sink is late-bound below, once the CaretTracker exists.
@@ -195,12 +212,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     svcSettings.modelDir = g_config.modelPath;
     // Each configured direction becomes a system prompt + a JIT-compiled .bkv
     // branch (the radix tree dedups the shared prefix). Only the target language
-    // name reaches the service; the "EN -> RU" label is a UI concern.
+    // name reaches the service; the "RU -> EN" label is a UI concern.
     svcSettings.targetLanguages.clear();  // replace the {"English"} default
-    for (const LanguagePair& pair : g_config.languagePairs) {
+    for (const LanguagePair& pair : g_sessionPairs) {
         svcSettings.targetLanguages.push_back(ToUtf8(pair.target));
     }
-    svcSettings.activeLanguage = g_config.activeLanguage;
+    svcSettings.activeLanguage = g_sessionActive;
     // promptCacheRoot left empty -> %LOCALAPPDATA%\Blackwell\Cache. The service
     // derives the per-model subdirectory from the loaded checkpoint's hash and
     // JIT-compiles the .bkv prompt cache there on first run -- nothing is
@@ -247,7 +264,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         translator.SetActiveLanguage(index);
     };
     CaretTracker caretTracker(std::move(trackerCallbacks), g_config.captureGranularity,
-                              g_config.idleTimerMs, DeriveLanguageRouting(g_config.languagePairs));
+                              g_config.idleTimerMs, DeriveLanguageRouting(g_sessionPairs));
     g_caretTracker = &caretTracker;
 
     // The overlay's header/dropdown chrome: give it the pair labels to display,
@@ -256,7 +273,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // through instead of hiding the overlay.
     {
         std::vector<std::wstring> labels;
-        for (const LanguagePair& pair : g_config.languagePairs) {
+        for (const LanguagePair& pair : g_sessionPairs) {
             labels.push_back(pair.label);
         }
         overlay.SetLanguageLabels(std::move(labels));
@@ -267,6 +284,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     });
     overlay.SetInteractiveRegionSink(
         [](const RECT* rect) { HookManager::Instance().SetInteractiveRect(rect); });
+
+    // Bound the Alt+<N> force-override hotkeys to the pairs the engine was built
+    // with at startup (editing pairs in Settings takes effect on the next run, so
+    // this count stays fixed for the session -- Alt+N never fires for a pair the
+    // engine has no compiled branch for).
+    HookManager::Instance().SetLanguagePairCount(static_cast<int>(g_sessionPairs.size()));
 
     // Late-bound sink: translation deltas/finals flow back into the tracker's
     // state machine (thread-safe enqueue), which decides what the overlay shows.
@@ -348,6 +371,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         caretTracker.SetLanguageOverride(g_config.activeLanguage);
         caretTracker.ShowHud(L"Language: " + g_config.languagePairs[g_config.activeLanguage].label,
                              /*fade=*/true);
+    };
+    // Force-override hotkeys (Alt+1, Alt+2, ...): pin a specific direction,
+    // suppressing OS-layout auto-routing. The hook already bounds the index to a
+    // configured pair; SetLanguageOverride pins it (the header shows "[Pinned]").
+    callbacks.onForceLanguage = [&caretTracker](int index) {
+        if (index < 0 || index >= static_cast<int>(g_config.languagePairs.size())) {
+            return;
+        }
+        g_config.activeLanguage = index;
+        caretTracker.SetLanguageOverride(index);
+        caretTracker.ShowHud(L"Pinned: " + g_config.languagePairs[index].label, /*fade=*/true);
     };
 
     const bool hookInstalled = HookManager::Instance().Install(std::move(callbacks));

@@ -144,7 +144,7 @@ bool PasteViaClipboard(const std::wstring& text) {
 }  // namespace
 
 Tier Replace(const Request& request) {
-    if (request.source.empty() && request.replacement.empty()) {
+    if (request.source.empty() && request.replacement.empty() && !request.selectionActive) {
         return Tier::None;
     }
 
@@ -183,7 +183,20 @@ Tier Replace(const Request& request) {
         }
     }
 
-    // Tier 3: UIA-opaque -- select N characters left of the caret, then paste.
+    // Tier 4: selection-commit fallback -- the OS/user already has the target
+    // highlighted, so paste straight over it. MUST come before the Shift+Left
+    // tier: re-selecting a live drag-selection by keystroke would move or clear
+    // the very range we mean to overwrite.
+    if (request.selectionActive) {
+        if (PasteViaClipboard(request.replacement)) {
+            return Tier::SelectionPaste;
+        }
+        return Tier::None;
+    }
+
+    // Tier 3: UIA-opaque typing commit -- select N characters left of the caret,
+    // then paste. Chromium collapses synthetic VK_BACK spam, so we select-then-
+    // paste (Shift+Left x N, then Ctrl+V) instead of backspacing.
     if (!request.source.empty()) {
         SendShiftLeft(request.source.size());
         Sleep(kSelectSettleMs);

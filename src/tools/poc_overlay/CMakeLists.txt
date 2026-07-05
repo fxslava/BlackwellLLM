@@ -86,6 +86,15 @@ target_link_libraries(poc_overlay PRIVATE
     agent_orchestrator   # AgentOrchestrator / ToolParser / ToolRegistry
 )
 
+# The Settings UI ships as external web assets (settings.html/.css/.js) served
+# by WebView2 via a virtual-host->folder mapping. Deploy the web/ folder next to
+# the exe so SettingsWindow can find it at <exe dir>\web at runtime.
+add_custom_command(TARGET poc_overlay POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/web"
+    "$<TARGET_FILE_DIR:poc_overlay>/web"
+    COMMENT "Deploying poc_overlay Settings web assets (web/ -> next to the exe)")
+
 # When the core lib was built with DirectStorage, the engine needs the DS runtime
 # DLLs next to the executable (same block as agent_playground; DS_BIN_DIR is set
 # in src/CMakeLists.txt and inherited here).

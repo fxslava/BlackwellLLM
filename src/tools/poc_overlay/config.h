@@ -45,11 +45,13 @@ struct Config {
     Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};               // Ctrl+Enter
     Shortcut cycleLanguageShortcut{HOTKEYF_ALT | HOTKEYF_SHIFT, 'L'};  // Alt+Shift+L (cycle direction)
 
-    // Translation directions cycled by cycleLanguageShortcut. Each compiles its
-    // own .bkv branch on first run; the radix tree dedups the shared prefix.
+    // Translation directions. Each compiles its own .bkv branch on first run
+    // (the radix tree dedups the shared prefix) and gets a global Alt+<N> force-
+    // override hotkey (Alt+1 = index 0, Alt+2 = index 1, ...). Editable in the
+    // Settings UI; engine/branch changes take effect on the next app start.
     std::vector<LanguagePair> languagePairs{
-        {L"EN -> RU", L"Russian"},
         {L"RU -> EN", L"English"},
+        {L"RU -> ZH", L"Chinese"},
     };
     int activeLanguage = 0;  // index into languagePairs
 

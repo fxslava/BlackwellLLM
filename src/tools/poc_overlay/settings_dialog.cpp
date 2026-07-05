@@ -8,8 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cstdlib>
-#include <fstream>
+#include <cstdlib>  // _wtoi
 #include <string>
 
 using Microsoft::WRL::Callback;
@@ -21,317 +20,31 @@ namespace {
 constexpr wchar_t kClassName[] = L"BlackwellPocSettingsWindow";
 HWND g_openWindow = nullptr;  // single-instance guard
 
-// Settings UI. Stored as a NARROW UTF-8 raw string literal (R"HTML(...)HTML") so
-// there is zero backslash/quote escaping to get wrong, then converted to UTF-16
-// for NavigateToString. The hotkey fields are readonly <input> boxes that capture
-// keydown and record { modifiers, vk } (event.keyCode maps to Windows VK_*). All
-// IPC handlers are wrapped in try/catch so a single bad message can't blank the UI.
-constexpr char kHtml[] = R"HTML(<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  :root{
-    color-scheme: dark;
-    --bg:#191a1f; --card:#232530; --card2:#1d1f27; --line:#33363f;
-    --fg:#e9eaee; --muted:#9aa0ad; --accent:#5b8cff; --accent2:#3f6fe0;
-    --ok:#4ade80; --field:#14151a;
-  }
-  *{ box-sizing:border-box; }
-  html,body{ margin:0; }
-  body{
-    background:var(--bg); color:var(--fg);
-    font-family:'Segoe UI',system-ui,-apple-system,sans-serif; font-size:13px;
-    padding:20px; -webkit-user-select:none; user-select:none;
-    overflow:hidden;  /* body itself never scrolls; the host fits the window to content */
-  }
-  h1{ font-size:18px; margin:0; font-weight:650; letter-spacing:.2px; }
-  .subtitle{ color:var(--muted); font-size:12px; margin:2px 0 18px; }
-  .card{ background:var(--card); border:1px solid var(--line);
-    border-radius:12px; padding:16px 16px 18px; margin-bottom:14px; }
-  .card > h2{ font-size:12px; text-transform:uppercase; letter-spacing:.6px;
-    color:var(--muted); margin:0 0 14px; font-weight:600; }
-  .field{ margin-bottom:12px; }
-  .field:last-child{ margin-bottom:0; }
-  label{ display:block; color:var(--muted); font-size:11.5px; margin-bottom:6px; }
-  input, select{
-    width:100%; background:var(--field); color:var(--fg);
-    border:1px solid var(--line); border-radius:8px; padding:9px 11px;
-    font-size:13px; font-family:inherit; outline:none; transition:border-color .12s, box-shadow .12s;
-  }
-  input:focus, select:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.22); }
-  input[readonly]{ cursor:pointer; }
-  input[readonly]:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(91,140,255,.28); }
-  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-  .footer{ display:flex; align-items:center; gap:14px; margin-top:4px; }
-  button{
-    background:var(--accent); color:#fff; border:none; border-radius:8px;
-    padding:10px 22px; font-size:13px; font-weight:600; cursor:pointer;
-    font-family:inherit; transition:background .12s;
-  }
-  button:hover{ background:var(--accent2); }
-  button:active{ transform:translateY(1px); }
-  #toast{ color:var(--ok); font-size:12.5px; font-weight:600; opacity:0;
-    transform:translateX(-6px); transition:opacity .2s, transform .2s; }
-  #toast.show{ opacity:1; transform:translateX(0); }
-  .hint{ color:var(--muted); font-size:11px; margin-top:6px; }
-  .pathrow{ display:flex; gap:8px; align-items:stretch; }
-  .pathrow input{ flex:1 1 auto; min-width:0; }
-  button.secondary{ background:#2b2e39; color:var(--fg); border:1px solid var(--line);
-    padding:9px 14px; font-weight:600; white-space:nowrap; flex:0 0 auto; }
-  button.secondary:hover{ background:#333747; }
-  label.check{ display:flex; align-items:center; gap:8px; color:var(--fg);
-    font-size:13px; cursor:pointer; margin:0; padding:9px 0; }
-  label.check input[type="checkbox"]{ width:auto; accent-color:var(--accent);
-    width:16px; height:16px; margin:0; }
-  html,body{ overflow-x:hidden; }
-</style>
-</head>
-<body>
-  <h1>Blackwell Overlay</h1>
-  <div class="subtitle">Live translation assistant &mdash; settings</div>
+// Virtual host the WebView2 maps onto the on-disk assets folder (web/ next to
+// the exe). Navigating https://<host>/settings.html serves settings.html and its
+// linked settings.css / settings.js exactly like a real site, so the UI markup,
+// styling, and logic all live in editable web files -- NOT in this C++ source.
+// The C++ side is now a pure state bridge: it pushes the Config as JSON on load
+// and applies the JSON the page posts back on Save.
+constexpr wchar_t kAssetHost[] = L"appassets.blackwell";
+constexpr wchar_t kAssetUrl[] = L"https://appassets.blackwell/settings.html";
 
-  <div class="card">
-    <h2>Shortcuts</h2>
-    <div class="field">
-      <label for="activation">Activation shortcut (toggle assistant on / off)</label>
-      <input type="text" id="activation" readonly placeholder="Click, then press keys">
-    </div>
-    <div class="field">
-      <label for="commit">Commit shortcut (replace typed text with translation)</label>
-      <input type="text" id="commit" readonly placeholder="Click, then press keys">
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Model &amp; inference</h2>
-    <div class="field">
-      <label for="modelPath">Model path (weights directory)</label>
-      <div class="pathrow">
-        <input type="text" id="modelPath" spellcheck="false" placeholder="C:\models\my-model">
-        <button type="button" id="browse" class="secondary">Browse&hellip;</button>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="field">
-        <label for="contextSize">Context size (tokens)</label>
-        <input type="number" id="contextSize" min="512" max="1048576" step="512">
-      </div>
-      <div class="field">
-        <label for="maxTokens">Max tokens</label>
-        <input type="number" id="maxTokens" min="1" max="1048576" step="1">
-      </div>
-      <div class="field">
-        <label for="temperature">Temperature (0.0 &ndash; 2.0)</label>
-        <input type="number" id="temperature" min="0" max="2" step="0.1">
-      </div>
-      <div class="field">
-        <label for="topP">Top P (0.0 &ndash; 1.0)</label>
-        <input type="number" id="topP" min="0" max="1" step="0.05">
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Capture &amp; timing</h2>
-    <div class="grid">
-      <div class="field">
-        <label for="granularity">Capture granularity (how far back from the caret)</label>
-        <select id="granularity">
-          <option value="clause">Clause &mdash; stops at , ; :</option>
-          <option value="sentence">Sentence &mdash; stops at . ? !</option>
-          <option value="paragraph">Paragraph &mdash; stops at newline</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="idleTimerMs">Idle timer (ms before translation starts)</label>
-        <input type="number" id="idleTimerMs" min="100" max="10000" step="50">
-      </div>
-    </div>
-    <div class="hint">While you type, the captured area shows dimmed in the overlay.
-      Pause for the idle delay to translate it; Ctrl+Enter replaces it with the translation.</div>
-  </div>
-
-  <div class="card">
-    <h2>Memory budget &mdash; prefix cache</h2>
-    <div class="grid">
-      <div class="field">
-        <label for="vramCacheBlocks">VRAM cache blocks (16 tokens each)</label>
-        <input type="number" id="vramCacheBlocks" min="0" max="1048576" step="64">
-      </div>
-      <div class="field">
-        <label for="ramTierBlocks">RAM tier blocks (pinned host memory)</label>
-        <input type="number" id="ramTierBlocks" min="0" max="1048576" step="64">
-      </div>
-      <div class="field">
-        <label for="diskSpillBlocks">Disk spill blocks</label>
-        <input type="number" id="diskSpillBlocks" min="0" max="16777216" step="256">
-      </div>
-      <div class="field">
-        <label for="diskSpillEnabled" style="margin-bottom:10px">Disk spill tier</label>
-        <label class="check"><input type="checkbox" id="diskSpillEnabled"> Enable NVMe spill</label>
-      </div>
-    </div>
-    <div class="field" style="margin-top:12px">
-      <label for="spillFilePath">Spill file path</label>
-      <input type="text" id="spillFilePath" spellcheck="false"
-             placeholder="C:\Users\...\AppData\Local\Blackwell\spill.bkv">
-    </div>
-    <div class="hint">Cold translation-context pages demote VRAM &rarr; pinned RAM &rarr; disk
-      instead of being recomputed. Changing these requires an app restart (engine rebuild).</div>
-  </div>
-
-  <div class="footer">
-    <button id="save" type="button">Save</button>
-    <span id="toast">Saved</span>
-  </div>
-
-<script>
-  "use strict";
-  const HK = { SHIFT:1, CONTROL:2, ALT:4 };
-  const MOD_VK = [16, 17, 18, 91, 92]; // Shift/Ctrl/Alt/Win left+right
-
-  const state = {
-    activation: { modifiers:0, vk:0 },
-    commit:     { modifiers:0, vk:0 }
-  };
-
-  function modsFromEvent(e){
-    return (e.ctrlKey ? HK.CONTROL : 0)
-         | (e.shiftKey ? HK.SHIFT : 0)
-         | (e.altKey ? HK.ALT : 0);
-  }
-
-  function vkName(vk){
-    const map = {
-      8:'Backspace', 9:'Tab', 13:'Enter', 27:'Esc', 32:'Space',
-      33:'PageUp', 34:'PageDown', 35:'End', 36:'Home',
-      37:'Left', 38:'Up', 39:'Right', 40:'Down', 45:'Insert', 46:'Delete',
-      186:';', 187:'=', 188:',', 189:'-', 190:'.', 191:'/', 192:'`',
-      219:'[', 220:'\\', 221:']', 222:"'"
-    };
-    if (map[vk]) return map[vk];
-    if (vk >= 65 && vk <= 90) return String.fromCharCode(vk);       // A-Z
-    if (vk >= 48 && vk <= 57) return String.fromCharCode(vk);       // 0-9
-    if (vk >= 96 && vk <= 105) return 'Num' + (vk - 96);            // numpad 0-9
-    if (vk >= 112 && vk <= 123) return 'F' + (vk - 111);            // F1-F12
-    return 'Key' + vk;
-  }
-
-  function label(sc){
-    if (!sc || !sc.vk) return '';
-    const parts = [];
-    if (sc.modifiers & HK.CONTROL) parts.push('Ctrl');
-    if (sc.modifiers & HK.SHIFT)   parts.push('Shift');
-    if (sc.modifiers & HK.ALT)     parts.push('Alt');
-    parts.push(vkName(sc.vk));
-    return parts.join(' + ');
-  }
-
-  function bindHotkey(id, key){
-    const el = document.getElementById(id);
-    el.addEventListener('keydown', function(e){
-      e.preventDefault();
-      e.stopPropagation();
-      if (MOD_VK.indexOf(e.keyCode) !== -1) return;  // wait for a real key
-      state[key] = { modifiers: modsFromEvent(e), vk: e.keyCode };
-      el.value = label(state[key]);
-    });
-  }
-  bindHotkey('activation', 'activation');
-  bindHotkey('commit', 'commit');
-
-  function applyConfig(cfg){
-    state.activation = cfg.activation || { modifiers:0, vk:0 };
-    state.commit     = cfg.commit     || { modifiers:0, vk:0 };
-    document.getElementById('activation').value  = label(state.activation);
-    document.getElementById('commit').value      = label(state.commit);
-    document.getElementById('modelPath').value   = cfg.modelPath || '';
-    document.getElementById('contextSize').value = cfg.contextSize != null ? cfg.contextSize : 4096;
-    document.getElementById('temperature').value = cfg.temperature != null ? cfg.temperature : 0.7;
-    document.getElementById('topP').value        = cfg.topP != null ? cfg.topP : 0.95;
-    document.getElementById('maxTokens').value   = cfg.maxTokens != null ? cfg.maxTokens : 1024;
-    document.getElementById('granularity').value = cfg.captureGranularity || 'sentence';
-    document.getElementById('idleTimerMs').value = cfg.idleTimerMs != null ? cfg.idleTimerMs : 700;
-    document.getElementById('vramCacheBlocks').value  = cfg.vramCacheBlocks != null ? cfg.vramCacheBlocks : 1024;
-    document.getElementById('ramTierBlocks').value    = cfg.ramTierBlocks != null ? cfg.ramTierBlocks : 2048;
-    document.getElementById('diskSpillEnabled').checked = cfg.diskSpillEnabled !== false;
-    document.getElementById('diskSpillBlocks').value  = cfg.diskSpillBlocks != null ? cfg.diskSpillBlocks : 8192;
-    document.getElementById('spillFilePath').value    = cfg.spillFilePath || '';
-  }
-
-  function showToast(){
-    const t = document.getElementById('toast');
-    t.classList.add('show');
-    setTimeout(function(){ t.classList.remove('show'); }, 1600);
-  }
-
-  const bridge = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
-
-  // Ask the host to size its window to the content so there are no scrollbars.
-  // Measure body (content) height, not documentElement (which is clamped to the
-  // viewport and would never let the window shrink). +2 guards DPI rounding.
-  function reportSize(){
-    try {
-      const h = Math.ceil(document.body.scrollHeight) + 2;
-      if (bridge) bridge.postMessage({ type:'resize', height:h });
-    } catch (err) { /* ignore */ }
-  }
-
-  if (bridge){
-    bridge.addEventListener('message', function(event){
-      try {
-        const msg = event.data;
-        if (!msg || typeof msg !== 'object') return;
-        if (msg.type === 'load') {
-          applyConfig(msg);
-          reportSize();
-        } else if (msg.type === 'modelPath') {
-          if (msg.path) document.getElementById('modelPath').value = msg.path;
-        } else if (msg.type === 'saved') {
-          showToast();
-        }
-      } catch (err) {
-        console.error('settings: failed to handle host message', err);
-      }
-    });
-  }
-
-  document.getElementById('browse').addEventListener('click', function(){
-    try { if (bridge) bridge.postMessage({ type:'browse' }); }
-    catch (err) { console.error('settings: failed to request folder picker', err); }
-  });
-
-  window.addEventListener('load', reportSize);
-
-  document.getElementById('save').addEventListener('click', function(){
-    try {
-      const payload = {
-        type: 'save',
-        activation: state.activation,
-        commit: state.commit,
-        modelPath: document.getElementById('modelPath').value,
-        contextSize: parseInt(document.getElementById('contextSize').value, 10) || 4096,
-        temperature: parseFloat(document.getElementById('temperature').value) || 0.0,
-        topP: parseFloat(document.getElementById('topP').value) || 0.0,
-        maxTokens: parseInt(document.getElementById('maxTokens').value, 10) || 1024,
-        captureGranularity: document.getElementById('granularity').value,
-        idleTimerMs: parseInt(document.getElementById('idleTimerMs').value, 10) || 700,
-        vramCacheBlocks: parseInt(document.getElementById('vramCacheBlocks').value, 10) || 0,
-        ramTierBlocks: parseInt(document.getElementById('ramTierBlocks').value, 10) || 0,
-        diskSpillEnabled: document.getElementById('diskSpillEnabled').checked,
-        diskSpillBlocks: parseInt(document.getElementById('diskSpillBlocks').value, 10) || 0,
-        spillFilePath: document.getElementById('spillFilePath').value
-      };
-      if (bridge) bridge.postMessage(payload);
-    } catch (err) {
-      console.error('settings: failed to post save message', err);
+// <exe dir>\web -- where CMake deploys settings.html/.css/.js next to the binary.
+std::wstring AssetsDir() {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring dir(exePath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        dir.resize(slash + 1);
     }
-  });
-</script>
-</body>
-</html>)HTML";
+    return dir + L"web";
+}
+
+bool FileExists(const std::wstring& path) {
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
 
 // Owns the settings window + its WebView2. Heap-allocated; self-deletes on
 // WM_NCDESTROY.
@@ -345,7 +58,7 @@ public:
         // and ResizeToContentHeight() fits the window exactly (no scrollbars).
         hwnd_ = CreateWindowExW(0, kClassName, L"Blackwell PoC - Settings",
                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                 CW_USEDEFAULT, CW_USEDEFAULT, 580, 660, owner, nullptr, hInstance,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, 620, 680, owner, nullptr, hInstance,
                                  this);
         if (!hwnd_) {
             return false;
@@ -364,14 +77,14 @@ public:
 private:
     void CreateWebView();
     void OnControllerCreated(ICoreWebView2Controller* controller);
+    bool MapAssetsAndNavigate();  // virtual-host map -> Navigate; false = assets missing
     void OnWebMessage(const std::wstring& messageJson);
     void PushConfigToJs();
     void ResizeToClient();
     void ResizeToContentHeight(int cssHeight);  // fit the window to the page (no scrollbars)
     void FitWindowToContent();                  // measure the page via ExecuteScript, then fit
     void ReportWebViewUnavailable();
-    bool WriteHtmlFile(std::wstring& outUrl);  // returns a file:// URL to the UI
-    void BrowseForModelFolder();               // native folder picker -> JS
+    void BrowseForModelFolder();                // native folder picker -> JS
 
     HWND hwnd_ = nullptr;
     ComPtr<ICoreWebView2Controller> controller_;
@@ -474,40 +187,35 @@ void SettingsWindow::OnControllerCreated(ICoreWebView2Controller* controller) {
     ResizeToClient();
     SetForegroundWindow(hwnd_);
 
-    // Prefer navigating to a real file (most reliable, and you can open the same
-    // file in a browser to confirm the HTML renders). Fall back to NavigateToString.
-    std::wstring url;
-    if (WriteHtmlFile(url)) {
-        webview_->Navigate(url.c_str());
-    } else {
-        webview_->NavigateToString(FromUtf8(kHtml).c_str());
+    if (!MapAssetsAndNavigate()) {
+        MessageBoxW(hwnd_,
+                    L"Settings UI assets were not found next to the executable "
+                    L"(expected a 'web' folder with settings.html). Reinstall or rebuild.",
+                    L"Settings", MB_ICONWARNING | MB_OK);
+        DestroyWindow(hwnd_);
     }
 }
 
-bool SettingsWindow::WriteHtmlFile(std::wstring& outUrl) {
-    wchar_t local[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) == 0) {
-        return false;
+bool SettingsWindow::MapAssetsAndNavigate() {
+    const std::wstring dir = AssetsDir();
+    if (!FileExists(dir + L"\\settings.html")) {
+        return false;  // assets not deployed -- caller reports it
     }
-    const std::wstring dir = std::wstring(local) + L"\\BlackwellPocOverlay";
-    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);  // ok if it already exists
-
-    const std::wstring path = dir + L"\\settings.html";
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return false;
+    // Map the virtual host onto the assets folder so https://<host>/settings.html
+    // serves the file (and its linked .css/.js) with normal same-origin fetches.
+    // Requires ICoreWebView2_3 (WebView2 SDK 1.0.774+); on an ancient runtime we
+    // simply fall back to a file:// navigation below.
+    ComPtr<ICoreWebView2_3> wv3;
+    if (SUCCEEDED(webview_.As(&wv3)) && wv3) {
+        wv3->SetVirtualHostNameToFolderMapping(
+            kAssetHost, dir.c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+        return SUCCEEDED(webview_->Navigate(kAssetUrl));
     }
-    out.write(kHtml, static_cast<std::streamsize>(sizeof(kHtml) - 1));  // raw UTF-8 bytes
-    out.close();
-
-    std::wstring url = L"file:///" + path;
-    for (wchar_t& c : url) {
-        if (c == L'\\') {
-            c = L'/';
-        }
+    std::wstring fileUrl = L"file:///" + dir + L"\\settings.html";
+    for (wchar_t& c : fileUrl) {
+        if (c == L'\\') c = L'/';
     }
-    outUrl = url;
-    return true;
+    return SUCCEEDED(webview_->Navigate(fileUrl.c_str()));
 }
 
 void SettingsWindow::PushConfigToJs() {
@@ -517,6 +225,17 @@ void SettingsWindow::PushConfigToJs() {
                        {"vk", config_.activationShortcut.vk}};
     j["commit"] = {{"modifiers", config_.commitShortcut.modifiers},
                    {"vk", config_.commitShortcut.vk}};
+    j["cycle"] = {{"modifiers", config_.cycleLanguageShortcut.modifiers},
+                  {"vk", config_.cycleLanguageShortcut.vk}};
+    // Language pairs (index-aligned with the Alt+<N> force hotkeys and the engine
+    // branches). label = HUD/overlay text, target = the language name the model
+    // translates INTO (source is auto-detected).
+    json pairs = json::array();
+    for (const LanguagePair& p : config_.languagePairs) {
+        pairs.push_back({{"label", ToUtf8(p.label)}, {"target", ToUtf8(p.target)}});
+    }
+    j["languagePairs"] = std::move(pairs);
+    j["activeLanguage"] = config_.activeLanguage;
     j["modelPath"] = ToUtf8(config_.modelPath);
     j["contextSize"] = config_.contextSize;
     j["temperature"] = config_.temperature;
@@ -560,6 +279,31 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
         if (j.contains("commit")) {
             config_.commitShortcut.modifiers = j["commit"].value("modifiers", 0u);
             config_.commitShortcut.vk = j["commit"].value("vk", 0u);
+        }
+        if (j.contains("cycle")) {
+            config_.cycleLanguageShortcut.modifiers = j["cycle"].value("modifiers", 0u);
+            config_.cycleLanguageShortcut.vk = j["cycle"].value("vk", 0u);
+        }
+        // Language pairs: replace the whole list (add/remove is done in the UI).
+        // Drop rows with no target; keep the old set if the UI sent nothing usable
+        // so a stray message can never wipe the user's directions.
+        if (j.contains("languagePairs") && j["languagePairs"].is_array()) {
+            std::vector<LanguagePair> pairs;
+            for (const auto& e : j["languagePairs"]) {
+                LanguagePair p;
+                p.label = FromUtf8(e.value("label", std::string()));
+                p.target = FromUtf8(e.value("target", std::string()));
+                if (!p.target.empty()) {
+                    if (p.label.empty()) p.label = p.target;  // fall back to the target name
+                    pairs.push_back(std::move(p));
+                }
+            }
+            if (!pairs.empty()) config_.languagePairs = std::move(pairs);
+        }
+        config_.activeLanguage = j.value("activeLanguage", config_.activeLanguage);
+        if (config_.activeLanguage < 0 ||
+            config_.activeLanguage >= static_cast<int>(config_.languagePairs.size())) {
+            config_.activeLanguage = 0;
         }
         config_.modelPath = FromUtf8(j.value("modelPath", std::string()));
         config_.contextSize = j.value("contextSize", config_.contextSize);

@@ -296,7 +296,9 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
 
     float chromeW = 0.0f;
     if (showHeader) {
-        chromeW = labelWidth(L"\x25BE  " + labels_[state.language]);  // header + chevron
+        // Measure with the longer "[Pinned]" tag so the box never has to reflow
+        // when the direction is pinned vs. auto (chevron + tag + pair label).
+        chromeW = labelWidth(L"\x25BE  [Pinned]  " + labels_[state.language]);
         if (dropdownOpen_) {
             chromeW = std::max(chromeW, labelWidth(L"Auto (OS layout)"));
             for (const std::wstring& l : labels_) {
@@ -343,6 +345,11 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     ComPtr<ID2D1SolidColorBrush> sepBrush;
     renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f),
                                           sepBrush.GetAddressOf());
+    // Amber header tint for a PINNED (manually overridden) direction, so it reads
+    // differently at a glance from the blue "[Auto]" (OS-layout) header.
+    ComPtr<ID2D1SolidColorBrush> pinnedBrush;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.78f, 0.38f, 0.98f),
+                                          pinnedBrush.GetAddressOf());
     if (dimLen > 0 && dimBrush) {
         layout->SetDrawingEffect(dimBrush.Get(),
                                  DWRITE_TEXT_RANGE{0, static_cast<UINT32>(dimLen)});
@@ -390,9 +397,16 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
             D2D1::RectF(static_cast<float>(kPadX), hTop + headerH - 1.0f,
                         static_cast<float>(boxW - kPadX), hTop + headerH),
             sepBrush.Get());  // hairline under the header
-        const std::wstring headerText =
-            (dropdownOpen_ ? L"\x25B4  " : L"\x25BE  ") + labels_[state.language];
-        drawStrip(headerText, hTop, static_cast<float>(headerH), headerBrush.Get());
+        // "<chevron> [Auto|Pinned] <pair>" -- the tag tells the user WHY this
+        // direction is active (OS keyboard layout vs. a manual override), and the
+        // pinned state also gets the distinct amber tint.
+        const std::wstring headerText = (dropdownOpen_ ? L"\x25B4  " : L"\x25BE  ") +
+                                        std::wstring(state.languagePinned ? L"[Pinned]  "
+                                                                          : L"[Auto]  ") +
+                                        labels_[state.language];
+        ID2D1SolidColorBrush* headerTextBrush =
+            (state.languagePinned && pinnedBrush) ? pinnedBrush.Get() : headerBrush.Get();
+        drawStrip(headerText, hTop, static_cast<float>(headerH), headerTextBrush);
     }
     if (fgBrush) {
         renderTarget_->DrawTextLayout(

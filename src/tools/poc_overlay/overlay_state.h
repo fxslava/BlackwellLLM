@@ -33,4 +33,9 @@ struct OverlaySnapshot {
     // (selection popup, HUD). Drives the overlay's header bar + override dropdown;
     // the OverlayWindow maps the index to a label from its own configured list.
     int language = -1;
+    // How that direction was chosen: false = OS keyboard-layout auto-routing
+    // ("[Auto]"), true = a manual override pinned via the dropdown or an Alt+<N>
+    // force hotkey ("[Pinned]"). Shown in the header so the user always knows WHY
+    // this direction is active.
+    bool languagePinned = false;
 };

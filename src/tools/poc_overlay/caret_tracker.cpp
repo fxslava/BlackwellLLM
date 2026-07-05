@@ -208,8 +208,18 @@ std::wstring CaretTracker::ExtractCapture(const std::wstring& segment,
     while (begin > 0 && !IsBoundaryChar(segment[begin - 1], granularity)) {
         --begin;
     }
-    while (begin < segment.size() && std::iswspace(segment[begin])) {
+    // Smart left-trim: strip ALL leading whitespace, tabs, newlines AND
+    // punctuation from the head of the capture. Without this, a leading "- ",
+    // ", " or stray space the user typed before the new phrase would ride along
+    // into source_raw, and the injected translation would physically stick to
+    // the previous output ("Hello.- Привет" instead of "Hello. Привет"). Bounded
+    // by scanEnd so a capture that is nothing but separators collapses to empty.
+    while (begin < scanEnd &&
+           (std::iswspace(segment[begin]) || std::iswpunct(segment[begin]))) {
         ++begin;
+    }
+    if (begin >= scanEnd) {
+        return {};  // only leading separators/punctuation -> nothing to translate
     }
     // Capture runs to the REAL end (trailing punctuation/whitespace included),
     // so the commit-time ends_with verification is exact.
@@ -715,20 +725,27 @@ void CaretTracker::HandleSelectionCommit(IUIAutomation* automation) {
         callbacks_.injectionGuard(true);
     }
 
+    TextInjector::Request request;
+    request.source = sourceRaw_;
+    request.replacement = translationRaw_;
+    // The OS/user still has the range highlighted, so a bare Ctrl+V overwrites it
+    // even in UIA-opaque apps (Telegram/Notepad) that expose no Selectable range.
+    request.selectionActive = true;
+
     ComPtr<IUIAutomationElement> focused;
     if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused) {
         ComPtr<IUIAutomationTextRange> range;
         std::wstring current;
-        // Re-query: the selection must still be the exact text we translated
-        // (the user may have clicked into it, collapsing the range).
+        // Prefer a verified UIA range: re-query and, only if the selection is
+        // STILL exactly the text we translated, offer the range for the precise
+        // Tier-2 Select()+paste. Otherwise Replace() falls through to the Tier-4
+        // paste-over-live-selection (a plain click that collapsed the range would
+        // have reset us out of SelReady before ever reaching here).
         if (ReadSelection(focused.Get(), range, current) && current == sourceRaw_) {
-            TextInjector::Request request;
-            request.source = sourceRaw_;
-            request.replacement = translationRaw_;
-            request.selectionRange = range.Get();  // Tier 2: Select() (idempotent) + paste
-            TextInjector::Replace(request);
+            request.selectionRange = range.Get();
         }
     }
+    TextInjector::Replace(request);
     // Stateless prosthetic: a selection translation is a one-shot, so the
     // context never carries across it (see HandleCommit for the full rationale).
     inferenceContext_.clear();
@@ -786,8 +803,11 @@ void CaretTracker::Render() const {
     snapshot.anchor = anchor_;
     snapshot.anchorValid = anchorValid_;
     // The header bar + override dropdown only exist for the caret-anchored typing
-    // pipeline; the locked session direction drives them.
+    // pipeline; the locked session direction drives them. `languagePinned`
+    // distinguishes a manual override ("[Pinned]") from OS-layout auto-routing
+    // ("[Auto]") so the header can explain WHY this direction is active.
     snapshot.language = sessionLanguage_;
+    snapshot.languagePinned = languageOverride_.has_value();
     switch (phase_) {
         case Phase::Idle:
             snapshot.phase = OverlayPhase::Hidden;

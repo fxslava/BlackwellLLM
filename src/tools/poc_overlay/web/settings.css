@@ -1,0 +1,199 @@
+/* Blackwell Overlay — Settings UI (Official Light Theme)
+   White / light-gray surfaces, dark text, clean 1px borders, soft focus rings.
+   The host window auto-sizes to document.body.scrollHeight, so the body itself
+   never scrolls: only the active tab panel contributes height. */
+
+:root {
+  color-scheme: light;
+  --bg: #f4f5f7;          /* window background          */
+  --card: #ffffff;        /* card surface               */
+  --line: #e2e5ea;        /* hairline borders           */
+  --line-strong: #d3d7de;
+  --fg: #1c2024;          /* primary text               */
+  --muted: #6b7280;       /* secondary text / labels    */
+  --accent: #2563eb;      /* primary blue               */
+  --accent-hover: #1d4ed8;
+  --accent-soft: rgba(37, 99, 235, .12);
+  --ok: #16a34a;          /* success text               */
+  --field: #ffffff;
+  --field-disabled: #f0f2f5;
+  --danger: #dc2626;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 1px 3px rgba(16, 24, 40, .06);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+html, body { overflow-x: hidden; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 20px 22px 22px;
+  -webkit-user-select: none;
+  user-select: none;
+  overflow-y: hidden; /* the host fits the window to content — no body scrollbar */
+}
+
+/* ---- header ---- */
+.app-header { margin-bottom: 14px; }
+h1 { font-size: 19px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.subtitle { color: var(--muted); font-size: 12px; margin: 3px 0 0; }
+
+/* ---- tabs ---- */
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 16px;
+}
+.tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 600;
+  padding: 9px 14px;
+  margin-bottom: -1px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s;
+}
+.tab:hover { color: var(--fg); }
+.tab.is-active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 2px; border-radius: 6px; }
+
+/* ---- panels ---- */
+.panel { display: none; }
+.panel.is-active { display: block; }
+
+/* ---- cards ---- */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 16px 18px;
+  margin-bottom: 14px;
+  box-shadow: var(--shadow);
+}
+.card > h2 {
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  color: var(--muted);
+  margin: 0 0 14px;
+  font-weight: 700;
+}
+
+/* ---- fields ---- */
+.field { margin-bottom: 12px; }
+.field:last-child { margin-bottom: 0; }
+label { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 6px; }
+
+input, select {
+  width: 100%;
+  background: var(--field);
+  color: var(--fg);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+input::placeholder { color: #9aa1ac; }
+input:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+input[readonly] { cursor: pointer; background: var(--field-disabled); }
+input[readonly]:focus { background: var(--field); }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.hint { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
+.hint strong { color: var(--fg); font-weight: 600; }
+
+/* ---- path row ---- */
+.pathrow { display: flex; gap: 8px; align-items: stretch; }
+.pathrow input { flex: 1 1 auto; min-width: 0; }
+
+/* ---- buttons ---- */
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 22px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background .12s, transform .05s;
+}
+button:hover { background: var(--accent-hover); }
+button:active { transform: translateY(1px); }
+
+button.secondary {
+  background: #fff;
+  color: var(--fg);
+  border: 1px solid var(--line-strong);
+  padding: 9px 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+button.secondary:hover { background: #f6f7f9; }
+
+button.icon {
+  background: #fff;
+  color: var(--danger);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0;
+  width: 34px; height: 34px;
+  font-size: 16px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+button.icon:hover { background: #fdecec; border-color: #f3c4c4; }
+
+/* ---- checkbox ---- */
+label.check {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--fg); font-size: 13px; cursor: pointer; margin: 22px 0 0; padding: 0;
+}
+label.check input[type="checkbox"] {
+  width: 16px; height: 16px; margin: 0; accent-color: var(--accent);
+}
+
+/* ---- language pairs table ---- */
+.pairs-head, .pair-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 64px 64px 34px;
+  gap: 8px;
+  align-items: center;
+}
+.pairs-head {
+  padding: 0 2px 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.pairs-head span { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; }
+.pairs-col-hotkey, .pairs-col-active { text-align: center; }
+.pair-row { margin-bottom: 8px; }
+.pair-row input { padding: 8px 10px; }
+.pair-hotkey { text-align: center; color: var(--muted); font-size: 12px; font-weight: 600; }
+.pair-active { display: flex; justify-content: center; }
+.pair-active input[type="radio"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+.pairs-empty { color: var(--muted); font-size: 12px; padding: 6px 2px; }
+
+/* ---- footer ---- */
+.app-footer { display: flex; align-items: center; gap: 14px; margin-top: 4px; }
+#toast {
+  color: var(--ok); font-size: 12.5px; font-weight: 600;
+  opacity: 0; transform: translateX(-6px); transition: opacity .2s, transform .2s;
+}
+#toast.show { opacity: 1; transform: translateX(0); }

@@ -62,6 +62,12 @@ public:
         // Language switcher shortcut: cycle to the next translation direction.
         // Only fired while Translation Mode is active.
         VoidCallback onCycleLanguage;
+        // A force-override hotkey (Alt+1 -> 0, Alt+2 -> 1, ...) was pressed:
+        // pin that language-pair index (CaretTracker::SetLanguageOverride),
+        // suppressing OS-layout auto-routing. Only fired while Translation Mode
+        // is active, and only for an index that actually maps to a configured
+        // pair (see SetLanguagePairCount). Carries the 0-based index.
+        std::function<void(int index)> onForceLanguage;
     };
 
     static HookManager& Instance();
@@ -81,6 +87,12 @@ public:
     // only while Translation Mode is active.
     void SetCycleLanguageShortcut(const Shortcut& shortcut) { cycleLanguageShortcut_ = shortcut; }
     Shortcut GetCycleLanguageShortcut() const { return cycleLanguageShortcut_; }
+
+    // Number of configured language pairs. Bounds the Alt+<N> force-override
+    // hotkeys: only Alt+1 .. Alt+<count> (max 9) fire onForceLanguage / are
+    // consumed, so pressing Alt+5 with two pairs configured passes through to the
+    // app untouched. Set at startup on the hook-owning (UI) thread.
+    void SetLanguagePairCount(int count) { languagePairCount_ = count; }
 
     // Guards a text-injection window: while set (and, more robustly, for any event
     // carrying TextInjector::kInjectedSignature), the keyboard hook passes input
@@ -125,6 +137,7 @@ private:
     Shortcut commitShortcut_;
     Shortcut activationShortcut_;
     Shortcut cycleLanguageShortcut_;
+    int languagePairCount_ = 0;  // bounds the Alt+<N> force-override hotkeys
     bool enabled_ = false;  // Translation Mode: OFF until the master toggle fires
     std::atomic<bool> injecting_{false};
 

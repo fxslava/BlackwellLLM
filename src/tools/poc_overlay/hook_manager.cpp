@@ -211,6 +211,27 @@ bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
         return true;  // consume
     }
 
+    // Force-override hotkeys: Alt+1 .. Alt+9 pin language-pair index 0..8,
+    // suppressing OS-layout auto-routing. Checked BEFORE the chord-reset logic
+    // below (Alt is a chord modifier) so it isn't mistaken for a context break.
+    // Bare Alt only -- no Ctrl/Shift/Win -- so it never collides with the
+    // Alt+Shift+* shortcuts above. Bounded by languagePairCount_ so an Alt+<N>
+    // with no matching pair falls through to the app untouched.
+    if (vk >= '1' && vk <= '9') {
+        const bool altOnly = (GetAsyncKeyState(VK_MENU) & 0x8000) &&
+                             !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+                             !(GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+                             !(GetAsyncKeyState(VK_LWIN) & 0x8000) &&
+                             !(GetAsyncKeyState(VK_RWIN) & 0x8000);
+        const int index = vk - '1';
+        if (altOnly && index < languagePairCount_) {
+            if (callbacks_.onForceLanguage) {
+                callbacks_.onForceLanguage(index);
+            }
+            return true;  // consume so the app never sees the Alt+<N> chord
+        }
+    }
+
     if (IsModifierKey(vk)) {
         return false;  // lone Shift/Ctrl/... press
     }
