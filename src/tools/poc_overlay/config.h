@@ -3,8 +3,17 @@
 #include <commctrl.h>  // HOTKEYF_*
 
 #include <string>
+#include <vector>
 
 #include "hook_manager.h"  // Shortcut
+
+// A translation direction cycled by the language switcher. The source language
+// is auto-detected by the model, so only the TARGET drives the system prompt
+// (and thus which cached radix branch is hit); `label` is purely for the HUD.
+struct LanguagePair {
+    std::wstring label;   // "EN -> RU" -- shown in the switcher HUD
+    std::wstring target;  // "Russian" -- used verbatim in the system prompt
+};
 
 // How far back from the caret the live capture area extends. Boundaries nest:
 // a newline always ends the capture; Sentence additionally stops at . ! ?;
@@ -32,8 +41,17 @@ inline CaptureGranularity CaptureGranularityFromString(const std::string& s,
 // encoding as everything else in this PoC (see Shortcut). The inference fields
 // mirror the playground server's generation settings.
 struct Config {
-    Shortcut activationShortcut{HOTKEYF_ALT | HOTKEYF_SHIFT, 'T'};  // Alt+Shift+T (master toggle)
-    Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};            // Ctrl+Enter
+    Shortcut activationShortcut{HOTKEYF_ALT | HOTKEYF_SHIFT, 'T'};      // Alt+Shift+T (master toggle)
+    Shortcut commitShortcut{HOTKEYF_CONTROL, VK_RETURN};               // Ctrl+Enter
+    Shortcut cycleLanguageShortcut{HOTKEYF_ALT | HOTKEYF_SHIFT, 'L'};  // Alt+Shift+L (cycle direction)
+
+    // Translation directions cycled by cycleLanguageShortcut. Each compiles its
+    // own .bkv branch on first run; the radix tree dedups the shared prefix.
+    std::vector<LanguagePair> languagePairs{
+        {L"EN -> RU", L"Russian"},
+        {L"RU -> EN", L"English"},
+    };
+    int activeLanguage = 0;  // index into languagePairs
 
     std::wstring modelPath;    // weights directory / file
     int contextSize = 4096;    // KV-cache / context window (tokens)

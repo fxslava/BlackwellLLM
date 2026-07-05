@@ -88,15 +88,16 @@ public:
 
     // `adapter` must outlive this object and must already own a live, Ready
     // engine (this class never constructs/tears down the engine itself --
-    // that stays TranslationService's job). `system_prompt` is the exact,
-    // already-rendered finish-only protocol text (see translation_service.cpp
-    // BuildPreviewPrompt) -- byte-identical to what the JIT cache compiled, so
-    // the two share radix-tree pages. `temperature`/`top_p` govern the DECODE
-    // steps only; the prompt phase (reconcile + first-token sample) is always
-    // deterministic, matching the adapter's own convention.
+    // that stays TranslationService's job). `system_prompts` holds one exact,
+    // already-rendered finish-only protocol text PER translation direction (see
+    // translation_service.cpp BuildPreviewPrompt) -- each byte-identical to the
+    // matching .bkv branch the JIT cache compiled, so they share radix-tree
+    // pages. `active_language` indexes it; SetActiveLanguage() switches live.
+    // `temperature`/`top_p` govern the DECODE steps only; the prompt phase
+    // (reconcile + first-token sample) is always deterministic.
     LiveTranslationTracker(playground::BlackwellLLMAdapter& adapter,
-                           std::string system_prompt, int max_new_tokens,
-                           float temperature, float top_p);
+                           std::vector<std::string> system_prompts, int active_language,
+                           int max_new_tokens, float temperature, float top_p);
     ~LiveTranslationTracker();
 
     LiveTranslationTracker(const LiveTranslationTracker&) = delete;
@@ -129,6 +130,12 @@ public:
     // how different it is from what came before.
     void Cancel();
 
+    // Switch the active translation direction (index into `system_prompts`).
+    // Thread-safe (atomic); out-of-range indices are clamped. The next request
+    // builds tokens from the new prompt -- update_sequence simply reconciles the
+    // (now larger) diff, so no explicit session reset is needed.
+    void SetActiveLanguage(int index);
+
 private:
     enum class JobKind { Track, Generate };
     struct Job {
@@ -158,13 +165,16 @@ private:
     // (and the same sequence the JIT cache compiler produced for the system
     // prompt prefix).
     std::vector<int> BuildTokens(const std::wstring& text, const std::wstring& context) const;
+    // The system prompt for the currently-active direction (clamped read).
+    const std::string& ActivePrompt() const;
     // Stream the text between <finish> and the (possibly still-streaming)
     // </finish> to `callback` if it changed since `last_posted`.
     void StreamPartial(const std::string& acc, const StreamCallback& callback,
                        std::wstring& last_posted) const;
 
     playground::BlackwellLLMAdapter& adapter_;
-    std::string system_prompt_;
+    std::vector<std::string> system_prompts_;      // one per translation direction
+    std::atomic<int> active_language_{0};          // index into system_prompts_
     int max_new_tokens_;
     float temperature_;
     float top_p_;

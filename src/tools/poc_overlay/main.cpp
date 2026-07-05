@@ -33,7 +33,10 @@
 #include <windows.h>
 #include <objbase.h>
 
+#include <algorithm>
+#include <cwctype>
 #include <string>
+#include <vector>
 
 #include "caret_tracker.h"
 #include "config.h"
@@ -59,6 +62,37 @@ CaretTracker* g_caretTracker = nullptr;
 // "Initializing..." to "ACTIVE". Only touched on the UI thread.
 TranslationService* g_translator = nullptr;
 
+// Map the configured language pairs onto the CaretTracker's OS-aware routing
+// indices. The source language is auto-detected by the model, so we key off each
+// pair's TARGET name: a pair targeting English is the "translate away from
+// Russian" branch (used when typing on a Cyrillic layout), a pair targeting
+// Russian is the "translate away from English" branch (Latin layout) and also
+// the asymmetric reading default for selections. Robust fallbacks keep every
+// index in range for single-pair or exotic configs.
+CaretTracker::LanguageRouting DeriveLanguageRouting(const std::vector<LanguagePair>& pairs) {
+    CaretTracker::LanguageRouting routing;
+    routing.count = static_cast<int>(pairs.size());
+
+    auto findTarget = [&](const wchar_t* needle) -> int {
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            std::wstring t = pairs[i].target;
+            std::transform(t.begin(), t.end(), t.begin(), ::towlower);
+            if (t.find(needle) != std::wstring::npos) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    };
+    const int toRussian = findTarget(L"rus");  // EN->RU branch
+    const int toEnglish = findTarget(L"eng");  // RU->EN branch
+    const int fallback = 0;                    // always in range (count>=1 in practice)
+
+    routing.typingLatin = (toRussian >= 0) ? toRussian : fallback;       // typing EN -> RU
+    routing.typingCyrillic = (toEnglish >= 0) ? toEnglish : fallback;    // typing RU -> EN
+    routing.selectionReading = (toRussian >= 0) ? toRussian : fallback;  // read foreign -> RU
+    return routing;
+}
+
 // Pushes a config into the running app: rebinds hotkeys and capture settings
 // in memory immediately. (Model path / context size are engine-construction
 // parameters and require a restart.)
@@ -66,6 +100,7 @@ void ApplyConfig(const Config& config) {
     g_config = config;
     HookManager::Instance().SetCommitShortcut(config.commitShortcut);
     HookManager::Instance().SetActivationShortcut(config.activationShortcut);
+    HookManager::Instance().SetCycleLanguageShortcut(config.cycleLanguageShortcut);
     if (g_caretTracker) {
         g_caretTracker->SetCaptureSettings(config.captureGranularity, config.idleTimerMs);
     }
@@ -158,6 +193,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // The preview sink is late-bound below, once the CaretTracker exists.
     TranslationService::Settings svcSettings;
     svcSettings.modelDir = g_config.modelPath;
+    // Each configured direction becomes a system prompt + a JIT-compiled .bkv
+    // branch (the radix tree dedups the shared prefix). Only the target language
+    // name reaches the service; the "EN -> RU" label is a UI concern.
+    svcSettings.targetLanguages.clear();  // replace the {"English"} default
+    for (const LanguagePair& pair : g_config.languagePairs) {
+        svcSettings.targetLanguages.push_back(ToUtf8(pair.target));
+    }
+    svcSettings.activeLanguage = g_config.activeLanguage;
     // promptCacheRoot left empty -> %LOCALAPPDATA%\Blackwell\Cache. The service
     // derives the per-model subdirectory from the loaded checkpoint's hash and
     // JIT-compiles the .bkv prompt cache there on first run -- nothing is
@@ -197,9 +240,33 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     trackerCallbacks.injectionGuard = [](bool active) {
         HookManager::Instance().SetInjecting(active);
     };
+    // The tracker owns the effective translation direction (OS-aware typing lock,
+    // asymmetric selection reading, or a manual override) and pushes it to the
+    // engine right before each request so the correct .bkv branch is addressed.
+    trackerCallbacks.setActiveLanguage = [&translator](int index) {
+        translator.SetActiveLanguage(index);
+    };
     CaretTracker caretTracker(std::move(trackerCallbacks), g_config.captureGranularity,
-                              g_config.idleTimerMs);
+                              g_config.idleTimerMs, DeriveLanguageRouting(g_config.languagePairs));
     g_caretTracker = &caretTracker;
+
+    // The overlay's header/dropdown chrome: give it the pair labels to display,
+    // a sink to apply a manual override (dropdown or the Auto row), and a sink to
+    // publish its clickable region so the global mouse hook lets those clicks
+    // through instead of hiding the overlay.
+    {
+        std::vector<std::wstring> labels;
+        for (const LanguagePair& pair : g_config.languagePairs) {
+            labels.push_back(pair.label);
+        }
+        overlay.SetLanguageLabels(std::move(labels));
+    }
+    overlay.SetOverrideSink([&caretTracker](int index) {
+        // -1 = Auto (clear the override, back to OS-aware routing); >=0 pins a pair.
+        caretTracker.SetLanguageOverride(index);
+    });
+    overlay.SetInteractiveRegionSink(
+        [](const RECT* rect) { HookManager::Instance().SetInteractiveRect(rect); });
 
     // Late-bound sink: translation deltas/finals flow back into the tracker's
     // state machine (thread-safe enqueue), which decides what the overlay shows.
@@ -265,6 +332,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     };
     // Left-button-up (Mode ACTIVE only): a selection may now exist -> translate it.
     callbacks.onSelectionCandidate = [&caretTracker]() { caretTracker.RequestSelectionCheck(); };
+    // Language switcher (Alt+Shift+L, Mode ACTIVE only): advance the active
+    // direction, push it to the tracker, and flash the new pair in a HUD. The
+    // next typing/selection translation uses it (the user can flip direction
+    // right before checking a reverse translation).
+    callbacks.onCycleLanguage = [&caretTracker]() {
+        const int count = static_cast<int>(g_config.languagePairs.size());
+        if (count <= 0) {
+            return;
+        }
+        g_config.activeLanguage = (g_config.activeLanguage + 1) % count;
+        // Cycling pins a manual override (like the overlay dropdown): the tracker
+        // owns pushing it to the engine, so OS-aware auto-routing is suspended
+        // until the user picks the "Auto" row in the dropdown.
+        caretTracker.SetLanguageOverride(g_config.activeLanguage);
+        caretTracker.ShowHud(L"Language: " + g_config.languagePairs[g_config.activeLanguage].label,
+                             /*fade=*/true);
+    };
 
     const bool hookInstalled = HookManager::Instance().Install(std::move(callbacks));
     if (!hookInstalled) {

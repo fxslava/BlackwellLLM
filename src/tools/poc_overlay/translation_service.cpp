@@ -87,10 +87,27 @@ std::string BuildPreviewPrompt(const std::string& lang) {
 
 }  // namespace
 
-TranslationService::TranslationService(Settings settings)
-    : settings_(std::move(settings)),
-      previewPrompt_(BuildPreviewPrompt(settings_.targetLang)) {
+TranslationService::TranslationService(Settings settings) : settings_(std::move(settings)) {
+    // One system prompt per configured direction. The set is fixed for the
+    // session; the switcher only changes WHICH one is active.
+    for (const std::string& lang : settings_.targetLanguages) {
+        previewPrompts_.push_back(BuildPreviewPrompt(lang));
+    }
+    if (previewPrompts_.empty()) {
+        previewPrompts_.push_back(BuildPreviewPrompt("English"));
+    }
+    int active = settings_.activeLanguage;
+    if (active < 0 || active >= static_cast<int>(previewPrompts_.size())) {
+        active = 0;
+    }
+    activeLanguage_.store(active, std::memory_order_relaxed);
     worker_ = std::thread(&TranslationService::ThreadMain, this);
+}
+
+void TranslationService::SetActiveLanguage(int index) {
+    activeLanguage_.store(index, std::memory_order_relaxed);  // remembered for the handoff
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (tracker_) tracker_->SetActiveLanguage(index);  // clamps internally
 }
 
 TranslationService::~TranslationService() {
@@ -158,8 +175,8 @@ void TranslationService::ThreadMain() {
     // scope -- its destructor joins that thread before this function returns,
     // so `tracker_` never gets published in a half-torn-down state.
     auto tracker = std::make_unique<LiveTranslationTracker>(
-        *adapter_, previewPrompt_, settings_.previewMaxNewTokens, settings_.temperature,
-        settings_.topP);
+        *adapter_, previewPrompts_, activeLanguage_.load(std::memory_order_relaxed),
+        settings_.previewMaxNewTokens, settings_.temperature, settings_.topP);
     std::lock_guard<std::mutex> lock(mutex_);
     if (!stop_.load(std::memory_order_relaxed)) {
         tracker_ = std::move(tracker);
@@ -300,30 +317,51 @@ bool TranslationService::CompilePromptCache(const std::wstring& dir) {
     using blackwell::paging::WarmupNode;
     using blackwell::paging::WarmupSpec;
 
-    // The cacheable text is the byte-exact serving prefix, not the raw prompt:
-    // radix-tree hits happen on token ids, and the serving path (both the
-    // adapter's generate() and LiveTranslationTracker's BuildTokens) tokenizes
-    // the chat-template-RENDERED transcript. An unrendered/misaligned node
-    // would compile fine and then never match.
-    const std::string prefix = StableServingPrefix();
-    if (prefix.empty()) {
+    // The WarmupSpec, constructed in C++ (no spec.json on disk). One ROOT PER
+    // translation direction: each holds that direction's full, chat-template-
+    // rendered system block (role framing, translation rules, the <finish>
+    // protocol -- and, critically, the target language). We emit them as
+    // sibling roots rather than a hand-built base+children tree because the
+    // radix tree dedups the shared LEADING tokens automatically at commit /
+    // serve time: "You translate text into " is identical across directions and
+    // shares pages; the branches diverge only at the language token onward. No
+    // fragile mid-sentence BPE seam to get right.
+    //
+    // The cacheable text per branch is the byte-exact serving PREFIX, not the
+    // raw prompt: radix-tree hits happen on token ids, and the serving path
+    // (LiveTranslationTracker's BuildTokens) tokenizes the RENDERED transcript.
+    // An unrendered/misaligned node would compile fine and then never match.
+    // Human-readable direction name for the logs (index-aligned with
+    // previewPrompts_ / targetLanguages), so the multi-branch compile is legible.
+    const auto branchName = [this](size_t i) -> std::wstring {
+        if (i < settings_.targetLanguages.size()) {
+            return L"->" + FromUtf8(settings_.targetLanguages[i]);
+        }
+        return L"#" + std::to_wstring(i);
+    };
+
+    WarmupSpec spec;
+    spec.name = "overlay-translator";
+    spec.emit_mode = WarmupSpec::EmitMode::All;
+    for (size_t i = 0; i < previewPrompts_.size(); ++i) {
+        const std::string prefix = StableServingPrefix(previewPrompts_[i]);
+        if (prefix.empty()) {
+            Log(L"prompt cache: no stable serving prefix for direction " + branchName(i) +
+                L"; skipping that branch");
+            continue;
+        }
+        WarmupNode node;
+        node.id = "system_prompt_" + std::to_string(i);
+        node.text = prefix;
+        Log(L"prompt cache: queuing branch " + branchName(i) + L" (" +
+            std::to_wstring(prefix.size()) + L" prefix bytes)");
+        spec.roots.push_back(std::move(node));
+    }
+    if (spec.roots.empty()) {
         Log(L"prompt cache: no stable serving prefix could be derived for this "
             L"chat template; skipping compilation");
         return false;
     }
-
-    // The WarmupSpec, constructed in C++ (no spec.json on disk). One root node
-    // today: the full system block -- role framing, translation rules and the
-    // <finish> protocol instructions ride inside it. The tree shape is ready
-    // for children (e.g. per-target-language variants) as long as every child
-    // extends the parent at a BPE-safe seam.
-    WarmupSpec spec;
-    spec.name = "overlay-translator";
-    spec.emit_mode = WarmupSpec::EmitMode::All;
-    WarmupNode node;
-    node.id = "system_prompt";
-    node.text = prefix;
-    spec.roots.push_back(std::move(node));
 
     // The engine's own prefill coordinator IS the production IPrefillDriver;
     // the adapter bound the checkpoint's tokenizer to it at construction, so
@@ -350,13 +388,13 @@ bool TranslationService::CompilePromptCache(const std::wstring& dir) {
     return true;
 }
 
-std::string TranslationService::StableServingPrefix() const {
+std::string TranslationService::StableServingPrefix(const std::string& previewPrompt) const {
     using Adapter = playground::BlackwellLLMAdapter;
 
     // Render two otherwise-identical transcripts that diverge only in the user
     // turn; their longest common prefix is everything the chat template emits
     // before request-specific content -- template-agnostically.
-    const std::string head = "[SYSTEM]\n" + previewPrompt_ + "\n\n[USER]\n";
+    const std::string head = "[SYSTEM]\n" + previewPrompt + "\n\n[USER]\n";
     const std::string a =
         Adapter::apply_chat_template(head + "A\n\n", adapter_->chat_template());
     const std::string b =

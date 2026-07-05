@@ -39,6 +39,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 class LiveTranslationTracker;
 
@@ -55,7 +56,11 @@ public:
         // .bkv prompt library there on first run, and warm-starts from it on
         // every run. Empty = %LOCALAPPDATA%\Blackwell\Cache.
         std::wstring promptCacheRoot;
-        std::string targetLang = "English";
+        // Target language NAME per translation direction (e.g. {"Russian",
+        // "English"}); the model auto-detects the source. Each gets its own
+        // system prompt + .bkv branch; the radix tree dedups the shared prefix.
+        std::vector<std::string> targetLanguages{"English"};
+        int activeLanguage = 0;  // initial index into targetLanguages
         size_t maxSeqLen = 4096;
         float temperature = 0.2f;  // low: translation wants determinism
         float topP = 0.9f;
@@ -103,6 +108,11 @@ public:
     // abort an in-flight decode.
     void Cancel();
 
+    // Switch the active translation direction (index into Settings::
+    // targetLanguages). Thread-safe; remembered and applied to the tracker
+    // even if it is called before the model finishes loading.
+    void SetActiveLanguage(int index);
+
     // Join the worker (and, once constructed, the tracker's own thread).
     // Called explicitly from wWinMain BEFORE stack unwinding so the sink can
     // never fire into an already-destroyed CaretTracker (the tracker is
@@ -128,20 +138,22 @@ private:
     // <dir>. Returns false when there was nothing cacheable (e.g. the stable
     // prefix is shorter than one KV page). Throws on engine/serializer errors.
     bool CompilePromptCache(const std::wstring& dir);
-    // The byte-exact, BPE-seam-safe prefix of every serving prompt: the
-    // chat-template-rendered system block, cut right after the end-of-turn
+    // The byte-exact, BPE-seam-safe prefix of `previewPrompt`'s serving prompt:
+    // the chat-template-rendered system block, cut right after the end-of-turn
     // marker. Empty when no safe prefix could be derived. LiveTranslationTracker
     // reconstructs the SAME transcript shape at request time (see BuildTokens);
-    // this is only the STATIC prefix used to seed the .bkv cache.
-    std::string StableServingPrefix() const;
+    // this is only the STATIC prefix used to seed one .bkv branch.
+    std::string StableServingPrefix(const std::string& previewPrompt) const;
     void DeliverToSink(std::uint64_t gen, const std::wstring& text, bool done);
 
     Settings settings_;
 
-    // Byte-stable per session (KV prefix reuse); built once in the constructor,
-    // shared by StableServingPrefix() (JIT cache compile) and the tracker
-    // (live requests) so both address the same radix-tree pages.
-    std::string previewPrompt_;
+    // One byte-stable system prompt per translation direction (KV prefix reuse);
+    // built once in the constructor, shared by CompilePromptCache (JIT compile,
+    // one .bkv branch each) and the tracker (live requests) so both address the
+    // same radix-tree pages. Never empty (at least one entry).
+    std::vector<std::string> previewPrompts_;
+    std::atomic<int> activeLanguage_{0};  // remembered across the tracker handoff
 
     // Owned by the load thread until handed off; tracker_ then owns all
     // further engine access on its own thread. Both guarded by mutex_ so

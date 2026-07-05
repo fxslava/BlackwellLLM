@@ -79,14 +79,35 @@ std::wstring ExtractFinishBody(const std::string& acc, bool require_close) {
 }  // namespace
 
 LiveTranslationTracker::LiveTranslationTracker(playground::BlackwellLLMAdapter& adapter,
-                                               std::string system_prompt, int max_new_tokens,
+                                               std::vector<std::string> system_prompts,
+                                               int active_language, int max_new_tokens,
                                                float temperature, float top_p)
     : adapter_(adapter),
-      system_prompt_(std::move(system_prompt)),
+      system_prompts_(std::move(system_prompts)),
       max_new_tokens_(max_new_tokens),
       temperature_(temperature),
       top_p_(top_p) {
+    if (system_prompts_.empty()) {
+        system_prompts_.emplace_back();  // never index into an empty vector
+    }
+    if (active_language < 0 || active_language >= static_cast<int>(system_prompts_.size())) {
+        active_language = 0;
+    }
+    active_language_.store(active_language, std::memory_order_relaxed);
     worker_ = std::thread(&LiveTranslationTracker::ThreadMain, this);
+}
+
+void LiveTranslationTracker::SetActiveLanguage(int index) {
+    if (index < 0 || index >= static_cast<int>(system_prompts_.size())) {
+        return;  // out of range: ignore (system_prompts_ is immutable after ctor)
+    }
+    active_language_.store(index, std::memory_order_relaxed);
+}
+
+const std::string& LiveTranslationTracker::ActivePrompt() const {
+    // system_prompts_ is non-empty (ctor guarantees it) and immutable, so this
+    // atomic read is always in range.
+    return system_prompts_[active_language_.load(std::memory_order_relaxed)];
 }
 
 LiveTranslationTracker::~LiveTranslationTracker() {
@@ -196,9 +217,10 @@ std::vector<int> LiveTranslationTracker::BuildTokens(const std::wstring& text,
     }
     // Exactly AgentOrchestrator::render_transcript()'s shape (and exactly what
     // translation_service.cpp's StableServingPrefix rendered for the JIT cache
-    // compile): exact match matters here, not resemblance.
+    // compile): exact match matters here, not resemblance. ActivePrompt() picks
+    // the current direction's system block -> the matching cached radix branch.
     const std::string role_transcript =
-        "[SYSTEM]\n" + system_prompt_ + "\n\n[USER]\n" + user_turn + "\n\n[ASSISTANT]\n";
+        "[SYSTEM]\n" + ActivePrompt() + "\n\n[USER]\n" + user_turn + "\n\n[ASSISTANT]\n";
     const std::string prompt_text =
         Adapter::apply_chat_template(role_transcript, adapter_.chat_template());
 
@@ -349,7 +371,7 @@ void LiveTranslationTracker::RunGenerateFallback(const Job& job) {
                     ToUtf8(job.context) + "\n\n" + user_turn;
     }
     const std::string transcript =
-        "[SYSTEM]\n" + system_prompt_ + "\n\n[USER]\n" + user_turn + "\n\n[ASSISTANT]\n";
+        "[SYSTEM]\n" + ActivePrompt() + "\n\n[USER]\n" + user_turn + "\n\n[ASSISTANT]\n";
 
     playground::BlackwellLLMAdapter::Params params;
     params.temperature = temperature_;

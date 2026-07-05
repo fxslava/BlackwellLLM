@@ -28,4 +28,9 @@ struct OverlaySnapshot {
     POINT anchor{};            // caret point (Typing*) or mouse point (Selection*)
     bool anchorValid = false;  // false = nothing to anchor to -> treat as Hidden
     bool fade = false;         // CenterHud only: hold briefly, then fade out and hide
+    // Currently-effective translation direction (index into the app's language
+    // pairs) for the caret-anchored typing pipeline. -1 = unknown/not applicable
+    // (selection popup, HUD). Drives the overlay's header bar + override dropdown;
+    // the OverlayWindow maps the index to a label from its own configured list.
+    int language = -1;
 };

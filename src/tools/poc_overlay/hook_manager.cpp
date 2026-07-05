@@ -138,6 +138,15 @@ LRESULT CALLBACK HookManager::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM
     // Only track the mouse while Translation Mode is active, and never react to
     // clicks in our own UI (settings window).
     if (nCode == HC_ACTION && g_instance && g_instance->enabled_ && !ForegroundIsOwnProcess()) {
+        const auto* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        // A click on the overlay's own chrome (header bar / open dropdown) is UI
+        // interaction, not a context break: let it reach the overlay window
+        // untouched -- no reset (which would hide the overlay out from under the
+        // click) and no selection check.
+        if (g_instance->hasInteractiveRect_ && ms &&
+            PtInRect(&g_instance->interactiveRect_, ms->pt)) {
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        }
         // A button press can reposition the caret / dismiss a live popup: break
         // the input flow (cancels any in-flight generation, hides the overlay).
         if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN ||
@@ -189,6 +198,15 @@ bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
         fallbackBuffer_.clear();
         if (callbacks_.onCommit) {
             callbacks_.onCommit(snapshot);
+        }
+        return true;  // consume
+    }
+
+    // Language switcher shortcut: cycle the active translation direction.
+    const Shortcut cycle = cycleLanguageShortcut_;
+    if (cycle.vk != 0 && vk == cycle.vk && ModifiersMatch(cycle.modifiers)) {
+        if (callbacks_.onCycleLanguage) {
+            callbacks_.onCycleLanguage();
         }
         return true;  // consume
     }

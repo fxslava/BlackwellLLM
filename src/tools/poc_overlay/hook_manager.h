@@ -59,6 +59,9 @@ public:
         // A left-mouse-button release: a text selection may now exist -- go check
         // it via UIA. Only fired while Translation Mode is active.
         VoidCallback onSelectionCandidate;
+        // Language switcher shortcut: cycle to the next translation direction.
+        // Only fired while Translation Mode is active.
+        VoidCallback onCycleLanguage;
     };
 
     static HookManager& Instance();
@@ -74,11 +77,32 @@ public:
     void SetActivationShortcut(const Shortcut& shortcut) { activationShortcut_ = shortcut; }
     Shortcut GetActivationShortcut() const { return activationShortcut_; }
 
+    // Cycles the active translation direction (fires onCycleLanguage). Honored
+    // only while Translation Mode is active.
+    void SetCycleLanguageShortcut(const Shortcut& shortcut) { cycleLanguageShortcut_ = shortcut; }
+    Shortcut GetCycleLanguageShortcut() const { return cycleLanguageShortcut_; }
+
     // Guards a text-injection window: while set (and, more robustly, for any event
     // carrying TextInjector::kInjectedSignature), the keyboard hook passes input
     // straight through without treating it as user typing. Set it around a
     // TextInjector::Replace() call so we never re-trigger on our own keystrokes.
     void SetInjecting(bool injecting) { injecting_.store(injecting, std::memory_order_relaxed); }
+
+    // The overlay's clickable chrome (header bar / open dropdown) in SCREEN
+    // coordinates. While a mouse button-down/up lands inside it, the mouse hook
+    // treats the click as UI interaction -- it does NOT fire the context-break
+    // reset (which would hide the overlay) or the selection candidate, letting
+    // the click reach the overlay window instead. Pass nullptr to clear. Called
+    // on the hook-owning (UI) thread only -- same thread the hook procs run on --
+    // so no locking is required.
+    void SetInteractiveRect(const RECT* rect) {
+        if (rect) {
+            interactiveRect_ = *rect;
+            hasInteractiveRect_ = true;
+        } else {
+            hasInteractiveRect_ = false;
+        }
+    }
 
 private:
     HookManager() = default;
@@ -100,6 +124,10 @@ private:
     std::wstring fallbackBuffer_;
     Shortcut commitShortcut_;
     Shortcut activationShortcut_;
+    Shortcut cycleLanguageShortcut_;
     bool enabled_ = false;  // Translation Mode: OFF until the master toggle fires
     std::atomic<bool> injecting_{false};
+
+    RECT interactiveRect_{};            // overlay chrome (screen coords); see SetInteractiveRect
+    bool hasInteractiveRect_ = false;
 };

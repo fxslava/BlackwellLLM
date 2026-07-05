@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include <cwctype>
+#include <vector>
 
 #include "text_injector.h"
 
@@ -216,10 +217,11 @@ std::wstring CaretTracker::ExtractCapture(const std::wstring& segment,
 }
 
 CaretTracker::CaretTracker(Callbacks callbacks, CaptureGranularity granularity,
-                           int idleTimerMs)
+                           int idleTimerMs, LanguageRouting routing)
     : callbacks_(std::move(callbacks)),
       granularity_(static_cast<int>(granularity)),
-      idleTimerMs_(idleTimerMs > 0 ? idleTimerMs : 1) {
+      idleTimerMs_(idleTimerMs > 0 ? idleTimerMs : 1),
+      routing_(routing) {
     thread_ = std::thread(&CaretTracker::ThreadMain, this);
 }
 
@@ -276,6 +278,13 @@ void CaretTracker::SetActive(bool active) {
     cv_.notify_all();
 }
 
+void CaretTracker::SetLanguageOverride(int index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingOverride_ = index;  // latest wins; -1 clears the override (back to auto)
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
 void CaretTracker::ShowHud(std::wstring message, bool fade) {
     std::lock_guard<std::mutex> lock(mutex_);
     pendingHud_.emplace(std::move(message), fade);  // latest wins
@@ -311,6 +320,7 @@ void CaretTracker::ThreadMain() {
         bool doSelectionCheck = false;
         bool timerFired = false;
         std::optional<bool> setActive;
+        std::optional<int> setOverride;
         std::optional<std::pair<std::wstring, bool>> hud;
         std::optional<std::pair<std::wstring, bool>> translation;
         {
@@ -349,6 +359,7 @@ void CaretTracker::ThreadMain() {
                 hasPendingUpdate_ = false;
             }
             setActive.swap(pendingActive_);
+            setOverride.swap(pendingOverride_);
             hud.swap(pendingHud_);
             translation.swap(pendingTranslation_);
             hasPending_ = false;
@@ -361,6 +372,11 @@ void CaretTracker::ThreadMain() {
         // of this wake-up's handlers respect.
         if (setActive) {
             HandleSetActive(*setActive);
+        }
+        // A manual direction override (dropdown / cycle) is applied before any
+        // coalesced keystroke this wake-up, so the capture below uses it.
+        if (setOverride) {
+            HandleSetOverride(*setOverride);
         }
         if (hud) {
             HandleShowHud(hud->first, hud->second);
@@ -431,9 +447,18 @@ void CaretTracker::HandleKeystroke(IUIAutomation* automation, const std::wstring
     if (sourceRaw_.empty() || !anchorValid_) {
         phase_ = Phase::Idle;  // nothing captured (or nowhere to anchor)
         idleArmed_ = false;
+        sessionLanguage_ = -1;  // session ended; the next capture re-detects the layout
         Render();
         return;
     }
+
+    // A "new session" is any keystroke that did NOT arrive mid-typing-pipeline
+    // (i.e. we were Idle / in a HUD / in a selection popup): only THEN do we
+    // re-read the OS keyboard layout and lock the direction. Once locked, an
+    // accidental layout tap mid-sentence can no longer flip it.
+    const bool newSession = (phase_ != Phase::Typing && phase_ != Phase::Translating &&
+                             phase_ != Phase::Ready);
+    PublishLanguage(ResolveTypingLanguage(newSession));
 
     phase_ = Phase::Typing;
     idleArmed_ = true;
@@ -572,15 +597,14 @@ void CaretTracker::HandleCommit(IUIAutomation* automation) {
         injected = TextInjector::Replace(request) != TextInjector::Tier::None;
     }
 
-    if (injected) {
-        // The AI history keeps the ORIGINAL text (what the user actually wrote).
-        if (!inferenceContext_.empty()) {
-            inferenceContext_ += L' ';
-        }
-        inferenceContext_ += sourceRaw_;
-        OutputDebugStringW(
-            (L"[poc_overlay] InferenceContext: \"" + inferenceContext_ + L"\"\n").c_str());
-    }
+    // CONTEXT BLEED FIX: this is a STATELESS translation prosthetic. Do NOT
+    // accumulate committed source into inferenceContext_ -- the assistant's
+    // reply was injected into the field WITHOUT chat-template turn markers, so
+    // feeding "<prev source><prev translation><new source>" back as one user
+    // turn made the model re-emit the previous output. Every commit ends the
+    // conversation: the next capture is a fresh single user turn vs. the system
+    // prompt. (committedPrefix_ still hides the applied text from the capture.)
+    inferenceContext_.clear();
 
     if (callbacks_.injectionGuard) {
         callbacks_.injectionGuard(false);
@@ -612,19 +636,38 @@ void CaretTracker::ResetToIdle() {
     sourceRaw_.clear();
     translationRaw_.clear();
     translationPartial_.clear();
+    inferenceContext_.clear();  // manual reset -> fresh conversation (context fix)
     idleArmed_ = false;
+    sessionLanguage_ = -1;      // the next capture re-detects the OS layout
     Render();
 }
 
 void CaretTracker::HandleSelectionCheck(IUIAutomation* automation) {
     ComPtr<IUIAutomationElement> focused;
-    if (FAILED(automation->GetFocusedElement(&focused)) || !focused) {
-        return;  // no focus -> a bare click, nothing to translate
-    }
     ComPtr<IUIAutomationTextRange> range;
     std::wstring selected;
-    if (!ReadSelection(focused.Get(), range, selected)) {
-        return;  // just a click / caret move -- no highlighted text
+
+    // Primary: the focused element's UIA text SELECTION. Fails silently on
+    // UIA-opaque controls (Qt/Telegram, WinUI3/Notepad) -- they either expose no
+    // TextPattern at all or hand back an empty range even with text highlighted.
+    if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused) {
+        ReadSelection(focused.Get(), range, selected);  // leaves `selected` empty on failure
+    }
+
+    // Bulletproof fallback: no usable UIA selection -> back up the clipboard,
+    // synthesize Ctrl+C against the focused control, read what it copied, and
+    // restore the clipboard. This yields the SOURCE text for a read-mode popup
+    // even in Qt/WinUI3. `range` stays null: there is no UIA range to Select() at
+    // commit time, so a Ctrl+Enter over such a selection is a best-effort no-op
+    // (the reading use-case does not write back) -- see HandleSelectionCommit.
+    if (selected.empty()) {
+        std::wstring clip;
+        if (ReadSelectionViaClipboard(clip)) {
+            selected = std::move(clip);
+        }
+    }
+    if (selected.empty()) {
+        return;  // genuinely just a click / caret move -- no highlighted text
     }
 
     // Supersede anything in flight (a prior popup or typing translation).
@@ -644,6 +687,12 @@ void CaretTracker::HandleSelectionCheck(IUIAutomation* automation) {
     translationRaw_.clear();
     phase_ = Phase::SelTranslating;
     idleArmed_ = false;
+    sessionLanguage_ = -1;  // a selection interrupts any locked typing session
+
+    // Asymmetric direction: a selection ignores the OS layout entirely and uses
+    // the reading default (e.g. EN->RU) -- read foreign text while your layout
+    // stays ready to reply -- unless a manual override is pinned.
+    PublishLanguage(ResolveSelectionLanguage());
 
     // A selection is an EXPLICIT request: warm the tree AND fire generation now
     // (no debounce, unlike the typing flow).
@@ -677,14 +726,12 @@ void CaretTracker::HandleSelectionCommit(IUIAutomation* automation) {
             request.source = sourceRaw_;
             request.replacement = translationRaw_;
             request.selectionRange = range.Get();  // Tier 2: Select() (idempotent) + paste
-            if (TextInjector::Replace(request) != TextInjector::Tier::None) {
-                if (!inferenceContext_.empty()) {
-                    inferenceContext_ += L' ';
-                }
-                inferenceContext_ += sourceRaw_;  // AI history keeps the original
-            }
+            TextInjector::Replace(request);
         }
     }
+    // Stateless prosthetic: a selection translation is a one-shot, so the
+    // context never carries across it (see HandleCommit for the full rationale).
+    inferenceContext_.clear();
 
     if (callbacks_.injectionGuard) {
         callbacks_.injectionGuard(false);
@@ -738,6 +785,9 @@ void CaretTracker::Render() const {
     OverlaySnapshot snapshot;
     snapshot.anchor = anchor_;
     snapshot.anchorValid = anchorValid_;
+    // The header bar + override dropdown only exist for the caret-anchored typing
+    // pipeline; the locked session direction drives them.
+    snapshot.language = sessionLanguage_;
     switch (phase_) {
         case Phase::Idle:
             snapshot.phase = OverlayPhase::Hidden;
@@ -832,4 +882,209 @@ std::wstring CaretTracker::StripCommittedPrefix(const std::wstring& fullText) {
     committedPrefix_.clear();
     inferenceContext_.clear();
     return fullText;
+}
+
+// ---------------------------------------------------------------------------
+// OS-aware language routing (worker thread only)
+// ---------------------------------------------------------------------------
+
+int CaretTracker::DetectTypingLanguage() const {
+    // The FOREGROUND thread's active keyboard layout is what actually produces
+    // the glyphs the user is typing (our own STA thread's layout is irrelevant).
+    const DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    const HKL layout = GetKeyboardLayout(fgThread);
+    const auto lang = static_cast<LANGID>(LOWORD(reinterpret_cast<UINT_PTR>(layout)));
+    // A Cyrillic (Russian) layout means the user is typing Russian -> translate
+    // AWAY from it (RU->EN); any other (Latin) layout -> EN->RU. PRIMARYLANGID
+    // keeps this robust across every Russian sublanguage.
+    if (PRIMARYLANGID(lang) == LANG_RUSSIAN) {
+        return routing_.typingCyrillic;
+    }
+    return routing_.typingLatin;
+}
+
+int CaretTracker::ResolveTypingLanguage(bool newSession) {
+    if (!newSession && sessionLanguage_ >= 0) {
+        return sessionLanguage_;  // locked for the whole session -- no mid-sentence flip
+    }
+    // A manual override pins the direction regardless of the OS layout; otherwise
+    // read the layout fresh and lock it in for the rest of this typing session.
+    sessionLanguage_ = languageOverride_ ? *languageOverride_ : DetectTypingLanguage();
+    return sessionLanguage_;
+}
+
+int CaretTracker::ResolveSelectionLanguage() const {
+    // Asymmetric: never the OS layout -- the reading default unless pinned.
+    return languageOverride_ ? *languageOverride_ : routing_.selectionReading;
+}
+
+void CaretTracker::PublishLanguage(int index) {
+    if (index < 0 || index >= routing_.count) {
+        return;  // unconfigured / out of range: keep the engine's current branch
+    }
+    if (index == publishedLanguage_) {
+        return;  // unchanged: a burst of same-direction keystrokes costs one store
+    }
+    publishedLanguage_ = index;
+    if (callbacks_.setActiveLanguage) {
+        callbacks_.setActiveLanguage(index);
+    }
+}
+
+void CaretTracker::HandleSetOverride(int index) {
+    if (index >= 0 && index < routing_.count) {
+        languageOverride_ = index;
+    } else {
+        languageOverride_.reset();  // -1 (or garbage) clears the pin -> OS-aware auto
+    }
+    // Apply immediately to a live typing session: relock to the new direction and
+    // push it so the very next keystroke's speculative prefill (and the header)
+    // use it. Idle/selection/HUD states pick it up on their next action.
+    if (phase_ == Phase::Typing || phase_ == Phase::Translating || phase_ == Phase::Ready) {
+        sessionLanguage_ = languageOverride_ ? *languageOverride_ : DetectTypingLanguage();
+        PublishLanguage(sessionLanguage_);
+        Render();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard-fallback selection capture (worker thread only)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Open the clipboard, tolerating the brief windows another process holds it.
+bool OpenClipboardRetry() {
+    for (int i = 0; i < 12; ++i) {
+        if (OpenClipboard(nullptr)) return true;
+        Sleep(8);
+    }
+    return false;
+}
+
+// A byte-exact snapshot of every HGLOBAL-backed clipboard format, so an injected
+// Ctrl+C can borrow the clipboard and then hand it back untouched. Non-HGLOBAL
+// formats (CF_BITMAP / CF_METAFILEPICT / CF_HDROP as a handle) are skipped --
+// adequate for text-selection contexts, where CF_UNICODETEXT and any HTML/RTF
+// payloads are all global-memory backed.
+struct ClipboardBackup {
+    struct Entry {
+        UINT format = 0;
+        std::vector<BYTE> bytes;
+    };
+    std::vector<Entry> entries;
+    bool captured = false;
+};
+
+ClipboardBackup BackupClipboard() {
+    ClipboardBackup backup;
+    if (!OpenClipboardRetry()) return backup;
+    for (UINT fmt = EnumClipboardFormats(0); fmt != 0; fmt = EnumClipboardFormats(fmt)) {
+        HANDLE handle = GetClipboardData(fmt);
+        if (!handle) continue;
+        const SIZE_T size = GlobalSize(handle);
+        if (size == 0) continue;  // not an HGLOBAL (or empty) -- skip
+        if (const void* src = GlobalLock(handle)) {
+            ClipboardBackup::Entry entry;
+            entry.format = fmt;
+            entry.bytes.assign(static_cast<const BYTE*>(src),
+                               static_cast<const BYTE*>(src) + size);
+            GlobalUnlock(handle);
+            backup.entries.push_back(std::move(entry));
+        }
+    }
+    CloseClipboard();
+    backup.captured = true;
+    return backup;
+}
+
+void RestoreClipboard(const ClipboardBackup& backup) {
+    if (!backup.captured || !OpenClipboardRetry()) return;
+    EmptyClipboard();
+    for (const auto& entry : backup.entries) {
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, entry.bytes.size());
+        if (!mem) continue;
+        if (void* dst = GlobalLock(mem)) {
+            memcpy(dst, entry.bytes.data(), entry.bytes.size());
+            GlobalUnlock(mem);
+            if (!SetClipboardData(entry.format, mem)) {
+                GlobalFree(mem);  // ownership not transferred
+            }
+        } else {
+            GlobalFree(mem);
+        }
+    }
+    CloseClipboard();
+}
+
+bool ReadClipboardUnicode(std::wstring& out) {
+    if (!OpenClipboardRetry()) return false;
+    bool ok = false;
+    if (HANDLE handle = GetClipboardData(CF_UNICODETEXT)) {
+        if (const auto* text = static_cast<const wchar_t*>(GlobalLock(handle))) {
+            out.assign(text);
+            GlobalUnlock(handle);
+            ok = true;
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
+// Synthesize a clean Ctrl+C: drop any physically-held modifier first (a stray
+// Shift/Alt would turn it into a different chord), then Ctrl down / C / Ctrl up.
+// Every event is tagged with the injector signature so our own low-level
+// keyboard hook recognizes and passes it straight through.
+void SendCopyChord() {
+    INPUT seq[8] = {};
+    int n = 0;
+    const auto key = [&](WORD vk, bool up) {
+        seq[n].type = INPUT_KEYBOARD;
+        seq[n].ki.wVk = vk;
+        seq[n].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        seq[n].ki.dwExtraInfo = TextInjector::kInjectedSignature;
+        ++n;
+    };
+    key(VK_LSHIFT, /*up=*/true);
+    key(VK_RSHIFT, /*up=*/true);
+    key(VK_LMENU, /*up=*/true);
+    key(VK_RMENU, /*up=*/true);
+    key(VK_CONTROL, /*up=*/false);
+    key('C', /*up=*/false);
+    key('C', /*up=*/true);
+    key(VK_CONTROL, /*up=*/true);
+    SendInput(static_cast<UINT>(n), seq, sizeof(INPUT));
+}
+
+}  // namespace
+
+bool CaretTracker::ReadSelectionViaClipboard(std::wstring& out) {
+    // Bracket the whole round-trip with the injection guard so the synthetic
+    // Ctrl+C never re-enters our keyboard hook as user input (or a chord reset).
+    if (callbacks_.injectionGuard) callbacks_.injectionGuard(true);
+
+    const ClipboardBackup backup = BackupClipboard();
+    const DWORD seqBefore = GetClipboardSequenceNumber();
+
+    SendCopyChord();
+
+    // The target services the copy on ITS OWN thread, so poll the clipboard
+    // sequence number (bumped by any SetClipboardData -- even copying identical
+    // text) rather than sleeping a fixed, guessed interval. An unchanged number
+    // means the control copied nothing: there was no real selection.
+    std::wstring text;
+    for (int i = 0; i < 25; ++i) {  // up to ~250 ms, then give up
+        Sleep(10);
+        if (GetClipboardSequenceNumber() != seqBefore) {
+            ReadClipboardUnicode(text);
+            break;
+        }
+    }
+
+    RestoreClipboard(backup);
+    if (callbacks_.injectionGuard) callbacks_.injectionGuard(false);
+
+    if (text.empty()) return false;
+    out = std::move(text);
+    return true;
 }

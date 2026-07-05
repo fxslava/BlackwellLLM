@@ -57,10 +57,31 @@ struct IUIAutomationElement;
 // callbacks fire ON THIS WORKER THREAD and must only enqueue/marshal.
 class CaretTracker {
 public:
+    // OS-aware translation-direction routing. The typing pipeline picks a
+    // language-pair index from the FOREGROUND keyboard layout (locked for the
+    // whole typing session so an accidental layout tap mid-sentence never flips
+    // it); a highlighted-text selection ignores the layout entirely and uses the
+    // asymmetric `selectionReading` direction (read foreign text while keeping
+    // your layout ready to reply). All fields are indices into the app's
+    // languagePairs (see config.h) -- the exact same indices the
+    // TranslationService/LiveTranslationTracker address their .bkv branches by.
+    struct LanguageRouting {
+        int count = 0;             // number of configured language pairs
+        int typingCyrillic = 0;    // index used when typing on a Cyrillic (RU) layout -> RU->EN
+        int typingLatin = 0;       // index used when typing on a Latin (EN) layout   -> EN->RU
+        int selectionReading = 0;  // index used for a selection (asymmetric reading) -> EN->RU
+    };
+
     struct Callbacks {
         // State changed -> repaint. Wire to OverlayWindow::PostState (PostMessage-
         // marshaled, safe from this thread).
         std::function<void(const OverlaySnapshot&)> render;
+        // The effective translation direction changed (typing-session lock, a
+        // selection's reading direction, or a manual override). Fired on the
+        // worker thread BEFORE the matching trackUpdate/triggerGeneration so the
+        // engine addresses the correct .bkv branch. Wire to
+        // TranslationService::SetActiveLanguage (an atomic store; O(1)).
+        std::function<void(int languageIndex)> setActiveLanguage;
         // EVERY keystroke while a capture area exists: fire-and-forget
         // speculative background prefill of `source` (+ durable committed
         // `context`) that warms the engine's radix tree token-by-token as the
@@ -83,7 +104,8 @@ public:
         std::function<void(bool)> injectionGuard;
     };
 
-    CaretTracker(Callbacks callbacks, CaptureGranularity granularity, int idleTimerMs);
+    CaretTracker(Callbacks callbacks, CaptureGranularity granularity, int idleTimerMs,
+                 LanguageRouting routing);
     ~CaretTracker();
 
     // Keystroke trigger. `fallbackText` is used only if UIA yields no text.
@@ -112,6 +134,14 @@ public:
     // CenterHud banner owns the overlay). Typing/selection are only honored
     // while Active. Marshals into the worker loop; O(1).
     void SetActive(bool active);
+
+    // Manually override the active translation direction (index into the app's
+    // languagePairs), overriding the OS-aware typing heuristic and the selection
+    // reading default. Pass a valid index to pin a direction (e.g. the overlay
+    // header dropdown, or the Alt+Shift+L cycle); pass -1 to clear the override
+    // and return to fully automatic OS-aware routing. Marshals into the worker
+    // loop; O(1). Takes effect immediately for an in-progress typing session.
+    void SetLanguageOverride(int index);
 
     // Show a large, screen-centered HUD banner (master-toggle feedback). `fade`
     // = hold briefly, then dissolve and hide; !fade = persist until replaced
@@ -160,8 +190,33 @@ private:
     void HandleSelectionCommit(IUIAutomation* automation);  // Ctrl+Enter over a selection
     void HandleSetActive(bool active);
     void HandleShowHud(const std::wstring& message, bool fade);
+    void HandleSetOverride(int index);
     void ResetToIdle();
     void Render() const;
+
+    // --- OS-aware language routing (worker thread only) -----------------------
+    // Index of the language pair implied by the FOREGROUND window's current
+    // keyboard layout: Cyrillic (Russian) layout -> typingCyrillic, otherwise
+    // typingLatin. Reads GetKeyboardLayout for the focused thread.
+    int DetectTypingLanguage() const;
+    // Resolve the direction to use for a NEW typing session and lock it into
+    // sessionLanguage_: the manual override if one is set, else the OS layout.
+    // Idempotent within a session (only recomputed when a fresh session begins).
+    int ResolveTypingLanguage(bool newSession);
+    // Resolve the direction for a selection (asymmetric): the manual override if
+    // set, else the reading default -- never the OS layout.
+    int ResolveSelectionLanguage() const;
+    // Push `index` to the engine (setActiveLanguage callback) if it changed since
+    // the last push, so a burst of same-direction keystrokes costs one store.
+    void PublishLanguage(int index);
+
+    // Read once from `read_selection_via_clipboard`: UIA-opaque controls (Qt /
+    // Telegram, WinUI3 / Notepad) expose no usable text SELECTION, so fall back
+    // to a backup-clipboard + synthetic Ctrl+C + restore round-trip. Returns true
+    // and fills `out` only on a non-empty capture. Runs on the worker thread;
+    // brackets the synthetic copy with the injection guard so our own keyboard
+    // hook ignores it.
+    bool ReadSelectionViaClipboard(std::wstring& out);
 
     Callbacks callbacks_;
     std::thread thread_;
@@ -189,6 +244,12 @@ private:
     std::wstring committedPrefix_;
     std::wstring inferenceContext_;
 
+    // --- language routing (worker-thread-only) --------------------------------
+    LanguageRouting routing_;                  // index map from config (immutable)
+    std::optional<int> languageOverride_;      // manual pin (dropdown / cycle); nullopt = auto
+    int sessionLanguage_ = -1;                 // direction locked for the CURRENT typing session
+    int publishedLanguage_ = -1;               // last index handed to setActiveLanguage
+
     // --- cross-thread event slots (guarded by mutex_) -------------------------
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -198,6 +259,7 @@ private:
     bool pendingReset_ = false;
     bool pendingSelectionCheck_ = false;
     std::optional<bool> pendingActive_;                               // SetActive slot
+    std::optional<int> pendingOverride_;                              // SetLanguageOverride slot
     std::optional<std::pair<std::wstring, bool>> pendingHud_;         // message, fade
     std::optional<std::pair<std::wstring, bool>> pendingTranslation_;  // text, done
     bool hasPending_ = false;

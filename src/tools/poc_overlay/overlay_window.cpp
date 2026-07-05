@@ -1,4 +1,7 @@
+#define NOMINMAX
 #include "overlay_window.h"
+
+#include <windowsx.h>  // GET_X_LPARAM / GET_Y_LPARAM
 
 #include <algorithm>
 #include <cmath>
@@ -57,12 +60,14 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
 
-    // WS_EX_TRANSPARENT + WS_EX_NOACTIVATE: click-through and never steals focus
-    // from whatever the user is typing into. WS_EX_LAYERED: required for
-    // UpdateLayeredWindow per-pixel alpha. WS_EX_TOPMOST: stays above the target.
-    // WS_EX_TOOLWINDOW: keeps it out of the taskbar and Alt+Tab.
-    hwnd_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST |
-                                 WS_EX_TOOLWINDOW,
+    // WS_EX_NOACTIVATE: never steals focus from whatever the user is typing into.
+    // WS_EX_LAYERED: required for UpdateLayeredWindow per-pixel alpha. WS_EX_TOPMOST:
+    // stays above the target. WS_EX_TOOLWINDOW: keeps it out of the taskbar and
+    // Alt+Tab. NOTE: WS_EX_TRANSPARENT is deliberately NOT set -- the header bar /
+    // override dropdown must receive clicks. Click-through is instead implemented
+    // per-pixel in WM_NCHITTEST (HTTRANSPARENT everywhere but the interactive
+    // header/menu rects), so the body still never intercepts the user's clicks.
+    hwnd_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                              wc.lpszClassName, L"", WS_POPUP, 0, 0, kMaxWidth, kMaxHeight, nullptr,
                              nullptr, hInstance, this);
     if (!hwnd_) {
@@ -113,6 +118,17 @@ bool OverlayWindow::InitDirect2D() {
     popupFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
     popupFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
 
+    // Header bar + dropdown rows: small, left-aligned, vertically centered within
+    // their strip; never wraps (a language label is short and single-line).
+    if (FAILED(writeFactory_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                                13.0f, L"en-us", headerFormat_.GetAddressOf()))) {
+        return false;
+    }
+    headerFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    headerFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    headerFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
     const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
@@ -150,7 +166,21 @@ void OverlayWindow::PostState(const OverlaySnapshot& state) {
 }
 
 void OverlayWindow::Hide() {
+    dropdownOpen_ = false;
+    headerRectValid_ = false;
+    menuRows_.clear();
+    PublishInteractiveRegion();
     ShowWindow(hwnd_, SW_HIDE);
+}
+
+bool OverlayWindow::HeaderVisible(const OverlaySnapshot& state) const {
+    // The header/dropdown belongs only to the caret-anchored typing pipeline, and
+    // only when there is a known language and a configured label set to show.
+    const bool typingPhase = state.phase == OverlayPhase::Typing ||
+                             state.phase == OverlayPhase::Translating ||
+                             state.phase == OverlayPhase::Ready;
+    return typingPhase && state.language >= 0 &&
+           state.language < static_cast<int>(labels_.size());
 }
 
 void OverlayWindow::Repaint(const OverlaySnapshot& state) {
@@ -169,7 +199,7 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
 
     switch (state.phase) {
         case OverlayPhase::Hidden:
-            ShowWindow(hwnd_, SW_HIDE);
+            Hide();
             return;
         case OverlayPhase::Typing:
             text = state.source;
@@ -208,19 +238,27 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     // Nothing to show (empty text, or a caret/cursor-anchored pill with no
     // anchor) -- hide rather than flash an empty pill. Centered HUDs need no anchor.
     if (text.empty() || (anchorMode != AnchorMode::ScreenCenter && !state.anchorValid)) {
-        ShowWindow(hwnd_, SW_HIDE);
+        Hide();
         return;
     }
 
-    // Measure the text to size the pill to its content (supports multiple lines).
+    // Remember the last drawn content so toggling the dropdown can re-render
+    // without waiting for a fresh snapshot.
+    lastState_ = state;
+
+    const bool showHeader = HeaderVisible(state);
+    if (!showHeader) {
+        dropdownOpen_ = false;  // no header -> the menu can't be open
+    }
+
+    // Measure the body text to size the pill to its content (multiple lines OK).
     const float maxTextW = static_cast<float>(kMaxWidth - 2 * kPadX);
-    const float maxTextH = static_cast<float>(kMaxHeight - 2 * kPadY);
+    const float maxTextH = static_cast<float>(kMaxHeight - kHeaderH - 2 * kPadY);
     ComPtr<IDWriteTextLayout> layout;
     if (FAILED(writeFactory_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.length()),
                                                 format, maxTextW, maxTextH, layout.GetAddressOf()))) {
         return;
     }
-    // Captured-source range: italic (the brush split happens at draw time).
     if (dimLen > 0) {
         layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC,
                              DWRITE_TEXT_RANGE{0, static_cast<UINT32>(dimLen)});
@@ -233,13 +271,51 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     textW = std::clamp(textW, 1.0f, maxTextW);
     textH = std::clamp(textH, 1.0f, maxTextH);
 
-    // Pin the layout box to the measured content so alignment hugs the pill's
-    // inset (each line right-aligns under the caret; centered for the HUD).
-    layout->SetMaxWidth(textW);
+    // --- header / dropdown geometry ------------------------------------------
+    // The header spans the box width; the drop-up menu (Auto + one row per pair)
+    // stacks ABOVE the header, so the body stays glued to the caret and the menu
+    // grows upward into free screen space -- never over the caret or the text.
+    const int headerH = showHeader ? kHeaderH : 0;
+    const int menuCount = (showHeader && dropdownOpen_)
+                              ? static_cast<int>(labels_.size()) + 1  // +1 for the Auto row
+                              : 0;
+    const int menuH = menuCount * kMenuItemH;
+
+    // Width: at least the body, widened to fit the header label + any menu row.
+    auto labelWidth = [&](const std::wstring& s) -> float {
+        ComPtr<IDWriteTextLayout> l;
+        if (FAILED(writeFactory_->CreateTextLayout(s.c_str(), static_cast<UINT32>(s.length()),
+                                                    headerFormat_.Get(), maxTextW,
+                                                    static_cast<float>(kHeaderH), l.GetAddressOf()))) {
+            return 0.0f;
+        }
+        DWRITE_TEXT_METRICS m{};
+        l->GetMetrics(&m);
+        return m.widthIncludingTrailingWhitespace;
+    };
+
+    float chromeW = 0.0f;
+    if (showHeader) {
+        chromeW = labelWidth(L"\x25BE  " + labels_[state.language]);  // header + chevron
+        if (dropdownOpen_) {
+            chromeW = std::max(chromeW, labelWidth(L"Auto (OS layout)"));
+            for (const std::wstring& l : labels_) {
+                chromeW = std::max(chromeW, labelWidth(l));
+            }
+        }
+    }
+
+    int boxW = std::max(static_cast<int>(textW) + 2 * kPadX,
+                        static_cast<int>(std::ceil(chromeW)) + 2 * kPadX);
+    boxW = std::clamp(boxW, 1, kMaxWidth);
+    // Right-align the body within the (possibly header-widened) box so its last
+    // glyph still lands under the caret.
+    layout->SetMaxWidth(static_cast<float>(boxW - 2 * kPadX));
     layout->SetMaxHeight(textH);
 
-    const int boxW = static_cast<int>(textW) + 2 * kPadX;
-    const int boxH = static_cast<int>(textH) + 2 * kPadY;
+    const int bodyBoxH = static_cast<int>(textH) + 2 * kPadY;
+    int boxH = std::clamp(menuH + headerH + bodyBoxH, 1, kMaxHeight);
+    const int bodyTop = menuH + headerH;  // body sits below the menu + header
 
     // Bind + paint only the top-left boxW x boxH sub-rect of the max-size DIB.
     const RECT bounds{0, 0, boxW, boxH};
@@ -255,11 +331,18 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
                                           bgBrush.GetAddressOf());
     ComPtr<ID2D1SolidColorBrush> fgBrush;
     renderTarget_->CreateSolidColorBrush(fgColor, fgBrush.GetAddressOf());
-    // Dimmed brush for the captured-source range (visually distinct from the
-    // translation so the user always knows what is captured vs. produced).
     ComPtr<ID2D1SolidColorBrush> dimBrush;
     renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.72f, 0.74f, 0.78f, 0.85f),
                                           dimBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> headerBrush;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.62f, 0.72f, 0.90f, 0.95f),
+                                          headerBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> hiliteBrush;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.45f, 0.70f, 0.55f),
+                                          hiliteBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> sepBrush;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f),
+                                          sepBrush.GetAddressOf());
     if (dimLen > 0 && dimBrush) {
         layout->SetDrawingEffect(dimBrush.Get(),
                                  DWRITE_TEXT_RANGE{0, static_cast<UINT32>(dimLen)});
@@ -270,10 +353,51 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     if (bgBrush) {
         renderTarget_->FillRoundedRectangle(bg, bgBrush.Get());
     }
+
+    // Draw a single strip of header/menu text via a layout (DrawTextLayout avoids
+    // the windows.h DrawText macro ambiguity and gives us vertical centering for
+    // free through headerFormat_'s PARAGRAPH_ALIGNMENT_CENTER).
+    const auto drawStrip = [&](const std::wstring& s, float top, float height,
+                               ID2D1SolidColorBrush* brush) {
+        if (!brush) return;
+        ComPtr<IDWriteTextLayout> l;
+        if (FAILED(writeFactory_->CreateTextLayout(
+                s.c_str(), static_cast<UINT32>(s.length()), headerFormat_.Get(),
+                static_cast<float>(boxW - 2 * kPadX), height, l.GetAddressOf()))) {
+            return;
+        }
+        renderTarget_->DrawTextLayout(D2D1::Point2F(static_cast<float>(kPadX), top), l.Get(), brush);
+    };
+
+    // Drop-up menu rows (top of the box), then the header strip, then the body.
+    if (menuCount > 0 && headerBrush && hiliteBrush) {
+        for (int i = 0; i < menuCount; ++i) {
+            const int rowIndex = (i == 0) ? -1 : (i - 1);  // row 0 = Auto (-1)
+            const float top = static_cast<float>(i * kMenuItemH);
+            if (rowIndex == state.language) {  // mark the active pair
+                renderTarget_->FillRectangle(
+                    D2D1::RectF(1.0f, top, static_cast<float>(boxW) - 1.0f, top + kMenuItemH),
+                    hiliteBrush.Get());
+            }
+            const std::wstring rowText =
+                (i == 0) ? L"Auto (OS layout)" : labels_[static_cast<size_t>(rowIndex)];
+            drawStrip(rowText, top, static_cast<float>(kMenuItemH), headerBrush.Get());
+        }
+    }
+    if (showHeader && headerBrush && sepBrush) {
+        const float hTop = static_cast<float>(menuH);
+        renderTarget_->FillRectangle(
+            D2D1::RectF(static_cast<float>(kPadX), hTop + headerH - 1.0f,
+                        static_cast<float>(boxW - kPadX), hTop + headerH),
+            sepBrush.Get());  // hairline under the header
+        const std::wstring headerText =
+            (dropdownOpen_ ? L"\x25B4  " : L"\x25BE  ") + labels_[state.language];
+        drawStrip(headerText, hTop, static_cast<float>(headerH), headerBrush.Get());
+    }
     if (fgBrush) {
-        renderTarget_->DrawTextLayout(D2D1::Point2F(static_cast<float>(kPadX),
-                                                     static_cast<float>(kPadY)),
-                                       layout.Get(), fgBrush.Get());
+        renderTarget_->DrawTextLayout(
+            D2D1::Point2F(static_cast<float>(kPadX), static_cast<float>(bodyTop + kPadY)),
+            layout.Get(), fgBrush.Get());
     }
     renderTarget_->EndDraw();
 
@@ -281,13 +405,11 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     POINT dstPos{};
     switch (anchorMode) {
         case AnchorMode::CaretPill:
-            // Anchor the string's END (bottom-right, inset by the padding) to the
-            // caret: text right edge -> anchor.x, text bottom -> kGapAboveCaret px
-            // above anchor.y. Floats up-and-to-the-left of the caret.
+            // Anchor the body's END (bottom-right, inset by the padding) to the
+            // caret; the header/menu extend upward from there.
             dstPos = {state.anchor.x - boxW + kPadX, state.anchor.y - kGapAboveCaret - boxH + kPadY};
             break;
         case AnchorMode::CursorPopup:
-            // Below-and-right of the cursor/selection end, clamped on-screen.
             dstPos = {state.anchor.x + kCursorOffsetX, state.anchor.y + kCursorOffsetY};
             ClampToMonitor(dstPos, boxW, boxH, state.anchor);
             break;
@@ -304,12 +426,85 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
     lastSize_ = SIZE{boxW, boxH};
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
 
+    // Recompute the interactive SCREEN rects (header + open menu rows) so
+    // WM_NCHITTEST / WM_LBUTTONDOWN and the global mouse hook agree on where the
+    // clickable chrome is.
+    headerRectValid_ = showHeader;
+    menuRows_.clear();
+    if (showHeader) {
+        headerRect_ = {dstPos.x, dstPos.y + menuH, dstPos.x + boxW, dstPos.y + menuH + headerH};
+        for (int i = 0; i < menuCount; ++i) {
+            const int rowIndex = (i == 0) ? -1 : (i - 1);
+            menuRows_.push_back({{dstPos.x, dstPos.y + i * kMenuItemH, dstPos.x + boxW,
+                                  dstPos.y + (i + 1) * kMenuItemH},
+                                 rowIndex});
+        }
+    }
+    PublishInteractiveRegion();
+
     // CenterHud with fade: hold at full opacity, then dissolve away.
     if (fade) {
         fadeActive_ = true;
         fadeStart_ = GetTickCount64();
         SetTimer(hwnd_, kFadeTimerId, kFadeTimerMs, nullptr);
     }
+}
+
+OverlayWindow::Hit OverlayWindow::HitTest(POINT screenPt, int& outMenuIndex) const {
+    outMenuIndex = 0;
+    if (!headerRectValid_) {
+        return Hit::None;
+    }
+    if (dropdownOpen_) {
+        for (const MenuRow& row : menuRows_) {
+            if (PtInRect(&row.rect, screenPt)) {
+                outMenuIndex = row.index;
+                return Hit::MenuItem;
+            }
+        }
+    }
+    if (PtInRect(&headerRect_, screenPt)) {
+        return Hit::Header;
+    }
+    return Hit::None;
+}
+
+void OverlayWindow::OnLeftButtonDown(POINT screenPt) {
+    int menuIndex = 0;
+    switch (HitTest(screenPt, menuIndex)) {
+        case Hit::Header:
+            dropdownOpen_ = !dropdownOpen_;
+            Repaint(lastState_);  // re-render with the menu open/closed
+            break;
+        case Hit::MenuItem:
+            dropdownOpen_ = false;
+            if (overrideSink_) {
+                overrideSink_(menuIndex);  // -1 = Auto, >=0 = pin that pair
+            }
+            Repaint(lastState_);  // close the menu immediately (the header updates
+                                  // to the new pair on the next snapshot)
+            break;
+        case Hit::None:
+            break;
+    }
+}
+
+void OverlayWindow::PublishInteractiveRegion() {
+    if (!interactiveSink_) {
+        return;
+    }
+    if (!headerRectValid_) {
+        interactiveSink_(nullptr);  // nothing clickable right now
+        return;
+    }
+    RECT region = headerRect_;
+    for (const MenuRow& row : menuRows_) {  // union in the open menu rows
+        region.left = std::min(region.left, row.rect.left);
+        region.top = std::min(region.top, row.rect.top);
+        region.right = std::max(region.right, row.rect.right);
+        region.bottom = std::max(region.bottom, row.rect.bottom);
+    }
+    interactiveSink_(&region);
 }
 
 void OverlayWindow::Blit(POINT dst, SIZE size, BYTE alpha) {
@@ -352,6 +547,29 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self) {
             self->RunFadeStep();
+        }
+        return 0;
+    }
+    // Per-pixel click-through: only the header bar and (when open) the dropdown
+    // rows are hittable; the body and everything else fall through to the app
+    // beneath, so the overlay never intercepts the user's real clicks.
+    if (msg == WM_NCHITTEST) {
+        auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self) {
+            POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};  // NCHITTEST is in screen coords
+            int ignored = 0;
+            if (self->HitTest(pt, ignored) != Hit::None) {
+                return HTCLIENT;
+            }
+        }
+        return HTTRANSPARENT;
+    }
+    if (msg == WM_LBUTTONDOWN) {
+        auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self) {
+            POINT pt{};
+            GetCursorPos(&pt);  // reliable screen coords for the just-happened click
+            self->OnLeftButtonDown(pt);
         }
         return 0;
     }

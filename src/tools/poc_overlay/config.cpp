@@ -52,6 +52,22 @@ Config ConfigStore::Load() {
         in >> j;
         ReadShortcut(j, "activationShortcut", config.activationShortcut);
         ReadShortcut(j, "commitShortcut", config.commitShortcut);
+        ReadShortcut(j, "cycleLanguageShortcut", config.cycleLanguageShortcut);
+        if (j.contains("languagePairs") && j["languagePairs"].is_array()) {
+            std::vector<LanguagePair> pairs;
+            for (const auto& e : j["languagePairs"]) {
+                LanguagePair p;
+                p.label = FromUtf8(e.value("label", std::string()));
+                p.target = FromUtf8(e.value("target", std::string()));
+                if (!p.target.empty()) pairs.push_back(std::move(p));
+            }
+            if (!pairs.empty()) config.languagePairs = std::move(pairs);  // else keep defaults
+        }
+        config.activeLanguage = j.value("activeLanguage", config.activeLanguage);
+        if (config.activeLanguage < 0 ||
+            config.activeLanguage >= static_cast<int>(config.languagePairs.size())) {
+            config.activeLanguage = 0;
+        }
         config.modelPath = FromUtf8(j.value("modelPath", std::string()));
         config.contextSize = j.value("contextSize", config.contextSize);
         config.temperature = j.value("temperature", config.temperature);
@@ -79,6 +95,15 @@ bool ConfigStore::Save(const Config& config) {
     json j;
     j["activationShortcut"] = WriteShortcut(config.activationShortcut);
     j["commitShortcut"] = WriteShortcut(config.commitShortcut);
+    j["cycleLanguageShortcut"] = WriteShortcut(config.cycleLanguageShortcut);
+    {
+        json arr = json::array();
+        for (const LanguagePair& p : config.languagePairs) {
+            arr.push_back({{"label", ToUtf8(p.label)}, {"target", ToUtf8(p.target)}});
+        }
+        j["languagePairs"] = std::move(arr);
+    }
+    j["activeLanguage"] = config.activeLanguage;
     j["modelPath"] = ToUtf8(config.modelPath);
     j["contextSize"] = config.contextSize;
     j["temperature"] = config.temperature;

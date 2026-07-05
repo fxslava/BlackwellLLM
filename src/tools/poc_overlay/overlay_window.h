@@ -4,7 +4,9 @@
 #include <dwrite.h>
 #include <wrl/client.h>
 
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "overlay_state.h"
 
@@ -48,18 +50,40 @@ public:
 
     void Hide();
 
+    // Language-pair labels (index-aligned with the app's languagePairs), shown in
+    // the header bar (active pair) and the override dropdown. Set once at startup
+    // on the UI thread, before any state arrives. A leading "Auto" entry (OS-aware
+    // routing) is added by the dropdown itself and maps to override index -1.
+    void SetLanguageLabels(std::vector<std::wstring> labels) { labels_ = std::move(labels); }
+
+    // A dropdown item was chosen: `index` is the language-pair index to pin, or
+    // -1 for "Auto" (clear the manual override). Wire to
+    // CaretTracker::SetLanguageOverride. Called on the UI thread.
+    void SetOverrideSink(std::function<void(int index)> sink) { overrideSink_ = std::move(sink); }
+
+    // Reports the current interactive screen rectangle (header, or header+menu
+    // when the dropdown is open) so the global mouse hook can let those clicks
+    // reach this window instead of treating them as a context-break reset. A
+    // null rect means "nothing interactive right now". Wire to
+    // HookManager::SetInteractiveRect. Called on the UI thread.
+    void SetInteractiveRegionSink(std::function<void(const RECT*)> sink) {
+        interactiveSink_ = std::move(sink);
+    }
+
 private:
     static constexpr UINT kMsgState = WM_APP + 1;
     static constexpr UINT_PTR kFadeTimerId = 1;  // drives the CenterHud fade-out
     // The backing DIB is allocated once at this maximum size; each frame only
     // blits the content-sized sub-rect from its top-left corner.
     static constexpr int kMaxWidth = 720;
-    static constexpr int kMaxHeight = 260;
+    static constexpr int kMaxHeight = 360;   // header + drop-up menu + multi-line body
     static constexpr int kPadX = 14;         // horizontal text inset within the pill
     static constexpr int kPadY = 8;          // vertical text inset within the pill
     static constexpr int kGapAboveCaret = 6; // px between the text bottom and the caret
     static constexpr int kCursorOffsetX = 16; // selection popup offset from the cursor
     static constexpr int kCursorOffsetY = 22;
+    static constexpr int kHeaderH = 24;      // clickable header-bar strip height
+    static constexpr int kMenuItemH = 26;    // dropdown row height
     // CenterHud fade: hold at full opacity, then fade to zero over these spans.
     static constexpr UINT kFadeTimerMs = 30;
     static constexpr ULONGLONG kHudHoldMs = 900;
@@ -78,6 +102,19 @@ private:
     void Blit(POINT dst, SIZE size, BYTE alpha);
     void RunFadeStep();  // WM_TIMER: advance / finish the CenterHud fade
 
+    // --- interactive header bar + override dropdown --------------------------
+    // True while the caret pill is showing a clickable header (typing pipeline
+    // with a known language and configured labels).
+    bool HeaderVisible(const OverlaySnapshot& state) const;
+    // Hit-test a SCREEN point against the header / open menu rows. Returns the
+    // region so WM_NCHITTEST can claim only those pixels (everything else stays
+    // click-through) and WM_LBUTTONDOWN can act.
+    enum class Hit { None, Header, MenuItem };
+    Hit HitTest(POINT screenPt, int& outMenuIndex) const;
+    void OnLeftButtonDown(POINT screenPt);
+    // Push the current interactive rectangle (or null) to the hook via the sink.
+    void PublishInteractiveRegion();
+
     HWND hwnd_ = nullptr;
 
     Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
@@ -85,6 +122,7 @@ private:
     Microsoft::WRL::ComPtr<IDWriteTextFormat> textFormat_;    // caret pill (trailing/far)
     Microsoft::WRL::ComPtr<IDWriteTextFormat> hudFormat_;     // center banner (center/center)
     Microsoft::WRL::ComPtr<IDWriteTextFormat> popupFormat_;   // selection popup (leading/near)
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> headerFormat_;  // header + menu (leading/center)
     Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> renderTarget_;
 
     // Cached blit geometry so the fade timer can re-blit without re-rendering.
@@ -92,6 +130,21 @@ private:
     SIZE lastSize_{};
     bool fadeActive_ = false;
     ULONGLONG fadeStart_ = 0;
+
+    // Header / dropdown state. `lastState_` is the most recent NON-hidden
+    // snapshot, so toggling the dropdown can re-render without a new snapshot.
+    std::vector<std::wstring> labels_;   // language-pair labels (index-aligned)
+    OverlaySnapshot lastState_;          // last rendered content (for dropdown re-render)
+    bool dropdownOpen_ = false;
+    // Interactive rectangles in SCREEN coordinates, recomputed each paint. The
+    // menu maps row -> override index (row 0 = "Auto" = -1, row i = pair i-1).
+    RECT headerRect_{};
+    bool headerRectValid_ = false;
+    struct MenuRow { RECT rect; int index; };  // index: -1 = Auto, >=0 = pair
+    std::vector<MenuRow> menuRows_;
+
+    std::function<void(int)> overrideSink_;
+    std::function<void(const RECT*)> interactiveSink_;
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;
