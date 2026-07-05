@@ -111,6 +111,33 @@ public:
     blackwell::paging::PrefixCacheManager& prefix_cache();
     blackwell::EnginePrefillCoordinator&   prefill_driver();
 
+    // ------------------------------------------------------------------------
+    // Inactivity lifecycle (RAII-friendly: the engine object stays alive
+    // through both stages; nothing is torn down or re-loaded from disk).
+    //
+    //   spill_kv_cache() — stage 1: bulk-demote every unpinned KV prefix-cache
+    //     page down the tier waterfall (VRAM -> pinned RAM -> NVMe spill file),
+    //     freeing KV VRAM. The radix-tree index survives; pages fault back in
+    //     transparently on the next prefill. Returns the number of page
+    //     demotions (0 when the model has no prefix-cache substrate).
+    //
+    //   hibernate() — stage 2: offload the resident model weights from GPU
+    //     VRAM into a pinned host-RAM stash and free the device arena. The
+    //     engine must be idle (no decode in flight); forward() is invalid until
+    //     wakeup(). Idempotent.
+    //
+    //   wakeup() — DMA the weights back over PCIe into a fresh device arena
+    //     and resume serving. Fast: the stash is pinned, so this is a single
+    //     bulk H2D burst, not a disk re-load. Idempotent.
+    //
+    // All three follow the engine's single-threaded control-plane rule: call
+    // them only from the thread that owns forward()/prefill.
+    // ------------------------------------------------------------------------
+    int  spill_kv_cache();
+    void hibernate();
+    void wakeup();
+    bool hibernated() const noexcept;
+
     Impl* get_impl() const { return pImpl.get(); }
 
 private:

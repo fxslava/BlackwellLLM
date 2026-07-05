@@ -144,6 +144,7 @@ void LiveTranslationTracker::TrackUpdate(std::wstring current_text, std::wstring
         std::lock_guard<std::mutex> lock(mutex_);
         pending_ = std::move(job);  // latest wins, whether it displaces a Track
                                     // or a not-yet-started Generate
+        pendingLifecycle_ = LifecycleOp::None;  // activity cancels a queued spill/hibernate
     }
     cv_.notify_all();
 }
@@ -163,6 +164,7 @@ void LiveTranslationTracker::TriggerGeneration(std::wstring current_text, std::w
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_ = std::move(job);
+        pendingLifecycle_ = LifecycleOp::None;  // activity cancels a queued spill/hibernate
     }
     cv_.notify_all();
 }
@@ -173,22 +175,124 @@ void LiveTranslationTracker::Cancel() {
     pending_.reset();
 }
 
+void LiveTranslationTracker::SetLifecycleSink(LifecycleSink sink) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    lifecycleSink_ = std::move(sink);
+}
+
+void LiveTranslationTracker::RequestKvSpill() {
+    if (stop_.load(std::memory_order_relaxed)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Never escalate past a queued Hibernate, and never race a queued job
+        // (the job clears lifecycle requests when it lands anyway).
+        if (pendingLifecycle_ == LifecycleOp::None) {
+            pendingLifecycle_ = LifecycleOp::Spill;
+        }
+    }
+    cv_.notify_all();
+}
+
+void LiveTranslationTracker::RequestHibernate() {
+    if (stop_.load(std::memory_order_relaxed)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pendingLifecycle_ = LifecycleOp::Hibernate;  // supersedes a queued Spill
+    }
+    cv_.notify_all();
+}
+
+void LiveTranslationTracker::EmitLifecycle(LifecycleEvent event) {
+    LifecycleSink sink;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink = lifecycleSink_;  // copy under the lock; call outside it
+    }
+    if (sink) sink(event);
+}
+
+void LiveTranslationTracker::WakeIfHibernated() {
+    if (!adapter_.engine().hibernated()) return;
+    EmitLifecycle(LifecycleEvent::WakingUp);
+    try {
+        adapter_.engine().wakeup();  // one pinned-RAM -> VRAM PCIe DMA burst
+        EmitLifecycle(LifecycleEvent::Awake);
+    } catch (const std::exception& e) {
+        // VRAM reclaim failed (another process grabbed it while we slept).
+        // Leave the engine hibernated; the job that triggered us will fail
+        // loudly on its engine call and the next activity retries the wakeup.
+        Log(L"wakeup FAILED (still hibernated): " + FromUtf8(e.what()));
+    }
+}
+
+void LiveTranslationTracker::RunLifecycle(LifecycleOp op) {
+    try {
+        // Release the persistent tracking session first: its pinned prefix
+        // pages are excluded from demotion, and holding a live sequence across
+        // a weight offload has no meaning anyway. The session self-heals -- the
+        // next reconcile simply begin_sequence()s from the (spilled, faulted-
+        // back-on-demand) radix tree.
+        if (session_ && session_->seq.valid()) {
+            adapter_.engine().prefill_driver().finish(session_->seq);
+        }
+        session_.reset();
+
+        // Stage 1 either way: hibernation without the KV spill would strand
+        // the radix tree's VRAM pages while the weights leave.
+        const int moved = adapter_.engine().spill_kv_cache();
+        Log(L"lifecycle: KV spill demoted " + std::to_wstring(moved) + L" page(s)");
+
+        if (op == LifecycleOp::Hibernate) {
+            if (!adapter_.engine().hibernated()) {
+                adapter_.engine().hibernate();
+            }
+            EmitLifecycle(LifecycleEvent::Hibernated);
+        } else {
+            EmitLifecycle(LifecycleEvent::KvSpilled);
+        }
+    } catch (const std::exception& e) {
+        // Best-effort by design: a failed lifecycle step must never take the
+        // translator down -- the engine stays in whatever consistent state the
+        // failing call guaranteed, and the next tick may retry.
+        Log(L"lifecycle step failed: " + FromUtf8(e.what()));
+    }
+}
+
 void LiveTranslationTracker::ThreadMain() {
     while (true) {
         Job job;
+        bool haveJob = false;
+        LifecycleOp lifecycle = LifecycleOp::None;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] {
-                return stop_.load(std::memory_order_relaxed) || pending_.has_value();
+                return stop_.load(std::memory_order_relaxed) || pending_.has_value() ||
+                       pendingLifecycle_ != LifecycleOp::None;
             });
             if (stop_.load(std::memory_order_relaxed)) break;
-            job = std::move(*pending_);
-            pending_.reset();
+            if (pending_.has_value()) {
+                job = std::move(*pending_);
+                pending_.reset();
+                haveJob = true;
+            } else {
+                lifecycle = pendingLifecycle_;
+                pendingLifecycle_ = LifecycleOp::None;
+            }
+        }
+
+        if (!haveJob) {
+            RunLifecycle(lifecycle);
+            continue;
         }
 
         // Superseded while queued: dead on arrival, skip the engine call
         // entirely instead of letting the decode loop cancel it mid-flight.
         if (job.gen != current_gen_.load(std::memory_order_relaxed)) continue;
+
+        // First activity after a hibernation restores the weights before any
+        // engine work; the KV pages it spilled fault back in on demand during
+        // the reconcile itself.
+        WakeIfHibernated();
 
         if (job.kind == JobKind::Track) {
             RunTrack(job);

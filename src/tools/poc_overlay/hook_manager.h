@@ -94,6 +94,15 @@ public:
     // app untouched. Set at startup on the hook-owning (UI) thread.
     void SetLanguagePairCount(int count) { languagePairCount_ = count; }
 
+    // Programmatic master toggle (the activateOnStartup launch path): puts the
+    // hook in the given Translation Mode WITHOUT firing onActivationToggle --
+    // the caller owns the accompanying HUD/engine work, exactly as the hotkey
+    // handler owns them when the user toggles. Hook-owning (UI) thread only.
+    void SetTranslationMode(bool enabled) {
+        enabled_ = enabled;
+        fallbackBuffer_.clear();
+    }
+
     // Guards a text-injection window: while set (and, more robustly, for any event
     // carrying TextInjector::kInjectedSignature), the keyboard hook passes input
     // straight through without treating it as user typing. Set it around a

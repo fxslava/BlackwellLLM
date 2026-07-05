@@ -160,6 +160,7 @@ void VRAMArena::release_pools() {
     }
 
     if (d_weights_arena) { cudaFree(d_weights_arena); d_weights_arena = nullptr; }
+    if (m_h_hibernate_stash) { cudaFreeHost(m_h_hibernate_stash); m_h_hibernate_stash = nullptr; }
     if (d_activation_A)  { cudaFree(d_activation_A);  d_activation_A  = nullptr; }
     if (d_activation_B)  { cudaFree(d_activation_B);  d_activation_B  = nullptr; }
     if (d_k_cache)       { cudaFree(d_k_cache);       d_k_cache       = nullptr; }
@@ -344,6 +345,62 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
 }
 
 // ============================================================================
+// Soft hibernation (weights VRAM <-> pinned host RAM; see memory_pool.h)
+// ============================================================================
+void VRAMArena::hibernate() {
+    if (m_hibernated || !d_weights_arena || total_weights_bytes == 0) return;
+
+    if (!m_h_hibernate_stash) {
+        const cudaError_t err =
+            cudaHostAlloc(&m_h_hibernate_stash, total_weights_bytes, cudaHostAllocDefault);
+        if (err != cudaSuccess) {
+            m_h_hibernate_stash = nullptr;
+            throw std::runtime_error(std::string("[VRAMArena] hibernate: pinned stash "
+                                                 "allocation failed: ") +
+                                     cudaGetErrorString(err));
+        }
+    }
+
+    // The engine is idle by contract, but "idle" host-side still allows queued
+    // async work (transfer-stream prefetches, KV commits). Drain everything so
+    // the snapshot is consistent and nothing reads the arena after the free.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(m_h_hibernate_stash, d_weights_arena, total_weights_bytes,
+                          cudaMemcpyDeviceToHost));
+
+    m_hibernated_old_base = d_weights_arena;
+    CUDA_CHECK(cudaFree(d_weights_arena));
+    d_weights_arena = nullptr;
+    m_hibernated = true;
+    std::cout << "[VRAM Arena] Hibernated: "
+              << (total_weights_bytes / (1024 * 1024 * 1024.0))
+              << " GB of weights moved VRAM -> pinned host RAM.\n";
+}
+
+void VRAMArena::wakeup() {
+    if (!m_hibernated) return;
+
+    CUDA_CHECK(cudaMalloc(&d_weights_arena, total_weights_bytes));
+    // Pinned source => a pure PCIe DMA burst, no pageable staging copy.
+    CUDA_CHECK(cudaMemcpy(d_weights_arena, m_h_hibernate_stash, total_weights_bytes,
+                          cudaMemcpyHostToDevice));
+
+    // The registry values are absolute addresses into the OLD arena; rebase
+    // them onto the fresh allocation. (Offloaded tensors resolve through the
+    // staging slots and never touch this map.)
+    const ptrdiff_t delta = static_cast<uint8_t*>(d_weights_arena) -
+                            static_cast<uint8_t*>(m_hibernated_old_base);
+    if (delta != 0) {
+        for (auto& [name, ptr] : weight_pointers) {
+            ptr = static_cast<uint8_t*>(ptr) + delta;
+        }
+    }
+    m_hibernated_old_base = nullptr;
+    m_hibernated = false;
+    std::cout << "[VRAM Arena] Awake: weights DMA'd back to VRAM.\n";
+}
+
+// ============================================================================
 // Weight resolution
 // ============================================================================
 void* VRAMArena::resolve_offloaded(const std::string& name) const {
@@ -360,6 +417,9 @@ void* VRAMArena::resolve_offloaded(const std::string& name) const {
 }
 
 void* VRAMArena::get_weight_ptr(const std::string& name) const {
+    if (m_hibernated)
+        throw std::runtime_error("[VRAMArena] weight access while hibernated (" + name +
+                                 "): call wakeup() before any forward pass");
     auto it = weight_pointers.find(name);
     if (it != weight_pointers.end()) return it->second;
 
@@ -368,6 +428,9 @@ void* VRAMArena::get_weight_ptr(const std::string& name) const {
 }
 
 const void* VRAMArena::get_weight_ptr_optional(const std::string& name) const {
+    if (m_hibernated)
+        throw std::runtime_error("[VRAMArena] weight access while hibernated (" + name +
+                                 "): call wakeup() before any forward pass");
     auto it = weight_pointers.find(name);
     if (it != weight_pointers.end()) return it->second;
     return resolve_offloaded(name); // nullptr when the tensor does not exist

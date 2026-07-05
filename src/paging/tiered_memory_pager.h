@@ -216,6 +216,20 @@ public:
         return true;
     }
 
+    // Bulk cold-spill (the inactivity lifecycle's "stage 1"): demote EVERY
+    // unpinned page down the waterfall as far as capacity allows — VRAM pages
+    // to RAM (cascading to disk when RAM fills), then RAM pages on to disk.
+    // Pinned pages (live sequences, in-flight I/O) are naturally skipped: the
+    // LRU lists never contain them. Returns the number of demotions performed.
+    // Contents and radix-tree index survive intact; the pages fault back in on
+    // the next acquire, so this is purely a residency change, never data loss.
+    int spill_all() {
+        int moved = 0;
+        while (m_vram_lru.tail != kNoVPid && demote_vram_vpid(m_vram_lru.tail)) ++moved;
+        while (m_ram_lru.tail != kNoVPid && demote_ram_vpid(m_ram_lru.tail)) ++moved;
+        return moved;
+    }
+
     // Explicit tier hint (cold-load a deserialized branch straight out of
     // VRAM, pre-spill an idle branch before a big batch, …). Fails (false) if
     // the page is pinned or the target tier has no room after cascading.

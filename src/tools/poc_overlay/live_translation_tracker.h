@@ -86,6 +86,17 @@ public:
     // never touch a window or COM directly.
     using StreamCallback = std::function<void(const std::wstring& text, bool done)>;
 
+    // The dual-stage inactivity lifecycle, as observed from the worker thread:
+    //   KvSpilled  -- stage 1 done: the KV prefix cache was demoted to disk.
+    //   Hibernated -- stage 2 done: model weights left VRAM for host RAM.
+    //   WakingUp   -- a job arrived while hibernated; the PCIe DMA restore is
+    //                 about to run (show the "Waking up..." HUD now).
+    //   Awake      -- the restore finished; the job is about to be served.
+    // Fired on THIS CLASS'S WORKER THREAD -- enqueue/marshal only, like the
+    // StreamCallback.
+    enum class LifecycleEvent { KvSpilled, Hibernated, WakingUp, Awake };
+    using LifecycleSink = std::function<void(LifecycleEvent event)>;
+
     // `adapter` must outlive this object and must already own a live, Ready
     // engine (this class never constructs/tears down the engine itself --
     // that stays TranslationService's job). `system_prompts` holds one exact,
@@ -136,8 +147,27 @@ public:
     // (now larger) diff, so no explicit session reset is needed.
     void SetActiveLanguage(int index);
 
+    // Late-bound observer for the inactivity lifecycle (TranslationService
+    // wires it to the HUD). Thread-safe; pass nullptr to detach.
+    void SetLifecycleSink(LifecycleSink sink);
+
+    // Inactivity lifecycle, requested from any thread (the UI-thread timer in
+    // practice) and EXECUTED on the worker thread -- the only thread allowed
+    // to touch the engine. Both first release the persistent tracking session
+    // (its pinned pages would otherwise be excluded from the spill; it
+    // self-heals on the next reconcile) and spill the KV prefix cache to
+    // disk; RequestHibernate additionally offloads the model weights from GPU
+    // VRAM to pinned host RAM (BlackwellEngine::hibernate -- the engine object
+    // survives). A queued translation job always wins: new activity clears a
+    // not-yet-executed lifecycle request, and a hibernated engine is woken
+    // (with WakingUp/Awake events bracketing the PCIe DMA restore) before any
+    // job runs.
+    void RequestKvSpill();
+    void RequestHibernate();
+
 private:
     enum class JobKind { Track, Generate };
+    enum class LifecycleOp { None, Spill, Hibernate };
     struct Job {
         JobKind kind = JobKind::Track;
         std::wstring text;
@@ -154,6 +184,13 @@ private:
     void ThreadMain();
     void RunTrack(const Job& job);
     void RunGenerate(const Job& job);
+    // Worker thread: execute a Spill/Hibernate request (release session ->
+    // spill -> optionally offload weights) and fire the lifecycle sink.
+    void RunLifecycle(LifecycleOp op);
+    // Worker thread: if the engine is hibernated, restore it (WakingUp/Awake
+    // events bracket the DMA) before the caller touches forward()/prefill.
+    void WakeIfHibernated();
+    void EmitLifecycle(LifecycleEvent event);
     // Fallback decode for models without a prefix-cache substrate: routes
     // through the adapter's own generate(), forfeiting the speculative-
     // tracking advantage but keeping correctness for every model the user can
@@ -193,5 +230,10 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::optional<Job> pending_;  // latest-wins single slot (Track OR Generate)
+    // Latest-wins lifecycle slot, separate from pending_ so a spill/hibernate
+    // request never displaces a translation job (jobs run first; enqueuing a
+    // job clears a not-yet-executed lifecycle request -- activity wins).
+    LifecycleOp pendingLifecycle_ = LifecycleOp::None;  // guarded by mutex_
+    LifecycleSink lifecycleSink_;                       // guarded by mutex_ (late-bound)
     std::thread worker_;
 };

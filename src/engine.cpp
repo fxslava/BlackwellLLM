@@ -672,3 +672,25 @@ blackwell::EnginePrefillCoordinator& BlackwellEngine::prefill_driver() {
     require_prefix_cache(pImpl.get(), "prefill_driver");
     return *pImpl->prefill;
 }
+
+// ============================================================================
+// Inactivity lifecycle (see include/blackwell/engine.h for the contract).
+// ============================================================================
+int BlackwellEngine::spill_kv_cache() {
+    // Deliberately NOT require_prefix_cache: a lifecycle sweep over a model
+    // with no substrate is a benign no-op, not a caller error.
+    if (!pImpl->prefix_cache) return 0;
+    return pImpl->prefix_cache->spill_all();
+}
+
+void BlackwellEngine::hibernate() {
+    pImpl->arena.hibernate();
+}
+
+void BlackwellEngine::wakeup() {
+    pImpl->arena.wakeup();
+}
+
+bool BlackwellEngine::hibernated() const noexcept {
+    return pImpl->arena.hibernated();
+}

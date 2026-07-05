@@ -77,6 +77,15 @@ Config ConfigStore::Load() {
             j.value("captureGranularity", std::string()), config.captureGranularity);
         config.idleTimerMs = j.value("idleTimerMs", config.idleTimerMs);
         if (config.idleTimerMs < 100) config.idleTimerMs = 100;  // sane floor
+        config.activateOnStartup = j.value("activateOnStartup", config.activateOnStartup);
+        config.kvSpillTimeoutMin = j.value("kvSpillTimeoutMin", config.kvSpillTimeoutMin);
+        config.hibernateTimeoutMin = j.value("hibernateTimeoutMin", config.hibernateTimeoutMin);
+        if (config.kvSpillTimeoutMin < 1) config.kvSpillTimeoutMin = 1;
+        // Stage 2 never fires before stage 1: hibernation without the KV spill
+        // would strand the radix tree in VRAM while the weights leave it.
+        if (config.hibernateTimeoutMin < config.kvSpillTimeoutMin) {
+            config.hibernateTimeoutMin = config.kvSpillTimeoutMin;
+        }
         config.vramCacheBlocks = j.value("vramCacheBlocks", config.vramCacheBlocks);
         config.ramTierBlocks = j.value("ramTierBlocks", config.ramTierBlocks);
         config.diskSpillEnabled = j.value("diskSpillEnabled", config.diskSpillEnabled);
@@ -111,6 +120,9 @@ bool ConfigStore::Save(const Config& config) {
     j["maxTokens"] = config.maxTokens;
     j["captureGranularity"] = ToString(config.captureGranularity);
     j["idleTimerMs"] = config.idleTimerMs;
+    j["activateOnStartup"] = config.activateOnStartup;
+    j["kvSpillTimeoutMin"] = config.kvSpillTimeoutMin;
+    j["hibernateTimeoutMin"] = config.hibernateTimeoutMin;
     j["vramCacheBlocks"] = config.vramCacheBlocks;
     j["ramTierBlocks"] = config.ramTierBlocks;
     j["diskSpillEnabled"] = config.diskSpillEnabled;

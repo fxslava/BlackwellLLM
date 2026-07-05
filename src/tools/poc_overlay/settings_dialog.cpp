@@ -243,6 +243,9 @@ void SettingsWindow::PushConfigToJs() {
     j["maxTokens"] = config_.maxTokens;
     j["captureGranularity"] = ToString(config_.captureGranularity);
     j["idleTimerMs"] = config_.idleTimerMs;
+    j["activateOnStartup"] = config_.activateOnStartup;
+    j["kvSpillTimeoutMin"] = config_.kvSpillTimeoutMin;
+    j["hibernateTimeoutMin"] = config_.hibernateTimeoutMin;
     j["vramCacheBlocks"] = config_.vramCacheBlocks;
     j["ramTierBlocks"] = config_.ramTierBlocks;
     j["diskSpillEnabled"] = config_.diskSpillEnabled;
@@ -314,6 +317,13 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
             j.value("captureGranularity", std::string()), config_.captureGranularity);
         config_.idleTimerMs = j.value("idleTimerMs", config_.idleTimerMs);
         if (config_.idleTimerMs < 100) config_.idleTimerMs = 100;
+        config_.activateOnStartup = j.value("activateOnStartup", config_.activateOnStartup);
+        config_.kvSpillTimeoutMin = j.value("kvSpillTimeoutMin", config_.kvSpillTimeoutMin);
+        config_.hibernateTimeoutMin = j.value("hibernateTimeoutMin", config_.hibernateTimeoutMin);
+        if (config_.kvSpillTimeoutMin < 1) config_.kvSpillTimeoutMin = 1;
+        if (config_.hibernateTimeoutMin < config_.kvSpillTimeoutMin) {
+            config_.hibernateTimeoutMin = config_.kvSpillTimeoutMin;  // stage 2 never precedes stage 1
+        }
         config_.vramCacheBlocks = j.value("vramCacheBlocks", config_.vramCacheBlocks);
         config_.ramTierBlocks = j.value("ramTierBlocks", config_.ramTierBlocks);
         config_.diskSpillEnabled = j.value("diskSpillEnabled", config_.diskSpillEnabled);

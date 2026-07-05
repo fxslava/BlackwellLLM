@@ -180,6 +180,9 @@ function applyConfig(cfg) {
   $('maxTokens').value    = cfg.maxTokens != null ? cfg.maxTokens : 1024;
   $('granularity').value  = cfg.captureGranularity || 'sentence';
   $('idleTimerMs').value  = cfg.idleTimerMs != null ? cfg.idleTimerMs : 700;
+  $('activateOnStartup').checked = cfg.activateOnStartup === true;
+  $('kvSpillTimeoutMin').value   = cfg.kvSpillTimeoutMin != null ? cfg.kvSpillTimeoutMin : 10;
+  $('hibernateTimeoutMin').value = cfg.hibernateTimeoutMin != null ? cfg.hibernateTimeoutMin : 30;
   $('vramCacheBlocks').value = cfg.vramCacheBlocks != null ? cfg.vramCacheBlocks : 1024;
   $('ramTierBlocks').value   = cfg.ramTierBlocks != null ? cfg.ramTierBlocks : 2048;
   $('diskSpillEnabled').checked = cfg.diskSpillEnabled !== false;
@@ -209,6 +212,9 @@ function buildPayload() {
     maxTokens: parseInt($('maxTokens').value, 10) || 1024,
     captureGranularity: $('granularity').value,
     idleTimerMs: parseInt($('idleTimerMs').value, 10) || 700,
+    activateOnStartup: $('activateOnStartup').checked,
+    kvSpillTimeoutMin: parseInt($('kvSpillTimeoutMin').value, 10) || 10,
+    hibernateTimeoutMin: parseInt($('hibernateTimeoutMin').value, 10) || 30,
     vramCacheBlocks: parseInt($('vramCacheBlocks').value, 10) || 0,
     ramTierBlocks: parseInt($('ramTierBlocks').value, 10) || 0,
     diskSpillEnabled: $('diskSpillEnabled').checked,

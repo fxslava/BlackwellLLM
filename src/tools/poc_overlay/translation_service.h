@@ -41,7 +41,7 @@
 #include <thread>
 #include <vector>
 
-class LiveTranslationTracker;
+#include "live_translation_tracker.h"  // LiveTranslationTracker::LifecycleEvent
 
 namespace playground {
 class BlackwellLLMAdapter;
@@ -73,9 +73,21 @@ public:
         bool diskSpillEnabled = true;
         int diskSpillBlocks = 8192;
         std::wstring spillFilePath;  // required when diskSpillEnabled
+
+        // Deferred launch: construct the service (instant) but do NOT load the
+        // model weights into VRAM until EnsureLoaded() -- the "start inactive"
+        // startup mode. false keeps the historical load-immediately behavior.
+        bool deferLoad = false;
     };
 
-    enum class State { Loading, Ready, Error };
+    // Idle exists only for deferLoad: the C++ backend is alive but no load has
+    // been requested yet (no VRAM touched). EnsureLoaded() moves Idle->Loading.
+    enum class State { Idle, Loading, Ready, Error };
+
+    // Re-exported from the tracker so main.cpp binds one HUD sink without
+    // reaching into the tracker type itself.
+    using LifecycleEvent = LiveTranslationTracker::LifecycleEvent;
+    using LifecycleSink = std::function<void(LifecycleEvent event)>;
 
     // Runs ON THE TRACKER'S THREAD for every streamed delta (done=false,
     // growing text) and exactly once per TriggerGeneration with done=true --
@@ -94,6 +106,25 @@ public:
     // Late-bound because the sink's target (CaretTracker) is constructed after
     // this service (the tracker's callbacks point back here). Thread-safe.
     void SetPreviewSink(PreviewSink sink);
+
+    // Late-bound lifecycle observer (HUD banners: hibernated / "Waking up...").
+    // Fires on the tracker's worker thread -- enqueue/marshal only. Thread-safe.
+    void SetLifecycleSink(LifecycleSink sink);
+
+    // Kick the deferred engine load (no-op once a load has ever started, so
+    // it is safe to call on every activation toggle). Instant: the slow work
+    // runs on the service's own load thread exactly as the eager path does.
+    void EnsureLoaded();
+
+    // The dual-stage inactivity state machine, driven by a coarse UI-thread
+    // timer. Compares the time since the last typing/selection activity
+    // (TrackUpdate / TriggerGeneration) against the two thresholds and asks
+    // the tracker's worker to run the due stage: kvSpillTimeoutMin -> spill
+    // the KV prefix cache to disk; hibernateTimeoutMin -> soft-hibernate
+    // (weights VRAM -> host RAM; the engine object survives). Each stage
+    // fires at most once per idle period; any new activity re-arms both.
+    // Cheap and non-blocking -- safe to call every few seconds.
+    void LifecycleTick(int kvSpillTimeoutMin, int hibernateTimeoutMin);
 
     // Every keystroke: fire-and-forget speculative background prefill that
     // warms the engine's radix tree for `segment` (+ durable `context`), so a
@@ -145,6 +176,8 @@ private:
     // this is only the STATIC prefix used to seed one .bkv branch.
     std::string StableServingPrefix(const std::string& previewPrompt) const;
     void DeliverToSink(std::uint64_t gen, const std::wstring& text, bool done);
+    void DeliverLifecycle(LifecycleEvent event);  // tracker worker -> bound sink
+    void MarkActivity();  // refresh lastActivityMs_ and re-arm the stage ladder
 
     Settings settings_;
 
@@ -166,7 +199,16 @@ private:
     std::atomic<std::uint64_t> requestSeq_{0};  // debug/log id surfaced to the sink
     std::atomic<bool> stop_{false};
 
+    // Inactivity lifecycle bookkeeping. lastActivityMs_ is a steady-clock
+    // millisecond stamp refreshed by TrackUpdate/TriggerGeneration; stage_
+    // records how far down the ladder this idle period has gone (0 = engaged,
+    // 1 = KV spilled, 2 = hibernated) so LifecycleTick fires each stage once.
+    std::atomic<std::int64_t> lastActivityMs_{0};
+    std::atomic<int> lifecycleStage_{0};
+    bool loadStarted_ = false;  // ctor (eager) or EnsureLoaded; UI thread only
+
     std::mutex mutex_;
-    PreviewSink previewSink_;  // guarded by mutex_ (late-bound)
-    std::thread worker_;       // the one-shot load thread
+    PreviewSink previewSink_;      // guarded by mutex_ (late-bound)
+    LifecycleSink lifecycleSink_;  // guarded by mutex_ (late-bound)
+    std::thread worker_;           // the one-shot load thread
 };

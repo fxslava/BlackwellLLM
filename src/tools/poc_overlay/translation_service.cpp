@@ -8,6 +8,7 @@
 #include <windows.h>  // OutputDebugStringW
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <utility>
 
@@ -85,6 +86,13 @@ std::string BuildPreviewPrompt(const std::string& lang) {
            "Assistant: <finish>Hello world</finish>\n";
 }
 
+// Steady-clock milliseconds -- the lifecycle's activity stamp unit.
+std::int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 }  // namespace
 
 TranslationService::TranslationService(Settings settings) : settings_(std::move(settings)) {
@@ -101,6 +109,26 @@ TranslationService::TranslationService(Settings settings) : settings_(std::move(
         active = 0;
     }
     activeLanguage_.store(active, std::memory_order_relaxed);
+    lastActivityMs_.store(NowMs(), std::memory_order_relaxed);
+
+    if (settings_.deferLoad) {
+        // Start-inactive mode: the backend exists (this object, its queues,
+        // its prompts) but VRAM stays untouched until EnsureLoaded().
+        state_.store(State::Idle, std::memory_order_relaxed);
+    } else {
+        loadStarted_ = true;
+        worker_ = std::thread(&TranslationService::ThreadMain, this);
+    }
+}
+
+void TranslationService::EnsureLoaded() {
+    // UI-thread only (like the ctor's calling thread), so no lock around
+    // loadStarted_/worker_ is needed -- Shutdown() also runs there.
+    if (loadStarted_ || stop_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    loadStarted_ = true;
+    state_.store(State::Loading, std::memory_order_relaxed);
     worker_ = std::thread(&TranslationService::ThreadMain, this);
 }
 
@@ -130,6 +158,53 @@ void TranslationService::SetPreviewSink(PreviewSink sink) {
     previewSink_ = std::move(sink);
 }
 
+void TranslationService::SetLifecycleSink(LifecycleSink sink) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    lifecycleSink_ = std::move(sink);
+}
+
+void TranslationService::DeliverLifecycle(LifecycleEvent event) {
+    LifecycleSink sink;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink = lifecycleSink_;  // copy under the lock; call outside it
+    }
+    if (sink) sink(event);
+}
+
+void TranslationService::MarkActivity() {
+    lastActivityMs_.store(NowMs(), std::memory_order_relaxed);
+    lifecycleStage_.store(0, std::memory_order_relaxed);  // re-arm both stages
+}
+
+void TranslationService::LifecycleTick(int kvSpillTimeoutMin, int hibernateTimeoutMin) {
+    if (state_.load(std::memory_order_relaxed) != State::Ready ||
+        stop_.load(std::memory_order_relaxed)) {
+        return;  // nothing resident yet (Idle/Loading) or already torn down
+    }
+    const std::int64_t idleMs = NowMs() - lastActivityMs_.load(std::memory_order_relaxed);
+    const std::int64_t idleMin = idleMs / 60000;
+    const int stage = lifecycleStage_.load(std::memory_order_relaxed);
+
+    if (stage < 2 && hibernateTimeoutMin > 0 && idleMin >= hibernateTimeoutMin) {
+        lifecycleStage_.store(2, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (tracker_) {
+            Log(L"lifecycle: " + std::to_wstring(idleMin) +
+                L" min idle -> stage 2 (soft hibernation)");
+            tracker_->RequestHibernate();
+        }
+    } else if (stage < 1 && kvSpillTimeoutMin > 0 && idleMin >= kvSpillTimeoutMin) {
+        lifecycleStage_.store(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (tracker_) {
+            Log(L"lifecycle: " + std::to_wstring(idleMin) +
+                L" min idle -> stage 1 (KV disk spill)");
+            tracker_->RequestKvSpill();
+        }
+    }
+}
+
 void TranslationService::DeliverToSink(std::uint64_t gen, const std::wstring& text,
                                        bool done) {
     PreviewSink sink;
@@ -142,6 +217,7 @@ void TranslationService::DeliverToSink(std::uint64_t gen, const std::wstring& te
 
 void TranslationService::TrackUpdate(std::wstring segment, std::wstring inferenceContext) {
     if (stop_.load(std::memory_order_relaxed) || segment.empty()) return;
+    MarkActivity();
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tracker_) return;  // still loading (or failed) -- nothing to warm yet
     tracker_->TrackUpdate(std::move(segment), std::move(inferenceContext));
@@ -150,6 +226,7 @@ void TranslationService::TrackUpdate(std::wstring segment, std::wstring inferenc
 void TranslationService::TriggerGeneration(std::wstring segment,
                                            std::wstring inferenceContext) {
     if (stop_.load(std::memory_order_relaxed) || segment.empty()) return;
+    MarkActivity();
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tracker_) return;
     const std::uint64_t gen = requestSeq_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -177,6 +254,10 @@ void TranslationService::ThreadMain() {
     auto tracker = std::make_unique<LiveTranslationTracker>(
         *adapter_, previewPrompts_, activeLanguage_.load(std::memory_order_relaxed),
         settings_.previewMaxNewTokens, settings_.temperature, settings_.topP);
+    // Wire the lifecycle observer BEFORE publishing: LifecycleTick can only
+    // reach the tracker through tracker_, so no event can fire un-forwarded.
+    tracker->SetLifecycleSink(
+        [this](LifecycleEvent event) { DeliverLifecycle(event); });
     std::lock_guard<std::mutex> lock(mutex_);
     if (!stop_.load(std::memory_order_relaxed)) {
         tracker_ = std::move(tracker);

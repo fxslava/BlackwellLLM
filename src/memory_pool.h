@@ -85,6 +85,29 @@ public:
     size_t get_activation_buffer_size() const { return m_activation_bytes; }
 
     // ------------------------------------------------------------------
+    // Soft hibernation (inactivity lifecycle, stage 2)
+    // ------------------------------------------------------------------
+    // hibernate() evacuates the resident weights arena — the multi-GB VRAM
+    // block — into a pinned host stash (D2H DMA) and frees the device
+    // allocation; the arena object itself, the name->pointer registry, and
+    // every dynamic pool stay alive. wakeup() re-allocates device memory,
+    // DMAs the stash back over PCIe, and REBASES the registry to the new
+    // device base, so callers keep using get_weight_ptr() with no re-load
+    // from disk. The pinned stash is allocated once (first hibernate) and
+    // kept for the process lifetime: repeat cycles never re-pay the pinning
+    // cost, and a wakeup can never fail on host allocation.
+    //
+    // Contract: the engine must be idle — no kernel launched against the
+    // arena may still be in flight (hibernate() synchronizes the device
+    // before copying) and no forward() may run until wakeup() returns.
+    // get_weight_ptr() throws while hibernated to make violations loud.
+    // Both are idempotent. Not thread-safe; call from the single engine-
+    // owning thread, like every other engine entry point.
+    void hibernate();
+    void wakeup();
+    bool hibernated() const { return m_hibernated; }
+
+    // ------------------------------------------------------------------
     // Layer offloading control plane (all no-ops for VRAM-resident layers)
     // ------------------------------------------------------------------
     size_t num_gpu_layers() const { return m_num_gpu_layers; }
@@ -138,6 +161,13 @@ private:
     // Contiguous memory blocks
     void* d_weights_arena = nullptr;
     size_t total_weights_bytes = 0;
+
+    // Soft-hibernation state: the pinned host stash the weights evacuate to,
+    // and the device base they were registered against (wakeup() rebases the
+    // registry by the delta between the old and the fresh allocation).
+    void* m_h_hibernate_stash = nullptr;
+    void* m_hibernated_old_base = nullptr;
+    bool  m_hibernated = false;
 
     // Activation buffers (FP32)
     float* d_activation_A = nullptr;

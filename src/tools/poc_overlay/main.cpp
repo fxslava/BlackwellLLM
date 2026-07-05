@@ -49,7 +49,9 @@
 namespace {
 
 constexpr UINT kTrayIconId = 1;
-constexpr UINT_PTR kReadyTimerId = 1;  // polls engine readiness after Mode ON
+constexpr UINT_PTR kReadyTimerId = 1;      // polls engine readiness after Mode ON
+constexpr UINT_PTR kLifecycleTimerId = 2;  // coarse inactivity tick (spill/hibernate)
+constexpr UINT kLifecycleTickMs = 30'000;  // minute-scale thresholds -> 30s poll is plenty
 
 // The live, in-memory application config. Loaded at startup and rewritten by the
 // settings window; only ever touched on the UI thread.
@@ -154,9 +156,18 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                         g_caretTracker->ShowHud(L"Engine unavailable - set the model path in Settings",
                                                 /*fade=*/true);
                         break;
+                    case TranslationService::State::Idle:     // EnsureLoaded is imminent
                     case TranslationService::State::Loading:
                         break;  // keep waiting
                 }
+            }
+            // Coarse inactivity tick: the service compares idle time against
+            // the configured thresholds and hands the due stage (KV disk
+            // spill / soft hibernation) to the engine-owning worker thread --
+            // nothing heavy ever runs on this UI thread.
+            if (wParam == kLifecycleTimerId && g_translator) {
+                g_translator->LifecycleTick(g_config.kvSpillTimeoutMin,
+                                            g_config.hibernateTimeoutMin);
             }
             return 0;
         case WM_DESTROY:
@@ -234,6 +245,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     svcSettings.spillFilePath = g_config.spillFilePath.empty()
                                     ? ConfigStore::DefaultSpillPath()
                                     : g_config.spillFilePath;
+    // Launch behavior: activate-on-startup loads the engine immediately (the
+    // HUD flow below tracks it); otherwise the backend is constructed but the
+    // heavy VRAM weight load is deferred until the first activation toggle.
+    svcSettings.deferLoad = !g_config.activateOnStartup;
     TranslationService translator(std::move(svcSettings));
     g_translator = &translator;  // for the readiness poll (WM_TIMER)
 
@@ -300,6 +315,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             caretTracker.OnPreviewResult(text, done);
         });
 
+    // Lifecycle HUDs. Fired on the tracker's worker thread; ShowHud is a
+    // lock+notify enqueue, so this stays marshaling-only like the preview sink.
+    // The KV spill (stage 1) is deliberately silent -- it is invisible to the
+    // user by design (pages fault back in on demand).
+    translator.SetLifecycleSink([&caretTracker](TranslationService::LifecycleEvent event) {
+        switch (event) {
+            case TranslationService::LifecycleEvent::KvSpilled:
+                break;
+            case TranslationService::LifecycleEvent::Hibernated:
+                caretTracker.ShowHud(L"Translation Engine: hibernated (VRAM freed)",
+                                     /*fade=*/true);
+                break;
+            case TranslationService::LifecycleEvent::WakingUp:
+                // Sticky banner: it covers the whole PCIe DMA restore and is
+                // replaced by the Awake HUD (or the translation overlay) below.
+                caretTracker.ShowHud(L"Waking up...", /*fade=*/false);
+                break;
+            case TranslationService::LifecycleEvent::Awake:
+                caretTracker.ShowHud(L"Translation Mode: ACTIVE", /*fade=*/true);
+                break;
+        }
+    });
+
     // Invisible controller window: owns the tray icon, receives its callback
     // messages (WM_TRAYICON), and drives the engine-readiness poll timer. Created
     // BEFORE the hooks so the master-toggle callback can arm its timer on it.
@@ -340,6 +378,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // Master toggle (Alt+Shift+T): show the HUD, warm the engine, gate tracking.
     callbacks.onActivationToggle = [&caretTracker, &translator, controller](bool active) {
         if (active) {
+            translator.EnsureLoaded();  // deferred-launch path: first toggle loads the model
             if (translator.state() == TranslationService::State::Ready) {
                 caretTracker.SetActive(true);
                 caretTracker.ShowHud(L"Translation Mode: ACTIVE", /*fade=*/true);
@@ -390,6 +429,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                     MB_ICONERROR);
         return 1;
     }
+
+    // Launch behavior. activateOnStartup: the engine load is already running
+    // (deferLoad=false); enter Translation Mode now, hold the sticky
+    // "Initializing..." center HUD, and let the readiness poll flip it to
+    // ACTIVE (fading out) exactly like a manual toggle. Otherwise: start
+    // inactive with a flashed OFF banner -- the backend is alive, but no model
+    // weights touch VRAM until the first Alt+Shift+T.
+    if (g_config.activateOnStartup) {
+        HookManager::Instance().SetTranslationMode(true);
+        caretTracker.ShowHud(L"Initializing Translation Engine...", /*fade=*/false);
+        SetTimer(controller, kReadyTimerId, 150, nullptr);  // -> SetActive + ACTIVE fade
+    } else {
+        caretTracker.ShowHud(L"Translation Mode: OFF", /*fade=*/true);
+    }
+    // The dual-stage inactivity state machine's heartbeat (a no-op until the
+    // engine is Ready; see LifecycleTick).
+    SetTimer(controller, kLifecycleTimerId, kLifecycleTickMs, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {

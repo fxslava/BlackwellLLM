@@ -70,6 +70,29 @@
     </div>
 
     <div class="card">
+      <h2>Startup &amp; lifecycle</h2>
+      <div class="field">
+        <label for="activateOnStartup">Launch behavior</label>
+        <label class="check"><input type="checkbox" id="activateOnStartup">
+          Activate Translation Mode on startup (loads the engine immediately)</label>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label for="kvSpillTimeoutMin">KV spill after inactivity (minutes)</label>
+          <input type="number" id="kvSpillTimeoutMin" min="1" max="1440" step="1">
+        </div>
+        <div class="field">
+          <label for="hibernateTimeoutMin">Hibernate after inactivity (minutes)</label>
+          <input type="number" id="hibernateTimeoutMin" min="1" max="1440" step="1">
+        </div>
+      </div>
+      <p class="hint">When idle, the assistant first spills the KV translation cache to disk
+        (freeing KV VRAM), then soft-hibernates: model weights move from GPU VRAM to system RAM.
+        The engine stays alive — the next keystroke DMAs the weights back over PCIe
+        (a brief “Waking up…” HUD).</p>
+    </div>
+
+    <div class="card">
       <h2>Memory budget — prefix cache</h2>
       <div class="grid">
         <div class="field">

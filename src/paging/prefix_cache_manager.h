@@ -195,6 +195,14 @@ public:
         return n;
     }
 
+    // -----------------------------------------------------------------------
+    // Inactivity lifecycle, stage 1: cold-spill the whole cache down the tier
+    // waterfall (unpinned pages only — release live sequences first for a full
+    // spill). The index survives; pages fault back in on the next acquire().
+    // Returns the number of page demotions performed.
+    // -----------------------------------------------------------------------
+    int spill_all() { return m_pager.spill_all(); }
+
     // -- introspection --------------------------------------------------------
     size_t   indexed_pages() const { return m_tree.total_pages(); }
     uint64_t model_hash()    const { return m_model_hash; }

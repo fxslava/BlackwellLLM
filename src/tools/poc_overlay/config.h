@@ -65,6 +65,17 @@ struct Config {
     CaptureGranularity captureGranularity = CaptureGranularity::Sentence;
     int idleTimerMs = 700;  // typing-idle debounce before preview inference starts
 
+    // Startup & inactivity lifecycle (the dual-stage memory state machine).
+    // activateOnStartup: true = warm the engine and enter Translation Mode at
+    // launch; false = start inactive and defer loading model weights into VRAM
+    // until the first activation. The timeouts are minutes of typing/selection
+    // inactivity: stage 1 spills the KV prefix cache (radix tree) down the tier
+    // waterfall to disk; stage 2 soft-hibernates -- weights leave GPU VRAM for
+    // pinned host RAM (the engine object survives; wakeup is a PCIe DMA burst).
+    bool activateOnStartup = false;
+    int kvSpillTimeoutMin = 10;    // stage 1: KV disk spill
+    int hibernateTimeoutMin = 30;  // stage 2: soft hibernation (weights -> RAM)
+
     // Tiered KV prefix-cache memory budget (engine RuntimeConfig knobs; one
     // block = one KV page = 16 tokens across all layers).
     int vramCacheBlocks = 1024;    // device-pool floor kept for cached prefixes
