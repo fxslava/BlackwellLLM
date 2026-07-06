@@ -1,0 +1,47 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_CUDA_ARCHITECTURES": "120",
+                "USE_DIRECT_STORAGE": "ON"
+            }
+        },
+        {
+            "name": "x64-debug",
+            "displayName": "x64 Debug",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/out/build/x64-Debug",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "x64-release",
+            "displayName": "x64 Release",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/out/build/x64-Release",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "x64-debug",   "configurePreset": "x64-debug" },
+        { "name": "x64-release", "configurePreset": "x64-release" }
+    ],
+    "testPresets": [
+        {
+            "name": "test-base",
+            "hidden": true,
+            "configurePreset": "x64-debug",
+            "output": { "outputOnFailure": true }
+        },
+        { "name": "validation",         "inherits": "test-base", "filter": { "include": { "label": "^validation$" } } },
+        { "name": "benchmark",          "inherits": "test-base", "filter": { "include": { "label": "^benchmark$" } } },
+        { "name": "integration",        "inherits": "test-base", "filter": { "include": { "label": "^integration$" } } },
+        { "name": "agent",              "inherits": "test-base", "filter": { "include": { "label": "^agent$" } } },
+        { "name": "agent-env",          "inherits": "test-base", "filter": { "include": { "label": "^agent_env$" } } },
+        { "name": "agent-orchestrator", "inherits": "test-base", "filter": { "include": { "label": "^agent_orchestrator$" } } }
+    ]
+}

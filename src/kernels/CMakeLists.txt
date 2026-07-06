@@ -51,5 +51,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set_target_properties(blackwell_kernels PROPERTIES CUDA_PTX_COMPILATION_FLAGS "-v")
 endif()
 
-# Разрешаем включать заголовочные файлы из этой директории
-target_include_directories(blackwell_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+# Ядра самодостаточны (включают только соседние .cuh) и НЕ экспортируют
+# include-путей: потребители, читающие kernels/*.cuh, объявляют
+# PRIVATE ${CMAKE_SOURCE_DIR}/src сами (см. skill cmake-hygiene).

@@ -5,75 +5,85 @@ description: Build BlackwellLLM targets and run the labeled CTest suites. Use wh
 
 # Build & Test — BlackwellLLM
 
-Windows-only tree: MSVC (VS 2022 Community) + CUDA v13.2, cache generated from the VS IDE
-into `out/build/x64-Debug` (Release lives in `out/build/x64-Release`, separate cache).
+Windows-only tree: MSVC (VS 2022 Community) + CUDA v13.2, Ninja. The canonical entry
+points are the committed **`CMakePresets.json`** presets; `out/build/x64-Debug` and
+`out/build/x64-Release` are the preset binary dirs.
 
-## Building a target
+## Building
 
-Always build through the wrapper — a bare `cmake --build` in a fresh shell fails because
-nvcc needs vcvars64 plus the CUDA include path injected:
+From a VS Developer prompt (or any vcvars64 shell):
+
+```bat
+cmake --preset x64-debug                                  :: configure (once, or after CMakeLists edits)
+cmake --build --preset x64-debug --target <target>
+```
+
+From any other shell, the transitional wrapper does the environment setup
+(vcvars64 + the CUDA v13.2 INCLUDE injection nvcc needs) and forwards to the preset:
 
 ```bat
 .\build_target.bat <target>
 ```
 
-What it does (see `build_target.bat`): calls
-`"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`,
-appends `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\include` to `INCLUDE`,
-then runs `cmake --build out/build/x64-Debug --target <target>`.
+Presets pin `CMAKE_CUDA_ARCHITECTURES=120` and `USE_DIRECT_STORAGE=ON` (matching the
+flagship overlay workflow). A bare `cmake --build` in a non-vcvars shell fails — cl.exe
+is not on PATH; that is why the wrapper exists.
 
 Useful target names:
 
 | Target | Notes |
 |---|---|
-| `blackwell_kernels` | CUDA kernel static lib |
-| `blackwell_core` | engine static lib (pulls kernels) |
-| `blackwell_llm` / `blackwell_bench` | chat CLI / perplexity benchmark |
-| `poc_overlay` | overlay translator; ~1–2 min, POST_BUILD deploys `src/tools/poc_overlay/web/` next to the exe |
+| `blackwell_kernels` | CUDA kernel static lib (`src/kernels/`) |
+| `blackwell_core` | engine static lib (`src/core/`; pulls kernels) |
+| `blackwell_llm` / `blackwell_bench` | chat CLI / perplexity benchmark (`src/apps/`) |
+| `poc_overlay` | overlay translator; ~1–2 min, POST_BUILD deploys `web/` + DS DLLs next to the exe |
+| `agent_playground` | HTTP playground GUI (links core + orchestrator) |
 | `agent_core`, `agent_env`, `agent_orchestrator` | CUDA-free agent stack |
+| `awq_benchmark` | standalone experiment (`src/experiments/`) |
 | `validation_tests`, `benchmark_tests`, `integration_tests`, `agent_tests`, `agent_env_tests`, `agent_orchestrator_tests` | test executables |
 
 Build only the target you need — a full build is slow (CUDA), and test suites glob their
 sources with `CONFIGURE_DEPENDS`, so a *new* test file is picked up on the next build
-without re-running CMake.
+without a manual CMake re-run.
 
 ## Running tests
 
-From the build tree:
+Test presets run from the repo root and map 1:1 onto the ctest labels:
 
 ```bat
-cd out\build\x64-Debug
-ctest -L validation            :: fast kernel-correctness vs CPU references
-ctest -L benchmark             :: stress shapes + CUDA-event performance
-ctest -L integration           :: engine vs PyTorch golden dumps
-ctest -L agent                 :: tree-sitter agent core
-ctest -L agent_env             :: sandbox OS layer
-ctest -L agent_orchestrator    :: ReAct loop (MockLLM)
+ctest --preset validation            :: fast kernel-correctness vs CPU references
+ctest --preset benchmark             :: stress shapes + CUDA-event performance
+ctest --preset integration           :: engine vs PyTorch golden dumps
+ctest --preset agent                 :: tree-sitter agent core
+ctest --preset agent-env             :: sandbox OS layer
+ctest --preset agent-orchestrator    :: ReAct loop (MockLLM)
 ```
 
+(`ctest -L <label>` from `out/build/x64-Debug` still works; the presets add exact-label
+anchoring — plain `-L agent` regex-matches all three agent suites.)
+
 Sharp edges:
+- **Build the test target first** — ctest does not build, and `gtest_discover_tests`
+  registers tests at build time.
 - **Integration tests skip silently** when the local checkpoint / golden dumps are absent
-  — a green integration run on a machine without models proves nothing. Check the test
-  output for skip messages. Regenerating dumps: skill `golden-dumps`.
+  — a green integration run on a machine without models proves nothing. Check the output
+  for skip messages. Regenerating dumps: skill `golden-dumps`.
 - GPU suites (`validation`, `benchmark`, `integration`) need the Blackwell GPU free;
   close the overlay/playground first (the engine holds multi-GB VRAM unless hibernated).
-- Test executables copy `nvcomp64_5.dll` (and DirectStorage DLLs when enabled) next to
-  themselves via POST_BUILD — if a test exe fails to start with a missing-DLL error,
-  rebuild the target rather than copying DLLs by hand.
+- Test executables get the DirectStorage DLLs copied next to themselves via
+  `blackwell_copy_dstorage_dlls()` — if a test exe fails to start with a missing-DLL
+  error, rebuild the target rather than copying DLLs by hand.
 - Run a single test directly for fast iteration:
   `out\build\x64-Debug\tests\validation_tests.exe --gtest_filter=Foo.*`
 
-<evolution_protocol>
-**Current workaround:** `build_target.bat` exists because the CMake cache is IDE-generated
-and the CLI environment (vcvars64 + CUDA INCLUDE) is not reproducible from a fresh shell.
-**Target state:** a committed `CMakePresets.json` with configure presets (`x64-debug`,
-`x64-release`), build presets, and test presets carrying the ctest labels — so the canonical
-commands become `cmake --preset x64-debug`, `cmake --build --preset x64-debug --target <t>`,
-`ctest --preset validation`.
-**When CMakePresets.json lands (Roadmap #6 in CLAUDE.md):** rewrite this skill —
-(1) replace the `build_target.bat` section with the preset commands and preset names taken
-from the actual committed file; (2) verify whether the vcvars64/INCLUDE injection is still
-needed (presets can set environment) and delete the environment section if not;
-(3) keep the sharp-edges list, re-verifying each item; (4) update CLAUDE.md's Quickstart
-to match; (5) only then propose deleting `build_target.bat`.
-</evolution_protocol>
+<migration_context>
+Roadmap #7 landed 2026-07: `CMakePresets.json` (configure `x64-debug`/`x64-release`,
+matching build presets, per-label test presets) replaced the IDE-generated-cache-only
+workflow; the presets were verified to adopt the pre-existing `out/build/x64-Debug` tree
+without a cache wipe. `build_target.bat` remains ONLY as the environment wrapper for
+non-vcvars shells — the vcvars64/INCLUDE injection is still required because nvcc/cl
+discovery is environmental, not cache-persisted. If a future CMake/toolchain change makes
+the injection unnecessary (verify: bare `cmake --build --preset x64-debug` from a plain
+shell), delete `build_target.bat` and the wrapper mentions here and in CLAUDE.md's
+Quickstart.
+</migration_context>

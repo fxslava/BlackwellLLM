@@ -74,22 +74,19 @@ over what-comments.
 ## Quickstart: build & test
 
 ```bat
-:: Build one target (sets up vcvars64 + CUDA 13.2 include, then cmake --build)
-.\build_target.bat poc_overlay
+:: Canonical (CMakePresets.json; run from a VS Developer / vcvars64 shell):
+cmake --preset x64-debug                                  :: configure (once, or after CMake edits)
+cmake --build --preset x64-debug --target poc_overlay
+ctest --preset validation                                 :: fast kernel-correctness suite
+:: other test presets: benchmark / integration / agent / agent-env / agent-orchestrator
 
-:: Run a test suite (from the build tree)
-cd out\build\x64-Debug
-ctest -L validation      :: fast kernel-correctness suite
-ctest -L benchmark       :: stress shapes + CUDA-event perf
-ctest -L integration     :: engine vs PyTorch golden dumps (skips silently without local models)
-ctest -L agent           :: tree-sitter agent core (no CUDA)
-ctest -L agent_env       :: sandbox OS layer (no CUDA)
-ctest -L agent_orchestrator :: ReAct loop, MockLLM-driven (no CUDA)
+:: One-shot from ANY shell (transitional wrapper: vcvars64 + CUDA include, then the preset build):
+.\build_target.bat poc_overlay
 ```
 
-The build tree lives in `out/build/x64-Debug` (cache generated from the VS IDE). Details,
-failure modes, and target names: skill `build-and-test`. Regenerating the PyTorch reference
-dumps the integration suite compares against: skill `golden-dumps`.
+The build tree lives in `out/build/x64-Debug` (`x64-release` preset → `out/build/x64-Release`).
+Details, failure modes, and target names: skill `build-and-test`. Regenerating the PyTorch
+reference dumps the integration suite compares against: skill `golden-dumps`.
 
 ## Design docs (read before touching the subsystem)
 
@@ -106,17 +103,18 @@ target state; existing code migrates opportunistically when you touch it.
 
 | # | Debt (current state) | Target state | Status |
 |---|---|---|---|
-| 1 | `CUDA_CHECK` in `src/common.h` calls `exit(EXIT_FAILURE)` from library code | Throws a `blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`); consumers (overlay, playground) surface it | planned |
-| 2 | ~105 raw `cudaMalloc`/`cudaFree` sites; `BlackwellEngine::Impl` holds ~30 raw `float*` freed by a hand-maintained list in `~Impl()` | `DeviceBuffer<T>` RAII wrapper (move-only, sized ctor, implicit `T*` like `CudaVector`); Impl's destructor becomes `= default` | planned |
-| 3 | ~~`src/CMakeLists.txt` monolith~~ | One `CMakeLists.txt` per target directory (`src/core/`, `src/apps/`, `src/experiments/`, tools); `src/CMakeLists.txt` is orchestration-only; deps in `cmake/` modules | **done** (core physically relocated to `src/core/`, 2026-07) |
-| 4 | `blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks) | Narrow per-target `target_include_directories` | in progress (global `tests/reference` include + shim removed with the compress experiment, 2026-07) |
-| 5 | ~~Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`~~ | Scripts live in `scripts/` (paths anchored to repo root, checkpoints via `BLACKWELL_MODELS_DIR`); stray artifacts deleted; the 126 MB of tracked golden dumps moved to Git LFS (`.gitattributes`); `backup/` stays local-only (gitignored) | **done** |
-| 6 | `build_target.bat` + IDE-generated cache is the only CLI build path | Committed `CMakePresets.json` (configure + build + test presets) | planned |
-| 7 | ~~`TLS_VERIFY OFF` on the DirectStorage NuGet fetch; nvcomp vendored as raw binaries~~ | All fetches TLS-verified (`cmake/DirectStorage.cmake`); vendored nvcomp deleted | **done** |
-| 8 | Thread-ownership doctrine enforced only by comments | Debug thread-ID asserts on engine entry points (see doctrine section) | planned |
-| 9 | Sanitizers absent | ASan config for MSVC on the CUDA-free agent stack first; UBSan/TSan via clang-cl or Linux CI lane for `agent*` targets | idea |
+| 1 | No hard binary boundary: `blackwell_core` is a STATIC lib — consumers compile against the concrete `BlackwellEngine` and share CRT/exception ABI with the engine | **Next milestone:** DirectX/COM-style SHARED library (DLL) — pure-virtual `IBlackwellEngine`, C factory export, `HRESULT` error mapping at the DLL edge (internal C++ exceptions never cross it) | **next** |
+| 2 | `CUDA_CHECK` in `src/common.h` calls `exit(EXIT_FAILURE)` from library code | Throws a `blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`), mapped to `HRESULT` at the #1 boundary; consumers (overlay, playground) surface it | planned (after #1) |
+| 3 | ~105 raw `cudaMalloc`/`cudaFree` sites; `BlackwellEngine::Impl` holds ~30 raw `float*` freed by a hand-maintained list in `~Impl()` | `DeviceBuffer<T>` RAII wrapper (move-only, sized ctor, implicit `T*` like `CudaVector`); Impl's destructor becomes `= default` | planned (after #1) |
+| 4 | ~~`src/CMakeLists.txt` monolith~~ | One `CMakeLists.txt` per target directory (`src/core/`, `src/apps/`, `src/experiments/`, tools); `src/CMakeLists.txt` is orchestration-only; deps in `cmake/` modules | **done** (core physically relocated to `src/core/`, 2026-07) |
+| 5 | ~~`blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks)~~ | No target exports `src/`; core-internal consumers declare `PRIVATE src/` + `src/core` themselves | **done** (2026-07) |
+| 6 | ~~Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`~~ | Scripts live in `scripts/` (paths anchored to repo root, checkpoints via `BLACKWELL_MODELS_DIR`); stray artifacts deleted; the 126 MB of tracked golden dumps moved to Git LFS (`.gitattributes`); `backup/` stays local-only (gitignored) | **done** |
+| 7 | ~~`build_target.bat` + IDE-generated cache is the only CLI build path~~ | Committed `CMakePresets.json` (configure + build + test presets); `build_target.bat` is a thin transitional wrapper over the presets | **done** (2026-07) |
+| 8 | ~~`TLS_VERIFY OFF` on the DirectStorage NuGet fetch; nvcomp vendored as raw binaries~~ | All fetches TLS-verified (`cmake/DirectStorage.cmake`); vendored nvcomp deleted | **done** |
+| 9 | Thread-ownership doctrine enforced only by comments | Debug thread-ID asserts on engine entry points (see doctrine section); natural home: the `IBlackwellEngine` boundary from #1 | planned |
+| 10 | Sanitizers absent | ASan config for MSVC on the CUDA-free agent stack first; UBSan/TSan via clang-cl or Linux CI lane for `agent*` targets | idea |
 
 When a row lands: flip its Status, update the affected section above, and follow the
-`<evolution_protocol>` in the corresponding skill (`build-and-test` for #6,
-`engine-extension` for #1/#2/#8, `cmake-hygiene` for #3/#4, `golden-dumps` for #5's
-path migration).
+`<evolution_protocol>` in the corresponding skill (`engine-extension` for #1/#2/#3/#9,
+`cmake-hygiene` for #1's SHARED-library build work, `golden-dumps` for dump-path
+concerns, `build-and-test` for build-workflow changes).

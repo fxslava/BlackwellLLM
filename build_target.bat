@@ -1,7 +1,6 @@
 @echo off
-rem Builds one CMake target from the CLI: usage  build_target.bat <target>
-rem MSVC env comes from vcvars64; nvcc additionally needs the CUDA headers
-rem on INCLUDE because the CMake cache was generated from the VS IDE.
+rem Transitional wrapper over CMakePresets.json: usage  build_target.bat <target>
+rem (vcvars64 puts cl.exe on PATH; nvcc additionally needs the CUDA headers on INCLUDE)
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
 set "INCLUDE=%INCLUDE%;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\include"
-cmake --build out/build/x64-Debug --target %1
+cmake --build --preset x64-debug --target %1

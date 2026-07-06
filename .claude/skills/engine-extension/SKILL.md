@@ -29,7 +29,7 @@ comments state them at each site — preserve that comment discipline in your ch
   Place new members deliberately and write the placement comment.
 - New device buffers today: `CUDA_CHECK(cudaMalloc(...))` in the Impl ctor **and** a
   matching `cudaFree` in `~Impl()` — three places to keep in sync (member, alloc, free).
-  This is Roadmap debt #2; see the evolution protocol below before adding many buffers.
+  This is Roadmap debt #3; see the evolution protocol below before adding many buffers.
 - Buffers that are per-decode-step hot must be allocated once and reused (see the
   `d_next_token` comment in `step_embedding`: a per-step malloc/free pair is forbidden).
 - Subsystem state that is conditional on model family stays behind `unique_ptr` + null
@@ -66,14 +66,20 @@ comments state them at each site — preserve that comment discipline in your ch
   engine/CUDA includes) and update `docs/INFERENCE_API.md`.
 
 <evolution_protocol>
+**Sequencing (decided 2026-07):** the next milestone is CLAUDE.md Roadmap #1 — a
+DirectX/COM-style SHARED-library boundary (pure-virtual `IBlackwellEngine`, C factory
+export, `HRESULT` mapping at the DLL edge, so internal C++ exceptions never cross it).
+The RAII and error-handling work below lands AFTER that boundary exists: throwing
+`CUDA_CHECK` is only safe for consumers once the DLL edge catches and maps exceptions.
 **Current workaround:** raw `cudaMalloc`/`cudaFree` with hand-maintained destructor lists
 (~105 sites), and `CUDA_CHECK` in `src/common.h` calling `exit(EXIT_FAILURE)` from library
-code (Roadmap #1/#2 in CLAUDE.md). Also: the single-thread doctrine is comment-enforced
-only (Roadmap #8).
+code (Roadmap #2/#3 in CLAUDE.md). Also: the single-thread doctrine is comment-enforced
+only (Roadmap #9 — the debug thread-ID asserts fit naturally on the `IBlackwellEngine`
+entry points once #1 lands).
 **Target state:** a move-only `DeviceBuffer<T>` RAII wrapper (sized ctor, implicit `T*`
 conversion like `CudaVector`, throwing allocation); `CUDA_CHECK` throws
-`blackwell::cuda_error : std::runtime_error` with file:line; debug thread-ID asserts on
-every public engine entry point.
+`blackwell::cuda_error : std::runtime_error` with file:line, translated to `HRESULT` at
+the #1 boundary; debug thread-ID asserts on every public engine entry point.
 **When DeviceBuffer<T> / throwing CUDA_CHECK land:** rewrite section 2 of this skill —
 (1) new buffers become `DeviceBuffer<float> d_foo{count};` members with **no** ctor/dtor
 edits (declaration order still matters — keep that rule); (2) delete the three-places-in-
