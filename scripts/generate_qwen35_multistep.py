@@ -12,8 +12,8 @@ Outputs (raw little-endian, into the same golden_dumps dir):
     multistep_logits.bin   fp32   [seq_len][vocab]     logits at every position
 
 Usage:
-    python generate_qwen35_multistep.py
-    python generate_qwen35_multistep.py --prompt "The quick brown fox jumps"
+    python scripts/generate_qwen35_multistep.py
+    python scripts/generate_qwen35_multistep.py --prompt "The quick brown fox jumps"
 """
 
 import argparse
@@ -21,9 +21,13 @@ import os
 import numpy as np
 import torch
 
-DEFAULT_MODEL_DIR = "F:/AI/Qwen3.5-9B-AWQ-4bit"
+# Checkpoint root comes from BLACKWELL_MODELS_DIR; out dir is anchored to the
+# repo root (parent of scripts/), NOT the CWD -- same convention as the
+# single-step generator, and the SAME golden_dumps dir.
+DEFAULT_MODEL_DIR = os.path.join(
+    os.environ.get("BLACKWELL_MODELS_DIR", "F:/AI"), "Qwen3.5-9B-AWQ-4bit")
 DEFAULT_OUT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "tests", "integration", "golden_dumps", "qwen3.5_hybrid",
 )
 

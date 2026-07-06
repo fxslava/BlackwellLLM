@@ -20,7 +20,10 @@ def main():
     print(f"[Hardware] GPU detected: {torch.cuda.get_device_name(0)}")
     print(f"[Hardware] VRAM used by OS: {torch.cuda.memory_allocated(0) / (1024**2):.1f} MB\n")
 
-    model_path = "./llama3-8b-fp8"
+    # Checkpoint root: BLACKWELL_MODELS_DIR, defaulting to the CWD (the legacy
+    # ./llama3-8b-fp8 layout).
+    model_path = os.path.join(
+        os.environ.get("BLACKWELL_MODELS_DIR", "."), "llama3-8b-fp8")
 
     print("[System] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_path)

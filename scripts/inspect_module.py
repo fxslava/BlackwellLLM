@@ -1,4 +1,5 @@
 import inspect
+import os
 import sys
 from transformers import AutoModelForCausalLM
 
@@ -8,7 +9,9 @@ def main():
     print(" Blackwell LLM: Module Source Code Inspector ")
     print("==================================================\n")
 
-    model_path = "./llama3-8b-fp8"
+    # Корень чекпоинтов: BLACKWELL_MODELS_DIR (по умолчанию CWD — легаси ./llama3-8b-fp8)
+    model_path = os.path.join(
+        os.environ.get("BLACKWELL_MODELS_DIR", "."), "llama3-8b-fp8")
     print(f"[System] Быстрая загрузка структуры модели из '{model_path}'...\n")
 
     # Загружаем модель на CPU, нам нужна только структура питоновских классов

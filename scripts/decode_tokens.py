@@ -1,9 +1,12 @@
+import os
 import sys
 from transformers import AutoTokenizer
 
 def main():
-    # Загружаем токенизатор из локальной папки твоей модели
-    tokenizer = AutoTokenizer.from_pretrained("./llama3-8b-fp8")
+    # Загружаем токенизатор из локальной папки модели: корень задаётся через
+    # BLACKWELL_MODELS_DIR (по умолчанию — CWD, легаси-раскладка ./llama3-8b-fp8)
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(os.environ.get("BLACKWELL_MODELS_DIR", "."), "llama3-8b-fp8"))
 
     # Скрипт может принимать токены либо как аргумент консоли, либо просить ввести их
     if len(sys.argv) > 1:

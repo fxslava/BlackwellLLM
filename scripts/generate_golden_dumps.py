@@ -66,11 +66,17 @@ def main():
     print(" Blackwell LLM: Automated Golden Dumps Generator ")
     print("==================================================\n")
 
-    dumps_dir = "./dumps"
+    # Anchored to the repo root (parent of scripts/), NOT the CWD, so the dumps
+    # land where the integration tests expect them regardless of invocation dir.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dumps_dir = os.path.join(repo_root, "dumps")
     os.makedirs(dumps_dir, exist_ok=True)
     print(f"[System] Cleared and prepared output directory: {dumps_dir}")
 
-    model_path = "./llama3-8b-fp8"
+    # Checkpoint root: BLACKWELL_MODELS_DIR, defaulting to the repo root (the
+    # legacy ./llama3-8b-fp8 layout).
+    model_path = os.path.join(
+        os.environ.get("BLACKWELL_MODELS_DIR", repo_root), "llama3-8b-fp8")
     print(
         "[System] Loading FP8 model into VRAM (Bfloat16 precision baseline)..."
     )

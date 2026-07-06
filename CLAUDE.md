@@ -21,7 +21,7 @@ workloads: a background app that wakes on a hotkey, translates, and goes back to
 | Tools | `src/tools/playground/`, `src/tools/poc_overlay/` | links core | HTTP playground GUI; Win32/UIA/Direct2D overlay translator (the flagship consumer). |
 | Tests | `tests/` | mixed | Labeled CTest suites — see Quickstart. `tests/common/` holds shared fixtures; `tests/reference/` is a compatibility shim. |
 | Design docs | `docs/` | — | Read these before touching the corresponding subsystem (list below). |
-| Python scripts | repo root (moving to `scripts/`) | — | PyTorch golden-dump generators + CLI chat reference. |
+| Python scripts | `scripts/` | — | PyTorch golden-dump generators + CLI chat reference. Checkpoint roots resolve via `BLACKWELL_MODELS_DIR` (default `F:/AI`). |
 
 ## The single-threaded engine doctrine (the most important rule)
 
@@ -109,7 +109,7 @@ target state; existing code migrates opportunistically when you touch it.
 | 2 | ~105 raw `cudaMalloc`/`cudaFree` sites; `BlackwellEngine::Impl` holds ~30 raw `float*` freed by a hand-maintained list in `~Impl()` | `DeviceBuffer<T>` RAII wrapper (move-only, sized ctor, implicit `T*` like `CudaVector`); Impl's destructor becomes `= default` | planned |
 | 3 | `src/CMakeLists.txt` is a ~200-line monolith (core lib + DirectStorage FetchContent + nvcomp experiment + tool gating); re-declares `project()` | One `CMakeLists.txt` per target directory; root only orchestrates; deps in `cmake/` modules | planned |
 | 4 | `blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks); root has global `include_directories(tests/reference)` | Narrow per-target `target_include_directories`; the `tests/reference` shim dies with the experiments refactor | planned |
-| 5 | Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`, `backup/` worktree copies | Scripts → `scripts/`, artifacts deleted, model paths via `BLACKWELL_MODELS_DIR` env var | planned |
+| 5 | ~~Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`~~ | Scripts live in `scripts/` (paths anchored to repo root, checkpoints via `BLACKWELL_MODELS_DIR`); stray artifacts deleted; the 126 MB of tracked golden dumps moved to Git LFS (`.gitattributes`); `backup/` stays local-only (gitignored) | **done** |
 | 6 | `build_target.bat` + IDE-generated cache is the only CLI build path | Committed `CMakePresets.json` (configure + build + test presets) | planned |
 | 7 | `TLS_VERIFY OFF` on the DirectStorage NuGet fetch; nvcomp vendored as raw binaries in `external/` | Verified fetches; nvcomp acquisition documented/scripted | planned |
 | 8 | Thread-ownership doctrine enforced only by comments | Debug thread-ID asserts on engine entry points (see doctrine section) | planned |

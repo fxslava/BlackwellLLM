@@ -1,3 +1,4 @@
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 
@@ -6,7 +7,10 @@ def main():
     print(" Blackwell LLM: BOS Token Generation (ID 128000) ")
     print("==================================================\n")
 
-    model_path = "./llama3-8b-fp8"
+    # Checkpoint root: BLACKWELL_MODELS_DIR, defaulting to the CWD (the legacy
+    # ./llama3-8b-fp8 layout).
+    model_path = os.path.join(
+        os.environ.get("BLACKWELL_MODELS_DIR", "."), "llama3-8b-fp8")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
     print("[System] Loading FP8 model into VRAM...")

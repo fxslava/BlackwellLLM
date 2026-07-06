@@ -16,8 +16,8 @@ The forward pass runs on CPU in FP16 (oneDNN accumulates in FP32, matching
 GPU GEMM semantics); the 15 GB FP16 model does not fit the local 12 GB card.
 
 Usage:
-    python generate_qwen_dumps.py
-    python generate_qwen_dumps.py --model-dir F:/AI/Qwen2.5-Coder-7B-Instruct-AWQ \
+    python scripts/generate_qwen_dumps.py
+    python scripts/generate_qwen_dumps.py --model-dir F:/AI/Qwen2.5-Coder-7B-Instruct-AWQ \
         --out-dir tests/integration/golden_dumps/qwen2.5_awq
 """
 
@@ -34,9 +34,13 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 # therefore yields logical order {0,2,4,6,1,3,5,7}; this permutation undoes it.
 AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 
-DEFAULT_MODEL_DIR = "F:/AI/Qwen2.5-Coder-7B-Instruct-AWQ"
+# Checkpoint root comes from BLACKWELL_MODELS_DIR; out dir is anchored to the
+# repo root (parent of scripts/), NOT the CWD, so the dumps always land where
+# the C++ integration test reads them.
+DEFAULT_MODEL_DIR = os.path.join(
+    os.environ.get("BLACKWELL_MODELS_DIR", "F:/AI"), "Qwen2.5-Coder-7B-Instruct-AWQ")
 DEFAULT_OUT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "tests", "integration", "golden_dumps", "qwen2.5_awq",
 )
 

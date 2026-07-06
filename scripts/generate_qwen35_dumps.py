@@ -51,9 +51,9 @@ Extra (requested for inspection; the test does not assert these):
 
 Usage
 -----
-    python generate_qwen35_dumps.py
-    python generate_qwen35_dumps.py --token-id 0 --device cuda
-    python generate_qwen35_dumps.py --model-dir F:/AI/Qwen3.5-9B-AWQ-4bit \
+    python scripts/generate_qwen35_dumps.py
+    python scripts/generate_qwen35_dumps.py --token-id 0 --device cuda
+    python scripts/generate_qwen35_dumps.py --model-dir F:/AI/Qwen3.5-9B-AWQ-4bit \
         --out-dir tests/integration/golden_dumps/qwen3.5_hybrid
 """
 
@@ -64,9 +64,13 @@ import os
 import numpy as np
 import torch
 
-DEFAULT_MODEL_DIR = "F:/AI/Qwen3.5-9B-AWQ-4bit"
+# Checkpoint root comes from BLACKWELL_MODELS_DIR; out dir is anchored to the
+# repo root (parent of scripts/), NOT the CWD, so the dumps always land where
+# the C++ integration test reads them.
+DEFAULT_MODEL_DIR = os.path.join(
+    os.environ.get("BLACKWELL_MODELS_DIR", "F:/AI"), "Qwen3.5-9B-AWQ-4bit")
 DEFAULT_OUT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "tests", "integration", "golden_dumps", "qwen3.5_hybrid",
 )
 
