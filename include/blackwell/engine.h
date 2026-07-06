@@ -74,6 +74,14 @@ public:
                 int seq_id = 0);
     float forward_eval(int token_id, int pos, int target_token_id, int seq_id = 0);
 
+    // Softmax probability, in [0, 1], of `token_id` under the CURRENT logits --
+    // the distribution the most recent forward()/prefill left in the device
+    // logits buffer. Call right after sampling a token to record how confident
+    // the model was in it (the Developer-Mode heatmap does exactly this). Does a
+    // full-vocab device->host read, so it is a debug-path convenience, not a
+    // per-token steady-state cost. Returns 0 for an out-of-range id.
+    float last_token_probability(int token_id) const;
+
     // Sequence branching (Paged mode only; throws under Continuous). fork shares
     // the parent's KV pages via CoW; rewind rolls a sequence back to `pos` tokens.
     // A forked child is decoded by passing its id as seq_id to forward().

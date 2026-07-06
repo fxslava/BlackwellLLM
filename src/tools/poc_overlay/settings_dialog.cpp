@@ -258,6 +258,7 @@ void SettingsWindow::PushConfigToJs() {
     j["maxTokens"] = config_.maxTokens;
     j["captureGranularity"] = ToString(config_.captureGranularity);
     j["idleTimerMs"] = config_.idleTimerMs;
+    j["developerMode"] = config_.developerMode;
     j["activateOnStartup"] = config_.activateOnStartup;
     j["kvSpillTimeoutSec"] = config_.kvSpillTimeoutSec;
     j["hibernateTimeoutSec"] = config_.hibernateTimeoutSec;
@@ -338,6 +339,7 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
             j.value("captureGranularity", std::string()), config_.captureGranularity);
         config_.idleTimerMs = j.value("idleTimerMs", config_.idleTimerMs);
         if (config_.idleTimerMs < 100) config_.idleTimerMs = 100;
+        config_.developerMode = j.value("developerMode", config_.developerMode);
         config_.activateOnStartup = j.value("activateOnStartup", config_.activateOnStartup);
         config_.kvSpillTimeoutSec = j.value("kvSpillTimeoutSec", config_.kvSpillTimeoutSec);
         config_.hibernateTimeoutSec = j.value("hibernateTimeoutSec", config_.hibernateTimeoutSec);

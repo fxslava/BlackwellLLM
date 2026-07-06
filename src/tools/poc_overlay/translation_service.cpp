@@ -138,6 +138,12 @@ void TranslationService::SetActiveLanguage(int index) {
     if (tracker_) tracker_->SetActiveLanguage(index);  // clamps internally
 }
 
+void TranslationService::SetDeveloperMode(bool enabled) {
+    developerMode_.store(enabled, std::memory_order_relaxed);  // remembered for the handoff
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (tracker_) tracker_->SetCollectProbabilities(enabled);
+}
+
 void TranslationService::UpdateLanguagePairs(std::vector<std::string> targetLanguages,
                                              int activeLanguage) {
     // Rebuild the per-direction system prompts OUTSIDE the lock (pure string
@@ -247,6 +253,16 @@ void TranslationService::DeliverLifecycle(LifecycleEvent event) {
     if (sink) sink(event);
 }
 
+void TranslationService::DeliverToSink(std::uint64_t gen, const std::wstring& text,
+                                       const TokenHeatmap& tokens, bool done) {
+    PreviewSink sink;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink = previewSink_;  // copy under the lock; call outside it
+    }
+    if (sink) sink(gen, text, tokens, done);
+}
+
 void TranslationService::MarkActivity() {
     lastActivityMs_.store(NowMs(), std::memory_order_relaxed);
     lifecycleStage_.store(0, std::memory_order_relaxed);  // re-arm both stages
@@ -280,16 +296,6 @@ void TranslationService::LifecycleTick(int kvSpillTimeoutSec, int hibernateTimeo
     }
 }
 
-void TranslationService::DeliverToSink(std::uint64_t gen, const std::wstring& text,
-                                       bool done) {
-    PreviewSink sink;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        sink = previewSink_;  // copy under the lock; call outside it
-    }
-    if (sink) sink(gen, text, done);
-}
-
 void TranslationService::TrackUpdate(std::wstring segment, std::wstring inferenceContext) {
     if (stop_.load(std::memory_order_relaxed) || segment.empty()) return;
     MarkActivity();
@@ -307,7 +313,9 @@ void TranslationService::TriggerGeneration(std::wstring segment,
     const std::uint64_t gen = requestSeq_.fetch_add(1, std::memory_order_relaxed) + 1;
     tracker_->TriggerGeneration(
         std::move(segment), std::move(inferenceContext),
-        [this, gen](const std::wstring& text, bool done) { DeliverToSink(gen, text, done); });
+        [this, gen](const std::wstring& text, const TokenHeatmap& tokens, bool done) {
+            DeliverToSink(gen, text, tokens, done);
+        });
 }
 
 void TranslationService::Cancel() {
@@ -340,6 +348,9 @@ void TranslationService::ThreadMain() {
     // reach the tracker through tracker_, so no event can fire un-forwarded.
     tracker->SetLifecycleSink(
         [this](LifecycleEvent event) { DeliverLifecycle(event); });
+    // Carry the Developer-Mode flag across the handoff (it may have been toggled
+    // while the model was still loading).
+    tracker->SetCollectProbabilities(developerMode_.load(std::memory_order_relaxed));
     std::lock_guard<std::mutex> lock(mutex_);
     if (!stop_.load(std::memory_order_relaxed)) {
         tracker_ = std::move(tracker);

@@ -102,6 +102,23 @@ private:
     void Blit(POINT dst, SIZE size, BYTE alpha);
     void RunFadeStep();  // WM_TIMER: advance / finish the CenterHud fade
 
+    // Pre-draws the per-token probability heatmap ("thermograd") behind `layout`,
+    // which must hold exactly the concatenation of `tokens[].text`. Colored
+    // rectangles are filled at the token character ranges (measured via
+    // HitTestTextRange) BEFORE the text is drawn on top. No-op if `tokens` is
+    // empty. `origin` is where the layout is drawn in the DIB (its rects come
+    // back in that space).
+    void DrawHeatmap(IDWriteTextLayout* layout, const TokenHeatmap& tokens, D2D1_POINT_2F origin);
+
+    // --- Developer-Mode debug overlay (second, whole-virtual-screen window) ----
+    // The red UIA bounding box + green caret line live at arbitrary screen
+    // coordinates and can be far larger than the caret pill, so they get their
+    // own click-through layered window rather than fighting the pill's tiny,
+    // caret-anchored DIB. Lazily created on the first dev-mode paint.
+    bool EnsureDebugWindow();
+    void RenderDebug(const OverlaySnapshot& state);
+    void HideDebug();
+
     // --- interactive header bar + override dropdown --------------------------
     // True while the caret pill is showing a clickable header (typing pipeline
     // with a known language and configured labels).
@@ -148,4 +165,15 @@ private:
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;
+
+    // Developer-Mode debug overlay: its own window + DIB + DC render target,
+    // sized once to the virtual screen so any on-screen box fits. All null until
+    // the first dev-mode paint (EnsureDebugWindow).
+    HWND debugHwnd_ = nullptr;
+    HDC debugDC_ = nullptr;
+    HBITMAP debugDib_ = nullptr;
+    Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> debugRT_;
+    int debugDibW_ = 0;
+    int debugDibH_ = 0;
+    bool debugVisible_ = false;
 };

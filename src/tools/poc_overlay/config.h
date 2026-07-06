@@ -65,6 +65,14 @@ struct Config {
     CaptureGranularity captureGranularity = CaptureGranularity::Sentence;
     int idleTimerMs = 700;  // typing-idle debounce before preview inference starts
 
+    // Developer Mode: overlay debug instrumentation. When true the overlay draws
+    // what the OS hooks + UIA actually see (the focused element's bounding box in
+    // red, the exact caret rect in green) and paints a per-token probability
+    // heatmap ("thermograd") behind the translation. Off by default -- it adds a
+    // full-vocab logits read per decoded token, so it is a debugging aid, not a
+    // steady-state path.
+    bool developerMode = false;
+
     // Startup & inactivity lifecycle (the dual-stage memory state machine).
     // activateOnStartup: true = warm the engine and enter Translation Mode at
     // launch; false = start inactive and defer loading model weights into VRAM

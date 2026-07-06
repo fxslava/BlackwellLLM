@@ -4,8 +4,10 @@
 #include <windowsx.h>  // GET_X_LPARAM / GET_Y_LPARAM
 
 #include <algorithm>
+#include <climits>  // LONG_MAX / LONG_MIN (union-rect seed)
 #include <cmath>
 #include <memory>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -25,6 +27,37 @@ RECT WorkAreaUnderCursor() {
     return RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
 }
 
+// Thermograd ramp: map a token probability in [0, 1] to a semi-transparent
+// background color. Confident tokens (cold) fade toward transparent faint blue;
+// uncertain tokens (hot) run yellow -> red with rising opacity so the eye is
+// drawn to exactly where the model was unsure.
+//   p >= 0.90 : faint blue, barely there (cold)
+//   0.50..0.90: blue -> yellow
+//   p <  0.50 : yellow -> red, hotter (more opaque) as p -> 0
+D2D1_COLOR_F HeatColor(float p) {
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    if (p >= 0.9f) {
+        // Cold: a whisper of blue, mostly transparent.
+        return D2D1::ColorF(0.30f, 0.55f, 1.0f, 0.10f);
+    }
+    if (p >= 0.5f) {
+        // Blue -> yellow across [0.5, 0.9]; t=1 at the cold end.
+        const float t = (p - 0.5f) / 0.4f;            // 0 (warm) .. 1 (cool)
+        const float r = 0.95f * (1.0f - t) + 0.30f * t;
+        const float g = 0.85f * (1.0f - t) + 0.55f * t;
+        const float b = 0.20f * (1.0f - t) + 1.00f * t;
+        return D2D1::ColorF(r, g, b, 0.28f);
+    }
+    // Hot: yellow -> red across [0, 0.5]; h=1 at the hottest (p=0).
+    const float h = (0.5f - p) / 0.5f;                // 0 (yellow) .. 1 (red)
+    const float r = 0.95f;
+    const float g = 0.85f * (1.0f - h) + 0.20f * h;
+    const float b = 0.20f * (1.0f - h);
+    const float a = 0.30f + 0.35f * h;                // hotter = more opaque
+    return D2D1::ColorF(r, g, b, a);
+}
+
 // Keep a box fully on the monitor nearest `anchor`.
 void ClampToMonitor(POINT& dst, int boxW, int boxH, POINT anchor) {
     HMONITOR mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
@@ -41,11 +74,21 @@ void ClampToMonitor(POINT& dst, int boxW, int boxH, POINT anchor) {
 
 OverlayWindow::~OverlayWindow() {
     renderTarget_.Reset();
+    debugRT_.Reset();
     if (dib_) {
         DeleteObject(dib_);
     }
     if (memDC_) {
         DeleteDC(memDC_);
+    }
+    if (debugDib_) {
+        DeleteObject(debugDib_);
+    }
+    if (debugDC_) {
+        DeleteDC(debugDC_);
+    }
+    if (debugHwnd_) {
+        DestroyWindow(debugHwnd_);
     }
     if (hwnd_) {
         DestroyWindow(hwnd_);
@@ -408,10 +451,15 @@ void OverlayWindow::Repaint(const OverlaySnapshot& state) {
             (state.languagePinned && pinnedBrush) ? pinnedBrush.Get() : headerBrush.Get();
         drawStrip(headerText, hTop, static_cast<float>(headerH), headerTextBrush);
     }
+    const D2D1_POINT_2F bodyOrigin =
+        D2D1::Point2F(static_cast<float>(kPadX), static_cast<float>(bodyTop + kPadY));
+    // Developer-Mode thermograd: colored rectangles behind the body BEFORE the
+    // glyphs, so the text sits on top of its own per-token confidence heatmap.
+    if (state.developerMode && !state.translationTokens.empty()) {
+        DrawHeatmap(layout.Get(), state.translationTokens, bodyOrigin);
+    }
     if (fgBrush) {
-        renderTarget_->DrawTextLayout(
-            D2D1::Point2F(static_cast<float>(kPadX), static_cast<float>(bodyTop + kPadY)),
-            layout.Get(), fgBrush.Get());
+        renderTarget_->DrawTextLayout(bodyOrigin, layout.Get(), fgBrush.Get());
     }
     renderTarget_->EndDraw();
 
@@ -548,11 +596,224 @@ void OverlayWindow::RunFadeStep() {
     Blit(lastDst_, lastSize_, alpha);
 }
 
+// ---------------------------------------------------------------------------
+// Developer Mode: probability heatmap + UIA/caret debug overlay
+// ---------------------------------------------------------------------------
+void OverlayWindow::DrawHeatmap(IDWriteTextLayout* layout, const TokenHeatmap& tokens,
+                                D2D1_POINT_2F origin) {
+    if (!layout || tokens.empty()) {
+        return;
+    }
+    ComPtr<ID2D1SolidColorBrush> cell;
+    if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0),
+                                                    cell.GetAddressOf()))) {
+        return;
+    }
+    // Walk the tokens in text order, mapping each to its [offset, length) range
+    // in the layout (which holds exactly the concatenation of tokens[].text) and
+    // filling that range's bounding rect(s) with the token's heat color.
+    UINT32 offset = 0;
+    for (const TokenInfo& tok : tokens) {
+        const UINT32 len = static_cast<UINT32>(tok.text.length());
+        if (len == 0) {
+            continue;
+        }
+        // A single token rarely spans more than one line box; size for a few and
+        // grow only if HitTestTextRange asks for more.
+        DWRITE_HIT_TEST_METRICS hit[4];
+        UINT32 actual = 0;
+        HRESULT hr = layout->HitTestTextRange(offset, len, origin.x, origin.y, hit, 4, &actual);
+        std::vector<DWRITE_HIT_TEST_METRICS> dynamic;
+        if (hr == E_NOT_SUFFICIENT_BUFFER && actual > 0) {
+            dynamic.resize(actual);
+            hr = layout->HitTestTextRange(offset, len, origin.x, origin.y, dynamic.data(), actual,
+                                          &actual);
+        }
+        const DWRITE_HIT_TEST_METRICS* metrics = dynamic.empty() ? hit : dynamic.data();
+        if (SUCCEEDED(hr)) {
+            cell->SetColor(HeatColor(tok.probability));
+            for (UINT32 i = 0; i < actual; ++i) {
+                const auto& m = metrics[i];
+                renderTarget_->FillRectangle(
+                    D2D1::RectF(m.left, m.top, m.left + m.width, m.top + m.height), cell.Get());
+            }
+        }
+        offset += len;
+    }
+}
+
+bool OverlayWindow::EnsureDebugWindow() {
+    if (debugHwnd_ && debugRT_ && debugDib_) {
+        return true;
+    }
+    if (!debugHwnd_) {
+        static bool registered = false;
+        const wchar_t* kDebugClass = L"BlackwellPocOverlayDebugWindow";
+        if (!registered) {
+            WNDCLASSEXW wc{sizeof(wc)};
+            wc.lpfnWndProc = &DefWindowProcW;  // pure output surface; never handles input
+            wc.hInstance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
+            wc.lpszClassName = kDebugClass;
+            RegisterClassExW(&wc);
+            registered = true;
+        }
+        // WS_EX_TRANSPARENT: fully click-through (unlike the pill, this window has
+        // no interactive chrome, so it never needs WM_NCHITTEST). Same layered /
+        // no-activate / topmost / tool-window traits otherwise.
+        debugHwnd_ = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            kDebugClass, L"", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr,
+            reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE)), nullptr);
+        if (!debugHwnd_) {
+            return false;
+        }
+    }
+    // One DIB sized to the whole virtual screen, so any on-screen box fits from
+    // its top-left corner (we blit only the used sub-rect each frame).
+    if (!debugDib_) {
+        debugDibW_ = std::max(GetSystemMetrics(SM_CXVIRTUALSCREEN), 1);
+        debugDibH_ = std::max(GetSystemMetrics(SM_CYVIRTUALSCREEN), 1);
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = debugDibW_;
+        bmi.bmiHeader.biHeight = -debugDibH_;  // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        debugDC_ = CreateCompatibleDC(nullptr);
+        if (!debugDC_) {
+            return false;
+        }
+        void* bits = nullptr;
+        debugDib_ = CreateDIBSection(debugDC_, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!debugDib_) {
+            return false;
+        }
+        SelectObject(debugDC_, debugDib_);
+    }
+    if (!debugRT_) {
+        const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (FAILED(d2dFactory_->CreateDCRenderTarget(&props, debugRT_.GetAddressOf()))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void OverlayWindow::HideDebug() {
+    if (debugVisible_ && debugHwnd_) {
+        ShowWindow(debugHwnd_, SW_HIDE);
+        debugVisible_ = false;
+    }
+}
+
+void OverlayWindow::RenderDebug(const OverlaySnapshot& state) {
+    // Only paint when Developer Mode is on and there is at least one thing to
+    // draw. Any other state hides the debug surface so stale boxes never linger.
+    if (!state.developerMode || (!state.uiaBoundsValid && !state.caretRectValid)) {
+        HideDebug();
+        return;
+    }
+    if (!EnsureDebugWindow()) {
+        return;
+    }
+
+    // Union of the two rects (screen pixels), clamped to the virtual-screen DIB.
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    RECT u{LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN};
+    auto expand = [&u](const RECT& r) {
+        u.left = std::min(u.left, r.left);
+        u.top = std::min(u.top, r.top);
+        u.right = std::max(u.right, r.right);
+        u.bottom = std::max(u.bottom, r.bottom);
+    };
+    if (state.uiaBoundsValid) expand(state.uiaBounds);
+    if (state.caretRectValid) expand(state.caretRect);
+    // Pad by the stroke width so a border drawn on the union edge is not clipped.
+    constexpr int kStroke = 2;
+    constexpr int kPad = kStroke + 1;
+    u.left -= kPad;
+    u.top -= kPad;
+    u.right += kPad;
+    u.bottom += kPad;
+
+    int boxW = static_cast<int>(u.right - u.left);
+    int boxH = static_cast<int>(u.bottom - u.top);
+    boxW = std::clamp(boxW, 1, debugDibW_);
+    boxH = std::clamp(boxH, 1, debugDibH_);
+
+    const RECT bind{0, 0, boxW, boxH};
+    if (FAILED(debugRT_->BindDC(debugDC_, &bind))) {
+        return;
+    }
+    const float ox = static_cast<float>(u.left);  // union origin -> DIB local
+    const float oy = static_cast<float>(u.top);
+
+    debugRT_->BeginDraw();
+    debugRT_->Clear(D2D1::ColorF(0, 0, 0, 0));  // transparent
+
+    // (a) The UIA element bounding box: 2px semi-transparent RED border.
+    if (state.uiaBoundsValid) {
+        ComPtr<ID2D1SolidColorBrush> red;
+        debugRT_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.15f, 0.15f, 0.75f),
+                                        red.GetAddressOf());
+        if (red) {
+            const RECT& b = state.uiaBounds;
+            // Inset by half the stroke so the 2px line sits ON the boundary.
+            const D2D1_RECT_F r = D2D1::RectF(b.left - ox + kStroke * 0.5f,
+                                              b.top - oy + kStroke * 0.5f,
+                                              b.right - ox - kStroke * 0.5f,
+                                              b.bottom - oy - kStroke * 0.5f);
+            debugRT_->DrawRectangle(r, red.Get(), static_cast<float>(kStroke));
+        }
+    }
+    // (b) The exact caret: 2px solid GREEN line at the caret's leading edge,
+    // spanning its height (a bare caret has zero width -> a vertical bar).
+    if (state.caretRectValid) {
+        ComPtr<ID2D1SolidColorBrush> green;
+        debugRT_->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.90f, 0.20f, 0.95f),
+                                        green.GetAddressOf());
+        if (green) {
+            const RECT& c = state.caretRect;
+            const float x = c.left - ox;
+            const float top = c.top - oy;
+            const float bottom = c.bottom - oy;
+            const float width = (c.right > c.left) ? static_cast<float>(c.right - c.left)
+                                                   : static_cast<float>(kStroke);
+            debugRT_->FillRectangle(D2D1::RectF(x, top, x + width, bottom), green.Get());
+        }
+    }
+    if (FAILED(debugRT_->EndDraw())) {
+        return;
+    }
+
+    POINT dst{static_cast<int>(u.left), static_cast<int>(u.top)};
+    // Guard against a union that started off the virtual-screen origin.
+    dst.x = std::max(dst.x, static_cast<LONG>(vx));
+    dst.y = std::max(dst.y, static_cast<LONG>(vy));
+    POINT src{0, 0};
+    SIZE size{boxW, boxH};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    HDC screenDC = GetDC(nullptr);
+    UpdateLayeredWindow(debugHwnd_, screenDC, &dst, &size, debugDC_, &src, 0, &blend, ULW_ALPHA);
+    ReleaseDC(nullptr, screenDC);
+    if (!debugVisible_) {
+        ShowWindow(debugHwnd_, SW_SHOWNOACTIVATE);
+        debugVisible_ = true;
+    }
+}
+
 LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == kMsgState) {
         std::unique_ptr<OverlaySnapshot> payload(reinterpret_cast<OverlaySnapshot*>(lParam));
         auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self) {
+            // The debug overlay tracks the focused field independently of the
+            // caret pill (which may hide), so paint it from the snapshot too.
+            self->RenderDebug(*payload);
             self->Repaint(*payload);
         }
         return 0;

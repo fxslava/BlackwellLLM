@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>  // OutputDebugStringW
 
+#include <algorithm>
 #include <string_view>
 #include <utility>
 
@@ -24,6 +25,20 @@ namespace {
 
 void Log(const std::wstring& message) {
     OutputDebugStringW((L"[live_tracker] " + message + L"\n").c_str());
+}
+
+// Length of the longest prefix of `s` that ends on a UTF-8 codepoint boundary
+// (i.e. contains only whole sequences). Used to keep a token whose bytes end
+// mid-codepoint from being converted until the completing bytes arrive.
+size_t CompleteUtf8Prefix(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        const size_t len = c < 0x80 ? 1 : (c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1);
+        if (i + len > s.size()) break;  // sequence runs past the end -> incomplete
+        i += len;
+    }
+    return i;
 }
 
 // Chop a trailing INCOMPLETE UTF-8 sequence so a mid-codepoint streaming
@@ -183,7 +198,7 @@ void LiveTranslationTracker::TrackUpdate(std::wstring current_text, std::wstring
 void LiveTranslationTracker::TriggerGeneration(std::wstring current_text, std::wstring context,
                                                StreamCallback callback) {
     if (stop_.load(std::memory_order_relaxed) || current_text.empty()) {
-        if (callback) callback(L"", true);
+        if (callback) callback(L"", {}, true);
         return;
     }
     Job job;
@@ -438,11 +453,11 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
         tokens = BuildTokens(job.text, job.context);
     } catch (const std::exception& e) {
         Log(L"generation aborted (token build): " + FromUtf8(e.what()));
-        if (job.callback) job.callback(L"", true);
+        if (job.callback) job.callback(L"", {}, true);
         return;
     }
     if (tokens.empty() || tokens.size() >= adapter_.max_seq_len()) {
-        if (job.callback) job.callback(L"", true);
+        if (job.callback) job.callback(L"", {}, true);
         return;
     }
 
@@ -461,7 +476,7 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
         coord.commit_sequence(session_->seq);
     } catch (const std::exception& e) {
         Log(L"generation aborted (prefill): " + FromUtf8(e.what()));
-        if (job.callback) job.callback(L"", true);
+        if (job.callback) job.callback(L"", {}, true);
         return;
     }
 
@@ -475,13 +490,18 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
         next = coord.sample_last_logits(0.0f, 1.0f);
     } catch (const std::exception& e) {
         Log(L"generation aborted (sampling): " + FromUtf8(e.what()));
-        if (job.callback) job.callback(L"", true);
+        if (job.callback) job.callback(L"", {}, true);
         return;
     }
 
+    const bool collectProbs = collect_probs_.load(std::memory_order_relaxed);
     const size_t cap = adapter_.max_seq_len();
     std::string acc;
     std::wstring last_posted;
+    // Parallel to `acc`: the byte length of `acc` after each token AND that
+    // token's probability, so BuildHeatmap can slice pieces against the
+    // <finish> body window without re-tokenizing. Empty unless collecting.
+    std::vector<std::pair<size_t, float>> pieceEnds;
     int generated = 0;
     bool finished = false;
     bool interrupted = false;
@@ -493,7 +513,20 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
         }
         if (adapter_.tokenizer().is_stop(next)) break;  // real eos, no <finish> ever closed
 
+        // Developer Mode: read the sampled token's probability from the CURRENT
+        // logits (the ones it was drawn from) BEFORE the next forward() pass
+        // overwrites them. A full-vocab read -- gated on the debug flag.
+        float prob = 1.0f;
+        if (collectProbs) {
+            try {
+                prob = adapter_.engine().last_token_probability(next);
+            } catch (const std::exception&) {
+                prob = 1.0f;  // never let a debug read break the decode
+            }
+        }
+
         acc += adapter_.tokenizer().decode(next);
+        if (collectProbs) pieceEnds.emplace_back(acc.size(), prob);
         if (acc.find("</finish>") != std::string::npos) finished = true;
 
         StreamPartial(acc, job.callback, last_posted);
@@ -517,7 +550,9 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
     }
     const std::wstring final_text =
         finished ? ExtractFinishBody(acc, /*require_close=*/true) : std::wstring();
-    job.callback(final_text, /*done=*/true);
+    const TokenHeatmap heatmap =
+        (collectProbs && finished) ? BuildHeatmap(acc, pieceEnds) : TokenHeatmap{};
+    job.callback(final_text, heatmap, /*done=*/true);
 }
 
 void LiveTranslationTracker::RunGenerateFallback(const Job& job) {
@@ -562,7 +597,9 @@ void LiveTranslationTracker::RunGenerateFallback(const Job& job) {
     if (final_text.empty() && !raw.empty() && raw.find('<') == std::string::npos) {
         final_text = FromUtf8(raw);
     }
-    job.callback(final_text, /*done=*/true);
+    // The fallback path (adapter generate()) exposes no per-token logits, so it
+    // carries no heatmap -- correctness over instrumentation on legacy models.
+    job.callback(final_text, {}, /*done=*/true);
 }
 
 void LiveTranslationTracker::StreamPartial(const std::string& acc,
@@ -572,5 +609,49 @@ void LiveTranslationTracker::StreamPartial(const std::string& acc,
     std::wstring text = ExtractFinishBody(acc, /*require_close=*/false);
     if (text.empty() || text == last_posted) return;
     last_posted = text;
-    callback(last_posted, /*done=*/false);
+    callback(last_posted, {}, /*done=*/false);  // partials never carry the heatmap
+}
+
+TokenHeatmap LiveTranslationTracker::BuildHeatmap(
+    const std::string& acc, const std::vector<std::pair<size_t, float>>& pieceEnds) const {
+    // Body window in RAW (UTF-8) byte offsets: the same slice ExtractFinishBody
+    // returns, but tracked in `acc`'s coordinates so it lines up with pieceEnds.
+    static constexpr std::string_view kOpen = "<finish>";
+    static constexpr std::string_view kClose = "</finish>";
+    const size_t open = acc.find(kOpen);
+    if (open == std::string::npos) return {};
+    const size_t bodyStart = open + kOpen.size();
+    size_t bodyEnd = acc.find(kClose, bodyStart);
+    if (bodyEnd == std::string::npos) bodyEnd = acc.size();
+
+    // Walk the tokens in order, clipping each to the body window. A token can
+    // end mid-codepoint (byte-level BPE), so carry the incomplete tail forward
+    // to the next token before converting -- this guarantees the concatenation
+    // of the emitted pieces equals FromUtf8(whole body) == the delivered
+    // translation, which is exactly what the overlay measures the heatmap
+    // against. The rare split codepoint takes the later token's probability.
+    TokenHeatmap heatmap;
+    size_t pieceStart = 0;
+    std::string carry;
+    float carryProb = 1.0f;
+    for (const auto& [pieceEnd, prob] : pieceEnds) {
+        const size_t lo = std::max(pieceStart, bodyStart);
+        const size_t hi = std::min(pieceEnd, bodyEnd);
+        pieceStart = pieceEnd;
+        if (lo >= hi) continue;  // token lies entirely in the <finish>/</finish> framing
+
+        std::string bytes = carry + acc.substr(lo, hi - lo);
+        const size_t good = CompleteUtf8Prefix(bytes);
+        std::wstring piece = FromUtf8(bytes.substr(0, good));
+        carry = bytes.substr(good);  // incomplete tail -> next token
+        carryProb = prob;
+        if (!piece.empty()) {
+            heatmap.push_back({std::move(piece), prob});
+        }
+    }
+    if (!carry.empty()) {  // valid UTF-8 never leaves a tail, but stay safe
+        std::wstring piece = FromUtf8(carry);
+        if (!piece.empty()) heatmap.push_back({std::move(piece), carryProb});
+    }
+    return heatmap;
 }

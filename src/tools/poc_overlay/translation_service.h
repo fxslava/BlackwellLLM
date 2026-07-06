@@ -93,9 +93,11 @@ public:
     // growing text) and exactly once per TriggerGeneration with done=true --
     // final translation, or EMPTY text when the run failed / was superseded,
     // so the consumer's state machine can leave its loading state either way.
-    // Must only enqueue/marshal -- never touch a window or COM directly.
-    using PreviewSink =
-        std::function<void(std::uint64_t gen, const std::wstring& text, bool done)>;
+    // `tokens` is the per-token confidence heatmap for `text`, non-empty only
+    // on the final delivery in Developer Mode (see LiveTranslationTracker's
+    // StreamCallback). Must only enqueue/marshal -- never touch a window or COM.
+    using PreviewSink = std::function<void(std::uint64_t gen, const std::wstring& text,
+                                           const TokenHeatmap& tokens, bool done)>;
 
     explicit TranslationService(Settings settings);
     ~TranslationService();  // calls Shutdown()
@@ -168,6 +170,10 @@ public:
     // even if it is called before the model finishes loading.
     void SetActiveLanguage(int index);
 
+    // Developer Mode: enable per-token probability collection for the heatmap.
+    // Thread-safe; remembered across the tracker handoff and applied live.
+    void SetDeveloperMode(bool enabled);
+
     // Join the worker (and, once constructed, the tracker's own thread).
     // Called explicitly from wWinMain BEFORE stack unwinding so the sink can
     // never fire into an already-destroyed CaretTracker (the tracker is
@@ -208,7 +214,8 @@ private:
     // reconstructs the SAME transcript shape at request time (see BuildTokens);
     // this is only the STATIC prefix used to seed one .bkv branch.
     std::string StableServingPrefix(const std::string& previewPrompt) const;
-    void DeliverToSink(std::uint64_t gen, const std::wstring& text, bool done);
+    void DeliverToSink(std::uint64_t gen, const std::wstring& text,
+                       const TokenHeatmap& tokens, bool done);
     void DeliverLifecycle(LifecycleEvent event);  // tracker worker -> bound sink
     void MarkActivity();  // refresh lastActivityMs_ and re-arm the stage ladder
 
@@ -232,6 +239,7 @@ private:
     std::atomic<State> state_{State::Loading};
     std::atomic<std::uint64_t> requestSeq_{0};  // debug/log id surfaced to the sink
     std::atomic<bool> stop_{false};
+    std::atomic<bool> developerMode_{false};  // remembered across the tracker handoff
 
     // Inactivity lifecycle bookkeeping. lastActivityMs_ is a steady-clock
     // millisecond stamp refreshed by TrackUpdate/TriggerGeneration; stage_

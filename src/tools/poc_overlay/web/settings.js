@@ -316,6 +316,7 @@ function applyConfig(cfg) {
   $('maxTokens').value    = cfg.maxTokens != null ? cfg.maxTokens : 1024;
   $('granularity').value  = cfg.captureGranularity || 'sentence';
   $('idleTimerMs').value  = cfg.idleTimerMs != null ? cfg.idleTimerMs : 700;
+  $('developerMode').checked = cfg.developerMode === true;
   $('activateOnStartup').checked = cfg.activateOnStartup === true;
   $('vramCacheBlocks').value = cfg.vramCacheBlocks != null ? cfg.vramCacheBlocks : 1024;
   $('ramTierBlocks').value   = cfg.ramTierBlocks != null ? cfg.ramTierBlocks : 2048;
@@ -350,6 +351,7 @@ function buildPayload() {
     maxTokens: parseInt($('maxTokens').value, 10) || 1024,
     captureGranularity: $('granularity').value,
     idleTimerMs: parseInt($('idleTimerMs').value, 10) || 700,
+    developerMode: $('developerMode').checked,
     activateOnStartup: $('activateOnStartup').checked,
     vramCacheBlocks: parseInt($('vramCacheBlocks').value, 10) || 0,
     ramTierBlocks: parseInt($('ramTierBlocks').value, 10) || 0,

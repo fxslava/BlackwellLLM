@@ -74,6 +74,8 @@
 #include <thread>
 #include <vector>
 
+#include "token_info.h"  // TokenInfo / TokenHeatmap
+
 namespace playground {
 class BlackwellLLMAdapter;
 }
@@ -83,9 +85,15 @@ public:
     // Runs on THIS CLASS'S WORKER THREAD. `done=false` carries a growing
     // partial translation as it streams from the model; `done=true` marks the
     // end (text empty on failure -- no <finish> ever closed, or the model's
-    // real eos fired before it did). The receiver must only enqueue/marshal --
-    // never touch a window or COM directly.
-    using StreamCallback = std::function<void(const std::wstring& text, bool done)>;
+    // real eos fired before it did). `tokens` is the per-token confidence
+    // heatmap for `text`, populated ONLY on the final delivery and ONLY when
+    // probability collection is enabled (Developer Mode); it is empty for
+    // partials and in the normal path. When non-empty, concatenating
+    // tokens[].text reproduces `text` exactly, so the overlay can align the
+    // heatmap. The receiver must only enqueue/marshal -- never touch a window
+    // or COM directly.
+    using StreamCallback =
+        std::function<void(const std::wstring& text, const TokenHeatmap& tokens, bool done)>;
 
     // The dual-stage inactivity lifecycle, as observed from the worker thread:
     //   KvSpilled  -- stage 1 done: the KV prefix cache was demoted to disk.
@@ -147,6 +155,14 @@ public:
     // request builds tokens from the new prompt -- update_sequence simply
     // reconciles the (now larger) diff, so no explicit session reset is needed.
     void SetActiveLanguage(int index);
+
+    // Developer Mode toggle: when true, the decode loop records each sampled
+    // token's probability (a full-vocab logits read per token) and the final
+    // delivery carries the per-token heatmap. Off by default -- purely a debug
+    // cost. Thread-safe (atomic); the next generation observes the new value.
+    void SetCollectProbabilities(bool enabled) {
+        collect_probs_.store(enabled, std::memory_order_relaxed);
+    }
 
     // Hot-reload the prompt set (language pairs edited in Settings -- NO app
     // restart). Thread-safe: the prompts live behind a shared_ptr snapshot
@@ -230,6 +246,13 @@ private:
     // </finish> to `callback` if it changed since `last_posted`.
     void StreamPartial(const std::string& acc, const StreamCallback& callback,
                        std::wstring& last_posted) const;
+    // Build the final translation heatmap: intersect the decoded token pieces
+    // (raw UTF-8 offsets in `acc`, parallel to `probs`) with the <finish> body
+    // window, emitting one TokenInfo per piece that lands inside it. The
+    // concatenation of the result's text equals ExtractFinishBody(acc) so the
+    // overlay's per-token measuring stays aligned. Empty if collection was off.
+    TokenHeatmap BuildHeatmap(const std::string& acc,
+                              const std::vector<std::pair<size_t, float>>& pieceEnds) const;
 
     playground::BlackwellLLMAdapter& adapter_;
     // One system prompt per translation direction, behind an immutable
@@ -242,6 +265,7 @@ private:
     float temperature_;
     float top_p_;
     std::atomic<bool> logged_fallback_{false};  // one-time note, not per-call spam
+    std::atomic<bool> collect_probs_{false};    // Developer Mode heatmap collection
 
     // Worker-thread-only: the persistent tracking session (Continuous
     // Speculative Tracking). Lazily created on the first reconcile; released

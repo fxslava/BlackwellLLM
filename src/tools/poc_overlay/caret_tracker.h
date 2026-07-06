@@ -157,13 +157,22 @@ public:
     // Translation stream delivery. THREAD-SAFE: called from the
     // TranslationService worker; marshals into this worker's event loop.
     // done=false carries a growing partial; done=true the final text (empty
-    // final = the run failed/was dropped -> falls back to Typing).
-    void OnPreviewResult(std::wstring text, bool done);
+    // final = the run failed/was dropped -> falls back to Typing). `tokens` is
+    // the per-token heatmap (Developer Mode, final delivery only); empty
+    // otherwise. When non-empty it concatenates to `text`.
+    void OnPreviewResult(std::wstring text, TokenHeatmap tokens, bool done);
 
     // Live-apply capture settings from the settings window (UI thread).
     void SetCaptureSettings(CaptureGranularity granularity, int idleTimerMs) {
         granularity_.store(static_cast<int>(granularity), std::memory_order_relaxed);
         idleTimerMs_.store(idleTimerMs > 0 ? idleTimerMs : 1, std::memory_order_relaxed);
+    }
+
+    // Live-apply Developer Mode (UI thread). Atomic: the next Render() stamps it
+    // into the snapshot, and the worker captures UIA bounds/caret rects only
+    // when it is on (an extra provider round-trip, skipped otherwise).
+    void SetDeveloperMode(bool enabled) {
+        developerMode_.store(enabled, std::memory_order_relaxed);
     }
 
     // Pure helper, exposed for tests: extract the capture area -- the suffix of
@@ -190,7 +199,7 @@ private:
     // --- state-machine event handlers; all run on the worker thread ----------
     void HandleKeystroke(IUIAutomation* automation, const std::wstring& fallback);
     void HandleIdleExpired();
-    void HandleTranslation(const std::wstring& text, bool done);
+    void HandleTranslation(const std::wstring& text, const TokenHeatmap& tokens, bool done);
     void HandleCommit(IUIAutomation* automation);
     void HandleSelectionCheck(IUIAutomation* automation);   // mouse-up -> translate selection
     void HandleSelectionCommit(IUIAutomation* automation);  // Ctrl+Enter over a selection
@@ -230,6 +239,7 @@ private:
 
     std::atomic<int> granularity_;
     std::atomic<int> idleTimerMs_;
+    std::atomic<bool> developerMode_{false};  // overlay debug instrumentation gate
 
     // --- worker-thread-only state machine ------------------------------------
     Phase phase_ = Phase::Idle;
@@ -237,12 +247,21 @@ private:
     std::wstring sourceRaw_;           // current capture / selected text (what inference sees)
     std::wstring translationPartial_;  // streamed partial while (Sel)Translating
     std::wstring translationRaw_;      // final translation while (Sel)Ready
+    TokenHeatmap translationTokens_;   // per-token heatmap for translationRaw_ (dev mode)
     std::wstring hudMessage_;          // CenterHud banner text (Phase::Hud)
     bool hudFade_ = false;             // CenterHud: auto-fade
     POINT anchor_{};                   // caret point (Typing*) or cursor point (Sel*)
     bool anchorValid_ = false;
     bool idleArmed_ = false;
     std::chrono::steady_clock::time_point idleDeadline_{};
+
+    // Developer-Mode debug geometry, refreshed by ResolveSegment when the flag
+    // is on: the focused UIA element's bounding box + the exact caret rect, both
+    // in screen pixels. Stamped into every snapshot so the overlay can draw them.
+    RECT uiaBounds_{};
+    bool uiaBoundsValid_ = false;
+    RECT caretRect_{};
+    bool caretRectValid_ = false;
 
     // State split: `committedPrefix_` is the text already committed/translated
     // and still sitting in the field, so capture tracks only the new segment.
@@ -269,7 +288,12 @@ private:
     std::optional<int> pendingOverride_;                              // SetLanguageOverride slot
     std::optional<LanguageRouting> pendingRouting_;                   // SetLanguageRouting slot
     std::optional<std::pair<std::wstring, bool>> pendingHud_;         // message, fade
-    std::optional<std::pair<std::wstring, bool>> pendingTranslation_;  // text, done
+    struct PendingTranslation {
+        std::wstring text;
+        TokenHeatmap tokens;  // per-token heatmap (dev mode, final only); may be empty
+        bool done = false;
+    };
+    std::optional<PendingTranslation> pendingTranslation_;
     bool hasPending_ = false;
     std::atomic<bool> stop_{false};
 };

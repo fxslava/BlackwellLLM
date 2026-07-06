@@ -7,6 +7,8 @@
 
 #include <string>
 
+#include "token_info.h"
+
 // Mirrors CaretTracker's phases. The first four are the caret-anchored typing
 // pipeline; CenterHud is the master-toggle banner; the Selection* pair is the
 // passive-selection popup anchored near the mouse.
@@ -38,4 +40,22 @@ struct OverlaySnapshot {
     // force hotkey ("[Pinned]"). Shown in the header so the user always knows WHY
     // this direction is active.
     bool languagePinned = false;
+
+    // ---- Developer Mode (all inert unless `developerMode` is true) -----------
+    bool developerMode = false;
+    // The focused UIA text element's bounding box, in SCREEN pixels -- drawn as a
+    // red border ("what UIA reports as the edit control"). Valid only when read
+    // from the provider this transition.
+    RECT uiaBounds{};
+    bool uiaBoundsValid = false;
+    // The exact caret rectangle from IUIAutomationTextRange (screen pixels): a
+    // zero-width sliver at the caret, drawn as a green line ("what the caret
+    // hook actually anchored to"). Valid only when the provider gave a caret.
+    RECT caretRect{};
+    bool caretRectValid = false;
+    // Per-token confidence for the heatmap behind the text. `sourceTokens`
+    // concatenate to `source`; `translationTokens` concatenate to `translation`.
+    // Empty = no heatmap for that run (render it flat).
+    TokenHeatmap sourceTokens;
+    TokenHeatmap translationTokens;
 };

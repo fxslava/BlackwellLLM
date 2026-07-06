@@ -77,6 +77,7 @@ Config ConfigStore::Load() {
             j.value("captureGranularity", std::string()), config.captureGranularity);
         config.idleTimerMs = j.value("idleTimerMs", config.idleTimerMs);
         if (config.idleTimerMs < 100) config.idleTimerMs = 100;  // sane floor
+        config.developerMode = j.value("developerMode", config.developerMode);
         config.activateOnStartup = j.value("activateOnStartup", config.activateOnStartup);
         // Lifecycle timeouts are stored in SECONDS; configs written before the
         // unit selector carried minutes under the *Min keys -- migrate those.
@@ -131,6 +132,7 @@ bool ConfigStore::Save(const Config& config) {
     j["maxTokens"] = config.maxTokens;
     j["captureGranularity"] = ToString(config.captureGranularity);
     j["idleTimerMs"] = config.idleTimerMs;
+    j["developerMode"] = config.developerMode;
     j["activateOnStartup"] = config.activateOnStartup;
     j["kvSpillTimeoutSec"] = config.kvSpillTimeoutSec;
     j["hibernateTimeoutSec"] = config.hibernateTimeoutSec;

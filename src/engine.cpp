@@ -17,6 +17,7 @@
 #include "paging/cuda_tier_backend.h"      // SmVramPool, CudaTierBackend
 #include "paging/prefix_cache_manager.h"   // TieredMemoryPager, PrefixCacheManager
 #include "engine_prefill_coordinator.h"
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -644,6 +645,20 @@ float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id, 
     auto* impl = pImpl.get();
     impl->run_token(token_id, pos, seq_id);
     return compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
+}
+
+float BlackwellEngine::last_token_probability(int token_id) const {
+    const auto* impl = pImpl.get();
+    if (token_id < 0 || static_cast<size_t>(token_id) >= impl->m_config.vocab_size) {
+        return 0.0f;
+    }
+    // compute_log_prob reads the current d_logits (no forward pass) and returns
+    // ln P(token). Exponentiate back to a probability and clamp against tiny FP
+    // drift so the heatmap always gets a clean [0, 1].
+    const float p = std::exp(compute_log_prob(impl->d_logits, impl->m_config.vocab_size, token_id));
+    if (p < 0.0f) return 0.0f;
+    if (p > 1.0f) return 1.0f;
+    return p;
 }
 
 // ============================================================================

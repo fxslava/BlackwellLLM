@@ -122,6 +122,10 @@ void ApplyConfig(const Config& config) {
     HookManager::Instance().SetCycleLanguageShortcut(config.cycleLanguageShortcut);
     if (g_caretTracker) {
         g_caretTracker->SetCaptureSettings(config.captureGranularity, config.idleTimerMs);
+        g_caretTracker->SetDeveloperMode(config.developerMode);
+    }
+    if (g_translator) {
+        g_translator->SetDeveloperMode(config.developerMode);
     }
 
     g_sessionPairs = config.languagePairs;
@@ -363,8 +367,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // The service's generation counter already suppresses most stale deliveries;
     // the tracker's phase check catches the rest.
     translator.SetPreviewSink(
-        [&caretTracker](std::uint64_t /*gen*/, const std::wstring& text, bool done) {
-            caretTracker.OnPreviewResult(text, done);
+        [&caretTracker](std::uint64_t /*gen*/, const std::wstring& text,
+                        const TokenHeatmap& tokens, bool done) {
+            caretTracker.OnPreviewResult(text, tokens, done);
         });
 
     // Lifecycle HUDs. Fired on the tracker's worker thread; ShowHud is a

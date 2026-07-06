@@ -16,7 +16,9 @@ namespace {
 // Extracts the caret point (screen coords) from a text range's bounding
 // rectangles. The range is expected to be collapsed to the caret, so there is
 // a single (x, y, w, h) rect; we take its left/top as the caret's leading edge.
-bool CaretPointFromRange(IUIAutomationTextRange* range, POINT& out) {
+// When `outRect` is non-null it also receives the full caret rectangle (screen
+// pixels) -- a possibly zero-width sliver -- for the Developer-Mode green line.
+bool CaretPointFromRange(IUIAutomationTextRange* range, POINT& out, RECT* outRect = nullptr) {
     SAFEARRAY* rectsArray = nullptr;
     if (FAILED(range->GetBoundingRectangles(&rectsArray)) || !rectsArray) {
         return false;
@@ -35,8 +37,16 @@ bool CaretPointFromRange(IUIAutomationTextRange* range, POINT& out) {
             // a collapsed caret that is the caret glyph; if a provider ever hands
             // back a multi-rect selection, the last rect sits at the active end.
             const long base = count - 4;
-            out.x = static_cast<LONG>(rects[base + 0]);
-            out.y = static_cast<LONG>(rects[base + 1]);
+            const double x = rects[base + 0];
+            const double y = rects[base + 1];
+            const double w = rects[base + 2];
+            const double h = rects[base + 3];
+            out.x = static_cast<LONG>(x);
+            out.y = static_cast<LONG>(y);
+            if (outRect) {
+                *outRect = RECT{static_cast<LONG>(x), static_cast<LONG>(y),
+                                static_cast<LONG>(x + w), static_cast<LONG>(y + h)};
+            }
             found = true;
         }
         SafeArrayUnaccessData(rectsArray);
@@ -51,7 +61,8 @@ bool CaretPointFromRange(IUIAutomationTextRange* range, POINT& out) {
 // so the commit path can Select() the exact text it is about to replace.
 bool ReadTextPattern(IUIAutomationElement* focused, std::wstring& outText, POINT& outCaret,
                      bool& outCaretFound,
-                     ComPtr<IUIAutomationTextRange>* outRange = nullptr) {
+                     ComPtr<IUIAutomationTextRange>* outRange = nullptr,
+                     RECT* outCaretRect = nullptr) {
     ComPtr<IUnknown> patternUnknown;
     if (FAILED(focused->GetCurrentPattern(UIA_TextPatternId, &patternUnknown)) || !patternUnknown) {
         return false;
@@ -81,7 +92,7 @@ bool ReadTextPattern(IUIAutomationElement* focused, std::wstring& outText, POINT
     // caret regardless of whether text is selected.
     caret->MoveEndpointByRange(TextPatternRangeEndpoint_Start, caret.Get(),
                                TextPatternRangeEndpoint_End);
-    outCaretFound = CaretPointFromRange(caret.Get(), outCaret);
+    outCaretFound = CaretPointFromRange(caret.Get(), outCaret, outCaretRect);
 
     // Build a range spanning [start of DOCUMENT .. caret] and read its text. Using
     // the whole document (not just the current line) means multiline input is
@@ -309,12 +320,12 @@ void CaretTracker::ShowHud(std::wstring message, bool fade) {
     cv_.notify_all();
 }
 
-void CaretTracker::OnPreviewResult(std::wstring text, bool done) {
+void CaretTracker::OnPreviewResult(std::wstring text, TokenHeatmap tokens, bool done) {
     // Called from the TranslationService worker thread: marshal into this
     // worker's serialized event loop. Latest-wins is correct here too -- a
     // newer partial supersedes an older one, and a final overwrites partials.
     std::lock_guard<std::mutex> lock(mutex_);
-    pendingTranslation_.emplace(std::move(text), done);
+    pendingTranslation_ = PendingTranslation{std::move(text), std::move(tokens), done};
     hasPending_ = true;
     cv_.notify_all();
 }
@@ -340,7 +351,7 @@ void CaretTracker::ThreadMain() {
         std::optional<int> setOverride;
         std::optional<LanguageRouting> setRouting;
         std::optional<std::pair<std::wstring, bool>> hud;
-        std::optional<std::pair<std::wstring, bool>> translation;
+        std::optional<PendingTranslation> translation;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             const auto pred = [this] {
@@ -430,7 +441,7 @@ void CaretTracker::ThreadMain() {
             HandleKeystroke(automation.Get(), fallback);
         }
         if (translation) {
-            HandleTranslation(translation->first, translation->second);
+            HandleTranslation(translation->text, translation->tokens, translation->done);
         }
         // A keystroke in the same wake-up already re-armed the timer; only a
         // "pure" expiry starts inference.
@@ -505,22 +516,25 @@ void CaretTracker::HandleIdleExpired() {
     }
     phase_ = Phase::Translating;
     translationPartial_.clear();
+    translationTokens_.clear();  // a fresh generation must never inherit the old heatmap
     if (callbacks_.triggerGeneration) {
         callbacks_.triggerGeneration(sourceRaw_, inferenceContext_);
     }
     Render();
 }
 
-void CaretTracker::HandleTranslation(const std::wstring& text, bool done) {
+void CaretTracker::HandleTranslation(const std::wstring& text, const TokenHeatmap& tokens,
+                                     bool done) {
     const bool typingFlow = (phase_ == Phase::Translating);
     const bool selectionFlow = (phase_ == Phase::SelTranslating);
     if (!typingFlow && !selectionFlow) {
         return;  // stale delivery: the user typed / committed / reselected meanwhile
     }
     if (!done) {
-        translationPartial_ = text;  // streamed partial
+        translationPartial_ = text;  // streamed partial (never carries a heatmap)
     } else if (!text.empty()) {
         translationRaw_ = text;
+        translationTokens_ = tokens;  // dev-mode heatmap for the final translation
         translationPartial_.clear();
         phase_ = typingFlow ? Phase::Ready : Phase::SelReady;
     } else {
@@ -528,6 +542,7 @@ void CaretTracker::HandleTranslation(const std::wstring& text, bool done) {
         // to Typing (next keystroke retries); the selection flow just hides the
         // popup (there is no debounce loop to fall back into). Neither re-arms.
         translationPartial_.clear();
+        translationTokens_.clear();
         phase_ = typingFlow ? Phase::Typing : Phase::Idle;
     }
     Render();
@@ -710,6 +725,7 @@ void CaretTracker::HandleSelectionCheck(IUIAutomation* automation) {
     sourceRaw_ = std::move(selected);
     translationPartial_.clear();
     translationRaw_.clear();
+    translationTokens_.clear();  // fresh selection generation: drop any prior heatmap
     phase_ = Phase::SelTranslating;
     idleArmed_ = false;
     sessionLanguage_ = -1;  // a selection interrupts any locked typing session
@@ -823,6 +839,14 @@ void CaretTracker::Render() const {
     // ("[Auto]") so the header can explain WHY this direction is active.
     snapshot.language = sessionLanguage_;
     snapshot.languagePinned = languageOverride_.has_value();
+    // Developer-Mode debug geometry (drawn as the red UIA box + green caret line).
+    // The heatmap is attached per phase below (only where there is a translation
+    // to sit behind). All inert unless the overlay's developerMode is set.
+    snapshot.developerMode = developerMode_.load(std::memory_order_relaxed);
+    snapshot.uiaBounds = uiaBounds_;
+    snapshot.uiaBoundsValid = uiaBoundsValid_;
+    snapshot.caretRect = caretRect_;
+    snapshot.caretRectValid = caretRectValid_;
     switch (phase_) {
         case Phase::Idle:
             snapshot.phase = OverlayPhase::Hidden;
@@ -839,6 +863,7 @@ void CaretTracker::Render() const {
         case Phase::Ready:
             snapshot.phase = OverlayPhase::Ready;
             snapshot.translation = translationRaw_;
+            snapshot.translationTokens = translationTokens_;  // heatmap behind the final text
             break;
         case Phase::Hud:
             snapshot.phase = OverlayPhase::CenterHud;
@@ -854,6 +879,7 @@ void CaretTracker::Render() const {
         case Phase::SelReady:
             snapshot.phase = OverlayPhase::SelectionReady;
             snapshot.translation = translationRaw_;
+            snapshot.translationTokens = translationTokens_;  // heatmap behind the final text
             break;
     }
     callbacks_.render(snapshot);
@@ -867,6 +893,11 @@ bool CaretTracker::ResolveSegment(IUIAutomation* automation, const std::wstring&
                                   std::wstring& segment, bool& fromUia) {
     anchorValid_ = false;
     fromUia = false;
+    // Developer-Mode debug geometry is re-derived from scratch each resolve --
+    // stale boxes from a previous focus must never linger on screen.
+    const bool devMode = developerMode_.load(std::memory_order_relaxed);
+    uiaBoundsValid_ = false;
+    caretRectValid_ = false;
 
     ComPtr<IUIAutomationElement> focused;
     if (FAILED(automation->GetFocusedElement(&focused)) || !focused) {
@@ -874,9 +905,29 @@ bool CaretTracker::ResolveSegment(IUIAutomation* automation, const std::wstring&
         return !segment.empty();
     }
 
-    // (1) Primary: TextPattern document-up-to-caret. This also yields the caret.
+    // Developer Mode: the focused element's bounding box (the red UIA rectangle),
+    // read regardless of whether TextPattern below succeeds -- it is "what UIA
+    // reports as the control", independent of the text round-trip.
+    if (devMode) {
+        RECT bounds{};
+        if (SUCCEEDED(focused->get_CurrentBoundingRectangle(&bounds)) &&
+            (bounds.right > bounds.left || bounds.bottom > bounds.top)) {
+            uiaBounds_ = bounds;
+            uiaBoundsValid_ = true;
+        }
+    }
+
+    // (1) Primary: TextPattern document-up-to-caret. This also yields the caret
+    // point and, in dev mode, the caret's full rectangle (the green line). The
+    // caret rect is valid exactly when the caret point was found.
     std::wstring uiaText;
-    bool haveText = ReadTextPattern(focused.Get(), uiaText, anchor_, anchorValid_);
+    RECT caretRect{};
+    bool haveText = ReadTextPattern(focused.Get(), uiaText, anchor_, anchorValid_,
+                                    /*outRange=*/nullptr, devMode ? &caretRect : nullptr);
+    if (devMode && anchorValid_) {
+        caretRect_ = caretRect;
+        caretRectValid_ = true;
+    }
 
     // (1) Secondary: ValuePattern whole-control value.
     if (!haveText) {

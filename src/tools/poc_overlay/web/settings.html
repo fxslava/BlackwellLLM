@@ -66,6 +66,19 @@
                 </div>
             </div>
         </div>
+
+        <div class="card">
+            <h2>Developer Mode</h2>
+            <div class="field">
+                <label class="check">
+                    <input type="checkbox" id="developerMode">
+                    Enable overlay debug instrumentation
+                </label>
+            </div>
+            <p class="hint">Draws the UIA text bounding box (red) and the exact caret rect (green)
+                the OS hooks see, and paints a per-token probability heatmap behind the translation
+                — cold blue where the model is confident, hot red where it is uncertain.</p>
+        </div>
     </section>
 
     <section class="panel" id="panel-memory" role="tabpanel">
