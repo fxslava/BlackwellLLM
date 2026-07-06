@@ -138,6 +138,73 @@ void TranslationService::SetActiveLanguage(int index) {
     if (tracker_) tracker_->SetActiveLanguage(index);  // clamps internally
 }
 
+void TranslationService::UpdateLanguagePairs(std::vector<std::string> targetLanguages,
+                                             int activeLanguage) {
+    // Rebuild the per-direction system prompts OUTSIDE the lock (pure string
+    // work), then swap everything in atomically with respect to the load
+    // thread (tracker construction / JIT compile snapshot the same state).
+    std::vector<std::string> prompts;
+    prompts.reserve(targetLanguages.size());
+    for (const std::string& lang : targetLanguages) {
+        prompts.push_back(BuildPreviewPrompt(lang));
+    }
+    if (prompts.empty()) {
+        targetLanguages = {"English"};
+        prompts.push_back(BuildPreviewPrompt("English"));
+    }
+    if (activeLanguage < 0 || activeLanguage >= static_cast<int>(prompts.size())) {
+        activeLanguage = 0;
+    }
+    activeLanguage_.store(activeLanguage, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    settings_.targetLanguages = std::move(targetLanguages);
+    previewPrompts_ = prompts;
+    if (tracker_) {
+        // Live hot-swap: the very next request addresses the new set. A brand-
+        // new direction has no compiled .bkv branch yet -- it prefills cold
+        // once and the radix tree commits it, exactly like any other prompt.
+        tracker_->UpdatePrompts(std::move(prompts), activeLanguage);
+    }
+    // No tracker yet (deferred / still loading): the load thread constructs it
+    // from previewPrompts_ under this same mutex, so it picks the new set up.
+}
+
+void TranslationService::PrecacheLanguage(const std::string& targetLanguage,
+                                          std::function<void(bool, int)> done) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        int index = -1;
+        for (size_t i = 0; i < settings_.targetLanguages.size(); ++i) {
+            if (settings_.targetLanguages[i] == targetLanguage) {
+                index = static_cast<int>(i);
+                break;
+            }
+        }
+        if (index >= 0 && tracker_ &&
+            state_.load(std::memory_order_relaxed) == State::Ready) {
+            // The compile drives the engine's prefill coordinator, so it MUST
+            // run on the tracker's engine-owning worker. `this` outlives the
+            // task: Shutdown joins that worker before this service unwinds.
+            tracker_->PostEngineTask([this, index, done = std::move(done)] {
+                bool ok = false;
+                int tokens = 0;
+                try {
+                    const std::wstring dir = ResolvePromptCacheDir();
+                    ok = !dir.empty() && CompilePromptCacheBranch(index, dir, &tokens);
+                } catch (const std::exception& e) {
+                    Log(L"pre-cache failed: " + FromUtf8(e.what()));
+                }
+                if (done) done(ok, tokens);
+            });
+            return;
+        }
+    }
+    // Unknown target (unsaved pair) or the engine isn't serving yet: fail
+    // fast -- outside the lock -- so the UI says so instead of spinning.
+    if (done) done(false, 0);
+}
+
 TranslationService::~TranslationService() {
     Shutdown();
 }
@@ -149,8 +216,16 @@ void TranslationService::Shutdown() {
         if (tracker_) tracker_->Cancel();  // unblock any in-flight decode promptly
     }
     if (worker_.joinable()) worker_.join();  // finishes LoadEngine (+ tracker handoff)
-    std::lock_guard<std::mutex> lock(mutex_);
-    tracker_.reset();  // joins LiveTranslationTracker's own worker thread
+    // Join the tracker's worker OUTSIDE mutex_: its thread takes mutex_ itself
+    // (DeliverToSink / DeliverLifecycle / a pre-cache task's prompt snapshot),
+    // so destroying it under the lock could deadlock the join against a worker
+    // blocked on the very mutex we hold.
+    std::unique_ptr<LiveTranslationTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tracker = std::move(tracker_);
+    }
+    tracker.reset();  // joins LiveTranslationTracker's own worker thread
 }
 
 void TranslationService::SetPreviewSink(PreviewSink sink) {
@@ -177,29 +252,29 @@ void TranslationService::MarkActivity() {
     lifecycleStage_.store(0, std::memory_order_relaxed);  // re-arm both stages
 }
 
-void TranslationService::LifecycleTick(int kvSpillTimeoutMin, int hibernateTimeoutMin) {
+void TranslationService::LifecycleTick(int kvSpillTimeoutSec, int hibernateTimeoutSec) {
     if (state_.load(std::memory_order_relaxed) != State::Ready ||
         stop_.load(std::memory_order_relaxed)) {
         return;  // nothing resident yet (Idle/Loading) or already torn down
     }
     const std::int64_t idleMs = NowMs() - lastActivityMs_.load(std::memory_order_relaxed);
-    const std::int64_t idleMin = idleMs / 60000;
+    const std::int64_t idleSec = idleMs / 1000;
     const int stage = lifecycleStage_.load(std::memory_order_relaxed);
 
-    if (stage < 2 && hibernateTimeoutMin > 0 && idleMin >= hibernateTimeoutMin) {
+    if (stage < 2 && hibernateTimeoutSec > 0 && idleSec >= hibernateTimeoutSec) {
         lifecycleStage_.store(2, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(mutex_);
         if (tracker_) {
-            Log(L"lifecycle: " + std::to_wstring(idleMin) +
-                L" min idle -> stage 2 (soft hibernation)");
+            Log(L"lifecycle: " + std::to_wstring(idleSec) +
+                L" s idle -> stage 2 (soft hibernation)");
             tracker_->RequestHibernate();
         }
-    } else if (stage < 1 && kvSpillTimeoutMin > 0 && idleMin >= kvSpillTimeoutMin) {
+    } else if (stage < 1 && kvSpillTimeoutSec > 0 && idleSec >= kvSpillTimeoutSec) {
         lifecycleStage_.store(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(mutex_);
         if (tracker_) {
-            Log(L"lifecycle: " + std::to_wstring(idleMin) +
-                L" min idle -> stage 1 (KV disk spill)");
+            Log(L"lifecycle: " + std::to_wstring(idleSec) +
+                L" s idle -> stage 1 (KV disk spill)");
             tracker_->RequestKvSpill();
         }
     }
@@ -251,8 +326,15 @@ void TranslationService::ThreadMain() {
     // thread immediately) so a shutdown race can simply let it fall out of
     // scope -- its destructor joins that thread before this function returns,
     // so `tracker_` never gets published in a half-torn-down state.
+    // Prompts are snapshotted under mutex_: a Settings save during the load
+    // may have hot-reloaded the pair set since the constructor ran.
+    std::vector<std::string> prompts;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        prompts = previewPrompts_;
+    }
     auto tracker = std::make_unique<LiveTranslationTracker>(
-        *adapter_, previewPrompts_, activeLanguage_.load(std::memory_order_relaxed),
+        *adapter_, std::move(prompts), activeLanguage_.load(std::memory_order_relaxed),
         settings_.previewMaxNewTokens, settings_.temperature, settings_.topP);
     // Wire the lifecycle observer BEFORE publishing: LifecycleTick can only
     // reach the tracker through tracker_, so no event can fire un-forwarded.
@@ -280,6 +362,13 @@ void TranslationService::LoadEngine() {
         // the user's settings; the engine validates it (a non-empty spill path
         // is required whenever the disk tier is on).
         blackwell::RuntimeOverrides overrides;
+        // Weight-load progress: the arena calls this per tensor on THIS load
+        // thread; the atomic percent is polled by the UI-thread readiness
+        // timer, which renders "Initializing... (N%)" into the center HUD.
+        overrides.load_progress = [this](size_t done, size_t total) {
+            const int pct = total ? static_cast<int>((done * 100) / total) : 0;
+            loadProgressPct_.store(pct, std::memory_order_relaxed);
+        };
         overrides.kv_vram_cache_pages = settings_.vramCacheBlocks;
         overrides.kv_ram_slots = settings_.ramTierBlocks;
         overrides.kv_disk_slots =
@@ -332,15 +421,11 @@ void TranslationService::WarmStartPromptCache() {
     try {
         auto& pc = adapter_->engine().prefix_cache();
 
-        // (1) Model-specific cache directory. Keyed by the substrate's own
-        // model hash -- the exact value warm_start() validates the manifest
-        // against -- so switching checkpoints switches directories, and a
-        // cache can never be replayed onto a model with different geometry
-        // or token ids.
-        const std::wstring root = settings_.promptCacheRoot.empty()
-                                      ? DefaultPromptCacheRoot()
-                                      : settings_.promptCacheRoot;
-        const std::wstring dir = root + L"\\" + HashDirName(pc.model_hash());
+        // (1) Model-specific cache directory (see ResolvePromptCacheDir).
+        const std::wstring dir = ResolvePromptCacheDir();
+        if (dir.empty()) {
+            return;  // unreachable here (has_prefix_cache checked above)
+        }
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         if (ec) {
@@ -414,9 +499,19 @@ bool TranslationService::CompilePromptCache(const std::wstring& dir) {
     // An unrendered/misaligned node would compile fine and then never match.
     // Human-readable direction name for the logs (index-aligned with
     // previewPrompts_ / targetLanguages), so the multi-branch compile is legible.
-    const auto branchName = [this](size_t i) -> std::wstring {
-        if (i < settings_.targetLanguages.size()) {
-            return L"->" + FromUtf8(settings_.targetLanguages[i]);
+    // Snapshot under mutex_: a Settings save can hot-reload the pair set at
+    // any moment, and this compile runs off the UI thread (load thread on
+    // first run, tracker worker for the on-demand pre-cache).
+    std::vector<std::string> prompts;
+    std::vector<std::string> targets;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        prompts = previewPrompts_;
+        targets = settings_.targetLanguages;
+    }
+    const auto branchName = [&targets](size_t i) -> std::wstring {
+        if (i < targets.size()) {
+            return L"->" + FromUtf8(targets[i]);
         }
         return L"#" + std::to_wstring(i);
     };
@@ -424,8 +519,8 @@ bool TranslationService::CompilePromptCache(const std::wstring& dir) {
     WarmupSpec spec;
     spec.name = "overlay-translator";
     spec.emit_mode = WarmupSpec::EmitMode::All;
-    for (size_t i = 0; i < previewPrompts_.size(); ++i) {
-        const std::string prefix = StableServingPrefix(previewPrompts_[i]);
+    for (size_t i = 0; i < prompts.size(); ++i) {
+        const std::string prefix = StableServingPrefix(prompts[i]);
         if (prefix.empty()) {
             Log(L"prompt cache: no stable serving prefix for direction " + branchName(i) +
                 L"; skipping that branch");
@@ -497,4 +592,128 @@ std::string TranslationService::StableServingPrefix(const std::string& previewPr
     if (end == std::string::npos) return {};  // template surprise: no safe cut
     return common.substr(0, end + marker.size());
 }
+
+bool TranslationService::CompilePromptCacheBranch(int index, const std::wstring& dir,
+                                                  int* prefilledTokens) {
+    using blackwell::paging::AOTCacheWarmer;
+    using blackwell::paging::WarmupNode;
+    using blackwell::paging::WarmupSpec;
+    using nlohmann::json;
+
+    if (prefilledTokens) *prefilledTokens = 0;
+    if (!adapter_->engine().has_prefix_cache()) {
+        Log(L"pre-cache skipped: this model has no prefix-cache substrate");
+        return false;
+    }
+
+    std::string prompt;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < 0 || index >= static_cast<int>(previewPrompts_.size())) {
+            return false;  // pair set changed under the queued task
+        }
+        prompt = previewPrompts_[index];
+    }
+    const std::string prefix = StableServingPrefix(prompt);
+    if (prefix.empty()) {
+        Log(L"pre-cache: no stable serving prefix for this chat template");
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path manifestPath = std::filesystem::path(dir) / L"manifest.json";
+
+    // The warmer rewrites manifest.json with ONLY the entries of THIS compile,
+    // which would strand every other branch on the next warm start -- so hold
+    // the pre-compile manifest and merge it back below.
+    json oldManifest;
+    if (std::ifstream in{manifestPath, std::ios::binary}) {
+        try {
+            oldManifest = json::parse(in);
+        } catch (...) {
+            oldManifest = json();  // torn/corrupt: nothing worth merging
+        }
+    }
+
+    WarmupSpec spec;
+    spec.name = "overlay-translator";
+    spec.emit_mode = WarmupSpec::EmitMode::All;
+    WarmupNode node;
+    node.id = "system_prompt_" + std::to_string(index);
+    node.text = prefix;
+    spec.roots.push_back(std::move(node));
+
+    AOTCacheWarmer::Options opt;
+    opt.out_dir = ToUtf8(dir);
+    opt.add_bos = false;  // must match the serving encode (see CompilePromptCache)
+    AOTCacheWarmer warmer(adapter_->engine().prefix_cache(),
+                          adapter_->engine().prefill_driver());
+    // NOTE: the compile itself acquires/prefills/commits through the LIVE
+    // radix tree, so the branch is zero-prefill-servable the moment this
+    // returns -- the .bkv file is only the cross-run persistence on top.
+    const AOTCacheWarmer::Report rep = warmer.compile(spec, opt);
+    if (prefilledTokens) {
+        *prefilledTokens = static_cast<int>(rep.prefilled_tokens + rep.reused_tokens);
+    }
+
+    // Merge: keep every previously-manifested branch this compile didn't just
+    // re-emit. Best-effort -- the live tree already has the branch either way.
+    try {
+        if (oldManifest.contains("entries") && oldManifest["entries"].is_array()) {
+            std::ifstream in{manifestPath, std::ios::binary};
+            json merged = json::parse(in);
+            in.close();
+            auto& entries = merged["entries"];
+            for (const auto& e : oldManifest["entries"]) {
+                const std::string file = e.value("file", std::string());
+                bool present = false;
+                for (const auto& n : entries) {
+                    if (n.value("file", std::string()) == file) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present && !file.empty() &&
+                    std::filesystem::exists(std::filesystem::path(dir) / file)) {
+                    entries.push_back(e);
+                }
+            }
+            std::ofstream out{manifestPath, std::ios::binary | std::ios::trunc};
+            out << merged.dump(2) << '\n';
+        }
+    } catch (const std::exception& e) {
+        Log(L"pre-cache: manifest merge failed (branch still live): " + FromUtf8(e.what()));
+    }
+
+    if (rep.files == 0) {
+        Log(L"pre-cache: branch shorter than one KV page; committed to the live "
+            L"tree but nothing was serialized");
+        return true;  // still a successful warm-up -- just nothing to persist
+    }
+    Log(L"pre-cache done: branch " + std::to_wstring(index) + L", " +
+        std::to_wstring(rep.prefilled_tokens) + L" tokens prefilled, " +
+        std::to_wstring(rep.reused_tokens) + L" reused");
+    return true;
+}
+
+std::wstring TranslationService::ResolvePromptCacheDir() const {
+    // adapter_ is stable here by construction: set once on the load thread
+    // before the tracker exists, and both callers (WarmStartPromptCache on the
+    // load thread, the pre-cache task on the tracker worker) run strictly
+    // after that.
+    if (!adapter_ || !adapter_->engine().has_prefix_cache()) {
+        return {};
+    }
+    const std::wstring root = settings_.promptCacheRoot.empty()
+                                  ? DefaultPromptCacheRoot()
+                                  : settings_.promptCacheRoot;
+    return root + L"\\" + HashDirName(adapter_->engine().prefix_cache().model_hash());
+}
+#else   // !BLACKWELL_ENGINE_HAS_PREFIX_CACHE -- keep the unconditional callers linking
+bool TranslationService::CompilePromptCacheBranch(int, const std::wstring&, int* tokens) {
+    if (tokens) *tokens = 0;
+    return false;
+}
+std::wstring TranslationService::ResolvePromptCacheDir() const { return {}; }
 #endif  // BLACKWELL_ENGINE_HAS_PREFIX_CACHE

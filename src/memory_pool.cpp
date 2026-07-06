@@ -97,8 +97,9 @@ private:
 // VRAMArena
 // ============================================================================
 VRAMArena::VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader,
-                     const ModelConfig& config, size_t max_seq_len, size_t num_gpu_layers)
-    : m_config(config), m_max_seq_len(max_seq_len),
+                     const ModelConfig& config, size_t max_seq_len, size_t num_gpu_layers,
+                     LoadProgressFn load_progress)
+    : m_config(config), m_load_progress(std::move(load_progress)), m_max_seq_len(max_seq_len),
       m_num_gpu_layers(std::min(num_gpu_layers, config.num_layers))
 {
     std::cout << "[VRAM Arena] Initializing static memory pools...\n";
@@ -237,6 +238,17 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
     // 4. Allocate one massive unified arena for all resident weights
     CUDA_CHECK(cudaMalloc(&d_weights_arena, total_weights_bytes));
 
+    // Weight-load progress: one cumulative byte counter across the resident
+    // upload AND the offloaded pinned-mirror fill, so the observer sees a
+    // single monotone 0..total sweep. Emitted per tensor; the observer is
+    // O(1) by contract.
+    const size_t progress_total = total_weights_bytes + pinned_weight_bytes;
+    size_t progress_done = 0;
+    const auto report_progress = [&] {
+        if (m_load_progress) m_load_progress(progress_done, progress_total);
+    };
+    report_progress();  // 0% -- the HUD can show the bar immediately
+
     // 🎯 5. Создаем наш полиморфный загрузчик
     auto io_loader = IWeightLoader::create();
 
@@ -250,6 +262,8 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
         io_loader->load_to_vram(entry.file_path, entry.file_offset, entry.byte_size, d_dest);
 
         weight_pointers[name] = d_dest;
+        progress_done += entry.byte_size;
+        report_progress();
     }
 
     // Batched loaders (DirectStorage) defer the disk reads; flush() is the
@@ -266,6 +280,8 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
                 const auto& entry = metadata_loader.get_tensor(name);
                 files.read(entry.file_path, entry.file_offset, entry.byte_size,
                            h_block + m_offloaded_tensors[name].offset);
+                progress_done += entry.byte_size;
+                report_progress();
             }
         }
 
@@ -278,6 +294,10 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+    // Force 100%: the per-tensor counter sums raw byte_size while the totals
+    // carry 16-byte alignment padding, so it lands slightly short of total.
+    progress_done = progress_total;
+    report_progress();
     std::cout << "[VRAM Arena] Weights successfully transferred to device arena.\n";
     std::cout << "[VRAM Arena] Loaded " << qweight_count << " quantized AWQ/GPTQ modules.\n";
 }

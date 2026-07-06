@@ -46,12 +46,21 @@ bool FileExists(const std::wstring& path) {
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// Pre-cache completion, marshaled from whatever thread the compile ran on back
+// to this window's UI thread (WebView2 methods are STA -- creating-thread only).
+// WPARAM = the request id the page sent; LPARAM = prefilled tokens, or -1 on
+// failure. No heap payload, so a window destroyed mid-flight leaks nothing.
+constexpr UINT kMsgPrecacheDone = WM_APP + 1;
+
 // Owns the settings window + its WebView2. Heap-allocated; self-deletes on
 // WM_NCDESTROY.
 class SettingsWindow {
 public:
-    SettingsWindow(Config config, std::function<void(const Config&)> onApply)
-        : config_(std::move(config)), onApply_(std::move(onApply)) {}
+    SettingsWindow(Config config, std::function<void(const Config&)> onApply,
+                   PrecacheHandler onPrecache)
+        : config_(std::move(config)),
+          onApply_(std::move(onApply)),
+          onPrecache_(std::move(onPrecache)) {}
 
     bool Create(HWND owner, HINSTANCE hInstance) {
         // Initial size is a close guess; the page reports its real height on load
@@ -84,13 +93,19 @@ private:
     void ResizeToContentHeight(int cssHeight);  // fit the window to the page (no scrollbars)
     void FitWindowToContent();                  // measure the page via ExecuteScript, then fit
     void ReportWebViewUnavailable();
-    void BrowseForModelFolder();                // native folder picker -> JS
+    // Native IFileOpenDialog (FOS_PICKFOLDERS) on this UI thread; replies
+    // {type:'browsed', target, path} so the page routes the result to the
+    // right input (model path, spill directory, ...). No-op on cancel.
+    void BrowseForFolder(const std::wstring& target);
+    void OnPrecacheRequest(int requestId, const std::wstring& target);
+    void OnPrecacheDone(int requestId, int tokensOrError);  // UI thread (kMsgPrecacheDone)
 
     HWND hwnd_ = nullptr;
     ComPtr<ICoreWebView2Controller> controller_;
     ComPtr<ICoreWebView2> webview_;
     Config config_;
     std::function<void(const Config&)> onApply_;
+    PrecacheHandler onPrecache_;
 };
 
 void SettingsWindow::CreateWebView() {
@@ -244,8 +259,8 @@ void SettingsWindow::PushConfigToJs() {
     j["captureGranularity"] = ToString(config_.captureGranularity);
     j["idleTimerMs"] = config_.idleTimerMs;
     j["activateOnStartup"] = config_.activateOnStartup;
-    j["kvSpillTimeoutMin"] = config_.kvSpillTimeoutMin;
-    j["hibernateTimeoutMin"] = config_.hibernateTimeoutMin;
+    j["kvSpillTimeoutSec"] = config_.kvSpillTimeoutSec;
+    j["hibernateTimeoutSec"] = config_.hibernateTimeoutSec;
     j["vramCacheBlocks"] = config_.vramCacheBlocks;
     j["ramTierBlocks"] = config_.ramTierBlocks;
     j["diskSpillEnabled"] = config_.diskSpillEnabled;
@@ -269,7 +284,13 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
             return;
         }
         if (type == "browse") {
-            BrowseForModelFolder();
+            // `target` routes the picked folder back to the right input; the
+            // old target-less message meant the model path.
+            BrowseForFolder(FromUtf8(j.value("target", std::string("modelPath"))));
+            return;
+        }
+        if (type == "precache") {
+            OnPrecacheRequest(j.value("id", 0), FromUtf8(j.value("target", std::string())));
             return;
         }
         if (type != "save") {
@@ -318,11 +339,11 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
         config_.idleTimerMs = j.value("idleTimerMs", config_.idleTimerMs);
         if (config_.idleTimerMs < 100) config_.idleTimerMs = 100;
         config_.activateOnStartup = j.value("activateOnStartup", config_.activateOnStartup);
-        config_.kvSpillTimeoutMin = j.value("kvSpillTimeoutMin", config_.kvSpillTimeoutMin);
-        config_.hibernateTimeoutMin = j.value("hibernateTimeoutMin", config_.hibernateTimeoutMin);
-        if (config_.kvSpillTimeoutMin < 1) config_.kvSpillTimeoutMin = 1;
-        if (config_.hibernateTimeoutMin < config_.kvSpillTimeoutMin) {
-            config_.hibernateTimeoutMin = config_.kvSpillTimeoutMin;  // stage 2 never precedes stage 1
+        config_.kvSpillTimeoutSec = j.value("kvSpillTimeoutSec", config_.kvSpillTimeoutSec);
+        config_.hibernateTimeoutSec = j.value("hibernateTimeoutSec", config_.hibernateTimeoutSec);
+        if (config_.kvSpillTimeoutSec < 5) config_.kvSpillTimeoutSec = 5;
+        if (config_.hibernateTimeoutSec < config_.kvSpillTimeoutSec) {
+            config_.hibernateTimeoutSec = config_.kvSpillTimeoutSec;  // stage 2 never precedes stage 1
         }
         config_.vramCacheBlocks = j.value("vramCacheBlocks", config_.vramCacheBlocks);
         config_.ramTierBlocks = j.value("ramTierBlocks", config_.ramTierBlocks);
@@ -398,7 +419,7 @@ void SettingsWindow::ResizeToContentHeight(int cssHeight) {
     ResizeToClient();  // WM_SIZE also does this, but keep the WebView in lockstep
 }
 
-void SettingsWindow::BrowseForModelFolder() {
+void SettingsWindow::BrowseForFolder(const std::wstring& target) {
     ComPtr<IFileDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&dialog)))) {
@@ -417,12 +438,40 @@ void SettingsWindow::BrowseForModelFolder() {
     PWSTR path = nullptr;
     if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
         json out;
-        out["type"] = "modelPath";
+        out["type"] = "browsed";
+        out["target"] = ToUtf8(target);
         out["path"] = ToUtf8(path);
         if (webview_) {
             webview_->PostWebMessageAsJson(FromUtf8(out.dump()).c_str());
         }
         CoTaskMemFree(path);
+    }
+}
+
+void SettingsWindow::OnPrecacheRequest(int requestId, const std::wstring& target) {
+    if (!onPrecache_ || target.empty()) {
+        OnPrecacheDone(requestId, -1);
+        return;
+    }
+    // The compile runs on the engine-owning worker; `done` fires THERE. Only a
+    // PostMessage crosses back to this window -- if the window is gone by then
+    // the post lands nowhere and nothing dangles (no heap payload, no `this`
+    // capture beyond the HWND value).
+    const HWND hwnd = hwnd_;
+    onPrecache_(target, [hwnd, requestId](bool ok, int tokens) {
+        PostMessageW(hwnd, kMsgPrecacheDone, static_cast<WPARAM>(requestId),
+                     static_cast<LPARAM>(ok ? tokens : -1));
+    });
+}
+
+void SettingsWindow::OnPrecacheDone(int requestId, int tokensOrError) {
+    json out;
+    out["type"] = "precacheDone";
+    out["id"] = requestId;
+    out["ok"] = tokensOrError >= 0;
+    out["tokens"] = tokensOrError >= 0 ? tokensOrError : 0;
+    if (webview_) {
+        webview_->PostWebMessageAsJson(FromUtf8(out.dump()).c_str());
     }
 }
 
@@ -448,6 +497,11 @@ LRESULT CALLBACK SettingsWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 self->ResizeToClient();
             }
             return 0;
+        case kMsgPrecacheDone:
+            if (self) {
+                self->OnPrecacheDone(static_cast<int>(wParam), static_cast<int>(lParam));
+            }
+            return 0;
         case WM_DESTROY:
             if (self && self->controller_) {
                 self->controller_->Close();
@@ -465,7 +519,8 @@ LRESULT CALLBACK SettingsWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 }  // namespace
 
 void ShowSettingsWindow(HWND owner, HINSTANCE hInstance, const Config& current,
-                        std::function<void(const Config&)> onApply) {
+                        std::function<void(const Config&)> onApply,
+                        PrecacheHandler onPrecache) {
     // Single instance: just refocus if it is already open.
     if (g_openWindow && IsWindow(g_openWindow)) {
         SetForegroundWindow(g_openWindow);
@@ -484,7 +539,7 @@ void ShowSettingsWindow(HWND owner, HINSTANCE hInstance, const Config& current,
         registered = true;
     }
 
-    auto* window = new SettingsWindow(current, std::move(onApply));
+    auto* window = new SettingsWindow(current, std::move(onApply), std::move(onPrecache));
     if (!window->Create(owner, hInstance)) {
         delete window;
     }

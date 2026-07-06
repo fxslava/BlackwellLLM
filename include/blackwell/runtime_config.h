@@ -2,6 +2,7 @@
 #include "blackwell/config.h"   // ModelConfig (tier 1)
 #include "blackwell/engine.h"   // BlackwellEngine::KVCacheMode, ModelCapabilities
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -111,6 +112,13 @@ struct RuntimeOverrides {
     std::optional<int>         kv_ram_slots;       // kMirrorDevicePool = mirror device pool
     std::optional<int>         kv_disk_slots;      // 0 = disk tier off
     std::optional<std::string> kv_spill_path;
+
+    // Observability seam, not an execution-plan knob (deliberately absent from
+    // RuntimeConfig): invoked from the engine-constructing thread while model
+    // weights stream from disk, with cumulative (bytes_done, bytes_total) --
+    // drive a load-progress UI from it. Called per tensor; keep it O(1) and
+    // never let it throw. Empty = no reporting.
+    std::function<void(size_t bytes_done, size_t bytes_total)> load_progress;
 };
 
 // Hard kernel/hardware limits the validator asserts against. These mirror

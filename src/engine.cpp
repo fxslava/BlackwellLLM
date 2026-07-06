@@ -51,7 +51,8 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
       m_caps(blackwell::derive_capabilities(m_config)),
       m_runtime(blackwell::build_and_validate_runtime(m_config, m_caps, request, overrides)),
       loader(index_path),
-      arena(index_path, loader, m_config, m_runtime.max_seq_len, m_runtime.num_gpu_layers),
+      arena(index_path, loader, m_config, m_runtime.max_seq_len, m_runtime.num_gpu_layers,
+            overrides.load_progress),
       dispatcher(arena, m_config)
 {
     // 1. Bind core activation buffers from the arena

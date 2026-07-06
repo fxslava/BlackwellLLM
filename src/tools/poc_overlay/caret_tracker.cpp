@@ -295,6 +295,13 @@ void CaretTracker::SetLanguageOverride(int index) {
     cv_.notify_all();
 }
 
+void CaretTracker::SetLanguageRouting(LanguageRouting routing) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingRouting_ = routing;  // latest wins
+    hasPending_ = true;
+    cv_.notify_all();
+}
+
 void CaretTracker::ShowHud(std::wstring message, bool fade) {
     std::lock_guard<std::mutex> lock(mutex_);
     pendingHud_.emplace(std::move(message), fade);  // latest wins
@@ -331,6 +338,7 @@ void CaretTracker::ThreadMain() {
         bool timerFired = false;
         std::optional<bool> setActive;
         std::optional<int> setOverride;
+        std::optional<LanguageRouting> setRouting;
         std::optional<std::pair<std::wstring, bool>> hud;
         std::optional<std::pair<std::wstring, bool>> translation;
         {
@@ -370,6 +378,7 @@ void CaretTracker::ThreadMain() {
             }
             setActive.swap(pendingActive_);
             setOverride.swap(pendingOverride_);
+            setRouting.swap(pendingRouting_);
             hud.swap(pendingHud_);
             translation.swap(pendingTranslation_);
             hasPending_ = false;
@@ -382,6 +391,12 @@ void CaretTracker::ThreadMain() {
         // of this wake-up's handlers respect.
         if (setActive) {
             HandleSetActive(*setActive);
+        }
+        // A routing hot-reload (Settings save) lands BEFORE any override or
+        // keystroke coalesced into this same wake-up, so they validate against
+        // the new table, never the stale one.
+        if (setRouting) {
+            HandleSetRouting(*setRouting);
         }
         // A manual direction override (dropdown / cycle) is applied before any
         // coalesced keystroke this wake-up, so the capture below uses it.
@@ -948,6 +963,23 @@ void CaretTracker::PublishLanguage(int index) {
     publishedLanguage_ = index;
     if (callbacks_.setActiveLanguage) {
         callbacks_.setActiveLanguage(index);
+    }
+}
+
+void CaretTracker::HandleSetRouting(const LanguageRouting& routing) {
+    routing_ = routing;
+    // The pair set may have shrunk: clear a now-dangling manual pin and relock
+    // a live typing session so no stale index ever reaches PublishLanguage.
+    if (languageOverride_ && *languageOverride_ >= routing_.count) {
+        languageOverride_.reset();
+    }
+    if (sessionLanguage_ >= routing_.count) {
+        sessionLanguage_ = -1;  // stale lock: force a fresh resolve below / next session
+    }
+    if (phase_ == Phase::Typing || phase_ == Phase::Translating || phase_ == Phase::Ready) {
+        sessionLanguage_ = languageOverride_ ? *languageOverride_ : DetectTypingLanguage();
+        PublishLanguage(sessionLanguage_);
+        Render();  // header label may have changed
     }
 }
 

@@ -51,18 +51,19 @@ namespace {
 constexpr UINT kTrayIconId = 1;
 constexpr UINT_PTR kReadyTimerId = 1;      // polls engine readiness after Mode ON
 constexpr UINT_PTR kLifecycleTimerId = 2;  // coarse inactivity tick (spill/hibernate)
-constexpr UINT kLifecycleTickMs = 30'000;  // minute-scale thresholds -> 30s poll is plenty
+constexpr UINT kLifecycleTickMs = 2'000;   // timeouts have second granularity now; the
+                                           // tick is two atomic reads -- 2s is cheap
 
 // The live, in-memory application config. Loaded at startup and rewritten by the
 // settings window; only ever touched on the UI thread.
 Config g_config;
 
-// Language pairs FROZEN at startup. Everything pair-derived -- the engine's .bkv
-// branches, the CaretTracker routing, the overlay dropdown labels, the Alt+<N>
-// hotkey bound, and the cycle/force HUDs -- is wired from this snapshot so it all
-// stays mutually consistent for the whole session. Editing pairs in Settings
-// persists to config.json and takes full effect on the next app start (the same
-// restart the engine already needs to recompile its per-branch prompt caches).
+// The pair set currently WIRED into the app -- the engine's prompt branches,
+// the CaretTracker routing, the overlay dropdown labels, and the Alt+<N>
+// hotkey bound all derive from it. ApplyConfig() re-derives everything on a
+// Settings save, so edited pairs work immediately (hot-reload, NO restart):
+// a brand-new direction simply prefills cold on first use, or explicitly via
+// the per-pair "Pre-cache" button.
 std::vector<LanguagePair> g_sessionPairs;
 int g_sessionActive = 0;  // active index among g_sessionPairs (cycle/force)
 
@@ -72,6 +73,8 @@ CaretTracker* g_caretTracker = nullptr;
 // The inference service, for the readiness poll that drives the toggle HUD from
 // "Initializing..." to "ACTIVE". Only touched on the UI thread.
 TranslationService* g_translator = nullptr;
+// The overlay, for hot-reloading the header/dropdown labels on a Settings save.
+OverlayWindow* g_overlay = nullptr;
 
 // Map the configured language pairs onto the CaretTracker's OS-aware routing
 // indices. The source language is auto-detected by the model, so we key off each
@@ -104,9 +107,14 @@ CaretTracker::LanguageRouting DeriveLanguageRouting(const std::vector<LanguagePa
     return routing;
 }
 
-// Pushes a config into the running app: rebinds hotkeys and capture settings
-// in memory immediately. (Model path / context size are engine-construction
-// parameters and require a restart.)
+// Pushes a config into the running app: rebinds hotkeys, capture settings AND
+// the language pairs in memory immediately -- pairs hot-reload through every
+// consumer (hook bound, overlay labels, tracker routing, engine prompts), so
+// a just-saved direction translates on the very next keystroke. Only the
+// model path / context size / memory budget remain engine-construction
+// parameters that need a restart. Runs at startup (before the consumers
+// exist -- the null checks skip them; wWinMain wires them explicitly) and on
+// every Settings save (UI thread).
 void ApplyConfig(const Config& config) {
     g_config = config;
     HookManager::Instance().SetCommitShortcut(config.commitShortcut);
@@ -114,6 +122,33 @@ void ApplyConfig(const Config& config) {
     HookManager::Instance().SetCycleLanguageShortcut(config.cycleLanguageShortcut);
     if (g_caretTracker) {
         g_caretTracker->SetCaptureSettings(config.captureGranularity, config.idleTimerMs);
+    }
+
+    g_sessionPairs = config.languagePairs;
+    g_sessionActive = (config.activeLanguage >= 0 &&
+                       config.activeLanguage < static_cast<int>(g_sessionPairs.size()))
+                          ? config.activeLanguage
+                          : 0;
+    HookManager::Instance().SetLanguagePairCount(static_cast<int>(g_sessionPairs.size()));
+    if (g_overlay) {
+        std::vector<std::wstring> labels;
+        for (const LanguagePair& pair : g_sessionPairs) {
+            labels.push_back(pair.label);
+        }
+        g_overlay->SetLanguageLabels(std::move(labels));
+    }
+    if (g_caretTracker) {
+        // Clears a now-dangling manual pin / relocks a live typing session.
+        g_caretTracker->SetLanguageRouting(DeriveLanguageRouting(g_sessionPairs));
+    }
+    if (g_translator) {
+        std::vector<std::string> targets;
+        for (const LanguagePair& pair : g_sessionPairs) {
+            targets.push_back(ToUtf8(pair.target));
+        }
+        // Rebuilds the per-direction system prompts and swaps them into the
+        // live tracker -- the engine serves the new set with no restart.
+        g_translator->UpdateLanguagePairs(std::move(targets), g_sessionActive);
     }
 }
 
@@ -129,8 +164,18 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 case TrayCommand::ShowSettings: {
                     const HINSTANCE hInst =
                         reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-                    ShowSettingsWindow(hwnd, hInst, g_config,
-                                       [](const Config& c) { ApplyConfig(c); });
+                    ShowSettingsWindow(
+                        hwnd, hInst, g_config, [](const Config& c) { ApplyConfig(c); },
+                        // Pre-cache: compile one direction's .bkv branch in the
+                        // background (tracker worker); `done` may fire on that
+                        // worker -- the settings window marshals it itself.
+                        [](const std::wstring& target, std::function<void(bool, int)> done) {
+                            if (g_translator) {
+                                g_translator->PrecacheLanguage(ToUtf8(target), std::move(done));
+                            } else if (done) {
+                                done(false, 0);
+                            }
+                        });
                     break;
                 }
                 case TrayCommand::Exit:
@@ -156,18 +201,29 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                         g_caretTracker->ShowHud(L"Engine unavailable - set the model path in Settings",
                                                 /*fade=*/true);
                         break;
-                    case TranslationService::State::Idle:     // EnsureLoaded is imminent
-                    case TranslationService::State::Loading:
-                        break;  // keep waiting
+                    case TranslationService::State::Idle:  // EnsureLoaded is imminent
+                    case TranslationService::State::Loading: {
+                        // Keep waiting, folding the weight-load progress into the
+                        // sticky center HUD. Re-shown only when the percent moves
+                        // (the poll runs at 150ms; the HUD repaint need not).
+                        static int lastShownPct = -1;
+                        const int pct = g_translator->LoadProgressPercent();
+                        if (pct != lastShownPct) {
+                            lastShownPct = pct;
+                            g_caretTracker->ShowHud(L"Initializing Translation Engine... (" +
+                                                        std::to_wstring(pct) + L"%)",
+                                                    /*fade=*/false);
+                        }
+                        break;
+                    }
                 }
             }
-            // Coarse inactivity tick: the service compares idle time against
-            // the configured thresholds and hands the due stage (KV disk
-            // spill / soft hibernation) to the engine-owning worker thread --
-            // nothing heavy ever runs on this UI thread.
+            // Coarse inactivity tick: the service compares idle time against the
+            // configured thresholds and hands the due stage (KV disk spill / soft
+            // hibernation) to the engine-owning worker -- nothing heavy runs here.
             if (wParam == kLifecycleTimerId && g_translator) {
-                g_translator->LifecycleTick(g_config.kvSpillTimeoutMin,
-                                            g_config.hibernateTimeoutMin);
+                g_translator->LifecycleTick(g_config.kvSpillTimeoutSec,
+                                            g_config.hibernateTimeoutSec);
             }
             return 0;
         case WM_DESTROY:
@@ -205,16 +261,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     // Config must be loaded BEFORE the TranslationService: it carries the model
     // directory and the sampling parameters the engine is constructed with.
+    // ApplyConfig also seeds g_sessionPairs/g_sessionActive -- the overlay,
+    // tracker and service consumers below wire from that seed explicitly (they
+    // do not exist yet, so ApplyConfig's own hot-reload pushes are skipped).
     g_config = ConfigStore::Load();
     ApplyConfig(g_config);
-
-    // Freeze the pair set for the session: the engine branches below, the
-    // routing, the overlay labels, and the Alt+<N> hotkeys all wire from this.
-    g_sessionPairs = g_config.languagePairs;
-    g_sessionActive = (g_config.activeLanguage >= 0 &&
-                       g_config.activeLanguage < static_cast<int>(g_sessionPairs.size()))
-                          ? g_config.activeLanguage
-                          : 0;
 
     // The inference stack. Engine construction (DirectStorage weight streaming)
     // happens on the service's own worker thread -- this constructor is instant.
@@ -285,7 +336,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // The overlay's header/dropdown chrome: give it the pair labels to display,
     // a sink to apply a manual override (dropdown or the Auto row), and a sink to
     // publish its clickable region so the global mouse hook lets those clicks
-    // through instead of hiding the overlay.
+    // through instead of hiding the overlay. Labels hot-reload on a Settings
+    // save via ApplyConfig (g_overlay).
+    g_overlay = &overlay;
     {
         std::vector<std::wstring> labels;
         for (const LanguagePair& pair : g_sessionPairs) {
@@ -300,10 +353,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     overlay.SetInteractiveRegionSink(
         [](const RECT* rect) { HookManager::Instance().SetInteractiveRect(rect); });
 
-    // Bound the Alt+<N> force-override hotkeys to the pairs the engine was built
-    // with at startup (editing pairs in Settings takes effect on the next run, so
-    // this count stays fixed for the session -- Alt+N never fires for a pair the
-    // engine has no compiled branch for).
+    // Bound the Alt+<N> force-override hotkeys to the configured pairs (kept in
+    // step by ApplyConfig on every Settings save) -- Alt+N never fires for a
+    // pair index the routing has no entry for.
     HookManager::Instance().SetLanguagePairCount(static_cast<int>(g_sessionPairs.size()));
 
     // Late-bound sink: translation deltas/finals flow back into the tracker's
@@ -456,6 +508,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     HookManager::Instance().Uninstall();
     g_caretTracker = nullptr;
     g_translator = nullptr;
+    g_overlay = nullptr;
 
     // Teardown ordering: join the service worker FIRST, so its sink can never
     // fire into the CaretTracker while (or after) the tracker is destroyed

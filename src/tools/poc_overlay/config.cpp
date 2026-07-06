@@ -78,13 +78,24 @@ Config ConfigStore::Load() {
         config.idleTimerMs = j.value("idleTimerMs", config.idleTimerMs);
         if (config.idleTimerMs < 100) config.idleTimerMs = 100;  // sane floor
         config.activateOnStartup = j.value("activateOnStartup", config.activateOnStartup);
-        config.kvSpillTimeoutMin = j.value("kvSpillTimeoutMin", config.kvSpillTimeoutMin);
-        config.hibernateTimeoutMin = j.value("hibernateTimeoutMin", config.hibernateTimeoutMin);
-        if (config.kvSpillTimeoutMin < 1) config.kvSpillTimeoutMin = 1;
+        // Lifecycle timeouts are stored in SECONDS; configs written before the
+        // unit selector carried minutes under the *Min keys -- migrate those.
+        if (j.contains("kvSpillTimeoutSec")) {
+            config.kvSpillTimeoutSec = j.value("kvSpillTimeoutSec", config.kvSpillTimeoutSec);
+        } else if (j.contains("kvSpillTimeoutMin")) {
+            config.kvSpillTimeoutSec = j.value("kvSpillTimeoutMin", 10) * 60;
+        }
+        if (j.contains("hibernateTimeoutSec")) {
+            config.hibernateTimeoutSec =
+                j.value("hibernateTimeoutSec", config.hibernateTimeoutSec);
+        } else if (j.contains("hibernateTimeoutMin")) {
+            config.hibernateTimeoutSec = j.value("hibernateTimeoutMin", 30) * 60;
+        }
+        if (config.kvSpillTimeoutSec < 5) config.kvSpillTimeoutSec = 5;  // sane floor
         // Stage 2 never fires before stage 1: hibernation without the KV spill
         // would strand the radix tree in VRAM while the weights leave it.
-        if (config.hibernateTimeoutMin < config.kvSpillTimeoutMin) {
-            config.hibernateTimeoutMin = config.kvSpillTimeoutMin;
+        if (config.hibernateTimeoutSec < config.kvSpillTimeoutSec) {
+            config.hibernateTimeoutSec = config.kvSpillTimeoutSec;
         }
         config.vramCacheBlocks = j.value("vramCacheBlocks", config.vramCacheBlocks);
         config.ramTierBlocks = j.value("ramTierBlocks", config.ramTierBlocks);
@@ -121,8 +132,8 @@ bool ConfigStore::Save(const Config& config) {
     j["captureGranularity"] = ToString(config.captureGranularity);
     j["idleTimerMs"] = config.idleTimerMs;
     j["activateOnStartup"] = config.activateOnStartup;
-    j["kvSpillTimeoutMin"] = config.kvSpillTimeoutMin;
-    j["hibernateTimeoutMin"] = config.hibernateTimeoutMin;
+    j["kvSpillTimeoutSec"] = config.kvSpillTimeoutSec;
+    j["hibernateTimeoutSec"] = config.hibernateTimeoutSec;
     j["vramCacheBlocks"] = config.vramCacheBlocks;
     j["ramTierBlocks"] = config.ramTierBlocks;
     j["diskSpillEnabled"] = config.diskSpillEnabled;

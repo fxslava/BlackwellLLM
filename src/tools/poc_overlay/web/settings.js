@@ -13,13 +13,48 @@ const MAX_HOTKEY_PAIRS = 9;          // Alt+1 .. Alt+9
 const bridge = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
 const $ = (id) => document.getElementById(id);
 
+/* [code, English name]. The name goes verbatim into the model's system prompt
+   (Config.target); the code only shapes the "RU -> EN" label. */
+const LANGUAGES = [
+  ['EN', 'English'],    ['RU', 'Russian'],   ['ZH', 'Chinese'],    ['ES', 'Spanish'],
+  ['FR', 'French'],     ['DE', 'German'],    ['JA', 'Japanese'],   ['KO', 'Korean'],
+  ['PT', 'Portuguese'], ['IT', 'Italian'],   ['NL', 'Dutch'],      ['PL', 'Polish'],
+  ['TR', 'Turkish'],    ['AR', 'Arabic'],    ['HE', 'Hebrew'],     ['HI', 'Hindi'],
+  ['BN', 'Bengali'],    ['ID', 'Indonesian'],['VI', 'Vietnamese'], ['TH', 'Thai'],
+  ['UK', 'Ukrainian'],  ['CS', 'Czech'],     ['SV', 'Swedish'],    ['DA', 'Danish'],
+  ['FI', 'Finnish'],    ['NO', 'Norwegian'], ['EL', 'Greek'],      ['HU', 'Hungarian'],
+  ['RO', 'Romanian'],   ['BG', 'Bulgarian'], ['FA', 'Persian'],    ['MS', 'Malay']
+];
+const AUTO_SOURCE = 'Auto'; // source is model-detected; "Auto" is the honest default
+
+function codeOfTarget(name) {
+  const hit = LANGUAGES.find(([, n]) => n.toLowerCase() === String(name).toLowerCase());
+  return hit ? hit[0] : String(name).slice(0, 2).toUpperCase();
+}
+
+function pairLabel(sourceCode, targetName) {
+  return sourceCode + ' -> ' + codeOfTarget(targetName);
+}
+
+/* Recover the source code from a stored label ("RU -> EN" -> "RU"); anything
+   unparseable (hand-edited configs) falls back to Auto. */
+function sourceOfLabel(label) {
+  const m = /^\s*([A-Za-z]{2,5})\s*->/.exec(label || '');
+  if (!m) return AUTO_SOURCE;
+  const code = m[1].toUpperCase();
+  if (code === AUTO_SOURCE.toUpperCase()) return AUTO_SOURCE;
+  return LANGUAGES.some(([c]) => c === code) ? code : AUTO_SOURCE;
+}
+
 // ---- shared state -----------------------------------------------------------
 const state = {
   activation: { modifiers: 0, vk: 0 },
   commit:     { modifiers: 0, vk: 0 },
   cycle:      { modifiers: 0, vk: 0 },
-  pairs:      [],      // [{ label, target }]
-  activeLanguage: 0
+  pairs:      [],      // [{ label, target, source }] (source is UI-only)
+  activeLanguage: 0,
+  savedTargets: [],    // targets the C++ side currently serves (pre-cache gate)
+  precacheState: {}    // row index -> 'compiling' | 'done' | 'error' | 'unsaved'
 };
 
 // ---- hotkey helpers ---------------------------------------------------------
@@ -60,18 +95,88 @@ function bindHotkey(id) {
   el.addEventListener('keydown', function (e) {
     e.preventDefault();
     e.stopPropagation();
-    if (CLEAR_VK.indexOf(e.keyCode) !== -1) {   // Backspace / Delete unbinds
+    if (CLEAR_VK.includes(e.keyCode)) {   // Backspace / Delete unbinds
       state[id] = { modifiers: 0, vk: 0 };
       el.value = '';
       return;
     }
-    if (MOD_VK.indexOf(e.keyCode) !== -1) return; // wait for a real (non-modifier) key
+    if (MOD_VK.includes(e.keyCode)) return; // wait for a real (non-modifier) key
     state[id] = { modifiers: modsFromEvent(e), vk: e.keyCode };
     el.value = hotkeyLabel(state[id]);
   });
 }
 
 // ---- language pairs ---------------------------------------------------------
+function makeSelect(options, value) {
+  const sel = document.createElement('select');
+  options.forEach(([val, text]) => {
+    const opt = document.createElement('option');
+    opt.value = val;
+    opt.textContent = text;
+    sel.appendChild(opt);
+  });
+  if (value && ![...sel.options].some(o => o.value === value)) {
+    const opt = document.createElement('option'); // keep an exotic stored value alive
+    opt.value = value;
+    opt.textContent = value;
+    sel.appendChild(opt);
+  }
+  sel.value = value;
+  return sel;
+}
+
+/* Pre-cache button per row. State machine: idle -> compiling -> done, with
+   transient 'error' / 'unsaved' ("Save first") states that auto-revert. */
+function makePrecacheButton(index, target) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'secondary btn-precache';
+  const st = state.precacheState[index];
+  if (st === 'compiling') {
+    btn.textContent = 'Compiling…';
+    btn.disabled = true;
+  } else if (st === 'done') {
+    btn.textContent = 'Cached ✓';
+    btn.disabled = true;
+  } else if (st === 'error') {
+    btn.textContent = 'Failed';
+    btn.disabled = true;
+  } else if (st === 'unsaved') {
+    btn.textContent = 'Save first';
+    btn.disabled = true;
+  } else {
+    btn.textContent = 'Pre-cache';
+    btn.addEventListener('click', function () {
+      // The C++ side compiles by target name against the SAVED pair set, so an
+      // unsaved row can only fail -- say so instead of round-tripping.
+      if (!state.savedTargets.includes(target)) {
+        flashPrecacheState(index, 'unsaved');
+        return;
+      }
+      state.precacheState[index] = 'compiling';
+      renderPairs();
+      try {
+        if (bridge) bridge.postMessage({ type: 'precache', target: target, id: index });
+      } catch (err) {
+        console.error('settings: failed to post precache request', err);
+        flashPrecacheState(index, 'error');
+      }
+    });
+  }
+  return btn;
+}
+
+function flashPrecacheState(index, transient) {
+  state.precacheState[index] = transient;
+  renderPairs();
+  setTimeout(function () {
+    if (state.precacheState[index] === transient) {
+      delete state.precacheState[index];
+      renderPairs();
+    }
+  }, 1800);
+}
+
 function renderPairs() {
   const list = $('pairsList');
   list.innerHTML = '';
@@ -89,21 +194,28 @@ function renderPairs() {
     const row = document.createElement('div');
     row.className = 'pair-row';
 
-    const label = document.createElement('input');
-    label.type = 'text';
-    label.value = pair.label || '';
-    label.placeholder = 'RU -> EN';
-    label.addEventListener('input', function () { state.pairs[index].label = label.value; });
+    const sourceSel = makeSelect(
+      [[AUTO_SOURCE, AUTO_SOURCE]].concat(LANGUAGES.map(([c]) => [c, c])),
+      pair.source || AUTO_SOURCE);
+    const targetSel = makeSelect(
+      LANGUAGES.map(([c, n]) => [n, c + ' — ' + n]),
+      pair.target || 'English');
 
-    const target = document.createElement('input');
-    target.type = 'text';
-    target.value = pair.target || '';
-    target.placeholder = 'English';
-    target.addEventListener('input', function () { state.pairs[index].target = target.value; });
+    const syncLabel = function () {
+      pair.source = sourceSel.value;
+      pair.target = targetSel.value;
+      pair.label = pairLabel(pair.source, pair.target);
+    };
+    sourceSel.addEventListener('change', syncLabel);
+    targetSel.addEventListener('change', function () {
+      syncLabel();
+      delete state.precacheState[index]; // a different target = a different branch
+      renderPairs();
+    });
 
     const hotkey = document.createElement('div');
     hotkey.className = 'pair-hotkey';
-    hotkey.textContent = index < MAX_HOTKEY_PAIRS ? ('Alt+' + (index + 1)) : '—';
+    hotkey.textContent = index < MAX_HOTKEY_PAIRS ? 'Alt+' + (index + 1) : '—';
 
     const activeWrap = document.createElement('div');
     activeWrap.className = 'pair-active';
@@ -122,6 +234,7 @@ function renderPairs() {
     remove.title = 'Remove this pair';
     remove.addEventListener('click', function () {
       state.pairs.splice(index, 1);
+      delete state.precacheState[index];
       if (state.activeLanguage >= state.pairs.length) {
         state.activeLanguage = Math.max(0, state.pairs.length - 1);
       }
@@ -129,17 +242,15 @@ function renderPairs() {
       reportSize();
     });
 
-    row.appendChild(label);
-    row.appendChild(target);
-    row.appendChild(hotkey);
-    row.appendChild(activeWrap);
-    row.appendChild(remove);
+    row.append(sourceSel, targetSel, hotkey, activeWrap,
+               makePrecacheButton(index, pair.target), remove);
     list.appendChild(row);
   });
 }
 
 $('addPair').addEventListener('click', function () {
-  state.pairs.push({ label: '', target: '' });
+  state.pairs.push({ source: AUTO_SOURCE, target: 'English',
+                     label: pairLabel(AUTO_SOURCE, 'English') });
   renderPairs();
   reportSize();
 });
@@ -158,6 +269,23 @@ document.querySelectorAll('.tab').forEach(function (t) {
   t.addEventListener('click', function () { selectTab(t.dataset.tab); });
 });
 
+// ---- lifecycle timeouts (value + minutes/seconds unit; C++ stores seconds) ---
+function setTimeInput(valId, unitId, seconds) {
+  if (seconds >= 60 && seconds % 60 === 0) {
+    $(valId).value = seconds / 60;
+    $(unitId).value = '60';
+  } else {
+    $(valId).value = seconds;
+    $(unitId).value = '1';
+  }
+}
+
+function getTimeInput(valId, unitId, fallbackSec) {
+  const value = parseInt($(valId).value, 10);
+  if (!value || value <= 0) return fallbackSec;
+  return value * parseInt($(unitId).value, 10);
+}
+
 // ---- config <-> form --------------------------------------------------------
 function applyConfig(cfg) {
   state.activation = cfg.activation || { modifiers: 0, vk: 0 };
@@ -167,13 +295,21 @@ function applyConfig(cfg) {
   $('commit').value     = hotkeyLabel(state.commit);
   $('cycle').value      = hotkeyLabel(state.cycle);
 
-  state.pairs = Array.isArray(cfg.languagePairs)
-    ? cfg.languagePairs.map(function (p) { return { label: p.label || '', target: p.target || '' }; })
-    : [];
+  state.pairs = (Array.isArray(cfg.languagePairs) ? cfg.languagePairs : [])
+    .map(function (p) {
+      return { label: p.label || '', target: p.target || '',
+               source: sourceOfLabel(p.label) };
+    });
   state.activeLanguage = cfg.activeLanguage != null ? cfg.activeLanguage : 0;
+  state.savedTargets = state.pairs.map(function (p) { return p.target; });
+  state.precacheState = {};
   renderPairs();
 
-  $('modelPath').value    = cfg.modelPath || '';
+  $('modelPath').value     = cfg.modelPath || '';
+  $('spillFilePath').value = cfg.spillFilePath || '';
+  setTimeInput('kvSpillVal', 'kvSpillUnit', cfg.kvSpillTimeoutSec || 600);
+  setTimeInput('hibernateVal', 'hibernateUnit', cfg.hibernateTimeoutSec || 1800);
+
   $('contextSize').value  = cfg.contextSize != null ? cfg.contextSize : 4096;
   $('temperature').value  = cfg.temperature != null ? cfg.temperature : 0.7;
   $('topP').value         = cfg.topP != null ? cfg.topP : 0.95;
@@ -181,20 +317,19 @@ function applyConfig(cfg) {
   $('granularity').value  = cfg.captureGranularity || 'sentence';
   $('idleTimerMs').value  = cfg.idleTimerMs != null ? cfg.idleTimerMs : 700;
   $('activateOnStartup').checked = cfg.activateOnStartup === true;
-  $('kvSpillTimeoutMin').value   = cfg.kvSpillTimeoutMin != null ? cfg.kvSpillTimeoutMin : 10;
-  $('hibernateTimeoutMin').value = cfg.hibernateTimeoutMin != null ? cfg.hibernateTimeoutMin : 30;
   $('vramCacheBlocks').value = cfg.vramCacheBlocks != null ? cfg.vramCacheBlocks : 1024;
   $('ramTierBlocks').value   = cfg.ramTierBlocks != null ? cfg.ramTierBlocks : 2048;
   $('diskSpillEnabled').checked = cfg.diskSpillEnabled !== false;
   $('diskSpillBlocks').value = cfg.diskSpillBlocks != null ? cfg.diskSpillBlocks : 8192;
-  $('spillFilePath').value   = cfg.spillFilePath || '';
 }
 
 function buildPayload() {
   // Trim empty rows so a stray blank pair never reaches the config.
   const pairs = state.pairs
-    .map(function (p) { return { label: (p.label || '').trim(), target: (p.target || '').trim() }; })
-    .filter(function (p) { return p.target.length > 0; });
+    .filter(function (p) { return (p.target || '').trim().length > 0; })
+    .map(function (p) {
+      return { label: pairLabel(p.source || AUTO_SOURCE, p.target), target: p.target };
+    });
   let active = state.activeLanguage;
   if (active < 0 || active >= pairs.length) active = 0;
 
@@ -206,6 +341,9 @@ function buildPayload() {
     languagePairs: pairs,
     activeLanguage: active,
     modelPath: $('modelPath').value,
+    spillFilePath: $('spillFilePath').value,
+    kvSpillTimeoutSec: getTimeInput('kvSpillVal', 'kvSpillUnit', 600),
+    hibernateTimeoutSec: getTimeInput('hibernateVal', 'hibernateUnit', 1800),
     contextSize: parseInt($('contextSize').value, 10) || 4096,
     temperature: parseFloat($('temperature').value) || 0.0,
     topP: parseFloat($('topP').value) || 0.0,
@@ -213,13 +351,10 @@ function buildPayload() {
     captureGranularity: $('granularity').value,
     idleTimerMs: parseInt($('idleTimerMs').value, 10) || 700,
     activateOnStartup: $('activateOnStartup').checked,
-    kvSpillTimeoutMin: parseInt($('kvSpillTimeoutMin').value, 10) || 10,
-    hibernateTimeoutMin: parseInt($('hibernateTimeoutMin').value, 10) || 30,
     vramCacheBlocks: parseInt($('vramCacheBlocks').value, 10) || 0,
     ramTierBlocks: parseInt($('ramTierBlocks').value, 10) || 0,
     diskSpillEnabled: $('diskSpillEnabled').checked,
-    diskSpillBlocks: parseInt($('diskSpillBlocks').value, 10) || 0,
-    spillFilePath: $('spillFilePath').value
+    diskSpillBlocks: parseInt($('diskSpillBlocks').value, 10) || 0
   };
 }
 
@@ -247,10 +382,27 @@ if (bridge) {
       if (msg.type === 'load') {
         applyConfig(msg);
         reportSize();
-      } else if (msg.type === 'modelPath') {
-        if (msg.path) $('modelPath').value = msg.path;
+      } else if (msg.type === 'browsed') {
+        // Folder picker result. The spill path is a FILE inside the picked
+        // directory; everything else takes the directory itself.
+        const el = $(msg.target);
+        if (el && msg.path) {
+          el.value = msg.target === 'spillFilePath'
+            ? msg.path.replace(/[\\/]+$/, '') + '\\spill.bkv'
+            : msg.path;
+        }
       } else if (msg.type === 'saved') {
+        // The just-saved pairs are live now (hot-reload) -- pre-cache may
+        // target them.
+        state.savedTargets = state.pairs.map(function (p) { return p.target; });
         showToast();
+      } else if (msg.type === 'precacheDone') {
+        if (msg.ok) {
+          state.precacheState[msg.id] = 'done';
+          renderPairs();
+        } else {
+          flashPrecacheState(msg.id, 'error');
+        }
       }
     } catch (err) {
       console.error('settings: failed to handle host message', err);
@@ -258,9 +410,11 @@ if (bridge) {
   });
 }
 
-$('browse').addEventListener('click', function () {
-  try { if (bridge) bridge.postMessage({ type: 'browse' }); }
-  catch (err) { console.error('settings: failed to request folder picker', err); }
+document.querySelectorAll('button[data-target]').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    try { if (bridge) bridge.postMessage({ type: 'browse', target: btn.dataset.target }); }
+    catch (err) { console.error('settings: failed to request folder picker', err); }
+  });
 });
 
 $('save').addEventListener('click', function () {

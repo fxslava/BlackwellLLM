@@ -143,6 +143,12 @@ public:
     // loop; O(1). Takes effect immediately for an in-progress typing session.
     void SetLanguageOverride(int index);
 
+    // Hot-reload the routing table after a Settings save changed the language
+    // pairs (NO app restart). An out-of-range manual override is cleared and a
+    // live typing session relocks its direction against the new table, so no
+    // stale index can ever reach the engine. Marshals into the worker loop.
+    void SetLanguageRouting(LanguageRouting routing);
+
     // Show a large, screen-centered HUD banner (master-toggle feedback). `fade`
     // = hold briefly, then dissolve and hide; !fade = persist until replaced
     // (e.g. "Initializing..."). Marshals into the worker loop.
@@ -191,6 +197,7 @@ private:
     void HandleSetActive(bool active);
     void HandleShowHud(const std::wstring& message, bool fade);
     void HandleSetOverride(int index);
+    void HandleSetRouting(const LanguageRouting& routing);
     void ResetToIdle();
     void Render() const;
 
@@ -245,7 +252,7 @@ private:
     std::wstring inferenceContext_;
 
     // --- language routing (worker-thread-only) --------------------------------
-    LanguageRouting routing_;                  // index map from config (immutable)
+    LanguageRouting routing_;                  // index map from config (hot-reloadable)
     std::optional<int> languageOverride_;      // manual pin (dropdown / cycle); nullopt = auto
     int sessionLanguage_ = -1;                 // direction locked for the CURRENT typing session
     int publishedLanguage_ = -1;               // last index handed to setActiveLanguage
@@ -260,6 +267,7 @@ private:
     bool pendingSelectionCheck_ = false;
     std::optional<bool> pendingActive_;                               // SetActive slot
     std::optional<int> pendingOverride_;                              // SetLanguageOverride slot
+    std::optional<LanguageRouting> pendingRouting_;                   // SetLanguageRouting slot
     std::optional<std::pair<std::wstring, bool>> pendingHud_;         // message, fade
     std::optional<std::pair<std::wstring, bool>> pendingTranslation_;  // text, done
     bool hasPending_ = false;

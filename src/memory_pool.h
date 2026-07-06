@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -54,9 +55,17 @@ private:
 // expressed exclusively through cudaEvents; the math kernels are untouched.
 class VRAMArena {
 public:
+    // Cumulative weight-load progress (bytes staged so far, total bytes). Called
+    // once per tensor on the constructing thread; drive a "(45%)" HUD from it.
+    // NOTE: with a batched loader (DirectStorage) the resident-tensor portion
+    // reports ENQUEUE progress and the real I/O completes at the flush barrier,
+    // so the bar may run ahead of the disk -- honest enough for a loading HUD.
+    using LoadProgressFn = std::function<void(size_t bytes_done, size_t bytes_total)>;
+
     VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader,
               const ModelConfig& config, size_t max_seq_len = 2048,
-              size_t num_gpu_layers = static_cast<size_t>(-1));
+              size_t num_gpu_layers = static_cast<size_t>(-1),
+              LoadProgressFn load_progress = {});
     ~VRAMArena();
 
     VRAMArena(const VRAMArena&) = delete;
@@ -178,6 +187,7 @@ private:
     float* d_v_cache = nullptr;
 
     ModelConfig m_config;
+    LoadProgressFn m_load_progress;  // optional weight-load progress observer
     size_t m_max_seq_len = 0;
     size_t m_total_cache_bytes = 0;
     size_t m_activation_bytes = 0;

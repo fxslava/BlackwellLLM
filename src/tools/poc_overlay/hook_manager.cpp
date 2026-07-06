@@ -2,6 +2,7 @@
 
 #include <commctrl.h>  // HOTKEYF_* modifier flags
 
+#include <algorithm>
 #include <cwctype>
 
 #include "text_injector.h"  // TextInjector::kInjectedSignature
@@ -58,6 +59,39 @@ bool ForegroundIsOwnProcess() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     return pid == GetCurrentProcessId();
+}
+
+// True while a Windows screenshot tool (Win+Shift+S clipping host / Snipping
+// Tool) holds the foreground. Its chords and Esc are aimed at the snip overlay,
+// not at the text field underneath -- resetting the fallback buffer on them
+// would wipe the typing context of a user who merely grabbed a screenshot
+// mid-sentence. The process-image lookup is cached per foreground pid so the
+// low-level hook does not pay OpenProcess on every chord keystroke; all state
+// lives on the single hook-owning thread.
+bool IsScreenshotToolActive() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+
+    static DWORD cachedPid = 0;
+    static bool cachedResult = false;
+    if (pid == cachedPid) return cachedResult;
+    cachedPid = pid;
+    cachedResult = false;
+
+    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[MAX_PATH] = {};
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+            std::wstring lowered(path);
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::towlower);
+            cachedResult = lowered.find(L"screenclippinghost.exe") != std::wstring::npos ||
+                           lowered.find(L"snippingtool.exe") != std::wstring::npos;
+        }
+        CloseHandle(process);
+    }
+    return cachedResult;
 }
 
 // Exact match of the currently-held modifiers against a shortcut's HOTKEYF_*
@@ -235,12 +269,19 @@ bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
     if (IsModifierKey(vk)) {
         return false;  // lone Shift/Ctrl/... press
     }
+    // Keys aimed at a foreground screenshot tool are not edits to the text
+    // field underneath -- keep the fallback buffer so the typing session
+    // survives a mid-sentence snip (see IsScreenshotToolActive).
     if (IsChordModifierHeld()) {
-        ResetFallback();  // Ctrl+A, Ctrl+V, Alt+Tab, ...
+        if (!IsScreenshotToolActive()) {
+            ResetFallback();  // Ctrl+A, Ctrl+V, Alt+Tab, ...
+        }
         return false;
     }
     if (IsContextBreakKey(vk)) {
-        ResetFallback();  // arrows / Home / End / Esc / Tab / ...
+        if (!IsScreenshotToolActive()) {
+            ResetFallback();  // arrows / Home / End / Esc / Tab / ...
+        }
         return false;
     }
 

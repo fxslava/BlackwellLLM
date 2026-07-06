@@ -118,13 +118,37 @@ public:
 
     // The dual-stage inactivity state machine, driven by a coarse UI-thread
     // timer. Compares the time since the last typing/selection activity
-    // (TrackUpdate / TriggerGeneration) against the two thresholds and asks
-    // the tracker's worker to run the due stage: kvSpillTimeoutMin -> spill
-    // the KV prefix cache to disk; hibernateTimeoutMin -> soft-hibernate
+    // (TrackUpdate / TriggerGeneration) against the two thresholds (SECONDS)
+    // and asks the tracker's worker to run the due stage: kvSpillTimeoutSec ->
+    // spill the KV prefix cache to disk; hibernateTimeoutSec -> soft-hibernate
     // (weights VRAM -> host RAM; the engine object survives). Each stage
     // fires at most once per idle period; any new activity re-arms both.
     // Cheap and non-blocking -- safe to call every few seconds.
-    void LifecycleTick(int kvSpillTimeoutMin, int hibernateTimeoutMin);
+    void LifecycleTick(int kvSpillTimeoutSec, int hibernateTimeoutSec);
+
+    // Hot-reload the translation directions (Settings saved a new pair set --
+    // NO app restart). Rebuilds the per-direction system prompts and swaps
+    // them into the live tracker: the very next typing/selection request
+    // addresses the new set. New directions simply prefill cold on first use
+    // and get committed to the radix tree like any other prompt; the explicit
+    // JIT pre-cache below is optional. UI thread; cheap.
+    void UpdateLanguagePairs(std::vector<std::string> targetLanguages, int activeLanguage);
+
+    // On-demand JIT pre-cache: compile the .bkv prompt-cache branch for ONE
+    // direction (looked up by its target-language name in the CURRENT pair
+    // set) on the tracker's engine-owning worker thread. `done(ok, tokens)`
+    // fires there -- marshal, don't touch UI. Fails fast (done(false, 0),
+    // called synchronously) when the engine isn't Ready or the target isn't in
+    // the current set (e.g. the user hasn't saved the pair yet).
+    void PrecacheLanguage(const std::string& targetLanguage,
+                          std::function<void(bool ok, int prefilledTokens)> done);
+
+    // Weight-load progress, 0..100, while state() == Loading (0 before the
+    // loader reaches the weights; 100 once they are resident). The readiness
+    // poll renders it into the "Initializing... (N%)" HUD.
+    int LoadProgressPercent() const {
+        return loadProgressPct_.load(std::memory_order_relaxed);
+    }
 
     // Every keystroke: fire-and-forget speculative background prefill that
     // warms the engine's radix tree for `segment` (+ durable `context`), so a
@@ -169,6 +193,15 @@ private:
     // <dir>. Returns false when there was nothing cacheable (e.g. the stable
     // prefix is shorter than one KV page). Throws on engine/serializer errors.
     bool CompilePromptCache(const std::wstring& dir);
+    // Per-branch variant for the on-demand pre-cache: compile ONLY the branch
+    // at `index` into the shared cache dir and MERGE the manifest (the AOT
+    // warmer rewrites it with just the compiled entries, which would strand
+    // the other branches on the next warm start). Runs on the tracker's
+    // worker thread; returns false when nothing was cacheable.
+    bool CompilePromptCacheBranch(int index, const std::wstring& dir, int* prefilledTokens);
+    // <promptCacheRoot>\<model-hash-hex> -- requires a live engine WITH a
+    // prefix-cache substrate (empty otherwise). Engine-owning thread only.
+    std::wstring ResolvePromptCacheDir() const;
     // The byte-exact, BPE-seam-safe prefix of `previewPrompt`'s serving prompt:
     // the chat-template-rendered system block, cut right after the end-of-turn
     // marker. Empty when no safe prefix could be derived. LiveTranslationTracker
@@ -179,12 +212,13 @@ private:
     void DeliverLifecycle(LifecycleEvent event);  // tracker worker -> bound sink
     void MarkActivity();  // refresh lastActivityMs_ and re-arm the stage ladder
 
-    Settings settings_;
+    Settings settings_;  // targetLanguages hot-reloads under mutex_; rest immutable
 
     // One byte-stable system prompt per translation direction (KV prefix reuse);
-    // built once in the constructor, shared by CompilePromptCache (JIT compile,
-    // one .bkv branch each) and the tracker (live requests) so both address the
-    // same radix-tree pages. Never empty (at least one entry).
+    // shared by the JIT compile paths (one .bkv branch each) and the tracker
+    // (live requests) so both address the same radix-tree pages. Never empty.
+    // Hot-reloaded by UpdateLanguagePairs -- guarded by mutex_ (readers on the
+    // load/worker threads snapshot it under the lock).
     std::vector<std::string> previewPrompts_;
     std::atomic<int> activeLanguage_{0};  // remembered across the tracker handoff
 
@@ -205,6 +239,7 @@ private:
     // 1 = KV spilled, 2 = hibernated) so LifecycleTick fires each stage once.
     std::atomic<std::int64_t> lastActivityMs_{0};
     std::atomic<int> lifecycleStage_{0};
+    std::atomic<int> loadProgressPct_{0};  // weight-load progress (engine callback)
     bool loadStarted_ = false;  // ctor (eager) or EnsureLoaded; UI thread only
 
     std::mutex mutex_;

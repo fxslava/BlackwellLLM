@@ -68,13 +68,15 @@ struct Config {
     // Startup & inactivity lifecycle (the dual-stage memory state machine).
     // activateOnStartup: true = warm the engine and enter Translation Mode at
     // launch; false = start inactive and defer loading model weights into VRAM
-    // until the first activation. The timeouts are minutes of typing/selection
-    // inactivity: stage 1 spills the KV prefix cache (radix tree) down the tier
-    // waterfall to disk; stage 2 soft-hibernates -- weights leave GPU VRAM for
-    // pinned host RAM (the engine object survives; wakeup is a PCIe DMA burst).
+    // until the first activation. The timeouts are SECONDS of typing/selection
+    // inactivity (the Settings UI offers a minutes/seconds unit selector and
+    // always persists seconds; legacy *Min keys are migrated on load): stage 1
+    // spills the KV prefix cache (radix tree) down the tier waterfall to disk;
+    // stage 2 soft-hibernates -- weights leave GPU VRAM for pinned host RAM
+    // (the engine object survives; wakeup is a PCIe DMA burst).
     bool activateOnStartup = false;
-    int kvSpillTimeoutMin = 10;    // stage 1: KV disk spill
-    int hibernateTimeoutMin = 30;  // stage 2: soft hibernation (weights -> RAM)
+    int kvSpillTimeoutSec = 600;     // stage 1: KV disk spill
+    int hibernateTimeoutSec = 1800;  // stage 2: soft hibernation (weights -> RAM)
 
     // Tiered KV prefix-cache memory budget (engine RuntimeConfig knobs; one
     // block = one KV page = 16 tokens across all layers).

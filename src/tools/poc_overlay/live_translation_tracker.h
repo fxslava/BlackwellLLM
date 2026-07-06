@@ -65,6 +65,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -141,11 +142,29 @@ public:
     // how different it is from what came before.
     void Cancel();
 
-    // Switch the active translation direction (index into `system_prompts`).
-    // Thread-safe (atomic); out-of-range indices are clamped. The next request
-    // builds tokens from the new prompt -- update_sequence simply reconciles the
-    // (now larger) diff, so no explicit session reset is needed.
+    // Switch the active translation direction (index into the CURRENT prompt
+    // set). Thread-safe (atomic); out-of-range indices are clamped. The next
+    // request builds tokens from the new prompt -- update_sequence simply
+    // reconciles the (now larger) diff, so no explicit session reset is needed.
     void SetActiveLanguage(int index);
+
+    // Hot-reload the prompt set (language pairs edited in Settings -- NO app
+    // restart). Thread-safe: the prompts live behind a shared_ptr snapshot
+    // that each job copies once at its start, so an in-flight decode keeps the
+    // set it started with and the very next job sees the new one. The
+    // persistent tracking session is deliberately left alone -- its next
+    // reconcile diffs against the new prompt tokens and self-heals (the shared
+    // "You translate text into " prefix keeps even that diff small). An empty
+    // vector is ignored (there is always at least one direction).
+    void UpdatePrompts(std::vector<std::string> prompts, int active);
+
+    // Run an arbitrary engine-touching task on THIS CLASS'S WORKER THREAD --
+    // the only thread allowed to drive the engine (used for the on-demand JIT
+    // prompt pre-cache). Tasks queue FIFO behind any pending translation job,
+    // are NEVER displaced by activity (unlike lifecycle requests), and run
+    // with the engine awake (a hibernated engine is restored first). The task
+    // must not throw.
+    void PostEngineTask(std::function<void()> task);
 
     // Late-bound observer for the inactivity lifecycle (TranslationService
     // wires it to the HUD). Thread-safe; pass nullptr to detach.
@@ -202,16 +221,23 @@ private:
     // (and the same sequence the JIT cache compiler produced for the system
     // prompt prefix).
     std::vector<int> BuildTokens(const std::wstring& text, const std::wstring& context) const;
-    // The system prompt for the currently-active direction (clamped read).
-    const std::string& ActivePrompt() const;
+    // The system prompt for the currently-active direction: one shared_ptr
+    // snapshot + clamped index, returned BY VALUE so a concurrent
+    // UpdatePrompts() can never invalidate the caller's string (the prompt is
+    // a few hundred bytes; the copy is noise next to a forward pass).
+    std::string ActivePrompt() const;
     // Stream the text between <finish> and the (possibly still-streaming)
     // </finish> to `callback` if it changed since `last_posted`.
     void StreamPartial(const std::string& acc, const StreamCallback& callback,
                        std::wstring& last_posted) const;
 
     playground::BlackwellLLMAdapter& adapter_;
-    std::vector<std::string> system_prompts_;      // one per translation direction
-    std::atomic<int> active_language_{0};          // index into system_prompts_
+    // One system prompt per translation direction, behind an immutable
+    // snapshot: readers copy the shared_ptr under mutex_ and keep using their
+    // copy lock-free; UpdatePrompts() swaps in a whole new vector. Never null,
+    // never empty (ctor and UpdatePrompts both guarantee it).
+    std::shared_ptr<const std::vector<std::string>> system_prompts_;  // guarded by mutex_
+    std::atomic<int> active_language_{0};          // index into the current prompt set
     int max_new_tokens_;
     float temperature_;
     float top_p_;
@@ -227,9 +253,12 @@ private:
     std::atomic<std::uint64_t> current_gen_{0};
     std::atomic<bool> stop_{false};
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::optional<Job> pending_;  // latest-wins single slot (Track OR Generate)
+    // FIFO engine tasks (JIT pre-cache): behind jobs, ahead of lifecycle ops,
+    // never displaced by activity -- the user explicitly asked for them.
+    std::deque<std::function<void()>> engineTasks_;     // guarded by mutex_
     // Latest-wins lifecycle slot, separate from pending_ so a spill/hibernate
     // request never displaces a translation job (jobs run first; enqueuing a
     // job clears a not-yet-executed lifecycle request -- activity wins).

@@ -83,31 +83,62 @@ LiveTranslationTracker::LiveTranslationTracker(playground::BlackwellLLMAdapter& 
                                                int active_language, int max_new_tokens,
                                                float temperature, float top_p)
     : adapter_(adapter),
-      system_prompts_(std::move(system_prompts)),
       max_new_tokens_(max_new_tokens),
       temperature_(temperature),
       top_p_(top_p) {
-    if (system_prompts_.empty()) {
-        system_prompts_.emplace_back();  // never index into an empty vector
+    if (system_prompts.empty()) {
+        system_prompts.emplace_back();  // never index into an empty vector
     }
-    if (active_language < 0 || active_language >= static_cast<int>(system_prompts_.size())) {
+    if (active_language < 0 || active_language >= static_cast<int>(system_prompts.size())) {
         active_language = 0;
     }
+    system_prompts_ =
+        std::make_shared<const std::vector<std::string>>(std::move(system_prompts));
     active_language_.store(active_language, std::memory_order_relaxed);
     worker_ = std::thread(&LiveTranslationTracker::ThreadMain, this);
 }
 
 void LiveTranslationTracker::SetActiveLanguage(int index) {
-    if (index < 0 || index >= static_cast<int>(system_prompts_.size())) {
-        return;  // out of range: ignore (system_prompts_ is immutable after ctor)
+    std::shared_ptr<const std::vector<std::string>> prompts;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        prompts = system_prompts_;
+    }
+    if (index < 0 || index >= static_cast<int>(prompts->size())) {
+        return;  // out of range for the CURRENT set: ignore
     }
     active_language_.store(index, std::memory_order_relaxed);
 }
 
-const std::string& LiveTranslationTracker::ActivePrompt() const {
-    // system_prompts_ is non-empty (ctor guarantees it) and immutable, so this
-    // atomic read is always in range.
-    return system_prompts_[active_language_.load(std::memory_order_relaxed)];
+void LiveTranslationTracker::UpdatePrompts(std::vector<std::string> prompts, int active) {
+    if (prompts.empty()) {
+        return;  // there is always at least one direction; ignore a bogus update
+    }
+    if (active < 0 || active >= static_cast<int>(prompts.size())) {
+        active = 0;
+    }
+    auto snapshot = std::make_shared<const std::vector<std::string>>(std::move(prompts));
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        system_prompts_ = std::move(snapshot);
+    }
+    // Ordered after the swap so a concurrent ActivePrompt() can at worst pair
+    // the OLD index with the NEW set -- and both stores clamp, so any pairing
+    // is in range. The tracking session self-heals on the next reconcile.
+    active_language_.store(active, std::memory_order_relaxed);
+}
+
+std::string LiveTranslationTracker::ActivePrompt() const {
+    std::shared_ptr<const std::vector<std::string>> prompts;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        prompts = system_prompts_;
+    }
+    int index = active_language_.load(std::memory_order_relaxed);
+    if (index < 0 || index >= static_cast<int>(prompts->size())) {
+        index = 0;  // set shrank under the index: fall back to the first pair
+    }
+    return (*prompts)[index];
 }
 
 LiveTranslationTracker::~LiveTranslationTracker() {
@@ -178,6 +209,15 @@ void LiveTranslationTracker::Cancel() {
 void LiveTranslationTracker::SetLifecycleSink(LifecycleSink sink) {
     std::lock_guard<std::mutex> lock(mutex_);
     lifecycleSink_ = std::move(sink);
+}
+
+void LiveTranslationTracker::PostEngineTask(std::function<void()> task) {
+    if (!task || stop_.load(std::memory_order_relaxed)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        engineTasks_.push_back(std::move(task));
+    }
+    cv_.notify_all();
 }
 
 void LiveTranslationTracker::RequestKvSpill() {
@@ -262,18 +302,26 @@ void LiveTranslationTracker::ThreadMain() {
     while (true) {
         Job job;
         bool haveJob = false;
+        std::function<void()> task;
         LifecycleOp lifecycle = LifecycleOp::None;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] {
                 return stop_.load(std::memory_order_relaxed) || pending_.has_value() ||
-                       pendingLifecycle_ != LifecycleOp::None;
+                       !engineTasks_.empty() || pendingLifecycle_ != LifecycleOp::None;
             });
             if (stop_.load(std::memory_order_relaxed)) break;
+            // Priority per wake-up: translation job, then one queued engine
+            // task (pre-cache), then a lifecycle op -- so a user-visible
+            // translation is never stuck behind a compile, and a spill/
+            // hibernate never preempts explicitly requested work.
             if (pending_.has_value()) {
                 job = std::move(*pending_);
                 pending_.reset();
                 haveJob = true;
+            } else if (!engineTasks_.empty()) {
+                task = std::move(engineTasks_.front());
+                engineTasks_.pop_front();
             } else {
                 lifecycle = pendingLifecycle_;
                 pendingLifecycle_ = LifecycleOp::None;
@@ -281,7 +329,12 @@ void LiveTranslationTracker::ThreadMain() {
         }
 
         if (!haveJob) {
-            RunLifecycle(lifecycle);
+            if (task) {
+                WakeIfHibernated();  // engine work needs the weights resident
+                task();
+            } else {
+                RunLifecycle(lifecycle);
+            }
             continue;
         }
 
