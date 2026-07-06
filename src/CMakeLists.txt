@@ -138,43 +138,12 @@ if(USE_DIRECT_STORAGE AND WIN32)
 endif()
 
 # ==============================================================================
-# 4. ЭКСПЕРИМЕНТЫ СО СЖАТИЕМ (NVIDIA nvCOMP)
+# 4. СТАНДАЛОН-ЭКСПЕРИМЕНТЫ (см. src/experiments/CMakeLists.txt)
 # ==============================================================================
-
-# Создаем таргет
-add_executable(blackwell_compress
-    experiments/compress_experiment.cu
-    experiments/nvcomp_baseline.cu
-)
-
-# 🎯 1. Руками указываем папку с заголовками (include)
-target_include_directories(blackwell_compress PRIVATE 
-    "${CMAKE_SOURCE_DIR}/external/nvcomp/include"
-)
-
-# 🎯 2. Руками указываем папку с библиотеками импорта (.lib)
-target_link_directories(blackwell_compress PRIVATE 
-    "${CMAKE_SOURCE_DIR}/external/nvcomp/lib"
-)
-
-# 🎯 3. Линкуем наш движок и саму библиотеку (имя файла nvcomp.lib)
-target_link_libraries(blackwell_compress PRIVATE 
-    blackwell_core 
-    nvcomp 
-)
-
-# 🎯 4. Твой идеальный скрипт для копирования DLL
-if(WIN32)
-    # Проверь только, чтобы имя dll точно совпадало с тем, что лежит в папке bin!
-    set(NVCOMP_DLL_PATH "${CMAKE_SOURCE_DIR}/external/nvcomp/bin/nvcomp64_5.dll") 
-    
-    add_custom_command(TARGET blackwell_compress POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NVCOMP_DLL_PATH}"
-        "$<TARGET_FILE_DIR:blackwell_compress>"
-        COMMENT "Copying nvcomp DLL to execution directory..."
-    )
-endif()
+# The nvCOMP compression experiment (blackwell_compress) was removed together
+# with the vendored external/nvcomp binaries; experiments now live in their own
+# subdirectory with per-target scripts.
+add_subdirectory(experiments)
 
 # ==============================================================================
 # 5. AGENT SIMULATOR / PROMPT PLAYGROUND (live LLM testing GUI)

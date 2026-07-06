@@ -19,7 +19,7 @@ workloads: a background app that wakes on a hotkey, translates, and goes back to
 | Public API | `include/blackwell/` | no | The only headers external consumers may include: `engine.h`, `config.h`, `runtime_config.h`, `tokenizer.h`, `chat_template.h`, `weight_loader.h`. |
 | Agent stack | `src/agent/`, `src/agent_env/`, `src/agent_orchestrator/` | **no** | Tree-sitter CST analysis, sandbox OS layer (VFS/subprocess/git), ReAct orchestrator. Deliberately CUDA-free; talks to the model via the `ILLMGenerator` text interface. |
 | Tools | `src/tools/playground/`, `src/tools/poc_overlay/` | links core | HTTP playground GUI; Win32/UIA/Direct2D overlay translator (the flagship consumer). |
-| Tests | `tests/` | mixed | Labeled CTest suites — see Quickstart. `tests/common/` holds shared fixtures; `tests/reference/` is a compatibility shim. |
+| Tests | `tests/` | mixed | Labeled CTest suites — see Quickstart. `tests/common/` holds shared fixtures (CPU references, CUDA fixtures). |
 | Design docs | `docs/` | — | Read these before touching the corresponding subsystem (list below). |
 | Python scripts | `scripts/` | — | PyTorch golden-dump generators + CLI chat reference. Checkpoint roots resolve via `BLACKWELL_MODELS_DIR` (default `F:/AI`). |
 
@@ -107,11 +107,11 @@ target state; existing code migrates opportunistically when you touch it.
 |---|---|---|---|
 | 1 | `CUDA_CHECK` in `src/common.h` calls `exit(EXIT_FAILURE)` from library code | Throws a `blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`); consumers (overlay, playground) surface it | planned |
 | 2 | ~105 raw `cudaMalloc`/`cudaFree` sites; `BlackwellEngine::Impl` holds ~30 raw `float*` freed by a hand-maintained list in `~Impl()` | `DeviceBuffer<T>` RAII wrapper (move-only, sized ctor, implicit `T*` like `CudaVector`); Impl's destructor becomes `= default` | planned |
-| 3 | `src/CMakeLists.txt` is a ~200-line monolith (core lib + DirectStorage FetchContent + nvcomp experiment + tool gating); re-declares `project()` | One `CMakeLists.txt` per target directory; root only orchestrates; deps in `cmake/` modules | planned |
-| 4 | `blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks); root has global `include_directories(tests/reference)` | Narrow per-target `target_include_directories`; the `tests/reference` shim dies with the experiments refactor | planned |
+| 3 | `src/CMakeLists.txt` is a ~170-line monolith (core lib + DirectStorage FetchContent + tool gating); re-declares `project()` | One `CMakeLists.txt` per target directory; root only orchestrates; deps in `cmake/` modules | planned |
+| 4 | `blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks) | Narrow per-target `target_include_directories` | in progress (global `tests/reference` include + shim removed with the compress experiment, 2026-07) |
 | 5 | ~~Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`~~ | Scripts live in `scripts/` (paths anchored to repo root, checkpoints via `BLACKWELL_MODELS_DIR`); stray artifacts deleted; the 126 MB of tracked golden dumps moved to Git LFS (`.gitattributes`); `backup/` stays local-only (gitignored) | **done** |
 | 6 | `build_target.bat` + IDE-generated cache is the only CLI build path | Committed `CMakePresets.json` (configure + build + test presets) | planned |
-| 7 | `TLS_VERIFY OFF` on the DirectStorage NuGet fetch; nvcomp vendored as raw binaries in `external/` | Verified fetches; nvcomp acquisition documented/scripted | planned |
+| 7 | `TLS_VERIFY OFF` on the DirectStorage NuGet fetch | Verified fetch | in progress (vendored nvcomp binaries deleted with the compress experiment, 2026-07) |
 | 8 | Thread-ownership doctrine enforced only by comments | Debug thread-ID asserts on engine entry points (see doctrine section) | planned |
 | 9 | Sanitizers absent | ASan config for MSVC on the CUDA-free agent stack first; UBSan/TSan via clang-cl or Linux CI lane for `agent*` targets | idea |
 

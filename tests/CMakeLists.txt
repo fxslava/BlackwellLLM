@@ -7,9 +7,6 @@
 #                  dims) and CUDA-event performance benchmarks -> benchmark_tests
 #   integration/ - end-to-end engine vs PyTorch golden dumps (skips when the
 #                  local model/dumps are absent)       -> integration_tests
-#   reference/   - compatibility shim only: cpu_models.h is included by
-#                  src/experiments/compress_experiment.cu via a relative path
-#                  and exposed globally by the root CMakeLists.txt
 #
 # Typical invocations:
 #   ctest -L validation     # fast correctness suite
@@ -29,7 +26,7 @@ function(blackwell_add_test_suite target source_dir label)
     add_executable(${target} ${suite_sources})
 
     target_include_directories(${target} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}   # common/..., reference/...
+        ${CMAKE_CURRENT_SOURCE_DIR}   # common/...
         ${CMAKE_SOURCE_DIR}/src       # common.h, engine_impl.h, kernels/*.cuh
     )
 
@@ -41,14 +38,6 @@ function(blackwell_add_test_suite target source_dir label)
     )
 
     if(WIN32)
-        # nvCOMP runtime DLL must sit next to the executable.
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_SOURCE_DIR}/external/nvcomp/bin/nvcomp64_5.dll"
-                "$<TARGET_FILE_DIR:${target}>"
-            COMMENT "Copying nvCOMP DLL next to ${target}..."
-        )
-
         # The DirectStorage SDK is only downloaded (into the build tree's
         # _deps) when USE_DIRECT_STORAGE=ON; without the option there is
         # nothing to copy.
@@ -127,8 +116,3 @@ if(TARGET agent_orchestrator)
         DISCOVERY_TIMEOUT 120
     )
 endif()
-
-# Standalone experiment binaries (awq_benchmark etc.). src/CMakeLists.txt does
-# not include the experiments subdirectory itself, so it is hooked up here;
-# long-term this line belongs in src/CMakeLists.txt as add_subdirectory(experiments).
-add_subdirectory(${CMAKE_SOURCE_DIR}/src/experiments ${CMAKE_BINARY_DIR}/src/experiments)

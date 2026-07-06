@@ -1,8 +1,7 @@
 #pragma once
 // CPU reference implementations of every engine kernel. Validation suites
 // assert GPU results against these; they favour clarity and FP64 accumulation
-// over speed. Also consumed by src/experiments via the compatibility shim
-// tests/reference/cpu_models.h.
+// over speed.
 #include <cstddef>
 #include <cstdint>
 #include <cmath>

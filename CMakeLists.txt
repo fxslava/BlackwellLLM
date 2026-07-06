@@ -42,9 +42,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-# Общие заголовки (tests/reference/ exposed via tests target include)
-include_directories(${CMAKE_SOURCE_DIR}/tests/reference)
-
 # Подключаем поддиректории
 add_subdirectory(src)
 add_subdirectory(tests)

@@ -1,6 +1,5 @@
-# Standalone experiment executables.
-# NOTE: blackwell_compress is still defined inline in src/CMakeLists.txt;
-# new experiments should be added here instead.
+# Standalone experiment executables. One target per experiment, defined here
+# (never inline in src/CMakeLists.txt). Explicit source lists, PRIVATE deps.
 
 add_executable(awq_benchmark awq_benchmark.cu)
 
