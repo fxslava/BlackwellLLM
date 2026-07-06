@@ -15,7 +15,7 @@ workloads: a background app that wakes on a hotkey, translates, and goes back to
 | Subsystem | Location | CUDA? | What it is |
 |---|---|---|---|
 | `blackwell_kernels` | `src/kernels/` | yes | Hand-written kernels: attention, paged-flash, AWQ/FP8/INT4/BF16 GEMV, RoPE, SSM, sampling. One `.cu` + `.cuh` pair per kernel, explicit source list in CMake. |
-| `blackwell_core` | `src/` | yes | The engine: `engine.cpp` (facade + Impl), `memory_pool` (VRAMArena, offloading, hibernation), `kv_cache/` (Continuous vs Paged strategies), `paging/` (header-only tiered KV + prefix cache + radix tree), `ssm/`, `tokenizer/`, `safetensors`, `weight_loader`, `config`. |
+| `blackwell_core` | `src/core/` | yes | The engine: `engine.cpp` (facade + Impl), `memory_pool` (VRAMArena, offloading, hibernation), `kv_cache/` (Continuous vs Paged strategies), `paging/` (header-only tiered KV + prefix cache + radix tree), `ssm/`, `tokenizer/`, `safetensors`, `weight_loader`, `config`. Shared `common.h` (CUDA_CHECK/CudaVector) stays one level up in `src/`. |
 | Public API | `include/blackwell/` | no | The only headers external consumers may include: `engine.h`, `config.h`, `runtime_config.h`, `tokenizer.h`, `chat_template.h`, `weight_loader.h`. |
 | Agent stack | `src/agent/`, `src/agent_env/`, `src/agent_orchestrator/` | **no** | Tree-sitter CST analysis, sandbox OS layer (VFS/subprocess/git), ReAct orchestrator. Deliberately CUDA-free; talks to the model via the `ILLMGenerator` text interface. |
 | Tools | `src/tools/playground/`, `src/tools/poc_overlay/` | links core | HTTP playground GUI; Win32/UIA/Direct2D overlay translator (the flagship consumer). |
@@ -37,7 +37,7 @@ workloads: a background app that wakes on a hotkey, translates, and goes back to
 - Callbacks fired from the worker thread must **only enqueue/marshal** — never touch a
   window, COM, or the engine directly.
 - `VRAMArena::hibernate()/wakeup()` and the whole paging substrate share this contract
-  ("Not thread-safe; call from the single engine-owning thread" — `src/memory_pool.h`).
+  ("Not thread-safe; call from the single engine-owning thread" — `src/core/memory_pool.h`).
 
 During the refactoring, convert this doctrine from comment-folklore into a checked
 invariant: capture `std::this_thread::get_id()` when the engine finishes loading and add
@@ -50,7 +50,7 @@ These three patterns are already in the code and are non-negotiable for extensio
 
 1. **Capability gating.** Never guess what a loaded model supports — query
    `ModelCapabilities` (`get_capabilities()`), and gate features the way
-   `require_branching()` / `require_prefix_cache()` do in `src/engine.cpp`: throw a
+   `require_branching()` / `require_prefix_cache()` do in `src/core/engine.cpp`: throw a
    `std::runtime_error` whose message tells the caller *what to do instead*
    ("construct with KVCacheMode::Paged", "run linear ReAct only").
 
@@ -61,7 +61,7 @@ These three patterns are already in the code and are non-negotiable for extensio
    themselves from the *resolved* plan, not from raw request fields.
 
 3. **Declaration order = dependency order.** In `BlackwellEngine::Impl`
-   (`src/engine_impl.h`), member declaration order *is* the construction order and the
+   (`src/core/engine_impl.h`), member declaration order *is* the construction order and the
    reverse destruction order, and the comments at each declaration site state why
    (e.g. `kv_mgr` after `arena` because the adapter holds a reference into the arena).
    When you add a member, place it deliberately and document the placement.
@@ -108,7 +108,7 @@ target state; existing code migrates opportunistically when you touch it.
 |---|---|---|---|
 | 1 | `CUDA_CHECK` in `src/common.h` calls `exit(EXIT_FAILURE)` from library code | Throws a `blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`); consumers (overlay, playground) surface it | planned |
 | 2 | ~105 raw `cudaMalloc`/`cudaFree` sites; `BlackwellEngine::Impl` holds ~30 raw `float*` freed by a hand-maintained list in `~Impl()` | `DeviceBuffer<T>` RAII wrapper (move-only, sized ctor, implicit `T*` like `CudaVector`); Impl's destructor becomes `= default` | planned |
-| 3 | `blackwell_core` target still defined inline in `src/CMakeLists.txt` (awaiting the `src/core/` physical move) | One `CMakeLists.txt` per target directory; root only orchestrates | in progress (deps → `cmake/Dependencies.cmake` + `cmake/DirectStorage.cmake`, executables → `src/apps/`, duplicate `project()` removed, 2026-07) |
+| 3 | ~~`src/CMakeLists.txt` monolith~~ | One `CMakeLists.txt` per target directory (`src/core/`, `src/apps/`, `src/experiments/`, tools); `src/CMakeLists.txt` is orchestration-only; deps in `cmake/` modules | **done** (core physically relocated to `src/core/`, 2026-07) |
 | 4 | `blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks) | Narrow per-target `target_include_directories` | in progress (global `tests/reference` include + shim removed with the compress experiment, 2026-07) |
 | 5 | ~~Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`~~ | Scripts live in `scripts/` (paths anchored to repo root, checkpoints via `BLACKWELL_MODELS_DIR`); stray artifacts deleted; the 126 MB of tracked golden dumps moved to Git LFS (`.gitattributes`); `backup/` stays local-only (gitignored) | **done** |
 | 6 | `build_target.bat` + IDE-generated cache is the only CLI build path | Committed `CMakePresets.json` (configure + build + test presets) | planned |

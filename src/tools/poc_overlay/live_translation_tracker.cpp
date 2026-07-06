@@ -13,7 +13,7 @@
 
 #include "blackwell_llm_adapter.h"              // playground::BlackwellLLMAdapter
 #include "config.h"                              // ToUtf8 / FromUtf8
-#include "../../engine_prefill_coordinator.h"    // EnginePrefillCoordinator, EngineSequence
+#include "engine_prefill_coordinator.h"    // EnginePrefillCoordinator, EngineSequence
 
 // The opaque holder promised by the header: keeps engine/CUDA includes out of
 // live_translation_tracker.h, mirroring BlackwellEngine::Impl's own pImpl.

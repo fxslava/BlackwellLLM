@@ -24,52 +24,10 @@ if(BUILD_AGENT_ORCHESTRATOR AND BUILD_AGENT_CORE AND BUILD_AGENT_ENV)
 endif()
 
 # ==============================================================================
-# 1. СТАТИЧЕСКАЯ БИБЛИОТЕКА ДВИЖКА (Core Library)
+# 1. ДВИЖОК И ИСПОЛНЯЕМЫЕ ФАЙЛЫ
 # ==============================================================================
-set(CORE_SOURCES
-    engine.cpp
-    engine_prefill_coordinator.cpp
-    runtime_config.cpp
-    ops_dispatcher.cpp
-    safetensors.cpp
-    memory_pool.cpp
-    kv_cache/continuous_kv_manager.cpp
-    kv_cache/paged_kv_manager.cpp
-    tokenizer/unicode.cpp
-    tokenizer/bpe_tokenizer.cpp
-    tokenizer/chat_template.cpp
-    tokenizer/tokenizer_factory.cpp
-    weight_loader.cpp
-    config.cpp
-)
-
-if(USE_DIRECT_STORAGE AND WIN32)
-    list(APPEND CORE_SOURCES direct_storage_loader.cpp)
-endif()
-
-add_library(blackwell_core STATIC ${CORE_SOURCES}) 
-
-# Линкуем базовые зависимости. blackwell::dstorage существует только при
-# USE_DIRECT_STORAGE=ON (см. cmake/DirectStorage.cmake); PRIVATE достаточно --
-# дефайн USE_DIRECT_STORAGE потребляют только TU самой библиотеки
-# (weight_loader.cpp / direct_storage_loader.cpp).
-target_link_libraries(blackwell_core PRIVATE
-    nlohmann_json::nlohmann_json
-    blackwell_kernels
-)
-if(TARGET blackwell_dstorage)
-    target_link_libraries(blackwell_core PRIVATE blackwell::dstorage)
-endif()
-
-target_include_directories(blackwell_core
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-# ==============================================================================
-# 2. ИСПОЛНЯЕМЫЕ ФАЙЛЫ (см. src/apps/CMakeLists.txt)
-# ==============================================================================
-add_subdirectory(apps)
+add_subdirectory(core)   # blackwell_core (см. src/core/CMakeLists.txt)
+add_subdirectory(apps)   # blackwell_llm, blackwell_bench
 
 # ==============================================================================
 # 4. СТАНДАЛОН-ЭКСПЕРИМЕНТЫ (см. src/experiments/CMakeLists.txt)

@@ -36,9 +36,9 @@
 // uniform full-attention models -- has_prefix_cache() is the authority.
 // ---------------------------------------------------------------------------
 #if defined(BLACKWELL_ENGINE_HAS_PREFIX_CACHE)
-#include "../../engine_prefill_coordinator.h"  // EnginePrefillCoordinator (IPrefillDriver)
-#include "../../paging/aot_cache_warmer.h"     // AOTCacheWarmer (compile + warm_start)
-#include "../../paging/warmup_spec.h"          // WarmupSpec / WarmupNode (built in C++)
+#include "engine_prefill_coordinator.h"  // EnginePrefillCoordinator (IPrefillDriver)
+#include "paging/aot_cache_warmer.h"     // AOTCacheWarmer (compile + warm_start)
+#include "paging/warmup_spec.h"          // WarmupSpec / WarmupNode (built in C++)
 #endif
 
 namespace {

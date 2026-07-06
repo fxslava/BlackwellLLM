@@ -39,6 +39,8 @@ find_package(CUDAToolkit REQUIRED)
 target_include_directories(poc_overlay PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator  # orchestrator headers
     ${CMAKE_CURRENT_SOURCE_DIR}/../playground             # blackwell_llm_adapter.h
+    ${CMAKE_SOURCE_DIR}/src/core                          # engine_prefill_coordinator.h, paging/
+    ${CMAKE_SOURCE_DIR}/src                               # paging/ headers reach kernels/*.cuh + common.h
     ${CUDAToolkit_INCLUDE_DIRS}                           # paging headers -> cuda_runtime.h
 )
 

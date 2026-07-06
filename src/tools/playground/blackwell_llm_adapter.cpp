@@ -11,7 +11,7 @@
 // Full definition of EnginePrefillCoordinator (engine.h only forward-declares
 // it) for prefill_driver().set_tokenizer(). Pulls the paging substrate headers,
 // which is why this target needs the CUDA include directories.
-#include "../../engine_prefill_coordinator.h"
+#include "engine_prefill_coordinator.h"
 
 namespace playground {
 namespace {

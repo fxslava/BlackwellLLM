@@ -41,6 +41,8 @@ find_package(CUDAToolkit REQUIRED)
 
 target_include_directories(agent_playground PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../agent_orchestrator  # orchestrator headers
+    ${CMAKE_SOURCE_DIR}/src/core                          # engine_prefill_coordinator.h
+    ${CMAKE_SOURCE_DIR}/src                               # paging/ headers reach kernels/*.cuh + common.h
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 

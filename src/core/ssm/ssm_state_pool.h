@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <cuda_runtime.h>
 
-#include "../common.h"          // CUDA_CHECK
+#include "common.h"          // CUDA_CHECK
 #include "blackwell/config.h"   // ModelConfig::LinearAttnConfig
 
 // ============================================================================

@@ -56,25 +56,26 @@ exceptions when you touch them (never extend them).
 `blackwell_core` target, the DirectStorage FetchContent block, the two executables, the
 nvcomp compression experiment, and the option-gating for tools — with ordering
 dependencies ("Added LAST so DS_BIN_DIR is in scope") that make it fragile.
-**Already landed (2026-07):** the obsolete `blackwell_compress` experiment, the vendored
-`external/nvcomp` binaries, the global `tests/reference` include and its shim — all
-deleted; `src/experiments/` wired via `add_subdirectory`; deps extracted to
-`cmake/Dependencies.cmake`; DirectStorage extracted to `cmake/DirectStorage.cmake`
-(`blackwell::dstorage` INTERFACE target + `blackwell_copy_dstorage_dlls()` — the old
-`DS_BIN_DIR` directory-scope coupling is gone, and `TLS_VERIFY OFF` with it);
-executables moved to `src/apps/`; the duplicate `project()` removed.
-**Target state (the remaining split, Roadmap #3/#4 in CLAUDE.md):**
-- `src/core/CMakeLists.txt` → `blackwell_core` target + its physically relocated
-  sources (engine, memory_pool, kv_cache/, paging/, ssm/, tokenizer/, safetensors,
-  config), leaving `src/CMakeLists.txt` orchestration-only.
-- `blackwell_kernels` narrows its PUBLIC include to a dedicated public header dir (or an
-  explicit `src/kernels` path), removing the `src/`-wide leak.
-**When executing the split:** core relocation and kernels include-narrowing are separate
-commits; after each, run `.\build_target.bat blackwell_core && .\build_target.bat
-poc_overlay` plus `ctest -L validation` as the acceptance gate. The core move touches
-every `#include` that reaches into `src/` (tests include `engine_impl.h`, `common.h`,
-`kernels/*.cuh` via `${CMAKE_SOURCE_DIR}/src`) — update the consumers' include dirs;
-don't re-widen the kernels export to compensate.
+**Already landed (2026-07, Roadmap #3 done):** the monolith is split — `blackwell_core`
+lives in `src/core/CMakeLists.txt` with its physically relocated sources, executables in
+`src/apps/`, experiments per-target, deps in `cmake/Dependencies.cmake`, DirectStorage in
+`cmake/DirectStorage.cmake` (`blackwell::dstorage` + `blackwell_copy_dstorage_dlls()`;
+`DS_BIN_DIR` coupling and `TLS_VERIFY OFF` are gone); the obsolete `blackwell_compress`
+experiment, vendored nvcomp, and the `tests/reference` shim were deleted;
+`src/CMakeLists.txt` is orchestration-only (~60 lines).
+**Include-dir convention for core-internal consumers** (tests, tools that reach past the
+public API): add BOTH `${CMAKE_SOURCE_DIR}/src/core` (engine_impl.h, memory_pool.h,
+paging/, ssm/, kv_cache/) and `${CMAKE_SOURCE_DIR}/src` (shared `common.h`,
+`kernels/*.cuh` — paging headers include these) as PRIVATE include dirs. No `../../`
+relative includes into the engine tree — that style was retired with the move.
+**Target state (the last split item, Roadmap #4):** `blackwell_kernels` narrows its
+`PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` export (all of `src/` leaks to kernel linkers) to
+a dedicated public header dir or an explicit `src/kernels` path.
+**When executing the narrowing:** one commit; consumers that lose `src/` transitively
+must declare their own PRIVATE include dirs (fix consumers, don't re-widen). Acceptance:
+`.\build_target.bat blackwell_core && .\build_target.bat poc_overlay` +
+`ctest -L validation`. Afterwards delete this protocol, fold the include-dir convention
+into the rules above, and flip CLAUDE.md Roadmap #4 to done.
 **Afterwards:** rewrite this skill — delete this protocol, replace the monolith references
 with the final file map, and update CLAUDE.md's project map + Roadmap rows #3/#4.
 </evolution_protocol>

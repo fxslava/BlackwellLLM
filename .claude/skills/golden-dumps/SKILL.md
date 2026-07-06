@@ -42,7 +42,7 @@ Run from anywhere — output paths are anchored to the repo root, not the CWD. R
 
 Each generator documents, in its module docstring, the exact geometry the C++ side reads —
 e.g. `scripts/generate_qwen35_dumps.py` must match `SsmGeometry::from_config` in
-`src/ssm/ssm_state_pool.h` (recurrent state `[H][Dk][Dv]`, conv ring buffer `[conv_dim][K-1]`
+`src/core/ssm/ssm_state_pool.h` (recurrent state `[H][Dk][Dv]`, conv ring buffer `[conv_dim][K-1]`
 — note HF keeps the full `K` window, the engine keeps `K-1`; the script synthesizes init
 buffers from the *engine* geometry deliberately).
 

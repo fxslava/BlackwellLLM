@@ -1,6 +1,6 @@
 ---
 name: engine-extension
-description: Checklist and invariants for modifying BlackwellLLM engine internals — src/engine.cpp, engine_impl.h, memory_pool, kv_cache/, paging/, ssm/, or any code that calls BlackwellEngine. Use before adding engine features, new model-architecture paths, new device buffers, new config knobs, or engine-facing tool features (overlay/playground).
+description: Checklist and invariants for modifying BlackwellLLM engine internals — src/core/ (engine.cpp, engine_impl.h, memory_pool, kv_cache/, paging/, ssm/), or any code that calls BlackwellEngine. Use before adding engine features, new model-architecture paths, new device buffers, new config knobs, or engine-facing tool features (overlay/playground).
 ---
 
 # Engine Extension — Invariants Checklist
@@ -23,7 +23,7 @@ comments state them at each site — preserve that comment discipline in your ch
 ## 2. Impl members & device memory
 
 - **Declaration order = construction order = reverse destruction order** in
-  `BlackwellEngine::Impl` (`src/engine_impl.h`). Config/runtime members precede `arena`;
+  `BlackwellEngine::Impl` (`src/core/engine_impl.h`). Config/runtime members precede `arena`;
   `kv_mgr` follows `arena` (holds a reference into it); the paging chain
   (`kv_vram_pool → kv_tier_backend → kv_pager → prefix_cache → prefill`) follows `kv_mgr`.
   Place new members deliberately and write the placement comment.
@@ -39,7 +39,7 @@ comments state them at each site — preserve that comment discipline in your ch
 
 - Query `ModelCapabilities`; never infer support ad-hoc. Gate with a `require_*()` helper
   that throws `std::runtime_error` telling the caller **what to do instead** — copy the
-  tone of `require_branching()` / `require_prefix_cache()` in `src/engine.cpp`.
+  tone of `require_branching()` / `require_prefix_cache()` in `src/core/engine.cpp`.
 - New knobs flow `InferenceConfig` (intent) → `build_and_validate_runtime()` (validation,
   in `runtime_config.cpp`) → `RuntimeConfig` (resolved plan) → members size themselves
   from the plan. Low-level escape hatches go on `RuntimeOverrides`. **Never** add loose

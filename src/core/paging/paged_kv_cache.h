@@ -9,8 +9,8 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 
-#include "../kernels/paged_flash_attention.cuh"
-#include "../common.h"   // CUDA_CHECK
+#include "kernels/paged_flash_attention.cuh"
+#include "common.h"   // CUDA_CHECK
 
 // ============================================================================
 // Paged KV cache + Copy-on-Write sequence manager (host control plane)

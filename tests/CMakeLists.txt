@@ -26,8 +26,9 @@ function(blackwell_add_test_suite target source_dir label)
     add_executable(${target} ${suite_sources})
 
     target_include_directories(${target} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}   # common/...
-        ${CMAKE_SOURCE_DIR}/src       # common.h, engine_impl.h, kernels/*.cuh
+        ${CMAKE_CURRENT_SOURCE_DIR}    # common/...
+        ${CMAKE_SOURCE_DIR}/src        # common.h, kernels/*.cuh
+        ${CMAKE_SOURCE_DIR}/src/core   # engine_impl.h, memory_pool.h, paging/, ssm/
     )
 
     target_link_libraries(${target} PRIVATE
