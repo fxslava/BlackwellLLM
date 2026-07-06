@@ -32,16 +32,20 @@ exceptions when you touch them (never extend them).
 6. **New test suites** go through `blackwell_add_test_suite()` in `tests/CMakeLists.txt`
    (CUDA-flavored: DLL copies, kernels+core links) or copy the minimal agent-suite pattern
    for CUDA-free targets. Always `gtest_discover_tests` with a `LABELS` property.
-7. **Runtime DLLs** are delivered by `POST_BUILD copy_if_different` next to the exe —
-   reuse the existing pattern; never rely on PATH.
-8. `project()` is declared **once**, at the root. (The extra one in `src/CMakeLists.txt`
-   is debt #3.)
+7. **Runtime DLLs** are delivered by `POST_BUILD copy_if_different` next to the exe.
+   For DirectStorage, call `blackwell_copy_dstorage_dlls(<target>)` (defined
+   unconditionally by `cmake/DirectStorage.cmake`; no-op when the SDK is off) — never
+   hand-roll the copy or rely on PATH.
+8. `project()` is declared **once**, at the root.
 
 ## Dependency management
 
-- Header/source deps: `FetchContent` pinned to a release tag (googletest v1.14.0,
-  nlohmann_json v3.11.3 pattern). No unpinned branches, and no new `TLS_VERIFY OFF`
-  (the DirectStorage fetch's one is debt #7).
+- Header/source deps: `FetchContent` pinned to a release tag, declared in
+  `cmake/Dependencies.cmake` (googletest v1.14.0, nlohmann_json v3.11.3 pattern). No
+  unpinned branches, and never disable `TLS_VERIFY` (the last instance was removed
+  2026-07). Optional binary SDKs follow the `cmake/DirectStorage.cmake` pattern: an
+  INTERFACE target carrying usage requirements + a DLL-path target property + an
+  unconditionally-defined copy helper.
 - One binary SDK remains vendored in `external/` (renderdoc, currently unreferenced by
   any target); don't add new vendored binaries without recording the acquisition source
   in a comment. (The vendored nvcomp was deleted 2026-07 together with the obsolete
@@ -53,23 +57,24 @@ exceptions when you touch them (never extend them).
 nvcomp compression experiment, and the option-gating for tools — with ordering
 dependencies ("Added LAST so DS_BIN_DIR is in scope") that make it fragile.
 **Already landed (2026-07):** the obsolete `blackwell_compress` experiment, the vendored
-`external/nvcomp` binaries, the global `tests/reference` include, and the
-`tests/reference` shim were all **deleted**; `src/experiments/` is now wired via
-`add_subdirectory` with per-target scripts.
+`external/nvcomp` binaries, the global `tests/reference` include and its shim — all
+deleted; `src/experiments/` wired via `add_subdirectory`; deps extracted to
+`cmake/Dependencies.cmake`; DirectStorage extracted to `cmake/DirectStorage.cmake`
+(`blackwell::dstorage` INTERFACE target + `blackwell_copy_dstorage_dlls()` — the old
+`DS_BIN_DIR` directory-scope coupling is gone, and `TLS_VERIFY OFF` with it);
+executables moved to `src/apps/`; the duplicate `project()` removed.
 **Target state (the remaining split, Roadmap #3/#4 in CLAUDE.md):**
-- `src/CMakeLists.txt` → orchestration only: options + `add_subdirectory()` calls.
-- `src/core/CMakeLists.txt` → `blackwell_core` target + its (physically relocated)
-  sources; `src/apps/CMakeLists.txt` → the two executables.
-- `cmake/DirectStorage.cmake` → the whole NuGet fetch, exposing an imported/interface
-  target `blackwell::dstorage` (kills the DS_BIN_DIR scope coupling; consumers get DLL
-  paths from target properties).
+- `src/core/CMakeLists.txt` → `blackwell_core` target + its physically relocated
+  sources (engine, memory_pool, kv_cache/, paging/, ssm/, tokenizer/, safetensors,
+  config), leaving `src/CMakeLists.txt` orchestration-only.
 - `blackwell_kernels` narrows its PUBLIC include to a dedicated public header dir (or an
   explicit `src/kernels` path), removing the `src/`-wide leak.
-**When executing the split:** migrate one block per commit in this order — DirectStorage
-module, core/apps extraction, kernels include-narrowing — and after each commit run
-`.\build_target.bat blackwell_core && .\build_target.bat poc_overlay` plus
-`ctest -L validation` as the acceptance gate (include-narrowing will surface missing
-`target_include_directories` in consumers; fix those consumers, don't re-widen).
+**When executing the split:** core relocation and kernels include-narrowing are separate
+commits; after each, run `.\build_target.bat blackwell_core && .\build_target.bat
+poc_overlay` plus `ctest -L validation` as the acceptance gate. The core move touches
+every `#include` that reaches into `src/` (tests include `engine_impl.h`, `common.h`,
+`kernels/*.cuh` via `${CMAKE_SOURCE_DIR}/src`) — update the consumers' include dirs;
+don't re-widen the kernels export to compensate.
 **Afterwards:** rewrite this skill — delete this protocol, replace the monolith references
 with the final file map, and update CLAUDE.md's project map + Roadmap rows #3/#4.
 </evolution_protocol>

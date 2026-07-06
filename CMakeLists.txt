@@ -18,29 +18,14 @@ add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 # Включаем тестирование
 enable_testing()
 
-include(FetchContent)
+# 🎯 Опция для включения DirectStorage (по умолчанию ВЫКЛЮЧЕНА). Объявлена до
+# включения модуля, который на неё смотрит.
+option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
 
-# 3. Адаптация под Windows/MSVC
-# Принудительно отключаем поиск pthreads, чтобы не мусорить в логах сборки
-set(gtest_disable_pthreads ON CACHE BOOL "" FORCE)
-# Заставляем GTest использовать ту же стандартную библиотеку (DLL/MD), что и VS2022
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-
-# Загрузка GoogleTest
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG        v1.14.0
-)
-FetchContent_MakeAvailable(googletest)
-
-# Загрузка nlohmann/json для парсинга Safetensors заголовков
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.3
-)
-FetchContent_MakeAvailable(nlohmann_json)
+# 3. Зависимости: pinned FetchContent + опциональный DirectStorage SDK
+# (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls()).
+include(cmake/Dependencies.cmake)
+include(cmake/DirectStorage.cmake)
 
 # Подключаем поддиректории
 add_subdirectory(src)

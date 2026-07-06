@@ -95,14 +95,7 @@ add_custom_command(TARGET poc_overlay POST_BUILD
     "$<TARGET_FILE_DIR:poc_overlay>/web"
     COMMENT "Deploying poc_overlay Settings web assets (web/ -> next to the exe)")
 
-# When the core lib was built with DirectStorage, the engine needs the DS runtime
-# DLLs next to the executable (same block as agent_playground; DS_BIN_DIR is set
-# in src/CMakeLists.txt and inherited here).
-if(USE_DIRECT_STORAGE AND WIN32)
-    add_custom_command(TARGET poc_overlay POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DS_BIN_DIR}/dstorage.dll"
-        "${DS_BIN_DIR}/dstoragecore.dll"
-        $<TARGET_FILE_DIR:poc_overlay>
-        COMMENT "Copying DirectStorage runtime DLLs next to poc_overlay.exe")
-endif()
+# When the core lib was built with DirectStorage, the engine needs the DS
+# runtime DLLs next to the executable (no-op otherwise; the helper comes from
+# cmake/DirectStorage.cmake).
+blackwell_copy_dstorage_dlls(poc_overlay)

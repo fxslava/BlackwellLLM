@@ -65,14 +65,7 @@ add_custom_command(TARGET agent_playground POST_BUILD
         "$<TARGET_FILE_DIR:agent_playground>/ui"
     COMMENT "Copying agent_playground UI assets (ui/) next to the executable")
 
-# When the core lib was built with DirectStorage, the engine needs the DS runtime
-# DLLs next to the executable. DS_BIN_DIR is set in src/CMakeLists.txt and inherited
-# here because this subdirectory is added after that block.
-if(USE_DIRECT_STORAGE AND WIN32)
-    add_custom_command(TARGET agent_playground POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DS_BIN_DIR}/dstorage.dll"
-        "${DS_BIN_DIR}/dstoragecore.dll"
-        $<TARGET_FILE_DIR:agent_playground>
-        COMMENT "Copying DirectStorage runtime DLLs next to agent_playground.exe")
-endif()
+# When the core lib was built with DirectStorage, the engine needs the DS
+# runtime DLLs next to the executable (no-op otherwise; the helper comes from
+# cmake/DirectStorage.cmake).
+blackwell_copy_dstorage_dlls(agent_playground)

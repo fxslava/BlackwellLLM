@@ -37,23 +37,9 @@ function(blackwell_add_test_suite target source_dir label)
         blackwell_core
     )
 
-    if(WIN32)
-        # The DirectStorage SDK is only downloaded (into the build tree's
-        # _deps) when USE_DIRECT_STORAGE=ON; without the option there is
-        # nothing to copy.
-        if(USE_DIRECT_STORAGE)
-            set(ds_bin "${CMAKE_BINARY_DIR}/_deps/directstorage_sdk-src/native/bin/x64")
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${ds_bin}/dstorage.dll"
-                    "$<TARGET_FILE_DIR:${target}>"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${ds_bin}/dstoragecore.dll"
-                    "$<TARGET_FILE_DIR:${target}>"
-                COMMENT "Copying DirectStorage DLLs next to ${target}..."
-            )
-        endif()
-    endif()
+    # No-op unless the core lib was built with DirectStorage (the helper is
+    # defined unconditionally by cmake/DirectStorage.cmake).
+    blackwell_copy_dstorage_dlls(${target})
 
     gtest_discover_tests(${target}
         PROPERTIES LABELS "${label}"
