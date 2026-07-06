@@ -84,7 +84,9 @@ target_link_libraries(poc_overlay PRIVATE
     version            # required by the WebView2 static loader
     nlohmann_json::nlohmann_json                       # config.json + WebView2 IPC
     ${WV2_DIR}/build/native/x64/WebView2LoaderStatic.lib
-    blackwell_core       # CUDA engine + tokenizer (PUBLIC-propagates include/ + kernels)
+    blackwell_core_obj   # white-box engine layer: the tracker/service drive the
+                         # EnginePrefillCoordinator + paging C++ API, which the
+                         # DLL's COM boundary does not (yet) cover
     agent_orchestrator   # AgentOrchestrator / ToolParser / ToolRegistry
 )
 

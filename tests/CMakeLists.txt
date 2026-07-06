@@ -31,11 +31,14 @@ function(blackwell_add_test_suite target source_dir label)
         ${CMAKE_SOURCE_DIR}/src/core   # engine_impl.h, memory_pool.h, paging/, ssm/
     )
 
+    # White-box suites link the OBJECT library, NOT the DLL: they include
+    # engine_impl.h / memory_pool.h and reach symbols the narrow COM boundary
+    # of blackwell_core.dll deliberately does not export.
     target_link_libraries(${target} PRIVATE
         GTest::gtest
         GTest::gtest_main
         blackwell_kernels
-        blackwell_core
+        blackwell_core_obj
     )
 
     # No-op unless the core lib was built with DirectStorage (the helper is

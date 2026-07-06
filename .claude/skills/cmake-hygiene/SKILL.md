@@ -55,23 +55,25 @@ exceptions when you touch them (never extend them).
   `blackwell_compress` experiment.)
 
 <migration_context>
-**Build-system stabilization is COMPLETE (2026-07, Roadmap #4–#8 done):** per-target
-CMakeLists (`src/core/`, `src/apps/`, `src/experiments/`, `src/kernels/`, tools), deps in
-`cmake/Dependencies.cmake` + `cmake/DirectStorage.cmake`, no global include commands, no
-`src/`-wide exports (kernels' `PUBLIC ..` leak removed), committed `CMakePresets.json`,
-all fetches TLS-verified. The rules above ARE the target state — enforce them as-is.
+**Build-system stabilization is COMPLETE (2026-07, Roadmap #4–#8 done)** and the
+**COM-style DLL boundary landed (Roadmap #1, 2026-07)**. The established two-tier core:
 
-**Next milestone this skill serves (CLAUDE.md Roadmap #1): `blackwell_core` becomes a
-SHARED library (DLL)** with a COM-style boundary. CMake implications to apply when it
-lands: `add_library(blackwell_core SHARED)` with an explicitly `__declspec(dllexport)`-ed
-C factory — do NOT reach for `WINDOWS_EXPORT_ALL_SYMBOLS` (the point is a narrow binary
-surface, not symbol spraying); kernels/dstorage/json stay linked PRIVATE inside the DLL;
-every consumer exe needs the DLL delivered next to it (add a copy helper modeled on
-`blackwell_copy_dstorage_dlls()`, or use `$<TARGET_RUNTIME_DLLS>`); white-box tests that
-include `engine_impl.h` cannot link a DLL's internals — plan an internal
-STATIC/OBJECT library that both the DLL and the test suites link, keeping the DLL itself
-consumers-only. Update this section (and the rules, if the internal-lib split changes the
-include conventions) when that lands.
+- `blackwell_core_obj` (OBJECT lib, `src/core/CMakeLists.txt`) — ALL engine sources; the
+  full-trust white-box surface. Linked by: the test suites, `poc_overlay`,
+  `agent_playground` (they drive the prefill-coordinator/paging C++ API the COM interface
+  does not yet cover). kernels + dstorage are `PUBLIC` on it (their objects/import libs
+  must reach every final link); nlohmann_json is `PRIVATE`.
+- `blackwell_core` (SHARED DLL) — single own TU `engine_com.cpp`, sole exports = the C
+  factories (`BLACKWELL_CORE_EXPORTS` → `__declspec(dllexport)`). No
+  `WINDOWS_EXPORT_ALL_SYMBOLS`, ever — narrowness is the point. Linked by: `src/apps/`
+  only, which get the DLL via `blackwell_copy_runtime_dlls(<exe> blackwell_core)`
+  (`cmake/BlackwellHelpers.cmake`).
+
+Rules when touching this: a target either links the DLL (COM consumer: boundary header
+only) or the OBJECT lib (white-box: internal headers allowed) — NEVER both (two copies of
+the engine code). New DLL exports go through `engine_com.cpp` + the boundary header, not
+new dllexport sites. When the interface grows to cover the coordinator surface, migrate
+poc_overlay/playground from `blackwell_core_obj` to the DLL and update this section.
 </migration_context>
 **Afterwards:** rewrite this skill — delete this protocol, replace the monolith references
 with the final file map, and update CLAUDE.md's project map + Roadmap rows #3/#4.

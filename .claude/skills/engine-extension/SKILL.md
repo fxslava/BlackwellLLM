@@ -58,24 +58,37 @@ comments state them at each site — preserve that comment discipline in your ch
 - Recurrent (SSM) state has **no rewind** — anything that resets/branches sequences must
   handle it explicitly (see `reset_state()` and the CoW-branching veto in the ctor).
 
-## 5. Verification
+## 5. The DLL boundary (any facade / public API change)
 
-- `ctest -L validation` for kernel-level changes; `ctest -L integration` for anything
-  touching numerics (regenerate dumps first if geometry moved — skill `golden-dumps`).
-- Public API changes: keep `include/blackwell/engine.h` light (forward declarations, no
-  engine/CUDA includes) and update `docs/INFERENCE_API.md`.
+- `blackwell_core.dll`'s surface is `include/blackwell/iblackwell_engine.h` +
+  `src/core/engine_com.cpp` (Roadmap #1). **No exception escapes a boundary method**:
+  every body runs under `boundary()`, which maps via `map_current_exception()`. Out-params
+  are checked (`E_POINTER`) before work; arrays/strings use the two-call protocol
+  documented in the header.
+- A new `BlackwellEngine` facade method that boundary consumers need gets a matching
+  `IBlackwellEngine` method (HRESULT + out-params, ABI-frozen types: `int32_t`, `BOOL`,
+  POD structs) in the same change. White-box-only surface (coordinator, paging) does NOT
+  go on the interface yet — tools link `blackwell_core_obj` for that.
+- Consumers are one-tier-only: COM consumers include the boundary header exclusively;
+  white-box consumers may use C++ headers but link the OBJECT lib, never the DLL.
+
+## 6. Verification
+
+- `ctest --preset validation` for kernel-level changes; `ctest --preset integration` for
+  anything touching numerics (regenerate dumps first if geometry moved — skill
+  `golden-dumps`).
+- Public C++ API changes: keep `include/blackwell/engine.h` light (forward declarations,
+  no engine/CUDA includes) and update `docs/INFERENCE_API.md`.
 
 <evolution_protocol>
-**Sequencing (decided 2026-07):** the next milestone is CLAUDE.md Roadmap #1 — a
-DirectX/COM-style SHARED-library boundary (pure-virtual `IBlackwellEngine`, C factory
-export, `HRESULT` mapping at the DLL edge, so internal C++ exceptions never cross it).
-The RAII and error-handling work below lands AFTER that boundary exists: throwing
-`CUDA_CHECK` is only safe for consumers once the DLL edge catches and maps exceptions.
+**Sequencing:** the Roadmap #1 COM boundary LANDED 2026-07 (see section 5), unblocking
+the work below: `map_current_exception()` in `src/core/engine_com.cpp` carries a NOTE
+marker at the exact spot where the `blackwell::cuda_error` catch clause goes.
 **Current workaround:** raw `cudaMalloc`/`cudaFree` with hand-maintained destructor lists
 (~105 sites), and `CUDA_CHECK` in `src/common.h` calling `exit(EXIT_FAILURE)` from library
 code (Roadmap #2/#3 in CLAUDE.md). Also: the single-thread doctrine is comment-enforced
-only (Roadmap #9 — the debug thread-ID asserts fit naturally on the `IBlackwellEngine`
-entry points once #1 lands).
+only (Roadmap #9 — the debug thread-ID asserts fit naturally on the `EngineCom` methods,
+which now wrap every boundary entry).
 **Target state:** a move-only `DeviceBuffer<T>` RAII wrapper (sized ctor, implicit `T*`
 conversion like `CudaVector`, throwing allocation); `CUDA_CHECK` throws
 `blackwell::cuda_error : std::runtime_error` with file:line, translated to `HRESULT` at

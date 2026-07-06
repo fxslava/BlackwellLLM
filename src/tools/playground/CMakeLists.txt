@@ -53,7 +53,8 @@ target_include_directories(agent_playground PRIVATE
 target_link_libraries(agent_playground PRIVATE
     httplib::httplib
     nlohmann_json::nlohmann_json
-    blackwell_core
+    blackwell_core_obj   # white-box engine layer (adapter drives the prefill
+                         # coordinator C++ API; see poc_overlay's CMakeLists)
     agent_orchestrator
 )
 

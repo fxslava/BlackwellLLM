@@ -23,7 +23,9 @@ enable_testing()
 option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
 
 # 3. Зависимости: pinned FetchContent + опциональный DirectStorage SDK
-# (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls()).
+# (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls())
+# + общие хелперы (blackwell_copy_runtime_dlls).
+include(cmake/BlackwellHelpers.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/DirectStorage.cmake)
 
