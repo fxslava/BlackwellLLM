@@ -88,18 +88,30 @@ EnginePrefillCoordinator::~EnginePrefillCoordinator() {
 // The KV tensors are written straight into the pool pages the block table
 // names — commit() later just wraps those pages in VPids. Zero copies.
 // ---------------------------------------------------------------------------
-void EnginePrefillCoordinator::run_delta(SeqId engine_seq, const TokenId* tokens,
-                                         int n, int start_pos, bool want_logits) {
-    for (int pos = start_pos; pos < n; ++pos) {
-        const bool last = (pos + 1 == n);
-        // run_token is status-tier (Hybrid doctrine); the coordinator's own API
-        // is exception-tier, so a failed step surfaces here as engine_error.
-        const blackwell::EngineStatus st = m_impl.run_token(
-            static_cast<int>(tokens[pos]), pos, engine_seq, want_logits && last);
-        if (st != blackwell::EngineStatus::Success)
-            throw blackwell::engine_error(
-                st, "EnginePrefillCoordinator::run_delta: token at pos " +
-                        std::to_string(pos) + " failed: " + blackwell::to_string(st));
+EngineStatus EnginePrefillCoordinator::run_delta(SeqId engine_seq, const TokenId* tokens,
+                                                 int n, int start_pos,
+                                                 bool want_logits) noexcept {
+    try {
+        for (int pos = start_pos; pos < n; ++pos) {
+            const bool last = (pos + 1 == n);
+            const EngineStatus st = m_impl.run_token(
+                static_cast<int>(tokens[pos]), pos, engine_seq, want_logits && last);
+            if (st != EngineStatus::Success) {
+                // Graceful halt: the sweep stops at the failed token; the caller
+                // unwinds/rolls back the sequence and reports the status.
+                std::cerr << "[blackwell_core] run_delta: token at pos " << pos
+                          << " failed: " << to_string(st) << "\n";
+                return st;
+            }
+        }
+        return EngineStatus::Success;
+    } catch (const std::exception& e) {
+        // Stray throw from an unmigrated subsystem (paged manager, arena):
+        // convert here so this method's noexcept status contract holds.
+        std::cerr << "[blackwell_core] run_delta: " << e.what() << "\n";
+        return EngineStatus::StateMismatch;
+    } catch (...) {
+        return EngineStatus::CudaRuntimeError;
     }
 }
 
@@ -131,25 +143,37 @@ EnginePrefillCoordinator::prefill_prompt(const TokenId* tokens, int n,
                 "the tree is already drained (raise max_seq_len headroom / "
                 "paged_branch_factor, or release live sequences)");
 
-        // [BIND] + [COMPUTE] + [COMMIT]
-        ScopedBinding binding(m_kv, a.seq);
-        run_delta(binding.id(), tokens, n, a.cached_tokens, /*want_logits=*/true);
+        // [BIND] + [COMPUTE] + [COMMIT]. COMPUTE is status-tier: a failed sweep
+        // exits the binding scope (unbind), releases the acquire, and returns
+        // the status in a faulted Result -- no throw for the live callers.
+        EngineStatus compute_st;
+        {
+            ScopedBinding binding(m_kv, a.seq);
+            compute_st = run_delta(binding.id(), tokens, n, a.cached_tokens,
+                                   /*want_logits=*/true);
+            if (compute_st == EngineStatus::Success) {
+                // Publish the completed full pages (partial tail stays private).
+                // After this the prompt is a zero-prefill hit for every branch.
+                m_pc.commit(a.seq, tokens, n);
 
-        // Publish the completed full pages (partial tail stays private). After
-        // this the prompt is a zero-prefill hit for every future branch.
-        m_pc.commit(a.seq, tokens, n);
-
+                Result r;
+                r.engine_seq      = binding.keep();
+                r.total_tokens    = n;
+                r.cached_tokens   = a.cached_tokens;
+                r.computed_tokens = n - a.cached_tokens;
+                m_sessions.emplace(r.engine_seq, a.seq);
+                return r;
+            }
+        }   // ~ScopedBinding: engine id unbound (keep() was not called)
+        m_pc.release(a.seq);   // unpin + unlock + destroy the aborted sequence
         Result r;
-        r.engine_seq      = binding.keep();
-        r.total_tokens    = n;
-        r.cached_tokens   = a.cached_tokens;
-        r.computed_tokens = n - a.cached_tokens;
-        m_sessions.emplace(r.engine_seq, a.seq);
+        r.total_tokens = n;
+        r.status       = compute_st;
         return r;
     } catch (...) {
-        // Unwind ACQUIRE: unpin + unlock + destroy. Pages the aborted sweep
-        // already filled die with the sequence's references; the tree holds
-        // only pre-existing state. (~ScopedBinding already unbound the id.)
+        // Session-admin failure (BUDGET/COMMIT): unwind ACQUIRE -- unpin +
+        // unlock + destroy. Pages an aborted sweep already filled die with the
+        // sequence's references; the tree holds only pre-existing state.
         m_pc.release(a.seq);
         throw;
     }
@@ -179,6 +203,8 @@ EnginePrefillCoordinator::begin_sequence(const std::vector<TokenId>& tokens,
     const Result r =
         prefill_prompt(tokens.data(), static_cast<int>(tokens.size()), compute_stream);
     EngineSequence s;
+    s.status = r.status;
+    if (r.status != EngineStatus::Success) return s;   // faulted handle, engine_seq -1
     s.engine_seq = r.engine_seq;
     s.tokens     = tokens;
     return s;
@@ -236,18 +262,24 @@ EnginePrefillCoordinator::update_sequence(EngineSequence& seq,
     }
 
     // (d) Delta compute for the new suffix; logits for new_tokens.back().
-    try {
-        run_delta(seq.engine_seq, new_tokens.data(), new_n, keep,
-                  /*want_logits=*/true);
-    } catch (...) {
-        // Roll back to the common prefix and shrink the mirror to match: the
-        // KV cache and the handle agree again, the session remains usable.
+    // Status tier: on failure roll back to the common prefix and shrink the
+    // mirror to match -- the KV cache and the handle agree again, the session
+    // remains usable (self-heals on the next reconcile); the caller sees the
+    // status in the stats AND on the handle.
+    const EngineStatus dst = run_delta(seq.engine_seq, new_tokens.data(), new_n, keep,
+                                       /*want_logits=*/true);
+    if (dst != EngineStatus::Success) {
         m_kv.truncate_sequence(seq.engine_seq, keep);
         seq.tokens.assign(new_tokens.begin(), new_tokens.begin() + keep);
-        throw;
+        seq.status = dst;
+        st.status  = dst;
+        st.reused_tokens    = keep;
+        st.truncated_tokens = old_n - keep;
+        return st;
     }
 
     seq.tokens           = new_tokens;
+    seq.status           = EngineStatus::Success;
     st.reused_tokens     = keep;
     st.truncated_tokens  = old_n - keep;
     st.computed_tokens   = new_n - keep;
@@ -299,7 +331,14 @@ void EnginePrefillCoordinator::prefill(paging::SeqId seq, const TokenId* tokens,
 
     // The warmer never samples: skip the lm_head GEMV for the whole tail.
     ScopedBinding binding(m_kv, seq);
-    run_delta(binding.id(), tokens, num_tokens, start_pos, /*want_logits=*/false);
+    const EngineStatus st =
+        run_delta(binding.id(), tokens, num_tokens, start_pos, /*want_logits=*/false);
+    // The warmup facet is INIT-tier (offline .bkv compilation, not the live
+    // decode loop), so a failed sweep may throw here -- the warmer's own
+    // failure contract is exception-based.
+    if (st != EngineStatus::Success)
+        throw engine_error(st, "EnginePrefillCoordinator::prefill: warmup branch "
+                               "sweep failed: " + std::string(to_string(st)));
 }
 
 } // namespace blackwell

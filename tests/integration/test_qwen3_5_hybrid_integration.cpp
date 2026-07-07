@@ -179,13 +179,15 @@ TEST(Qwen35Hybrid, SingleStepLogitParity) {
     // linear layers currently throw until step_linear_attention is wired; catch
     // that precise boundary and SKIP so this test is green-by-skip, not red.
     std::vector<float> logits(cfg.vocab_size);
-    try {
+    {
         const int decode_token = 0;     // golden generator uses a fixed prompt/token
-        (void)engine->forward(decode_token, /*pos=*/0);
+        int next = -1;
+        const auto st = engine->forward_status(decode_token, /*pos=*/0, 0.6f, 0.9f, 0, &next);
+        if (st != blackwell::EngineStatus::Success)
+            GTEST_SKIP() << "SSM decode path not yet wired (scaffold ready): "
+                         << blackwell::to_string(st);
         CUDA_CHECK(cudaMemcpy(logits.data(), impl->d_logits,
                               cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-    } catch (const std::exception& e) {
-        GTEST_SKIP() << "SSM decode path not yet wired (scaffold ready): " << e.what();
     }
 
     // ---- ASSERTION: exact-parity bar -----------------------------------------
@@ -260,7 +262,9 @@ TEST(Qwen35Hybrid, MultiStepDecodeParity) {
     double min_cos = 1.0;
     std::vector<float> mine(cfg.vocab_size);
     for (int pos = 0; pos < N; ++pos) {
-        (void)engine->forward(tokens[pos], pos);   // logits for predicting pos+1
+        int next = -1;   // logits for predicting pos+1
+        ASSERT_EQ(engine->forward_status(tokens[pos], pos, 0.6f, 0.9f, 0, &next),
+                  blackwell::EngineStatus::Success);
         CUDA_CHECK(cudaMemcpy(mine.data(), impl->d_logits,
                               cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         const float* rp = ref.data() + (size_t)pos * cfg.vocab_size;
@@ -330,7 +334,9 @@ TEST(Qwen35Hybrid, ResetStateClearsRecurrentPollution) {
 
     auto decode_B_logits = [&](void) {
         std::vector<float> v(cfg.vocab_size);
-        (void)engine->forward(tokens[0], /*pos=*/0);
+        int next = -1;
+        EXPECT_EQ(engine->forward_status(tokens[0], /*pos=*/0, 0.6f, 0.9f, 0, &next),
+                  blackwell::EngineStatus::Success);
         CUDA_CHECK(cudaMemcpy(v.data(), impl->d_logits, cfg.vocab_size * sizeof(float),
                               cudaMemcpyDeviceToHost));
         return v;
@@ -338,7 +344,11 @@ TEST(Qwen35Hybrid, ResetStateClearsRecurrentPollution) {
 
     // POLLUTE: advance the recurrent state with a few unrelated decode steps.
     if (impl->ssm_state) impl->ssm_state->reset(0);
-    for (int p = 0; p < 4; ++p) (void)engine->forward(tokens[p + 1], p);
+    for (int p = 0; p < 4; ++p) {
+        int next = -1;
+        ASSERT_EQ(engine->forward_status(tokens[p + 1], p, 0.6f, 0.9f, 0, &next),
+                  blackwell::EngineStatus::Success);
+    }
 
     // Decode B at pos 0 WITHOUT resetting -> recurrent state is stale.
     const std::vector<float> polluted = decode_B_logits();

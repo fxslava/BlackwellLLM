@@ -532,7 +532,18 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
         StreamPartial(acc, job.callback, last_posted);
         if (finished) break;
 
-        next = adapter_.engine().forward(next, pos, temperature_, top_p_, seq);
+        // Status-tier decode step: on failure halt the stream gracefully --
+        // the loop exits with finished=false, so the final delivery below is
+        // the standard "empty text = failure" contract; no exception, no crash
+        // of the worker thread. The tracking session self-heals on the next
+        // reconcile (see the block comment below).
+        const auto fwd_st = adapter_.engine().forward_status(
+            next, pos, temperature_, top_p_, seq, &next);
+        if (fwd_st != blackwell::EngineStatus::Success) {
+            std::wcerr << L"[tracker] decode step faulted: "
+                       << blackwell::to_string(fwd_st) << L"\n";
+            break;
+        }
         ++pos;
         ++generated;
     }

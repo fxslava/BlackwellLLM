@@ -60,7 +60,8 @@ HRESULT map_current_exception(const char* op) noexcept {
         return (e.code() == cudaErrorMemoryAllocation) ? E_OUTOFMEMORY
                                                        : BLACKWELL_E_CUDA_RUNTIME;
     } catch (const blackwell::engine_error& e) {
-        // A status-tier failure re-raised by an exception-tier wrapper below us.
+        // A status carried across an exception-tier surface (init/admin paths,
+        // e.g. the coordinator's warmup facet) -- unwrap and map the status.
         std::cerr << "[blackwell_core] " << op << ": " << e.what() << "\n";
         return hresult_from_status(e.status(), op);
     } catch (const std::bad_alloc&) {

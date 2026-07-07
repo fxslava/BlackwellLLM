@@ -67,16 +67,22 @@ These three patterns are already in the code and are non-negotiable for extensio
    When you add a member, place it deliberately and document the placement.
 
 4. **Hybrid error doctrine** (`include/blackwell/engine_status.h`). Two tiers, split
-   by phase. **INIT tier** (ctors / factories / setup): exceptions — `CUDA_CHECK_THROW`
-   throws `blackwell::cuda_error`, RAII members unwind, the DLL boundary maps it to an
-   HRESULT (`E_OUTOFMEMORY` for VRAM exhaustion). **RUNTIME tier** (the decode hot loop:
-   `Impl::run_token` / `step_*`): never throws — `CUDA_CHECK_RETURN` + `ENGINE_TRY`
-   propagate `EngineStatus` by return value, translated exactly once:
+   by phase. **INIT tier** (ctors / factories / setup / AOT warmup): exceptions —
+   `CUDA_CHECK_THROW` throws `blackwell::cuda_error`, RAII members unwind, the DLL
+   boundary maps it to an HRESULT (`E_OUTOFMEMORY` for VRAM exhaustion). **RUNTIME
+   tier** (the decode hot loop and everything a live stream touches): status codes,
+   end to end, no exceptions anywhere — the ONLY inference endpoints are the noexcept
+   `forward_status`/`forward_eval_status` (there is no throwing `forward()`; stray
+   subsystem exceptions are caught inside and converted), `Impl::run_token`/`step_*`
+   propagate via `CUDA_CHECK_RETURN` + `ENGINE_TRY`, and the prefill coordinator's
+   COMPUTE phase reports through the `status` fields on
+   `Result`/`UpdateStats`/`EngineSequence` (a faulted stream halts gracefully; the
+   session self-heals on the next reconcile). Statuses translate exactly once:
    `hresult_from_status()` at the COM edge (`OutOfVram`→`E_OUTOFMEMORY`,
    `InvalidArgument`/`InvalidConfig`→`E_INVALIDARG`, `StateMismatch`→`E_NOT_VALID_STATE`,
-   `CudaRuntimeError`→`BLACKWELL_E_CUDA_RUNTIME`), or `blackwell::engine_error` in the
-   exception-tier facade wrappers (`forward`/`forward_eval`) for white-box consumers.
-   Never add legacy exit()-`CUDA_CHECK` call sites in engine code.
+   `CudaRuntimeError`→`BLACKWELL_E_CUDA_RUNTIME`); UI layers branch on the status.
+   `blackwell::engine_error` exists only to carry a status across exception-tier
+   (init/admin) surfaces. Never add legacy exit()-`CUDA_CHECK` call sites in engine code.
 
 House comment style: comments state **contracts and invariants**, not narration — keep the
 existing density. Mixed Russian/English is accepted; match whichever the surrounding file

@@ -41,10 +41,11 @@ inline const char* to_string(EngineStatus status) noexcept {
     return "UnknownEngineStatus";
 }
 
-// Thrown by the exception-tier facade wrappers (forward/forward_eval) when the
-// status-tier core reports failure -- so white-box C++ consumers keep their
-// try/catch ergonomics while the hot loop itself stays throw-free. Derives
-// from std::runtime_error to preserve existing catch sites.
+// Carries an EngineStatus across an exception-tier surface. The runtime hot
+// loop NEVER raises this (it is status-only, end to end); the remaining
+// throwers are init/admin surfaces -- e.g. the coordinator's AOT-warmup facet
+// (EnginePrefillCoordinator::prefill), whose offline compilation contract is
+// exception-based. Derives from std::runtime_error to match existing catch sites.
 class engine_error : public std::runtime_error {
 public:
     engine_error(EngineStatus status, const std::string& what_arg)

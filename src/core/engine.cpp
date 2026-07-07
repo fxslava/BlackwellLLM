@@ -672,28 +672,46 @@ EngineStatus BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id,
 }
 
 // ============================================================================
-// Full Engine Inference -- runtime status tier + exception-tier wrappers.
+// Full Engine Inference -- runtime status tier ONLY (the throwing wrappers
+// were purged; no exception leaves these endpoints).
 // ============================================================================
-blackwell::EngineStatus BlackwellEngine::forward_status(int token_id, int pos,
-                                                        float temperature, float top_p,
-                                                        int seq_id, int* next_token) {
-    if (!next_token) return EngineStatus::InvalidArgument;
-    auto* impl = pImpl.get();
-    ENGINE_TRY(impl->run_token(token_id, pos, seq_id));
-    *next_token = sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature, top_p);
-    return EngineStatus::Success;
+// Convert a stray exception from an unmigrated subsystem (paged manager,
+// arena, kernels lib) into a status: called ONLY from a catch context inside
+// the noexcept endpoints below. This is what makes them safely noexcept.
+static EngineStatus status_from_current_exception(const char* op) noexcept {
+    try {
+        throw;
+    } catch (const blackwell::cuda_error& e) {
+        std::cerr << "[blackwell_core] " << op << ": " << e.what() << "\n";
+        return (e.code() == cudaErrorMemoryAllocation) ? EngineStatus::OutOfVram
+                                                       : EngineStatus::CudaRuntimeError;
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "[blackwell_core] " << op << ": " << e.what() << "\n";
+        return EngineStatus::InvalidArgument;
+    } catch (const std::exception& e) {
+        // Subsystem contract violations (unknown seq id, hibernated arena...)
+        // surface as runtime_errors today; StateMismatch is the closest status.
+        std::cerr << "[blackwell_core] " << op << ": " << e.what() << "\n";
+        return EngineStatus::StateMismatch;
+    } catch (...) {
+        std::cerr << "[blackwell_core] " << op << ": unknown exception\n";
+        return EngineStatus::CudaRuntimeError;
+    }
 }
 
-// Exception-tier wrapper for white-box C++ consumers: the status stays the
-// single source of truth; a failure becomes an engine_error at THIS edge, not
-// inside the decode chain.
-int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p, int seq_id) {
-    int next_token = -1;
-    const EngineStatus st = forward_status(token_id, pos, temperature, top_p, seq_id, &next_token);
-    if (st != EngineStatus::Success)
-        throw blackwell::engine_error(
-            st, std::string("BlackwellEngine::forward: ") + blackwell::to_string(st));
-    return next_token;
+blackwell::EngineStatus BlackwellEngine::forward_status(int token_id, int pos,
+                                                        float temperature, float top_p,
+                                                        int seq_id,
+                                                        int* next_token) noexcept {
+    if (!next_token) return EngineStatus::InvalidArgument;
+    try {
+        auto* impl = pImpl.get();
+        ENGINE_TRY(impl->run_token(token_id, pos, seq_id));
+        *next_token = sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature, top_p);
+        return EngineStatus::Success;
+    } catch (...) {
+        return status_from_current_exception("forward_status");
+    }
 }
 
 // ============================================================================
@@ -701,21 +719,17 @@ int BlackwellEngine::forward(int token_id, int pos, float temperature, float top
 // ============================================================================
 blackwell::EngineStatus BlackwellEngine::forward_eval_status(int token_id, int pos,
                                                              int target_token_id,
-                                                             int seq_id, float* log_prob) {
+                                                             int seq_id,
+                                                             float* log_prob) noexcept {
     if (!log_prob) return EngineStatus::InvalidArgument;
-    auto* impl = pImpl.get();
-    ENGINE_TRY(impl->run_token(token_id, pos, seq_id));
-    *log_prob = compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
-    return EngineStatus::Success;
-}
-
-float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id, int seq_id) {
-    float log_prob = 0.0f;
-    const EngineStatus st = forward_eval_status(token_id, pos, target_token_id, seq_id, &log_prob);
-    if (st != EngineStatus::Success)
-        throw blackwell::engine_error(
-            st, std::string("BlackwellEngine::forward_eval: ") + blackwell::to_string(st));
-    return log_prob;
+    try {
+        auto* impl = pImpl.get();
+        ENGINE_TRY(impl->run_token(token_id, pos, seq_id));
+        *log_prob = compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
+        return EngineStatus::Success;
+    } catch (...) {
+        return status_from_current_exception("forward_eval_status");
+    }
 }
 
 float BlackwellEngine::last_token_probability(int token_id) const {

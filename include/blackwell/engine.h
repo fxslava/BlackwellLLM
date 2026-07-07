@@ -67,26 +67,21 @@ public:
                     const blackwell::RuntimeOverrides& overrides);
     ~BlackwellEngine();
 
-    // seq_id selects which sequence to decode (Paged mode; default 0). It is the
-    // LAST parameter so existing positional calls -- forward(tok, pos) and
-    // forward(tok, pos, temp, top_p) -- keep binding temperature/top_p correctly;
-    // putting an int before the float defaults would silently capture them.
+    // seq_id selects which sequence to decode (Paged mode; default 0).
     // Continuous mode supports only seq_id 0.
     //
-    // Hybrid error doctrine (blackwell/engine_status.h): the *_status variants
-    // are the RUNTIME tier -- the decode hot loop reports engine-detected
-    // failures by return value, never by throw (the COM boundary translates the
-    // status straight to an HRESULT). The classic signatures are thin
-    // exception-tier wrappers for white-box C++ consumers: on non-Success they
-    // throw blackwell::engine_error (a std::runtime_error) carrying the status.
+    // Hybrid error doctrine (blackwell/engine_status.h): these are the ONLY
+    // runtime inference endpoints, and they are noexcept -- the decode hot loop
+    // reports failure exclusively by EngineStatus return value (stray
+    // subsystem exceptions are caught inside and converted). There is no
+    // throwing forward()/forward_eval(): a caller that wants exceptions writes
+    // its own wrapper at its own tier; the engine's runtime never unwinds.
     blackwell::EngineStatus forward_status(int token_id, int pos, float temperature,
-                                           float top_p, int seq_id, int* next_token);
+                                           float top_p, int seq_id,
+                                           int* next_token) noexcept;
     blackwell::EngineStatus forward_eval_status(int token_id, int pos,
                                                 int target_token_id, int seq_id,
-                                                float* log_prob);
-    int forward(int token_id, int pos, float temperature = 0.6f, float top_p = 0.9f,
-                int seq_id = 0);
-    float forward_eval(int token_id, int pos, int target_token_id, int seq_id = 0);
+                                                float* log_prob) noexcept;
 
     // Softmax probability, in [0, 1], of `token_id` under the CURRENT logits --
     // the distribution the most recent forward()/prefill left in the device

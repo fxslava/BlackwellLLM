@@ -350,12 +350,18 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
 
         // Prefill only the tokens not already resident, deterministically
         // (temperature 0): only the final forward yields the first generated token.
+        // Status tier: a faulted step is handled like the overflow case above --
+        // the KV is partial, so drop the reuse mirror and abort this generation.
         for (size_t i = cached.size(); i < prompt.size(); ++i) {
             if (static_cast<size_t>(pos) >= cap) {  // prompt overflows the window
                 cached.clear();                     // KV is now partial -> force a reset next call
                 return "";
             }
-            next = engine_->forward(prompt[i], pos, 0.0f, 1.0f, seq_id);
+            if (engine_->forward_status(prompt[i], pos, 0.0f, 1.0f, seq_id, &next) !=
+                blackwell::EngineStatus::Success) {
+                cached.clear();
+                return "";
+            }
             ++pos;
         }
         cached = prompt;  // KV now holds exactly `prompt` at positions 0..N-1
@@ -365,7 +371,11 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
         // recover the first-token logits.
         if (next < 0) {
             pos = static_cast<int>(prompt.size()) - 1;
-            next = engine_->forward(prompt.back(), pos, 0.0f, 1.0f, seq_id);
+            if (engine_->forward_status(prompt.back(), pos, 0.0f, 1.0f, seq_id, &next) !=
+                blackwell::EngineStatus::Success) {
+                cached.clear();
+                return "";
+            }
             ++pos;
         }
     }
@@ -390,8 +400,12 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
             // slot). On the coordinator path the sequence is released right
             // after this call, so writing the eos would be wasted work.
             if (history) {
-                engine_->forward(next, pos, 0.0f, 1.0f, decode_seq);
-                ++pos;
+                // Best-effort KV write (status tier): if it faults, the reuse
+                // mirror is already correct only up to `pos` -- skip the ++.
+                int ignored = -1;
+                if (engine_->forward_status(next, pos, 0.0f, 1.0f, decode_seq,
+                                            &ignored) == blackwell::EngineStatus::Success)
+                    ++pos;
             }
             break;
         }
@@ -441,7 +455,13 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
         // onto it. The coordinator path needs no mirror -- cross-turn reuse
         // lives in the radix tree, keyed by the tokens themselves.
         if (history) history->push_back(next);
-        next = engine_->forward(next, pos, params.temperature, params.top_p, decode_seq);
+        // Status tier: a faulted step ends the generation with what we have --
+        // the flush below still delivers the confirmed prefix to the caller.
+        if (engine_->forward_status(next, pos, params.temperature, params.top_p,
+                                    decode_seq, &next) != blackwell::EngineStatus::Success) {
+            aborted = true;
+            break;
+        }
         ++pos;
         ++generated;
     }

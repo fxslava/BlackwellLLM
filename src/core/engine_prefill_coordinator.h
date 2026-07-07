@@ -42,11 +42,18 @@
 //     finish(engine_seq) unbinds + releases (unpin/unlock/destroy) when the
 //     generation is over; committed pages survive in the tree.
 //
-// Failure contract: any throw after ACQUIRE unwinds BIND and releases the
-// sequence (unpin + unlock + destroy) before rethrowing — no leaked pins, no
-// dangling engine-id mappings, and the tree keeps only what commit() published
-// (nothing, on failure). The KV pages the aborted sweep already wrote die with
-// the sequence's page references, exactly like an abandoned decode.
+// Failure contract (hybrid, mirrors the engine's error doctrine):
+//   - COMPUTE failures are STATUS-tier: run_delta() never throws — a failed
+//     decode step gracefully halts the sweep, the coordinator unwinds BIND /
+//     rolls back exactly as below, and the failure comes back as an
+//     EngineStatus in the Result/UpdateStats/EngineSequence it returns. The
+//     live UI layer (overlay tracker) sees a faulted stream, never an unwind.
+//   - Session-admin failures (ACQUIRE/BUDGET/COMMIT: KV OOM, dead handles)
+//     stay exception-tier: any throw after ACQUIRE unwinds BIND and releases
+//     the sequence (unpin + unlock + destroy) before rethrowing — no leaked
+//     pins, no dangling engine-id mappings, and the tree keeps only what
+//     commit() published (nothing, on failure). The KV pages an aborted sweep
+//     already wrote die with the sequence's page references either way.
 //
 // COMPUTE today is a per-token sweep over the engine's single-token GEMV
 // pipeline (Impl::run_token): correct and zero-copy, but O(n) kernel launches.
@@ -87,10 +94,13 @@ public:
     // The prompt-level state machine (see the header comment).
     // -----------------------------------------------------------------------
     struct Result {
-        SeqId engine_seq      = -1;  // pass as forward()'s seq_id to decode
+        SeqId engine_seq      = -1;  // pass as forward_status()'s seq_id; -1 => faulted
         int   total_tokens    = 0;   // n
         int   cached_tokens   = 0;   // served from the radix tree (zero GPU work)
         int   computed_tokens = 0;   // delta that went through the forward pass
+        // COMPUTE outcome (status tier). On failure engine_seq stays -1 and the
+        // sequence was already released -- nothing to finish().
+        EngineStatus status = EngineStatus::Success;
     };
 
     // Run ACQUIRE..COMMIT for tokens[0..n). On return the sequence is live
@@ -131,8 +141,11 @@ public:
     // free.
     // -----------------------------------------------------------------------
     struct EngineSequence {
-        SeqId engine_seq = -1;         // forward()'s seq_id while live
+        SeqId engine_seq = -1;         // forward_status()'s seq_id while live
         std::vector<TokenId> tokens;   // host mirror of the KV cache content
+        // Last COMPUTE outcome for this stream (status tier). A failed
+        // begin_sequence returns an invalid handle carrying the reason here.
+        EngineStatus status = EngineStatus::Success;
         bool valid() const noexcept { return engine_seq != -1; }
     };
 
@@ -141,6 +154,10 @@ public:
         int truncated_tokens = 0;  // old tail rolled back
         int computed_tokens  = 0;  // new suffix run through the forward pass
         int freed_pages      = 0;  // physical pages the rollback returned
+        // COMPUTE outcome. On failure the sequence was rolled back to the
+        // common prefix and the mirror shrunk to match: the session stays
+        // coherent and usable (self-heals on the next reconcile).
+        EngineStatus status = EngineStatus::Success;
     };
 
     // prefill_prompt + a tracking handle (the initial prompt IS committed —
@@ -185,8 +202,10 @@ private:
     // COMPUTE: sweep tokens[start_pos..n) through the decode pipeline on the
     // bound engine sequence. want_logits gates the final-norm + lm_head GEMV
     // (only the last token of an interactive prompt needs them).
-    void run_delta(SeqId engine_seq, const TokenId* tokens, int n, int start_pos,
-                   bool want_logits);
+    // Status tier: NEVER throws -- a failed step halts the sweep and returns
+    // its status (stray subsystem exceptions are converted inside).
+    EngineStatus run_delta(SeqId engine_seq, const TokenId* tokens, int n,
+                           int start_pos, bool want_logits) noexcept;
 
     BlackwellEngine::Impl&      m_impl;
     PagedKVManager&             m_kv;

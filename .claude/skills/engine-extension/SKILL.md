@@ -54,11 +54,15 @@ comments state them at each site — preserve that comment discipline in your ch
   propagate with `ENGINE_TRY`, check CUDA calls with `CUDA_CHECK_RETURN` (both
   defined atop `src/core/engine.cpp`). Destructors use neither — raw `cudaFree`,
   errors swallowed (see `DeviceBuffer::reset()`).
-- A new runtime facade method gets a `*_status` variant (the source of truth) plus a
-  thin exception-tier wrapper throwing `blackwell::engine_error` — copy the
-  `forward`/`forward_status` pair. The COM boundary calls the `*_status` variant and
-  translates via `hresult_from_status()`; `boundary()`'s catch-all is the panic net,
-  not the mechanism.
+- Runtime facade methods are `*_status` ONLY — noexcept, with a `catch(...)` →
+  `status_from_current_exception()` net inside so stray subsystem throws become
+  statuses (copy `forward_status`). There are NO throwing runtime wrappers (purged
+  2026-07): every caller — COM boundary, coordinator, tracker, adapter, tests —
+  branches on the returned `EngineStatus`. The coordinator's COMPUTE phase reports via
+  the `status` fields on `Result`/`UpdateStats`/`EngineSequence` (halt gracefully,
+  roll back, self-heal); its session-admin surfaces (acquire/budget/commit/finish) and
+  the AOT-warmup facet stay exception-tier — `blackwell::engine_error` is the carrier
+  there.
 - Never add legacy exit()-`CUDA_CHECK` sites in engine code; unmigrated subsystems
   (`memory_pool`, `paging/`, `ssm/`, kernels) convert opportunistically when touched.
 
