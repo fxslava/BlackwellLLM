@@ -60,18 +60,19 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     d_X_accum = arena.get_activation_buffer_A();
     d_X_norm  = arena.get_activation_buffer_B();
 
-    // 2. Allocate layer-scoped compute buffers once
-    CUDA_CHECK(cudaMalloc(&d_Q,        m_config.num_attention_heads * m_config.head_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_K,        m_config.num_key_value_heads * m_config.head_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_V,        m_config.num_key_value_heads * m_config.head_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_Attn_out, m_config.hidden_dim * sizeof(float)));
+    // 2. Allocate layer-scoped compute buffers once (RAII: freed by the members
+    // themselves, in reverse declaration order -- no hand-maintained list).
+    d_Q.allocate(m_config.num_attention_heads * m_config.head_dim);
+    d_K.allocate(m_config.num_key_value_heads * m_config.head_dim);
+    d_V.allocate(m_config.num_key_value_heads * m_config.head_dim);
+    d_Attn_out.allocate(m_config.hidden_dim);
 
-    CUDA_CHECK(cudaMalloc(&d_Gate,       m_config.intermediate_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_Up,         m_config.intermediate_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_Swiglu_out, m_config.intermediate_dim * sizeof(float)));
+    d_Gate.allocate(m_config.intermediate_dim);
+    d_Up.allocate(m_config.intermediate_dim);
+    d_Swiglu_out.allocate(m_config.intermediate_dim);
 
-    CUDA_CHECK(cudaMalloc(&d_logits, m_config.vocab_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_next_token, sizeof(int)));
+    d_logits.allocate(m_config.vocab_size);
+    d_next_token.allocate(1);
 
     // Resident pool may be empty when every layer is offloaded to host RAM.
     if (arena.get_k_cache_size() > 0) {
@@ -153,20 +154,20 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
                                   + L.num_value_heads * L.value_head_dim;
         const size_t v_dim    = L.num_value_heads * L.value_head_dim;   // H * Dv
         const size_t H        = L.num_value_heads;
-        CUDA_CHECK(cudaMalloc(&d_ssm_qkv,      conv_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_qkv_conv, conv_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_z,        v_dim    * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_q,        v_dim    * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_k,        v_dim    * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_v,        v_dim    * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_core,     v_dim    * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_o,        v_dim    * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_a,        H        * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_ssm_b,        H        * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_dt_bias_f32,  H        * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_A_log_f32,    H        * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_norm_f32,     L.value_head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_conv_w_f32,   conv_dim * L.conv_kernel_dim * sizeof(float)));
+        d_ssm_qkv.allocate(conv_dim);
+        d_ssm_qkv_conv.allocate(conv_dim);
+        d_ssm_z.allocate(v_dim);
+        d_ssm_q.allocate(v_dim);
+        d_ssm_k.allocate(v_dim);
+        d_ssm_v.allocate(v_dim);
+        d_ssm_core.allocate(v_dim);
+        d_ssm_o.allocate(v_dim);
+        d_ssm_a.allocate(H);
+        d_ssm_b.allocate(H);
+        d_dt_bias_f32.allocate(H);
+        d_A_log_f32.allocate(H);
+        d_norm_f32.allocate(L.value_head_dim);
+        d_conv_w_f32.allocate(conv_dim * L.conv_kernel_dim);
     }
 
     // Qwen3.5 hybrid gated full-attention layers (head_dim 256). These cannot use
@@ -184,25 +185,20 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
         const size_t kv_dim = m_config.num_key_value_heads * m_config.head_dim;
         m_full_kv_layer_stride = kv_dim * arena.get_max_seq_len();
         const size_t total = (size_t)m_caps.num_full_attention_layers * m_full_kv_layer_stride;
-        CUDA_CHECK(cudaMalloc(&d_QG,    m_config.num_attention_heads * m_config.head_dim * 2 * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_gate,  m_config.num_attention_heads * m_config.head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_full_k_cache, total * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_full_v_cache, total * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_full_k_cache, 0, total * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_full_v_cache, 0, total * sizeof(float)));
+        d_QG.allocate(m_config.num_attention_heads * m_config.head_dim * 2);
+        d_gate.allocate(m_config.num_attention_heads * m_config.head_dim);
+        d_full_k_cache.allocate(total);
+        d_full_v_cache.allocate(total);
+        // The KV cache is read at positions beyond what has been written yet
+        // (masked lanes) -- it must start zeroed, unlike the per-step scratch.
+        d_full_k_cache.zero();
+        d_full_v_cache.zero();
     }
 }
 
-BlackwellEngine::Impl::~Impl() {
-    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
-    cudaFree(d_Attn_out); cudaFree(d_Gate); cudaFree(d_Up); cudaFree(d_Swiglu_out);
-    cudaFree(d_logits); cudaFree(d_next_token);
-    cudaFree(d_ssm_qkv); cudaFree(d_ssm_z); cudaFree(d_ssm_qkv_conv);
-    cudaFree(d_ssm_q); cudaFree(d_ssm_k); cudaFree(d_ssm_v);
-    cudaFree(d_ssm_a); cudaFree(d_ssm_b); cudaFree(d_ssm_core); cudaFree(d_ssm_o);
-    cudaFree(d_dt_bias_f32); cudaFree(d_A_log_f32); cudaFree(d_norm_f32); cudaFree(d_conv_w_f32);
-    cudaFree(d_QG); cudaFree(d_gate); cudaFree(d_full_k_cache); cudaFree(d_full_v_cache);
-}
+// Every owned device buffer is a DeviceBuffer member: they free themselves in
+// reverse declaration order. d_X_accum / d_X_norm are non-owning arena views.
+BlackwellEngine::Impl::~Impl() = default;
 
 // ============================================================================
 // STAGE 1: Embedding

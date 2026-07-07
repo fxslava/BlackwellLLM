@@ -27,9 +27,19 @@ comments state them at each site — preserve that comment discipline in your ch
   `kv_mgr` follows `arena` (holds a reference into it); the paging chain
   (`kv_vram_pool → kv_tier_backend → kv_pager → prefix_cache → prefill`) follows `kv_mgr`.
   Place new members deliberately and write the placement comment.
-- New device buffers today: `CUDA_CHECK(cudaMalloc(...))` in the Impl ctor **and** a
-  matching `cudaFree` in `~Impl()` — three places to keep in sync (member, alloc, free).
-  This is Roadmap debt #3; see the evolution protocol below before adding many buffers.
+- New device buffers are `blackwell::DeviceBuffer<T>` members (`src/core/device_buffer.h`)
+  — declare (placement still deliberate, with the comment), `.allocate(count)` in the
+  ctor or the owning subsystem's composition branch, and NEVER touch `~Impl()` (it is
+  `= default`; buffers free themselves in reverse declaration order). Model-conditional
+  scratch declares empty and allocates inside its branch. The implicit `operator T*()`
+  keeps kernel-launch sites and white-box test probes unchanged; no implicit zero-fill —
+  call `.zero()` when a buffer is read before first write (the full-attn KV cache is the
+  example).
+- Exception-safety rule this layout exists for: once `CUDA_CHECK` throws (Roadmap #2),
+  a mid-constructor failure must leak nothing — so any device resource acquired before a
+  potentially-throwing point must be owned by a RAII member, never by a naked pointer.
+  The only raw device pointers left in Impl are the NON-owning arena views
+  (`d_X_accum` / `d_X_norm`); keep it that way.
 - Buffers that are per-decode-step hot must be allocated once and reused (see the
   `d_next_token` comment in `step_embedding`: a per-step malloc/free pair is forbidden).
 - Subsystem state that is conditional on model family stays behind `unique_ptr` + null
@@ -81,26 +91,23 @@ comments state them at each site — preserve that comment discipline in your ch
   no engine/CUDA includes) and update `docs/INFERENCE_API.md`.
 
 <evolution_protocol>
-**Sequencing:** the Roadmap #1 COM boundary LANDED 2026-07 (see section 5), unblocking
-the work below: `map_current_exception()` in `src/core/engine_com.cpp` carries a NOTE
-marker at the exact spot where the `blackwell::cuda_error` catch clause goes.
-**Current workaround:** raw `cudaMalloc`/`cudaFree` with hand-maintained destructor lists
-(~105 sites), and `CUDA_CHECK` in `src/common.h` calling `exit(EXIT_FAILURE)` from library
-code (Roadmap #2/#3 in CLAUDE.md). Also: the single-thread doctrine is comment-enforced
-only (Roadmap #9 — the debug thread-ID asserts fit naturally on the `EngineCom` methods,
-which now wrap every boundary entry).
-**Target state:** a move-only `DeviceBuffer<T>` RAII wrapper (sized ctor, implicit `T*`
-conversion like `CudaVector`, throwing allocation); `CUDA_CHECK` throws
-`blackwell::cuda_error : std::runtime_error` with file:line, translated to `HRESULT` at
-the #1 boundary; debug thread-ID asserts on every public engine entry point.
-**When DeviceBuffer<T> / throwing CUDA_CHECK land:** rewrite section 2 of this skill —
-(1) new buffers become `DeviceBuffer<float> d_foo{count};` members with **no** ctor/dtor
-edits (declaration order still matters — keep that rule); (2) delete the three-places-in-
-sync warning; (3) add the exception-safety rule: Impl construction may now throw, so any
-remaining raw resources acquired before a throwing point must be owned by RAII members,
-never by naked pointers; (4) when migrating existing buffers, convert one subsystem at a
-time (SSM scratch, then full-attn cache, then core buffers), build + `ctest -L validation`
-after each, and remove the freed entries from `~Impl()` as you go until it is `= default`;
-(5) once thread asserts exist, update section 1 to reference the assert instead of only
-the comments. Update CLAUDE.md Roadmap statuses in the same change.
+**Landed so far:** the Roadmap #1 COM boundary (2026-07, section 5) and the Roadmap #3
+Impl migration to `DeviceBuffer<T>` (2026-07, section 2 — `~Impl()` is `= default`).
+`map_current_exception()` in `src/core/engine_com.cpp` carries a NOTE marker at the exact
+spot where the `blackwell::cuda_error` catch clause goes.
+**Current workaround:** `CUDA_CHECK` in `src/common.h` still calls `exit(EXIT_FAILURE)`
+from library code (Roadmap #2 — deliberately kept until the RAII layout made a throwing
+ctor leak-free, which is now true for Impl). ~75 raw `cudaMalloc`/`cudaFree` sites remain
+in `memory_pool` / `paging/` / `ssm/` / kernels. The single-thread doctrine is
+comment-enforced only (Roadmap #9 — the debug thread-ID asserts fit naturally on the
+`EngineCom` methods, which wrap every boundary entry).
+**Next (Roadmap #2, throwing CUDA_CHECK):** (1) `CUDA_CHECK` throws
+`blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`) — but NOT
+from destructor paths (`DeviceBuffer::reset()` already bypasses it deliberately; audit
+other teardown sites for the same); (2) add the `cuda_error` catch at the NOTE marker in
+`engine_com.cpp`, mapped to a dedicated HRESULT; (3) white-box consumers (tools/tests)
+get try/catch at their engine call sites; (4) before flipping, migrate or audit the
+remaining raw-malloc subsystems — a throw between a raw `cudaMalloc` and its owner
+assignment leaks; `memory_pool`'s ctor failure path (`release_pools()`) is the priority
+audit. Then update sections 2/5, CLAUDE.md rows #2/#3, and this protocol.
 </evolution_protocol>
