@@ -290,19 +290,33 @@ std::string BlackwellLLMAdapter::generate(const std::string& transcript,
             auto& coord = engine_->prefill_driver();
             const blackwell::EnginePrefillCoordinator::Result r =
                 coord.prefill_prompt(prompt.data(), static_cast<int>(prompt.size()));
-            session.coord = &coord;
-            session.seq = r.engine_seq;
-            decode_seq = r.engine_seq;
-            pos = r.total_tokens;
-            // The logits for prompt[N-1] are already live; sample the first
-            // token from them (temperature 0 = deterministic, like the legacy
-            // prefill) instead of re-running the last token through forward().
-            next = coord.sample_last_logits(0.0f, 1.0f);
+            // Hybrid error doctrine (2026-07): prefill_prompt reports a COMPUTE
+            // failure by RETURNING a faulted Result (engine_seq == -1, sequence
+            // already released), NOT by throwing -- only ACQUIRE/BUDGET/COMMIT
+            // still throw. Skipping this check would bind decode_seq = -1 and
+            // drive the paged manager with an invalid sequence id. Treat a
+            // faulted Result exactly like the throwing failure below: degrade to
+            // the legacy incremental prefill (path b), leaving session.coord
+            // null so nothing tries to finish() the already-released sequence.
+            if (r.status != blackwell::EngineStatus::Success) {
+                decode_seq = seq_id;
+                pos = 0;
+                next = -1;
+            } else {
+                session.coord = &coord;
+                session.seq = r.engine_seq;
+                decode_seq = r.engine_seq;
+                pos = r.total_tokens;
+                // The logits for prompt[N-1] are already live; sample the first
+                // token from them (temperature 0 = deterministic, like the
+                // legacy prefill) instead of re-running the last token.
+                next = coord.sample_last_logits(0.0f, 1.0f);
+            }
         } catch (const std::exception&) {
-            // Failure contract: the coordinator unwound (no pins, no bindings,
-            // nothing committed). True OOM here means the budget ladder is
-            // drained -- degrade to the legacy prefill rather than failing the
-            // generation. session.coord is still null, so no double-release.
+            // Session-admin failure (ACQUIRE/BUDGET/COMMIT still throw): the
+            // coordinator unwound (no pins, no bindings, nothing committed) --
+            // degrade to the legacy prefill. session.coord is still null, so no
+            // double-release.
             decode_seq = seq_id;
             pos = 0;
             next = -1;
