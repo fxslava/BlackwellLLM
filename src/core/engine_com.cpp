@@ -17,6 +17,7 @@
 
 #include "common.h"  // blackwell::cuda_error (init-tier CUDA failures)
 
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -24,8 +25,34 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+// Debug-only enforcement of the single-threaded control-plane doctrine (Roadmap
+// #9): the thread that called CreateBlackwellEngine OWNS the engine, and every
+// operational method must run on it (CLAUDE.md, "the most important rule").
+// Violations abort loudly with both thread ids -- the project's pragmatic TSan
+// substitute (MSVC has none). Release builds (NDEBUG) compile it to nothing:
+// zero hot-loop overhead. Used inside EngineCom methods where owner_thread_id_
+// is in scope.
+#ifndef NDEBUG
+#define BLACKWELL_VERIFY_OWNING_THREAD()                                          \
+    do {                                                                          \
+        if (std::this_thread::get_id() != owner_thread_id_) {                     \
+            std::cerr << "[blackwell_core] FATAL: single-threaded control-plane " \
+                         "contract violated -- engine owned by thread "           \
+                      << owner_thread_id_ << " entered from thread "              \
+                      << std::this_thread::get_id()                               \
+                      << ". Marshal engine work onto the owning thread "          \
+                         "(poc_overlay: LiveTranslationTracker::PostEngineTask)." \
+                      << std::endl;                                               \
+            std::abort();                                                         \
+        }                                                                         \
+    } while (0)
+#else
+#define BLACKWELL_VERIFY_OWNING_THREAD() ((void)0)
+#endif
 
 namespace {
 
@@ -121,15 +148,21 @@ HRESULT copy_utf8(const std::string& src, char* pText, uint32_t capacity,
 // ---------------------------------------------------------------------------
 class EngineCom final : public IBlackwellEngine {
 public:
+    // The constructing thread (== the factory caller's thread) becomes the
+    // owner: the engine loaded on it, so the doctrine binds every later call.
     explicit EngineCom(std::unique_ptr<BlackwellEngine> engine)
-        : engine_(std::move(engine)) {}
+        : engine_(std::move(engine)), owner_thread_id_(std::this_thread::get_id()) {}
 
+    // Deliberately NOT thread-checked: teardown-after-quiesce from a joining
+    // thread is an established pattern (LiveTranslationTracker joins its worker
+    // BEFORE releasing the engine, so no concurrent access is possible here).
     ULONG STDMETHODCALLTYPE Release() override {
         delete this;
         return 0;
     }
 
     HRESULT STDMETHODCALLTYPE GetCapabilities(BLACKWELL_CAPABILITIES* pCaps) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         if (!pCaps) return E_POINTER;
         return boundary("GetCapabilities", [&] {
             const ModelCapabilities c = engine_->get_capabilities();
@@ -145,6 +178,7 @@ public:
     HRESULT STDMETHODCALLTYPE Forward(int32_t token_id, int32_t pos, float temperature,
                                       float top_p, int32_t seq_id,
                                       int32_t* pNextToken) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         if (!pNextToken) return E_POINTER;
         // RUNTIME tier: the status returned by the hot loop translates straight
         // to an HRESULT -- no exception round-trip. boundary() remains as the
@@ -163,6 +197,7 @@ public:
     HRESULT STDMETHODCALLTYPE ForwardEval(int32_t token_id, int32_t pos,
                                           int32_t target_token_id, int32_t seq_id,
                                           float* pLogProb) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         if (!pLogProb) return E_POINTER;
         return boundary("ForwardEval", [&] {
             float log_prob = 0.0f;
@@ -177,6 +212,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE LastTokenProbability(int32_t token_id,
                                                    float* pProbability) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         if (!pProbability) return E_POINTER;
         return boundary("LastTokenProbability", [&] {
             *pProbability = engine_->last_token_probability(token_id);
@@ -185,6 +221,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Fork(int32_t parent_id, int32_t child_id) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         return boundary("Fork", [&] {
             engine_->fork(parent_id, child_id);
             return S_OK;
@@ -192,6 +229,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Rewind(int32_t seq_id, int32_t pos) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         return boundary("Rewind", [&] {
             engine_->rewind(seq_id, pos);
             return S_OK;
@@ -199,6 +237,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ResetState(int32_t seq_id) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         return boundary("ResetState", [&] {
             engine_->reset_state(seq_id);
             return S_OK;
@@ -206,6 +245,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SpillKvCache(int32_t* pPagesSpilled) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         if (!pPagesSpilled) return E_POINTER;
         return boundary("SpillKvCache", [&] {
             *pPagesSpilled = engine_->spill_kv_cache();
@@ -214,6 +254,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Hibernate() override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         return boundary("Hibernate", [&] {
             engine_->hibernate();
             return S_OK;
@@ -221,6 +262,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Wakeup() override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         return boundary("Wakeup", [&] {
             engine_->wakeup();
             return S_OK;
@@ -228,6 +270,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE IsHibernated(BOOL* pHibernated) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
         if (!pHibernated) return E_POINTER;
         *pHibernated = engine_->hibernated() ? TRUE : FALSE;
         return S_OK;
@@ -235,6 +278,9 @@ public:
 
 private:
     std::unique_ptr<BlackwellEngine> engine_;
+    // The doctrine's checked invariant: set once at creation, compared by
+    // BLACKWELL_VERIFY_OWNING_THREAD() in every operational method (debug only).
+    const std::thread::id owner_thread_id_;
 };
 
 // ---------------------------------------------------------------------------

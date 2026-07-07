@@ -39,10 +39,13 @@ workloads: a background app that wakes on a hotkey, translates, and goes back to
 - `VRAMArena::hibernate()/wakeup()` and the whole paging substrate share this contract
   ("Not thread-safe; call from the single engine-owning thread" — `src/core/memory_pool.h`).
 
-During the refactoring, convert this doctrine from comment-folklore into a checked
-invariant: capture `std::this_thread::get_id()` when the engine finishes loading and add
-debug-only asserts to every public engine entry point. This is also our pragmatic TSan
-substitute (MSVC has no TSan).
+This doctrine is a **checked invariant** at the DLL boundary (2026-07): `EngineCom`
+(`src/core/engine_com.cpp`) captures `std::this_thread::get_id()` in the factory and every
+operational method asserts it via `BLACKWELL_VERIFY_OWNING_THREAD()` — a debug-only
+(`#ifndef NDEBUG`) `std::abort()` on violation, compiled to nothing in Release. `Release()`
+is exempt (teardown-after-join). This is also our pragmatic TSan substitute (MSVC has no
+TSan). White-box consumers that drive the engine below the COM edge (the coordinator, the
+overlay tracker) still rely on the doctrine by convention.
 
 ## Extension patterns — the law for new engine features
 
@@ -129,7 +132,7 @@ target state; existing code migrates opportunistically when you touch it.
 | 6 | ~~Root pollution: 8 loose `.py` scripts, `logits_comparison.csv`, stray `CMakeCache.txt`~~ | Scripts live in `scripts/` (paths anchored to repo root, checkpoints via `BLACKWELL_MODELS_DIR`); stray artifacts deleted; the 126 MB of tracked golden dumps moved to Git LFS (`.gitattributes`); `backup/` stays local-only (gitignored) | **done** |
 | 7 | ~~`build_target.bat` + IDE-generated cache is the only CLI build path~~ | Committed `CMakePresets.json` (configure + build + test presets); `build_target.bat` is a thin transitional wrapper over the presets | **done** (2026-07) |
 | 8 | ~~`TLS_VERIFY OFF` on the DirectStorage NuGet fetch; nvcomp vendored as raw binaries~~ | All fetches TLS-verified (`cmake/DirectStorage.cmake`); vendored nvcomp deleted | **done** |
-| 9 | Thread-ownership doctrine enforced only by comments | Debug thread-ID asserts on engine entry points (see doctrine section); natural home: the `IBlackwellEngine` boundary from #1 | planned |
+| 9 | ~~Thread-ownership doctrine enforced only by comments~~ | Debug thread-ID asserts (`BLACKWELL_VERIFY_OWNING_THREAD`) on every `EngineCom` operational method — `#ifndef NDEBUG`, `std::abort()` on violation, zero Release-build cost (see doctrine section) | **done** (2026-07) |
 | 10 | Sanitizers absent | ASan config for MSVC on the CUDA-free agent stack first; UBSan/TSan via clang-cl or Linux CI lane for `agent*` targets | idea |
 
 When a row lands: flip its Status, update the affected section above, and follow the

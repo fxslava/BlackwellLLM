@@ -19,6 +19,12 @@ comments state them at each site — preserve that comment discipline in your ch
 - Lifecycle contract: `hibernate()` requires an idle engine; `get_weight_ptr()` throws
   while hibernated (violations are loud by design). Activity wins over queued lifecycle
   ops.
+- The doctrine is CHECKED at the DLL edge: every `EngineCom` method (`engine_com.cpp`)
+  runs `BLACKWELL_VERIFY_OWNING_THREAD()` — a debug-only `std::abort()` if a non-owning
+  thread enters (owner = the `CreateBlackwellEngine` caller). A new operational
+  `IBlackwellEngine` method MUST open with this macro (`Release` is the sole exception —
+  teardown-after-join). White-box callers below the COM edge aren't covered — keep the
+  marshaling discipline there.
 
 ## 2. Impl members & device memory
 
@@ -113,9 +119,10 @@ comments state them at each site — preserve that comment discipline in your ch
 
 <evolution_protocol>
 **Landed so far (2026-07):** the Roadmap #1 COM boundary (section 6), the Roadmap #3 Impl
-migration to `DeviceBuffer<T>` (section 2, `~Impl()` is `= default`), and the Roadmap #2
+migration to `DeviceBuffer<T>` (section 2, `~Impl()` is `= default`), the Roadmap #2
 Hybrid error doctrine for the engine core (section 3: INIT throws `cuda_error`, RUNTIME
-returns `EngineStatus`, both mapped at the DLL edge).
+returns `EngineStatus`, both mapped at the DLL edge), and the Roadmap #9 thread-ownership
+asserts (section 1: `BLACKWELL_VERIFY_OWNING_THREAD()` on every `EngineCom` method).
 **Remaining debt this skill tracks:**
 - Legacy exit()-`CUDA_CHECK` + raw `cudaMalloc`/`cudaFree` (~75 sites) in `memory_pool` /
   `paging/` / `ssm/` / kernels. When touching one of those subsystems: convert its
@@ -125,8 +132,7 @@ returns `EngineStatus`, both mapped at the DLL edge).
   (`release_pools()`), which predates RAII. Update CLAUDE.md rows #2/#3 as subsystems
   land; when the last legacy `CUDA_CHECK` site dies, delete the legacy macro from
   `src/common.h` (tests' `CudaVector` migrates to `CUDA_CHECK_THROW` then too).
-- The single-thread doctrine is comment-enforced only (Roadmap #9): the debug thread-ID
-  asserts fit naturally on the `EngineCom` methods, which wrap every boundary entry —
-  capture the owning thread id in `CreateBlackwellEngine`, assert in each method, and
-  update section 1 to reference the assert when it lands.
+- Sanitizers (Roadmap #10, idea): ASan for the CUDA-free agent stack first; UBSan/TSan
+  via a clang-cl or Linux CI lane. (Note: the MSVC ASan runtime shipped with toolset
+  14.34 crashes in its own init — `Symbolizer::PlatformInit`; use a 14.4x runtime.)
 </evolution_protocol>
