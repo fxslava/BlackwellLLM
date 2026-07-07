@@ -106,21 +106,26 @@ struct BlackwellEngine::Impl {
     // (per-token KV control plane latched via kv_mgr) -> optionally final norm
     // + lm_head. want_logits=false is the prefill fast path: every non-final
     // prompt token skips the vocab-size GEMV, since only its KV append matters.
-    void run_token(int token_id, int pos, int seq_id, bool want_logits = true);
+    //
+    // RUNTIME error tier (Hybrid doctrine, blackwell/engine_status.h): the
+    // decode chain reports failure by EngineStatus return, never by throw --
+    // callers propagate with ENGINE_TRY (engine.cpp) or translate at the edge.
+    blackwell::EngineStatus run_token(int token_id, int pos, int seq_id,
+                                      bool want_logits = true);
 
-    void step_embedding(int token_id);
-    void step_attention_norm(int layer_idx);
-    void step_attention_qkv_projections(int layer_idx);
-    void step_attention_math(int layer_idx, int pos);
-    void step_attention_out(int layer_idx);
+    blackwell::EngineStatus step_embedding(int token_id);
+    blackwell::EngineStatus step_attention_norm(int layer_idx);
+    blackwell::EngineStatus step_attention_qkv_projections(int layer_idx);
+    blackwell::EngineStatus step_attention_math(int layer_idx, int pos);
+    blackwell::EngineStatus step_attention_out(int layer_idx);
     // Linear-attention (SSM) layer: bypasses the KV cache, evolves the recurrent
     // state in SsmStatePool via the conv1d + GatedDeltaNet kernels.
-    void step_linear_attention(int layer_idx, int pos);
+    blackwell::EngineStatus step_linear_attention(int layer_idx, int pos);
     // Qwen3.5 hybrid gated full-attention layer (head_dim 256, q_proj query|gate,
     // q_norm/k_norm, partial RoPE). Uses the dedicated full-attn KV cache.
-    void step_full_attention(int layer_idx, int pos);
-    void step_mlp_norm(int layer_idx);
-    void step_mlp_projections(int layer_idx);
-    void step_mlp_out(int layer_idx);
-    void step_final_ops();
+    blackwell::EngineStatus step_full_attention(int layer_idx, int pos);
+    blackwell::EngineStatus step_mlp_norm(int layer_idx);
+    blackwell::EngineStatus step_mlp_projections(int layer_idx);
+    blackwell::EngineStatus step_mlp_out(int layer_idx);
+    blackwell::EngineStatus step_final_ops();
 };

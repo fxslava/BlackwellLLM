@@ -7,9 +7,9 @@
 //   - A default-constructed buffer is empty (nullptr) -- the pattern for
 //     model-conditional scratch (SSM / gated full-attention): declare empty,
 //     allocate() inside the subsystem's composition branch.
-//   - allocate() uses CUDA_CHECK, which today still exit()s on failure; when
-//     Roadmap #2 makes CUDA_CHECK throw, allocation failures become exceptions
-//     and the RAII layout below is what keeps a throwing Impl ctor leak-free.
+//   - allocate()/zero() are INIT-tier (Hybrid error doctrine): they THROW
+//     blackwell::cuda_error on failure. The RAII layout is what makes the
+//     throwing Impl ctor leak-free -- already-constructed members unwind.
 //   - NO implicit zero-fill (unlike CudaVector): decode scratch is written
 //     before it is read every step, and the one consumer that needs zeroed
 //     memory (the full-attention KV cache) calls zero() explicitly.
@@ -57,7 +57,7 @@ public:
     void allocate(size_t count) {
         reset();
         if (count == 0) return;
-        CUDA_CHECK(cudaMalloc(&ptr_, count * sizeof(T)));
+        CUDA_CHECK_THROW(cudaMalloc(&ptr_, count * sizeof(T)));
         count_ = count;
     }
 
@@ -73,7 +73,7 @@ public:
     }
 
     void zero() {
-        if (ptr_) CUDA_CHECK(cudaMemset(ptr_, 0, count_ * sizeof(T)));
+        if (ptr_) CUDA_CHECK_THROW(cudaMemset(ptr_, 0, count_ * sizeof(T)));
     }
 
     T* get() const noexcept { return ptr_; }

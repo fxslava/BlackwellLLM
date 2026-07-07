@@ -62,4 +62,7 @@ add_library(blackwell_core SHARED engine_com.cpp)
 target_link_libraries(blackwell_core PRIVATE blackwell_core_obj)
 # BLACKWELL_CORE_EXPORTS переключает BLACKWELL_API на dllexport только здесь.
 target_compile_definitions(blackwell_core PRIVATE BLACKWELL_CORE_EXPORTS)
-target_include_directories(blackwell_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(blackwell_core
+    PUBLIC  ${CMAKE_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_SOURCE_DIR}/src       # common.h: blackwell::cuda_error на границе
+)

@@ -4,7 +4,41 @@
 #include <vector>
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 
+namespace blackwell {
+// CUDA failure in an INIT-tier path (Hybrid error doctrine, Roadmap #2).
+// Carries the raw cudaError_t so the DLL boundary can distinguish VRAM
+// exhaustion (-> E_OUTOFMEMORY) from other runtime faults.
+class cuda_error : public std::runtime_error {
+public:
+    cuda_error(cudaError_t code, const std::string& what_arg)
+        : std::runtime_error(what_arg), code_(code) {}
+    cudaError_t code() const noexcept { return code_; }
+
+private:
+    cudaError_t code_;
+};
+} // namespace blackwell
+
+// INIT-tier check: throws blackwell::cuda_error. For constructors / factories /
+// setup paths ONLY -- RAII members make a throwing ctor leak-free, and the DLL
+// boundary maps the exception to an HRESULT. NEVER use in destructors (nothing
+// may throw there) or in the decode hot loop (use CUDA_CHECK_RETURN, defined
+// next to the runtime methods in src/core/engine.cpp).
+#define CUDA_CHECK_THROW(call) \
+    do { \
+        cudaError_t err = (call); \
+        if (err != cudaSuccess) { \
+            throw blackwell::cuda_error(err, std::string("CUDA error: ") + \
+                cudaGetErrorString(err) + " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
+        } \
+    } while (0)
+
+// LEGACY check: kills the process. Remaining users (memory_pool, paging/, ssm/,
+// kernels, tests' CudaVector) migrate to _THROW (init) or _RETURN (runtime)
+// opportunistically when touched -- do not add new call sites in engine code
+// (Roadmap #2/#3 in CLAUDE.md).
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \

@@ -66,6 +66,18 @@ These three patterns are already in the code and are non-negotiable for extensio
    (e.g. `kv_mgr` after `arena` because the adapter holds a reference into the arena).
    When you add a member, place it deliberately and document the placement.
 
+4. **Hybrid error doctrine** (`include/blackwell/engine_status.h`). Two tiers, split
+   by phase. **INIT tier** (ctors / factories / setup): exceptions — `CUDA_CHECK_THROW`
+   throws `blackwell::cuda_error`, RAII members unwind, the DLL boundary maps it to an
+   HRESULT (`E_OUTOFMEMORY` for VRAM exhaustion). **RUNTIME tier** (the decode hot loop:
+   `Impl::run_token` / `step_*`): never throws — `CUDA_CHECK_RETURN` + `ENGINE_TRY`
+   propagate `EngineStatus` by return value, translated exactly once:
+   `hresult_from_status()` at the COM edge (`OutOfVram`→`E_OUTOFMEMORY`,
+   `InvalidArgument`/`InvalidConfig`→`E_INVALIDARG`, `StateMismatch`→`E_NOT_VALID_STATE`,
+   `CudaRuntimeError`→`BLACKWELL_E_CUDA_RUNTIME`), or `blackwell::engine_error` in the
+   exception-tier facade wrappers (`forward`/`forward_eval`) for white-box consumers.
+   Never add legacy exit()-`CUDA_CHECK` call sites in engine code.
+
 House comment style: comments state **contracts and invariants**, not narration — keep the
 existing density. Mixed Russian/English is accepted; match whichever the surrounding file
 uses. Prefer contract comments ("must precede any kernel that reads the layer's weights")
@@ -104,7 +116,7 @@ target state; existing code migrates opportunistically when you touch it.
 | # | Debt (current state) | Target state | Status |
 |---|---|---|---|
 | 1 | ~~No hard binary boundary~~ | DirectX/COM-style SHARED `blackwell_core.dll`: pure-virtual `IBlackwellEngine`/`IBlackwellTokenizer` + C factories (`include/blackwell/iblackwell_engine.h`), `HRESULT` mapping in `src/core/engine_com.cpp`; white-box tier `blackwell_core_obj` (OBJECT lib) for tests + tools. `src/apps/` are true COM consumers; poc_overlay/playground stay white-box until the interface covers the prefill-coordinator surface | **done** (2026-07) |
-| 2 | `CUDA_CHECK` in `src/common.h` calls `exit(EXIT_FAILURE)` from library code | Throws a `blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`), caught + mapped to `HRESULT` in `engine_com.cpp` (the catch site carries a NOTE marker); white-box consumers surface it | planned (next) |
+| 2 | ~~Engine error handling = `exit()` from library code~~ (legacy `CUDA_CHECK` lingers in `memory_pool`/`paging/`/`ssm/`/kernels — migrates with #3) | Hybrid doctrine (extension pattern #4): INIT tier throws `blackwell::cuda_error`, RUNTIME tier returns `EngineStatus`, both mapped once at the DLL edge (`hresult_from_status` / `map_current_exception` in `engine_com.cpp`) | **done** for the engine core (2026-07) |
 | 3 | ~~`BlackwellEngine::Impl` held ~30 raw `float*` freed by a hand-maintained list~~; ~75 raw `cudaMalloc`/`cudaFree` sites remain in `memory_pool` / `paging/` / `ssm/` / kernels | `DeviceBuffer<T>` (`src/core/device_buffer.h`: move-only, `.allocate()`, implicit `T*` like `CudaVector`); Impl's dtor IS `= default`; remaining subsystems migrate opportunistically when touched | in progress (Impl migrated, 2026-07) |
 | 4 | ~~`src/CMakeLists.txt` monolith~~ | One `CMakeLists.txt` per target directory (`src/core/`, `src/apps/`, `src/experiments/`, tools); `src/CMakeLists.txt` is orchestration-only; deps in `cmake/` modules | **done** (core physically relocated to `src/core/`, 2026-07) |
 | 5 | ~~`blackwell_kernels` exports `PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..` (all of `src/` leaks)~~ | No target exports `src/`; core-internal consumers declare `PRIVATE src/` + `src/core` themselves | **done** (2026-07) |

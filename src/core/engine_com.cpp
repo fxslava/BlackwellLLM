@@ -12,7 +12,10 @@
 
 #include "blackwell/chat_template.h"
 #include "blackwell/engine.h"
+#include "blackwell/engine_status.h"
 #include "blackwell/tokenizer.h"
+
+#include "common.h"  // blackwell::cuda_error (init-tier CUDA failures)
 
 #include <cstring>
 #include <exception>
@@ -26,16 +29,40 @@
 
 namespace {
 
-// Rethrow-and-map: called ONLY from a catch context. Logs to stderr because
-// the boundary has no richer channel yet.
-//
-// NOTE (Roadmap #2, "Commit 8"): when CUDA_CHECK stops calling exit() and
-// throws blackwell::cuda_error instead, add its catch clause HERE (before
-// std::runtime_error) and map to a dedicated failure HRESULT -- today CUDA
-// errors terminate the process before ever reaching this boundary.
+// Hybrid error doctrine: RUNTIME-tier statuses map here, once, at the edge.
+HRESULT hresult_from_status(blackwell::EngineStatus status, const char* op) noexcept {
+    switch (status) {
+        case blackwell::EngineStatus::Success:
+            return S_OK;
+        default:
+            std::cerr << "[blackwell_core] " << op << ": "
+                      << blackwell::to_string(status) << "\n";
+            switch (status) {
+                case blackwell::EngineStatus::OutOfVram:        return E_OUTOFMEMORY;
+                case blackwell::EngineStatus::InvalidArgument:  return E_INVALIDARG;
+                case blackwell::EngineStatus::InvalidConfig:    return E_INVALIDARG;
+                case blackwell::EngineStatus::StateMismatch:    return E_NOT_VALID_STATE;
+                case blackwell::EngineStatus::CudaRuntimeError:
+                default:                                        return BLACKWELL_E_CUDA_RUNTIME;
+            }
+    }
+}
+
+// Rethrow-and-map: called ONLY from a catch context, for the INIT tier
+// (factories, lifecycle) and as the last-resort panic net around the status
+// tier. Logs to stderr because the boundary has no richer channel yet.
 HRESULT map_current_exception(const char* op) noexcept {
     try {
         throw;
+    } catch (const blackwell::cuda_error& e) {
+        // INIT-tier CUDA failure (CUDA_CHECK_THROW: DeviceBuffer/ctor paths).
+        std::cerr << "[blackwell_core] " << op << ": " << e.what() << "\n";
+        return (e.code() == cudaErrorMemoryAllocation) ? E_OUTOFMEMORY
+                                                       : BLACKWELL_E_CUDA_RUNTIME;
+    } catch (const blackwell::engine_error& e) {
+        // A status-tier failure re-raised by an exception-tier wrapper below us.
+        std::cerr << "[blackwell_core] " << op << ": " << e.what() << "\n";
+        return hresult_from_status(e.status(), op);
     } catch (const std::bad_alloc&) {
         std::cerr << "[blackwell_core] " << op << ": out of memory\n";
         return E_OUTOFMEMORY;
@@ -118,8 +145,16 @@ public:
                                       float top_p, int32_t seq_id,
                                       int32_t* pNextToken) override {
         if (!pNextToken) return E_POINTER;
+        // RUNTIME tier: the status returned by the hot loop translates straight
+        // to an HRESULT -- no exception round-trip. boundary() remains as the
+        // last-resort panic net (unmigrated subsystems may still throw).
         return boundary("Forward", [&] {
-            *pNextToken = engine_->forward(token_id, pos, temperature, top_p, seq_id);
+            int next = -1;
+            const auto st = engine_->forward_status(token_id, pos, temperature, top_p,
+                                                    seq_id, &next);
+            if (st != blackwell::EngineStatus::Success)
+                return hresult_from_status(st, "Forward");
+            *pNextToken = next;
             return S_OK;
         });
     }
@@ -129,7 +164,12 @@ public:
                                           float* pLogProb) override {
         if (!pLogProb) return E_POINTER;
         return boundary("ForwardEval", [&] {
-            *pLogProb = engine_->forward_eval(token_id, pos, target_token_id, seq_id);
+            float log_prob = 0.0f;
+            const auto st = engine_->forward_eval_status(token_id, pos, target_token_id,
+                                                         seq_id, &log_prob);
+            if (st != blackwell::EngineStatus::Success)
+                return hresult_from_status(st, "ForwardEval");
+            *pLogProb = log_prob;
             return S_OK;
         });
     }

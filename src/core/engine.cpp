@@ -21,7 +21,35 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
 #include <stdexcept>
+
+using blackwell::EngineStatus;
+
+// RUNTIME-tier CUDA check (Hybrid error doctrine, Roadmap #2): the decode hot
+// loop never throws -- a CUDA failure is logged once and becomes an
+// EngineStatus that ripples up by return value (ENGINE_TRY), translated to an
+// HRESULT at the COM boundary or to an engine_error by the facade wrappers.
+// INIT paths (ctor) use CUDA_CHECK_THROW from common.h instead.
+#define CUDA_CHECK_RETURN(call)                                                    \
+    do {                                                                           \
+        cudaError_t err__ = (call);                                                \
+        if (err__ != cudaSuccess) {                                                \
+            std::cerr << "[blackwell_core] CUDA error: " << cudaGetErrorString(err__) \
+                      << " at " << __FILE__ << ":" << __LINE__ << "\n";            \
+            return (err__ == cudaErrorMemoryAllocation)                            \
+                       ? EngineStatus::OutOfVram                                   \
+                       : EngineStatus::CudaRuntimeError;                           \
+        }                                                                          \
+    } while (0)
+
+// Propagate a non-Success status up the runtime call chain (zero-cost on the
+// happy path; one predictable branch per step).
+#define ENGINE_TRY(expr)                                                \
+    do {                                                                \
+        const EngineStatus st__ = (expr);                               \
+        if (st__ != EngineStatus::Success) return st__;                 \
+    } while (0)
 
 // Stable identity of (checkpoint x KV geometry) for the prefix cache and the
 // .bkv serializer: a page written under one hash must never be grafted into an
@@ -75,9 +103,10 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     d_next_token.allocate(1);
 
     // Resident pool may be empty when every layer is offloaded to host RAM.
+    // INIT tier: a failure here throws and unwinds the RAII members above.
     if (arena.get_k_cache_size() > 0) {
-        CUDA_CHECK(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
-        CUDA_CHECK(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
+        CUDA_CHECK_THROW(cudaMemset(arena.get_k_cache(), 0, arena.get_k_cache_size()));
+        CUDA_CHECK_THROW(cudaMemset(arena.get_v_cache(), 0, arena.get_v_cache_size()));
     }
 
     // KV-cache strategy from the resolved plan. Continuous (default) wraps the
@@ -210,13 +239,13 @@ static bool half_weights_are_fp16(const ModelConfig& cfg) {
     return cfg.quant_strategy == QuantStrategy::WEIGHT_ONLY_PACKED;
 }
 
-void BlackwellEngine::Impl::step_embedding(int token_id) {
+EngineStatus BlackwellEngine::Impl::step_embedding(int token_id) {
     // d_next_token doubles as the persistent device staging slot for the current
     // token id; a CudaVector here would cost a cudaMalloc/cudaFree pair on every
     // decode step.
-    CUDA_CHECK(cudaMemcpy(d_next_token, &token_id, sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK_RETURN(cudaMemcpy(d_next_token, &token_id, sizeof(int), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMemset(d_X_accum, 0, m_config.hidden_dim * sizeof(float)));
+    CUDA_CHECK_RETURN(cudaMemset(d_X_accum, 0, m_config.hidden_dim * sizeof(float)));
 
     const void* d_embed_table = arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight");
     if (half_weights_are_fp16(m_config)) {
@@ -224,12 +253,13 @@ void BlackwellEngine::Impl::step_embedding(int token_id) {
     } else {
         launch_bf16_embedding_kernel(d_next_token, d_embed_table, d_X_accum, 1, m_config.hidden_dim);
     }
+    return EngineStatus::Success;
 }
 
 // ============================================================================
 // STAGE 2: Granular Attention
 // ============================================================================
-void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
+EngineStatus BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
     // Offloaded layers: make the compute stream wait until the layer's weight
     // block is staged in VRAM (no-op for resident layers). Every step repeats
     // the call so the integration tests, which drive steps directly, stay safe.
@@ -241,9 +271,10 @@ void BlackwellEngine::Impl::step_attention_norm(int layer_idx) {
     } else {
         launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     }
+    return EngineStatus::Success;
 }
 
-void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
+EngineStatus BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
     std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".self_attn.";
 
@@ -260,10 +291,13 @@ void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
         d_bias_k = arena.get_weight_ptr_optional(prefix + "k_proj.bias");
         d_bias_v = arena.get_weight_ptr_optional(prefix + "v_proj.bias");
         if ((d_bias_q != nullptr) != (d_bias_k != nullptr) ||
-            (d_bias_q != nullptr) != (d_bias_v != nullptr))
-            throw std::runtime_error(
-                "BlackwellEngine: QKV bias tensors partially missing at layer " +
-                std::to_string(layer_idx) + " (Qwen2 requires all three or none)");
+            (d_bias_q != nullptr) != (d_bias_v != nullptr)) {
+            // Checkpoint-integrity violation discovered mid-decode: runtime
+            // tier, so log the detail and report by status, not by throw.
+            std::cerr << "[blackwell_core] QKV bias tensors partially missing at layer "
+                      << layer_idx << " (Qwen2 requires all three or none)\n";
+            return EngineStatus::InvalidConfig;
+        }
     }
 
     if (m_config.quant_strategy == QuantStrategy::NONE) {
@@ -275,7 +309,7 @@ void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
                                      d_X_norm, d_bias_k, d_K, kv_dim, m_config.hidden_dim);
         launch_bf16_gemv_bias_kernel(arena.get_weight_ptr(prefix + "v_proj.weight"),
                                      d_X_norm, d_bias_v, d_V, kv_dim, m_config.hidden_dim);
-        return;
+        return EngineStatus::Success;
     }
 
     dispatcher.forward(prefix + "q_proj", d_X_norm, d_Q, q_dim,  m_config.hidden_dim);
@@ -290,9 +324,10 @@ void BlackwellEngine::Impl::step_attention_qkv_projections(int layer_idx) {
         launch_fused_qkv_bias_kernel(d_Q, d_K, d_V, d_bias_q, d_bias_k, d_bias_v,
                                      q_dim, kv_dim, bias_dtype);
     }
+    return EngineStatus::Success;
 }
 
-void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
+EngineStatus BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
     // Delegated to the active KV-cache strategy. The continuous adapter runs the
     // exact legacy sequence (prepare_layer_kv -> fused RoPE+append -> decode
     // attention -> commit_layer_kv); the paged adapter routes through the block
@@ -300,14 +335,16 @@ void BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) {
     // granularity and is monomorphic, so it is free relative to the kernel
     // launches it wraps.
     kv_mgr->attention_decode(layer_idx, pos, d_Q, d_K, d_V, d_Attn_out);
+    return EngineStatus::Success;
 }
 
-void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
+EngineStatus BlackwellEngine::Impl::step_attention_out(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
     std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
 
     dispatcher.forward(base, d_Attn_out, nullptr,
                        m_config.hidden_dim, m_config.hidden_dim, d_X_accum);
+    return EngineStatus::Success;
 }
 
 // ============================================================================
@@ -315,7 +352,7 @@ void BlackwellEngine::Impl::step_attention_out(int layer_idx) {
 // AttnKind::Linear layers of a hybrid model. Bypasses the KV cache entirely; the
 // per-layer recurrent state lives in SsmStatePool and evolves in place.
 // ============================================================================
-void BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
+EngineStatus BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
     arena.ensure_layer_ready(layer_idx);
     const int li = m_linear_layer_index[layer_idx];
     const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
@@ -372,6 +409,7 @@ void BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
 
     // 7. out_proj (symmetric int4), accumulating into the residual stream.
     dispatcher.forward(la + "out_proj", d_ssm_o, nullptr, m_config.hidden_dim, v_dim, d_X_accum);
+    return EngineStatus::Success;
 }
 
 // ============================================================================
@@ -381,7 +419,7 @@ void BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
 // head_dim 256 exceeds the shared attention/KV kernel's 128-wide block. This is an
 // unoptimized "make it work" path over a dedicated continuous FP32 KV cache.
 // ============================================================================
-void BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos) {
+EngineStatus BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos) {
     arena.ensure_layer_ready(layer_idx);
     const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const std::string sa   = base + "self_attn.";
@@ -430,12 +468,13 @@ void BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos) {
     // 7. gate the context: attn_out *= sigmoid(gate), then o_proj into residual.
     launch_gate_sigmoid_mul(d_Attn_out, d_gate, (int)q_dim);
     dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, m_config.hidden_dim, q_dim, d_X_accum);
+    return EngineStatus::Success;
 }
 
 // ============================================================================
 // STAGE 3: Granular MLP
 // ============================================================================
-void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
+EngineStatus BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
     std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const void* d_w = arena.get_weight_ptr(prefix + "post_attention_layernorm.weight");
@@ -444,9 +483,10 @@ void BlackwellEngine::Impl::step_mlp_norm(int layer_idx) {
     } else {
         launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, 1, m_config.hidden_dim, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
     }
+    return EngineStatus::Success;
 }
 
-void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
+EngineStatus BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
     std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".mlp.";
 
@@ -454,9 +494,10 @@ void BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
                        m_config.intermediate_dim, m_config.hidden_dim);
     dispatcher.forward(prefix + "up_proj",   d_X_norm, d_Up,
                        m_config.intermediate_dim, m_config.hidden_dim);
+    return EngineStatus::Success;
 }
 
-void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
+EngineStatus BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
     std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".mlp.down_proj";
 
@@ -464,12 +505,13 @@ void BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
 
     dispatcher.forward(base, d_Swiglu_out, nullptr,
                        m_config.hidden_dim, m_config.intermediate_dim, d_X_accum);
+    return EngineStatus::Success;
 }
 
 // ============================================================================
 // STAGE 4: Final Operations
 // ============================================================================
-void BlackwellEngine::Impl::step_final_ops() {
+EngineStatus BlackwellEngine::Impl::step_final_ops() {
     const void* d_w = arena.get_weight_ptr(m_config.weight_prefix + "norm.weight");
     const bool fp16_w = half_weights_are_fp16(m_config);
     if (fp16_w) {
@@ -489,6 +531,7 @@ void BlackwellEngine::Impl::step_final_ops() {
     } else {
         launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, m_config.hidden_dim);
     }
+    return EngineStatus::Success;
 }
 
 // Реализация фасада BlackwellEngine.
@@ -571,16 +614,18 @@ void BlackwellEngine::reset_state(int seq_id) {
 // only the KV appended along the way matters and the vocab-size lm_head GEMV
 // (the single largest GEMV in the model) is skipped per prompt token.
 // ============================================================================
-void BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id, bool want_logits) {
+EngineStatus BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id, bool want_logits) {
     auto* impl = this;
     const size_t max_seq_len = impl->arena.get_max_seq_len();
-    if (pos < 0 || static_cast<size_t>(pos) >= max_seq_len)
-        throw std::out_of_range(
-            "BlackwellEngine: pos " + std::to_string(pos) +
-            " exceeds KV cache capacity " + std::to_string(max_seq_len) +
-            " (the RoPE/KV append kernel would write out of bounds)");
+    if (pos < 0 || static_cast<size_t>(pos) >= max_seq_len) {
+        // Caller error on the runtime tier: report by status (the RoPE/KV
+        // append kernel would write out of bounds).
+        std::cerr << "[blackwell_core] pos " << pos << " exceeds KV cache capacity "
+                  << max_seq_len << "\n";
+        return EngineStatus::InvalidArgument;
+    }
 
-    impl->step_embedding(token_id);
+    ENGINE_TRY(impl->step_embedding(token_id));
 
     // Per-token KV control plane: latch the target sequence before the layer
     // sweep. The paged manager resolves the CoW append slot, stages this
@@ -604,43 +649,73 @@ void BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id, bool wa
             impl->m_config.layer_types[i] == AttnKind::Linear;
 
         if (is_linear) {
-            impl->step_linear_attention(i, pos);
+            ENGINE_TRY(impl->step_linear_attention(i, pos));
         } else if (impl->m_config.attn_output_gate) {
             // Qwen3.5 hybrid: gated head_dim-256 full-attention (dedicated path).
-            impl->step_full_attention(i, pos);
+            ENGINE_TRY(impl->step_full_attention(i, pos));
         } else {
-            impl->step_attention_norm(i);
-            impl->step_attention_qkv_projections(i);
-            impl->step_attention_math(i, pos);
-            impl->step_attention_out(i);
+            ENGINE_TRY(impl->step_attention_norm(i));
+            ENGINE_TRY(impl->step_attention_qkv_projections(i));
+            ENGINE_TRY(impl->step_attention_math(i, pos));
+            ENGINE_TRY(impl->step_attention_out(i));
         }
 
         // The MLP block is identical for both layer kinds.
-        impl->step_mlp_norm(i);
-        impl->step_mlp_projections(i);
-        impl->step_mlp_out(i);
+        ENGINE_TRY(impl->step_mlp_norm(i));
+        ENGINE_TRY(impl->step_mlp_projections(i));
+        ENGINE_TRY(impl->step_mlp_out(i));
     }
 
     if (want_logits)
-        impl->step_final_ops();
+        ENGINE_TRY(impl->step_final_ops());
+    return EngineStatus::Success;
 }
 
 // ============================================================================
-// Full Engine Inference
+// Full Engine Inference -- runtime status tier + exception-tier wrappers.
 // ============================================================================
-int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p, int seq_id) {
+blackwell::EngineStatus BlackwellEngine::forward_status(int token_id, int pos,
+                                                        float temperature, float top_p,
+                                                        int seq_id, int* next_token) {
+    if (!next_token) return EngineStatus::InvalidArgument;
     auto* impl = pImpl.get();
-    impl->run_token(token_id, pos, seq_id);
-    return sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature, top_p);
+    ENGINE_TRY(impl->run_token(token_id, pos, seq_id));
+    *next_token = sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature, top_p);
+    return EngineStatus::Success;
+}
+
+// Exception-tier wrapper for white-box C++ consumers: the status stays the
+// single source of truth; a failure becomes an engine_error at THIS edge, not
+// inside the decode chain.
+int BlackwellEngine::forward(int token_id, int pos, float temperature, float top_p, int seq_id) {
+    int next_token = -1;
+    const EngineStatus st = forward_status(token_id, pos, temperature, top_p, seq_id, &next_token);
+    if (st != EngineStatus::Success)
+        throw blackwell::engine_error(
+            st, std::string("BlackwellEngine::forward: ") + blackwell::to_string(st));
+    return next_token;
 }
 
 // ============================================================================
 // Evaluation Inference (Для расчета Перплексии)
 // ============================================================================
-float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id, int seq_id) {
+blackwell::EngineStatus BlackwellEngine::forward_eval_status(int token_id, int pos,
+                                                             int target_token_id,
+                                                             int seq_id, float* log_prob) {
+    if (!log_prob) return EngineStatus::InvalidArgument;
     auto* impl = pImpl.get();
-    impl->run_token(token_id, pos, seq_id);
-    return compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
+    ENGINE_TRY(impl->run_token(token_id, pos, seq_id));
+    *log_prob = compute_log_prob(impl->d_logits, impl->m_config.vocab_size, target_token_id);
+    return EngineStatus::Success;
+}
+
+float BlackwellEngine::forward_eval(int token_id, int pos, int target_token_id, int seq_id) {
+    float log_prob = 0.0f;
+    const EngineStatus st = forward_eval_status(token_id, pos, target_token_id, seq_id, &log_prob);
+    if (st != EngineStatus::Success)
+        throw blackwell::engine_error(
+            st, std::string("BlackwellEngine::forward_eval: ") + blackwell::to_string(st));
+    return log_prob;
 }
 
 float BlackwellEngine::last_token_probability(int token_id) const {

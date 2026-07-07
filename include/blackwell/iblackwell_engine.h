@@ -43,6 +43,12 @@ enum BLACKWELL_KV_MODE : int32_t {
 // (subject to the BLACKWELL_GPU_LAYERS environment override, like the C++ ctor).
 constexpr uint32_t BLACKWELL_ALL_LAYERS_RESIDENT = 0xFFFFFFFFu;
 
+// Dedicated failure code for CUDA runtime/kernel faults during decode
+// (FACILITY_ITF custom range, distinct from E_OUTOFMEMORY = VRAM exhaustion
+// and E_NOT_VALID_STATE = operation illegal in the current engine state).
+constexpr HRESULT BLACKWELL_E_CUDA_RUNTIME =
+    MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x0200);
+
 // Engine creation descriptor (the D3D DESC idiom: a POD, not an interface).
 struct BLACKWELL_ENGINE_DESC {
     const char* index_path;          // UTF-8 path to model.safetensors.index.json (required)

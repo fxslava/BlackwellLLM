@@ -92,8 +92,14 @@ void EnginePrefillCoordinator::run_delta(SeqId engine_seq, const TokenId* tokens
                                          int n, int start_pos, bool want_logits) {
     for (int pos = start_pos; pos < n; ++pos) {
         const bool last = (pos + 1 == n);
-        m_impl.run_token(static_cast<int>(tokens[pos]), pos, engine_seq,
-                         want_logits && last);
+        // run_token is status-tier (Hybrid doctrine); the coordinator's own API
+        // is exception-tier, so a failed step surfaces here as engine_error.
+        const blackwell::EngineStatus st = m_impl.run_token(
+            static_cast<int>(tokens[pos]), pos, engine_seq, want_logits && last);
+        if (st != blackwell::EngineStatus::Success)
+            throw blackwell::engine_error(
+                st, "EnginePrefillCoordinator::run_delta: token at pos " +
+                        std::to_string(pos) + " failed: " + blackwell::to_string(st));
     }
 }
 

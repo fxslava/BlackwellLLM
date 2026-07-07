@@ -45,7 +45,24 @@ comments state them at each site — preserve that comment discipline in your ch
 - Subsystem state that is conditional on model family stays behind `unique_ptr` + null
   checks (pattern: `ssm_state`, `prefix_cache`) — the ctor is the single composition root.
 
-## 3. Capability gating & configuration (any new feature knob)
+## 3. Error handling — the Hybrid doctrine (every new code path)
+
+- Pick the tier by phase, not by taste (`blackwell/engine_status.h`):
+  **INIT** (ctor / factory / setup) → `CUDA_CHECK_THROW` (throws
+  `blackwell::cuda_error`; RAII members make it leak-free). **RUNTIME**
+  (`run_token` / `step_*` / anything per-token) → return `blackwell::EngineStatus`,
+  propagate with `ENGINE_TRY`, check CUDA calls with `CUDA_CHECK_RETURN` (both
+  defined atop `src/core/engine.cpp`). Destructors use neither — raw `cudaFree`,
+  errors swallowed (see `DeviceBuffer::reset()`).
+- A new runtime facade method gets a `*_status` variant (the source of truth) plus a
+  thin exception-tier wrapper throwing `blackwell::engine_error` — copy the
+  `forward`/`forward_status` pair. The COM boundary calls the `*_status` variant and
+  translates via `hresult_from_status()`; `boundary()`'s catch-all is the panic net,
+  not the mechanism.
+- Never add legacy exit()-`CUDA_CHECK` sites in engine code; unmigrated subsystems
+  (`memory_pool`, `paging/`, `ssm/`, kernels) convert opportunistically when touched.
+
+## 4. Capability gating & configuration (any new feature knob)
 
 - Query `ModelCapabilities`; never infer support ad-hoc. Gate with a `require_*()` helper
   that throws `std::runtime_error` telling the caller **what to do instead** — copy the
@@ -57,7 +74,7 @@ comments state them at each site — preserve that comment discipline in your ch
 - Benign no-ops beat errors for lifecycle sweeps (`spill_kv_cache()` on a model without a
   substrate returns 0); hard errors are for caller mistakes.
 
-## 4. Model-architecture paths
+## 5. Model-architecture paths
 
 - New layer kinds dispatch inside `Impl::run_token`'s per-layer branch; keep the
   legacy uniform path untouched when `layer_types` is empty.
@@ -68,7 +85,7 @@ comments state them at each site — preserve that comment discipline in your ch
 - Recurrent (SSM) state has **no rewind** — anything that resets/branches sequences must
   handle it explicitly (see `reset_state()` and the CoW-branching veto in the ctor).
 
-## 5. The DLL boundary (any facade / public API change)
+## 6. The DLL boundary (any facade / public API change)
 
 - `blackwell_core.dll`'s surface is `include/blackwell/iblackwell_engine.h` +
   `src/core/engine_com.cpp` (Roadmap #1). **No exception escapes a boundary method**:
@@ -82,7 +99,7 @@ comments state them at each site — preserve that comment discipline in your ch
 - Consumers are one-tier-only: COM consumers include the boundary header exclusively;
   white-box consumers may use C++ headers but link the OBJECT lib, never the DLL.
 
-## 6. Verification
+## 7. Verification
 
 - `ctest --preset validation` for kernel-level changes; `ctest --preset integration` for
   anything touching numerics (regenerate dumps first if geometry moved — skill
@@ -91,23 +108,21 @@ comments state them at each site — preserve that comment discipline in your ch
   no engine/CUDA includes) and update `docs/INFERENCE_API.md`.
 
 <evolution_protocol>
-**Landed so far:** the Roadmap #1 COM boundary (2026-07, section 5) and the Roadmap #3
-Impl migration to `DeviceBuffer<T>` (2026-07, section 2 — `~Impl()` is `= default`).
-`map_current_exception()` in `src/core/engine_com.cpp` carries a NOTE marker at the exact
-spot where the `blackwell::cuda_error` catch clause goes.
-**Current workaround:** `CUDA_CHECK` in `src/common.h` still calls `exit(EXIT_FAILURE)`
-from library code (Roadmap #2 — deliberately kept until the RAII layout made a throwing
-ctor leak-free, which is now true for Impl). ~75 raw `cudaMalloc`/`cudaFree` sites remain
-in `memory_pool` / `paging/` / `ssm/` / kernels. The single-thread doctrine is
-comment-enforced only (Roadmap #9 — the debug thread-ID asserts fit naturally on the
-`EngineCom` methods, which wrap every boundary entry).
-**Next (Roadmap #2, throwing CUDA_CHECK):** (1) `CUDA_CHECK` throws
-`blackwell::cuda_error : std::runtime_error` (file:line + `cudaGetErrorString`) — but NOT
-from destructor paths (`DeviceBuffer::reset()` already bypasses it deliberately; audit
-other teardown sites for the same); (2) add the `cuda_error` catch at the NOTE marker in
-`engine_com.cpp`, mapped to a dedicated HRESULT; (3) white-box consumers (tools/tests)
-get try/catch at their engine call sites; (4) before flipping, migrate or audit the
-remaining raw-malloc subsystems — a throw between a raw `cudaMalloc` and its owner
-assignment leaks; `memory_pool`'s ctor failure path (`release_pools()`) is the priority
-audit. Then update sections 2/5, CLAUDE.md rows #2/#3, and this protocol.
+**Landed so far (2026-07):** the Roadmap #1 COM boundary (section 6), the Roadmap #3 Impl
+migration to `DeviceBuffer<T>` (section 2, `~Impl()` is `= default`), and the Roadmap #2
+Hybrid error doctrine for the engine core (section 3: INIT throws `cuda_error`, RUNTIME
+returns `EngineStatus`, both mapped at the DLL edge).
+**Remaining debt this skill tracks:**
+- Legacy exit()-`CUDA_CHECK` + raw `cudaMalloc`/`cudaFree` (~75 sites) in `memory_pool` /
+  `paging/` / `ssm/` / kernels. When touching one of those subsystems: convert its
+  allocations to `DeviceBuffer<T>` (or RAII equivalent for non-buffer resources), its
+  init-path checks to `CUDA_CHECK_THROW`, and any per-token-path checks to the
+  status tier — the priority audit is `memory_pool`'s ctor failure path
+  (`release_pools()`), which predates RAII. Update CLAUDE.md rows #2/#3 as subsystems
+  land; when the last legacy `CUDA_CHECK` site dies, delete the legacy macro from
+  `src/common.h` (tests' `CudaVector` migrates to `CUDA_CHECK_THROW` then too).
+- The single-thread doctrine is comment-enforced only (Roadmap #9): the debug thread-ID
+  asserts fit naturally on the `EngineCom` methods, which wrap every boundary entry —
+  capture the owning thread id in `CreateBlackwellEngine`, assert in each method, and
+  update section 1 to reference the assert when it lands.
 </evolution_protocol>
