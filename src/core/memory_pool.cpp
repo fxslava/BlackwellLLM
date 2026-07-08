@@ -2,6 +2,14 @@
 #include "blackwell/weight_loader.h"
 #include "common.h"
 #include <algorithm>
+// Hybrid error doctrine (Roadmap #2): every CUDA check here is CUDA_CHECK_THROW
+// -- no exit() from this library. Construction/allocation failures unwind via
+// the VRAMArena ctor's try/catch -> release_pools() and map to E_OUTOFMEMORY at
+// the DLL edge; hibernate()/wakeup() throws surface as HRESULTs through the
+// EngineCom boundary that wraps them; and the rare offload-path throw (staging
+// during decode) propagates up through step_*/run_token into forward_status's
+// noexcept catch, which converts it to an EngineStatus. Teardown (release_pools,
+// destructors) uses RAW cudaFree/cudaFreeHost -- nothing may throw there.
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -20,13 +28,10 @@ void PinnedHostPool::reserve(size_t bytes) {
         throw std::logic_error("PinnedHostPool: arena already reserved");
     if (bytes == 0) return;
 
-    const cudaError_t err = cudaHostAlloc(&m_base, bytes, cudaHostAllocDefault);
-    if (err != cudaSuccess) {
-        m_base = nullptr;
-        throw std::runtime_error("PinnedHostPool: cudaHostAlloc of " +
-                                 std::to_string(bytes) + " bytes failed: " +
-                                 cudaGetErrorString(err));
-    }
+    // INIT tier: throws blackwell::cuda_error (cudaErrorMemoryAllocation ->
+    // E_OUTOFMEMORY at the DLL edge). On failure cudaHostAlloc sets m_base to
+    // null, so ~PinnedHostPool's free is a no-op.
+    CUDA_CHECK_THROW(cudaHostAlloc(&m_base, bytes, cudaHostAllocDefault));
     m_capacity = bytes;
     m_used = 0;
 }
@@ -130,14 +135,14 @@ void VRAMArena::init_streams() {
     // non-blocking transfer stream is exempt, so cudaMemcpyAsync H2D/D2H here
     // genuinely overlaps with kernel execution; ordering is restored only at
     // the explicit cudaEvent handshakes below.
-    CUDA_CHECK(cudaStreamCreateWithFlags(&m_transfer_stream, cudaStreamNonBlocking));
+    CUDA_CHECK_THROW(cudaStreamCreateWithFlags(&m_transfer_stream, cudaStreamNonBlocking));
 
     for (int s = 0; s < kNumSlots; ++s) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&m_wslots[s].ev_ready,  cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&m_wslots[s].ev_retire, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&m_kvslots[s].ev_ready,  cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&m_kvslots[s].ev_retire, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&m_kvslots[s].ev_commit, cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&m_wslots[s].ev_ready,  cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&m_wslots[s].ev_retire, cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&m_kvslots[s].ev_ready,  cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&m_kvslots[s].ev_retire, cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&m_kvslots[s].ev_commit, cudaEventDisableTiming));
     }
 }
 
@@ -236,7 +241,7 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
               << (total_weights_bytes / (1024 * 1024 * 1024.0)) << " GB\n";
 
     // 4. Allocate one massive unified arena for all resident weights
-    CUDA_CHECK(cudaMalloc(&d_weights_arena, total_weights_bytes));
+    CUDA_CHECK_THROW(cudaMalloc(&d_weights_arena, total_weights_bytes));
 
     // Weight-load progress: one cumulative byte counter across the resident
     // upload AND the offloaded pinned-mirror fill, so the observer sees a
@@ -288,12 +293,12 @@ void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const
         // Double-buffered device staging: layer N computes from one slot while
         // layer N+1 streams into the other (slot index = layer % 2).
         for (int s = 0; s < kNumSlots; ++s)
-            CUDA_CHECK(cudaMalloc(&m_wslots[s].d_base, m_max_layer_bytes));
+            CUDA_CHECK_THROW(cudaMalloc(&m_wslots[s].d_base, m_max_layer_bytes));
         std::cout << "[VRAM Arena] Weight staging slots: 2 x "
                   << (m_max_layer_bytes / (1024 * 1024.0)) << " MB\n";
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK_THROW(cudaDeviceSynchronize());
     // Force 100%: the per-tensor counter sums raw byte_size while the totals
     // carry 16-byte alignment padding, so it lands slightly short of total.
     progress_done = progress_total;
@@ -314,8 +319,8 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
     size_t ping_pong_bytes = std::max(intermediate_dim, m_config.hidden_dim) * sizeof(float);
     m_activation_bytes = ping_pong_bytes; // 🎯 Сохраняем размер буферов активации
 
-    CUDA_CHECK(cudaMalloc(&d_activation_A, ping_pong_bytes));
-    CUDA_CHECK(cudaMalloc(&d_activation_B, ping_pong_bytes));
+    CUDA_CHECK_THROW(cudaMalloc(&d_activation_A, ping_pong_bytes));
+    CUDA_CHECK_THROW(cudaMalloc(&d_activation_B, ping_pong_bytes));
 
     // Resident KV-Cache pool covers only VRAM-resident layers:
     // [num_gpu_layers, kv_heads, max_seq_len, head_dim]
@@ -324,15 +329,15 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
     m_total_cache_bytes = total_cache_bytes; // 🎯 Сохраняем размер в байтах одного пула кэша
 
     if (total_cache_bytes > 0) {
-        CUDA_CHECK(cudaMalloc(&d_k_cache, total_cache_bytes));
-        CUDA_CHECK(cudaMalloc(&d_v_cache, total_cache_bytes));
+        CUDA_CHECK_THROW(cudaMalloc(&d_k_cache, total_cache_bytes));
+        CUDA_CHECK_THROW(cudaMalloc(&d_v_cache, total_cache_bytes));
 
         // 🚨 ЖЕЛЕЗОБЕТОННАЯ ОЧИСТКА: Зануляем весь кэш
-        CUDA_CHECK(cudaMemset(d_k_cache, 0, total_cache_bytes));
-        CUDA_CHECK(cudaMemset(d_v_cache, 0, total_cache_bytes));
+        CUDA_CHECK_THROW(cudaMemset(d_k_cache, 0, total_cache_bytes));
+        CUDA_CHECK_THROW(cudaMemset(d_v_cache, 0, total_cache_bytes));
     }
-    CUDA_CHECK(cudaMemset(d_activation_A, 0, ping_pong_bytes));
-    CUDA_CHECK(cudaMemset(d_activation_B, 0, ping_pong_bytes));
+    CUDA_CHECK_THROW(cudaMemset(d_activation_A, 0, ping_pong_bytes));
+    CUDA_CHECK_THROW(cudaMemset(d_activation_B, 0, ping_pong_bytes));
 
     // Offloaded layers: pinned host mirror (authoritative copy) + two device
     // staging slots with the exact stride the attention kernel expects.
@@ -351,10 +356,10 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
         m_kv_host_filled.assign(offloaded_count, 0);
 
         for (int s = 0; s < kNumSlots; ++s) {
-            CUDA_CHECK(cudaMalloc(&m_kvslots[s].d_k, single_layer_kv_bytes));
-            CUDA_CHECK(cudaMalloc(&m_kvslots[s].d_v, single_layer_kv_bytes));
-            CUDA_CHECK(cudaMemset(m_kvslots[s].d_k, 0, single_layer_kv_bytes));
-            CUDA_CHECK(cudaMemset(m_kvslots[s].d_v, 0, single_layer_kv_bytes));
+            CUDA_CHECK_THROW(cudaMalloc(&m_kvslots[s].d_k, single_layer_kv_bytes));
+            CUDA_CHECK_THROW(cudaMalloc(&m_kvslots[s].d_v, single_layer_kv_bytes));
+            CUDA_CHECK_THROW(cudaMemset(m_kvslots[s].d_k, 0, single_layer_kv_bytes));
+            CUDA_CHECK_THROW(cudaMemset(m_kvslots[s].d_v, 0, single_layer_kv_bytes));
         }
     }
 
@@ -371,25 +376,22 @@ void VRAMArena::hibernate() {
     if (m_hibernated || !d_weights_arena || total_weights_bytes == 0) return;
 
     if (!m_h_hibernate_stash) {
-        const cudaError_t err =
-            cudaHostAlloc(&m_h_hibernate_stash, total_weights_bytes, cudaHostAllocDefault);
-        if (err != cudaSuccess) {
-            m_h_hibernate_stash = nullptr;
-            throw std::runtime_error(std::string("[VRAMArena] hibernate: pinned stash "
-                                                 "allocation failed: ") +
-                                     cudaGetErrorString(err));
-        }
+        // Admin/lifecycle tier: throws (mapped to an HRESULT at the EngineCom
+        // boundary that wraps hibernate()). cudaHostAlloc nulls the pointer on
+        // failure, so a later retry re-attempts cleanly.
+        CUDA_CHECK_THROW(
+            cudaHostAlloc(&m_h_hibernate_stash, total_weights_bytes, cudaHostAllocDefault));
     }
 
     // The engine is idle by contract, but "idle" host-side still allows queued
     // async work (transfer-stream prefetches, KV commits). Drain everything so
     // the snapshot is consistent and nothing reads the arena after the free.
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(m_h_hibernate_stash, d_weights_arena, total_weights_bytes,
+    CUDA_CHECK_THROW(cudaDeviceSynchronize());
+    CUDA_CHECK_THROW(cudaMemcpy(m_h_hibernate_stash, d_weights_arena, total_weights_bytes,
                           cudaMemcpyDeviceToHost));
 
     m_hibernated_old_base = d_weights_arena;
-    CUDA_CHECK(cudaFree(d_weights_arena));
+    CUDA_CHECK_THROW(cudaFree(d_weights_arena));
     d_weights_arena = nullptr;
     m_hibernated = true;
     std::cout << "[VRAM Arena] Hibernated: "
@@ -400,9 +402,9 @@ void VRAMArena::hibernate() {
 void VRAMArena::wakeup() {
     if (!m_hibernated) return;
 
-    CUDA_CHECK(cudaMalloc(&d_weights_arena, total_weights_bytes));
+    CUDA_CHECK_THROW(cudaMalloc(&d_weights_arena, total_weights_bytes));
     // Pinned source => a pure PCIe DMA burst, no pageable staging copy.
-    CUDA_CHECK(cudaMemcpy(d_weights_arena, m_h_hibernate_stash, total_weights_bytes,
+    CUDA_CHECK_THROW(cudaMemcpy(d_weights_arena, m_h_hibernate_stash, total_weights_bytes,
                           cudaMemcpyHostToDevice));
 
     // The registry values are absolute addresses into the OLD arena; rebase
@@ -488,12 +490,12 @@ void VRAMArena::stage_layer_weights(int layer) {
     // already been enqueued on the legacy stream, so an event recorded there
     // NOW conservatively brackets all of them. The transfer stream must not
     // overwrite the slot before that point.
-    CUDA_CHECK(cudaEventRecord(slot.ev_retire, 0));
-    CUDA_CHECK(cudaStreamWaitEvent(m_transfer_stream, slot.ev_retire, 0));
+    CUDA_CHECK_THROW(cudaEventRecord(slot.ev_retire, 0));
+    CUDA_CHECK_THROW(cudaStreamWaitEvent(m_transfer_stream, slot.ev_retire, 0));
 
-    CUDA_CHECK(cudaMemcpyAsync(slot.d_base, m_layer_host_base[layer], m_layer_bytes[layer],
+    CUDA_CHECK_THROW(cudaMemcpyAsync(slot.d_base, m_layer_host_base[layer], m_layer_bytes[layer],
                                cudaMemcpyHostToDevice, m_transfer_stream));
-    CUDA_CHECK(cudaEventRecord(slot.ev_ready, m_transfer_stream));
+    CUDA_CHECK_THROW(cudaEventRecord(slot.ev_ready, m_transfer_stream));
 
     slot.layer = layer;
     slot.compute_synced = false;
@@ -513,7 +515,7 @@ void VRAMArena::ensure_layer_ready(int layer) {
     WeightSlot& slot = m_wslots[layer % kNumSlots];
     if (!slot.compute_synced) {
         // Block the COMPUTE STREAM (not the host) until the H2D copy lands.
-        CUDA_CHECK(cudaStreamWaitEvent(0, slot.ev_ready, 0));
+        CUDA_CHECK_THROW(cudaStreamWaitEvent(0, slot.ev_ready, 0));
         slot.compute_synced = true;
     }
 }
@@ -553,8 +555,8 @@ void VRAMArena::stage_layer_kv(int layer, int pos) {
         // the slot may be rewritten. Its dirty column was already spilled by
         // commit_layer_kv on the same transfer stream (FIFO order protects
         // spill-before-refetch of the host mirror).
-        CUDA_CHECK(cudaEventRecord(slot.ev_retire, 0));
-        CUDA_CHECK(cudaStreamWaitEvent(m_transfer_stream, slot.ev_retire, 0));
+        CUDA_CHECK_THROW(cudaEventRecord(slot.ev_retire, 0));
+        CUDA_CHECK_THROW(cudaStreamWaitEvent(m_transfer_stream, slot.ev_retire, 0));
         slot.layer = layer;
         slot.valid_upto = 0;
         slot.compute_synced = false;
@@ -573,15 +575,15 @@ void VRAMArena::stage_layer_kv(int layer, int pos) {
 
         // Layout [kv_heads, max_seq_len, head_dim]: a token range is contiguous
         // within each head row, so one strided 2D copy moves all heads.
-        CUDA_CHECK(cudaMemcpy2DAsync(slot.d_k + row_offset, pitch,
+        CUDA_CHECK_THROW(cudaMemcpy2DAsync(slot.d_k + row_offset, pitch,
                                      m_h_k_mirror[oi] + row_offset, pitch,
                                      width, m_config.num_key_value_heads,
                                      cudaMemcpyHostToDevice, m_transfer_stream));
-        CUDA_CHECK(cudaMemcpy2DAsync(slot.d_v + row_offset, pitch,
+        CUDA_CHECK_THROW(cudaMemcpy2DAsync(slot.d_v + row_offset, pitch,
                                      m_h_v_mirror[oi] + row_offset, pitch,
                                      width, m_config.num_key_value_heads,
                                      cudaMemcpyHostToDevice, m_transfer_stream));
-        CUDA_CHECK(cudaEventRecord(slot.ev_ready, m_transfer_stream));
+        CUDA_CHECK_THROW(cudaEventRecord(slot.ev_ready, m_transfer_stream));
 
         slot.valid_upto = need;
         slot.compute_synced = false;
@@ -594,7 +596,7 @@ void VRAMArena::prepare_layer_kv(int layer, int pos) {
 
     KVSlot& slot = m_kvslots[layer % kNumSlots];
     if (!slot.compute_synced) {
-        CUDA_CHECK(cudaStreamWaitEvent(0, slot.ev_ready, 0));
+        CUDA_CHECK_THROW(cudaStreamWaitEvent(0, slot.ev_ready, 0));
         slot.compute_synced = true;
     }
 }
@@ -609,19 +611,19 @@ void VRAMArena::commit_layer_kv(int layer, int pos) {
 
     // The RoPE/attention kernels that wrote column `pos` are enqueued on the
     // legacy stream; spill must wait for them but NOT for future compute.
-    CUDA_CHECK(cudaEventRecord(slot.ev_commit, 0));
-    CUDA_CHECK(cudaStreamWaitEvent(m_transfer_stream, slot.ev_commit, 0));
+    CUDA_CHECK_THROW(cudaEventRecord(slot.ev_commit, 0));
+    CUDA_CHECK_THROW(cudaStreamWaitEvent(m_transfer_stream, slot.ev_commit, 0));
 
     const size_t pitch = m_max_seq_len * m_config.head_dim * sizeof(float);
     const size_t col_offset = static_cast<size_t>(pos) * m_config.head_dim;
     const size_t width = m_config.head_dim * sizeof(float);
 
     const int oi = layer - static_cast<int>(m_num_gpu_layers);
-    CUDA_CHECK(cudaMemcpy2DAsync(m_h_k_mirror[oi] + col_offset, pitch,
+    CUDA_CHECK_THROW(cudaMemcpy2DAsync(m_h_k_mirror[oi] + col_offset, pitch,
                                  slot.d_k + col_offset, pitch,
                                  width, m_config.num_key_value_heads,
                                  cudaMemcpyDeviceToHost, m_transfer_stream));
-    CUDA_CHECK(cudaMemcpy2DAsync(m_h_v_mirror[oi] + col_offset, pitch,
+    CUDA_CHECK_THROW(cudaMemcpy2DAsync(m_h_v_mirror[oi] + col_offset, pitch,
                                  slot.d_v + col_offset, pitch,
                                  width, m_config.num_key_value_heads,
                                  cudaMemcpyDeviceToHost, m_transfer_stream));

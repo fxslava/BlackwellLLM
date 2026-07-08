@@ -124,14 +124,19 @@ Hybrid error doctrine for the engine core (section 3: INIT throws `cuda_error`, 
 returns `EngineStatus`, both mapped at the DLL edge), and the Roadmap #9 thread-ownership
 asserts (section 1: `BLACKWELL_VERIFY_OWNING_THREAD()` on every `EngineCom` method).
 **Remaining debt this skill tracks:**
-- Legacy exit()-`CUDA_CHECK` + raw `cudaMalloc`/`cudaFree` (~75 sites) in `memory_pool` /
-  `paging/` / `ssm/` / kernels. When touching one of those subsystems: convert its
-  allocations to `DeviceBuffer<T>` (or RAII equivalent for non-buffer resources), its
-  init-path checks to `CUDA_CHECK_THROW`, and any per-token-path checks to the
-  status tier — the priority audit is `memory_pool`'s ctor failure path
-  (`release_pools()`), which predates RAII. Update CLAUDE.md rows #2/#3 as subsystems
-  land; when the last legacy `CUDA_CHECK` site dies, delete the legacy macro from
-  `src/common.h` (tests' `CudaVector` migrates to `CUDA_CHECK_THROW` then too).
+- Legacy exit()-`CUDA_CHECK` + raw `cudaMalloc`/`cudaFree` in `paging/` / `ssm/` /
+  kernels. When touching one of those subsystems: convert its init-path checks to
+  `CUDA_CHECK_THROW` and its allocations to `DeviceBuffer<T>` (or an RAII equivalent for
+  non-buffer resources). `memory_pool.cpp` landed 2026-07 as the pattern to copy: EVERY
+  check became `CUDA_CHECK_THROW` with NO signature cascade — INIT throws unwind via the
+  ctor's `try/catch → release_pools()` (→ `E_OUTOFMEMORY`); lifecycle throws map at the
+  `EngineCom` boundary; the rare offload-path throw during decode propagates up through
+  `step_*`/`run_token` into `forward_status`'s noexcept catch (which converts it to a
+  status). Teardown stays RAW `cudaFree` (nothing may throw in a destructor). Its device
+  buffers are still raw pointers (DeviceBuffer RAII migration pending — a separate step).
+  Update CLAUDE.md rows #2/#3 as subsystems land; when the last legacy `CUDA_CHECK` site
+  dies, delete the legacy macro from `src/common.h` (tests' `CudaVector` migrates to
+  `CUDA_CHECK_THROW` then too).
 - Sanitizers (Roadmap #10, idea): ASan for the CUDA-free agent stack first; UBSan/TSan
   via a clang-cl or Linux CI lane. (Note: the MSVC ASan runtime shipped with toolset
   14.34 crashes in its own init — `Symbolizer::PlatformInit`; use a 14.4x runtime.)
