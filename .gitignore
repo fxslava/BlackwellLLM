@@ -35,3 +35,9 @@ logits_comparison.csv
 # Регенерируемые golden-дампы Llama (generate_golden_dumps.py) и локальный бэкап
 /dumps/
 /backup/
+
+# Deployment artifacts: make_staging.py payload + Inno Setup compiler output.
+# (The loose *.dll/*.exe rules above cover the binaries, but not build_staging's
+#  ui/ assets or the Output/ dir itself -- ignore the whole trees explicitly.)
+/build_staging/
+/deploy/Output/

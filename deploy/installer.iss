@@ -60,6 +60,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; ---- application binaries (root of build_staging) ----------------------------
 Source: "{#StagingDir}\{#AppExeName}";            DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\blackwell_core.dll";       DestDir: "{app}"; Flags: ignoreversion
+; ---- DirectStorage runtime (hard load-time dep when built with USE_DIRECT_STORAGE) ---
+Source: "{#StagingDir}\dstorage.dll";             DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#StagingDir}\dstoragecore.dll";         DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; ---- portable CUDA runtime (exact cudart64_*.dll staged by make_staging.py) ---
 Source: "{#StagingDir}\cudart64_*.dll";           DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; ---- optional CUDA math libs (present only if the engine links them) ----------
@@ -251,9 +254,11 @@ begin
   Services := WmiConnect('root\Microsoft\Windows\Storage');
 
   { Partition(s) carrying this drive letter -> their owning disk number. }
+  { NB: keep the Format() argument array on the same line as the string -- a line
+    that STARTS with '[' is parsed by ISCC as a section header ("Invalid section
+    tag"), even inside [Code]. }
   PartSet := Services.ExecQuery(Format(
-    'SELECT DiskNumber FROM MSFT_Partition WHERE DriveLetter=''%s''',
-    [DriveLetter]));
+    'SELECT DiskNumber FROM MSFT_Partition WHERE DriveLetter=''%s''', [DriveLetter]));
   if PartSet.Count = 0 then
     Exit;   { unmapped (e.g. network / ReFS storage space) -> unknown }
 
@@ -274,8 +279,7 @@ begin
 
   { PhysicalDisk whose DeviceId matches the disk number -> its MediaType. }
   DiskSet := Services.ExecQuery(Format(
-    'SELECT MediaType FROM MSFT_PhysicalDisk WHERE DeviceId=''%d''',
-    [DiskNumber]));
+    'SELECT MediaType FROM MSFT_PhysicalDisk WHERE DeviceId=''%d''', [DiskNumber]));
   for J := 0 to DiskSet.Count - 1 do
   begin
     Disk := DiskSet.ItemIndex(J);
@@ -462,10 +466,12 @@ begin
     WebView2VersionPresent(HKEY_LOCAL_MACHINE, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Guid}') or
     WebView2VersionPresent(HKEY_CURRENT_USER, KeyPath);
 
-  { Deploy only if the runtime is BOTH absent AND we actually bundled the
-    bootstrapper (make_staging.py stages it opportunistically). Without the file
-    present in {tmp} there is nothing to run, so suppress the [Run] entry rather
-    than fire a "file not found" error. }
+  // Deploy only if the runtime is BOTH absent AND we actually bundled the
+  // bootstrapper (make_staging.py stages it opportunistically). Without the file
+  // present in {tmp} there is nothing to run, so suppress the [Run] entry rather
+  // than fire a "file not found" error.
+  // (Line comments here on purpose: a '{...}' constant inside a { } comment would
+  //  close the comment early -- Inno's brace comments do not nest.)
   Result := (not Installed) and
             FileExists(ExpandConstant('{tmp}\{#WebView2Setup}'));
 end;
