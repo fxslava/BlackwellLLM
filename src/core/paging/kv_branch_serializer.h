@@ -8,6 +8,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 
+#include "common.h"  // CUDA_CHECK_THROW (Hybrid error doctrine)
 #include "paged_kv_cache.h"
 #include "radix_tree.h"       // TokenId, hash helper
 
@@ -70,8 +71,8 @@ public:
     KVBranchSerializer(SequenceManager& sm, uint64_t model_hash)
         : m_sm(sm), m_model_hash(model_hash) {
         m_page_bytes = m_sm.page_elems() * sizeof(kv_t);
-        CUDA_CHECK(cudaHostAlloc(&m_stage_k, m_page_bytes, cudaHostAllocDefault));
-        CUDA_CHECK(cudaHostAlloc(&m_stage_v, m_page_bytes, cudaHostAllocDefault));
+        CUDA_CHECK_THROW(cudaHostAlloc(&m_stage_k, m_page_bytes, cudaHostAllocDefault));
+        CUDA_CHECK_THROW(cudaHostAlloc(&m_stage_v, m_page_bytes, cudaHostAllocDefault));
     }
     ~KVBranchSerializer() {
         cudaFreeHost(m_stage_k);
@@ -117,7 +118,7 @@ public:
         for (PageId p : pages) {
             for (int layer = 0; layer < m_sm.num_layers(); ++layer) {
                 m_sm.read_page(layer, p, m_stage_k, m_stage_v, stream);
-                CUDA_CHECK(cudaStreamSynchronize(stream));  // D2H into staging landed
+                CUDA_CHECK_THROW(cudaStreamSynchronize(stream));  // D2H into staging landed
                 f.write((const char*)m_stage_k, m_page_bytes);
                 f.write((const char*)m_stage_v, m_page_bytes);
             }
@@ -173,7 +174,7 @@ public:
                     if (!f) throw std::runtime_error("bkv load: truncated payload");
                     m_sm.write_page(layer, p, m_stage_k, m_stage_v, stream);
                     // Staging is reused next iteration; the H2D must be done.
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
                 }
             }
         } catch (...) {

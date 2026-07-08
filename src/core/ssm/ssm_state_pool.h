@@ -74,12 +74,12 @@ public:
         const size_t conv_bytes = (size_t)m_max_seqs * m_conv_stride * sizeof(float);
         // One allocation per sub-arena; zero-init == empty history for every seq.
         if (rec_bytes) {
-            CUDA_CHECK(cudaMalloc(&m_d_rec, rec_bytes));
-            CUDA_CHECK(cudaMemset(m_d_rec, 0, rec_bytes));
+            CUDA_CHECK_THROW(cudaMalloc(&m_d_rec, rec_bytes));
+            CUDA_CHECK_THROW(cudaMemset(m_d_rec, 0, rec_bytes));
         }
         if (conv_bytes) {
-            CUDA_CHECK(cudaMalloc(&m_d_conv, conv_bytes));
-            CUDA_CHECK(cudaMemset(m_d_conv, 0, conv_bytes));
+            CUDA_CHECK_THROW(cudaMalloc(&m_d_conv, conv_bytes));
+            CUDA_CHECK_THROW(cudaMemset(m_d_conv, 0, conv_bytes));
         }
     }
     ~SsmStatePool() { cudaFree(m_d_rec); cudaFree(m_d_conv); }
@@ -105,10 +105,10 @@ public:
     void reset(int seq, cudaStream_t stream = 0) {
         check(seq, 0);
         if (m_d_rec)
-            CUDA_CHECK(cudaMemsetAsync(rec_state(seq, 0), 0,
+            CUDA_CHECK_THROW(cudaMemsetAsync(rec_state(seq, 0), 0,
                                        m_rec_stride * sizeof(float), stream));
         if (m_d_conv)
-            CUDA_CHECK(cudaMemsetAsync(conv_state(seq, 0), 0,
+            CUDA_CHECK_THROW(cudaMemsetAsync(conv_state(seq, 0), 0,
                                        m_conv_stride * sizeof(float), stream));
     }
 

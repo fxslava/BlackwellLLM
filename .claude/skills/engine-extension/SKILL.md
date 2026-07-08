@@ -124,19 +124,21 @@ Hybrid error doctrine for the engine core (section 3: INIT throws `cuda_error`, 
 returns `EngineStatus`, both mapped at the DLL edge), and the Roadmap #9 thread-ownership
 asserts (section 1: `BLACKWELL_VERIFY_OWNING_THREAD()` on every `EngineCom` method).
 **Remaining debt this skill tracks:**
-- Legacy exit()-`CUDA_CHECK` + raw `cudaMalloc`/`cudaFree` in `paging/` / `ssm/` /
-  kernels. When touching one of those subsystems: convert its init-path checks to
-  `CUDA_CHECK_THROW` and its allocations to `DeviceBuffer<T>` (or an RAII equivalent for
-  non-buffer resources). `memory_pool.cpp` landed 2026-07 as the pattern to copy: EVERY
-  check became `CUDA_CHECK_THROW` with NO signature cascade — INIT throws unwind via the
-  ctor's `try/catch → release_pools()` (→ `E_OUTOFMEMORY`); lifecycle throws map at the
-  `EngineCom` boundary; the rare offload-path throw during decode propagates up through
-  `step_*`/`run_token` into `forward_status`'s noexcept catch (which converts it to a
-  status). Teardown stays RAW `cudaFree` (nothing may throw in a destructor). Its device
-  buffers are still raw pointers (DeviceBuffer RAII migration pending — a separate step).
-  Update CLAUDE.md rows #2/#3 as subsystems land; when the last legacy `CUDA_CHECK` site
-  dies, delete the legacy macro from `src/common.h` (tests' `CudaVector` migrates to
-  `CUDA_CHECK_THROW` then too).
+- **Error-handling migration is COMPLETE for all production code (Roadmap #2 done,
+  2026-07):** `memory_pool`, `paging/`, `ssm/` all converted `CUDA_CHECK` →
+  `CUDA_CHECK_THROW` with NO signature cascade (kernels never had `CUDA_CHECK`). The
+  pattern, if you add a new subsystem: INIT throws unwind via the ctor's
+  `try/catch → release_pools()`-style cleanup (→ `E_OUTOFMEMORY`); lifecycle throws map at
+  the `EngineCom` boundary; a rare runtime-path throw propagates up through
+  `step_*`/`run_token` into `forward_status`'s noexcept catch (→ status). Teardown stays
+  RAW `cudaFree` (nothing may throw in a destructor). The legacy exit()-`CUDA_CHECK`
+  survives ONLY in test fixtures' `CudaVector` + `src/experiments` — leave it (dying loudly
+  is fine in test code).
+- **RAII migration (Roadmap #3) still pending** for the raw device pointers in
+  `memory_pool` / `paging/` / `ssm/`: migrate them to `DeviceBuffer<T>` (or an RAII
+  equivalent for non-buffer resources like streams/events) when you next touch each,
+  shrinking the hand-maintained `release_pools()`/destructor free-lists. Update CLAUDE.md
+  row #3 as subsystems land.
 - Sanitizers (Roadmap #10, idea): ASan for the CUDA-free agent stack first; UBSan/TSan
   via a clang-cl or Linux CI lane. (Note: the MSVC ASan runtime shipped with toolset
   14.34 crashes in its own init — `Symbolizer::PlatformInit`; use a 14.4x runtime.)

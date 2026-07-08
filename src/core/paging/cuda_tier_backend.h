@@ -6,6 +6,7 @@
 #include <string>
 #include <cuda_runtime.h>
 
+#include "common.h"  // CUDA_CHECK_THROW (Hybrid error doctrine)
 #include "paged_kv_cache.h"
 #include "tiered_memory_pager.h"
 
@@ -64,12 +65,12 @@ public:
         m_record_bytes = (size_t)m_sm.num_layers() * 2 * m_page_bytes;
 
         if (ram_slots > 0)
-            CUDA_CHECK(cudaHostAlloc(&m_arena, (size_t)ram_slots * m_record_bytes,
+            CUDA_CHECK_THROW(cudaHostAlloc(&m_arena, (size_t)ram_slots * m_record_bytes,
                                      cudaHostAllocDefault));
         if (disk_slots > 0) {
             // One pinned staging record for DISK<->VRAM, plus the spill file
             // preallocated to full capacity (slot-addressed, never grows).
-            CUDA_CHECK(cudaHostAlloc(&m_stage, m_record_bytes, cudaHostAllocDefault));
+            CUDA_CHECK_THROW(cudaHostAlloc(&m_stage, m_record_bytes, cudaHostAllocDefault));
             m_spill.open(spill_path, std::ios::binary | std::ios::in |
                                      std::ios::out | std::ios::trunc);
             if (!m_spill)
@@ -79,8 +80,8 @@ public:
             m_spill.put('\0');
             m_spill.flush();
         }
-        CUDA_CHECK(cudaStreamCreateWithFlags(&m_xfer, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaEventCreateWithFlags(&m_evt, cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaStreamCreateWithFlags(&m_xfer, cudaStreamNonBlocking));
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&m_evt, cudaEventDisableTiming));
     }
     ~CudaTierBackend() override {
         cudaEventDestroy(m_evt);
@@ -96,7 +97,7 @@ public:
         char* rec = ram_record(ram_slot);
         for (int l = 0; l < m_sm.num_layers(); ++l)
             m_sm.read_page(l, phys, rec_k(rec, l), rec_v(rec, l), m_xfer);
-        CUDA_CHECK(cudaStreamSynchronize(m_xfer));   // D2H landed in the arena
+        CUDA_CHECK_THROW(cudaStreamSynchronize(m_xfer));   // D2H landed in the arena
     }
     void ram_to_disk(int ram_slot, int disk_slot) override {
         m_spill.seekp((std::streamoff)disk_slot * m_record_bytes);
@@ -123,15 +124,15 @@ public:
             m_sm.write_page(l, phys, rec_k(m_stage, l), rec_v(m_stage, l), m_xfer);
         // The single staging record is reused by the NEXT disk_to_vram in the
         // same fault batch: its H2D must have landed first.
-        CUDA_CHECK(cudaStreamSynchronize(m_xfer));
+        CUDA_CHECK_THROW(cudaStreamSynchronize(m_xfer));
     }
 
     void fence(void* compute_stream) override {
-        CUDA_CHECK(cudaEventRecord(m_evt, m_xfer));
+        CUDA_CHECK_THROW(cudaEventRecord(m_evt, m_xfer));
         if (compute_stream)
-            CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t)compute_stream, m_evt, 0));
+            CUDA_CHECK_THROW(cudaStreamWaitEvent((cudaStream_t)compute_stream, m_evt, 0));
         else
-            CUDA_CHECK(cudaEventSynchronize(m_evt));
+            CUDA_CHECK_THROW(cudaEventSynchronize(m_evt));
     }
 
 private:

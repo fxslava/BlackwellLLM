@@ -101,11 +101,11 @@ public:
         // device KV scales with m_resident, not num_layers.
         const int device_slabs = m_resident + (m_offloaded > 0 ? kNumSlots : 0);
         const size_t pool_elems = (size_t)device_slabs * m_slab_elems;
-        CUDA_CHECK(cudaMalloc(&m_d_k_pool, pool_elems * sizeof(kv_t)));
-        CUDA_CHECK(cudaMalloc(&m_d_v_pool, pool_elems * sizeof(kv_t)));
-        CUDA_CHECK(cudaMemset(m_d_k_pool, 0, pool_elems * sizeof(kv_t)));
-        CUDA_CHECK(cudaMemset(m_d_v_pool, 0, pool_elems * sizeof(kv_t)));
-        CUDA_CHECK(cudaMalloc(&m_d_block_scratch, max_blocks_per_seq * sizeof(int32_t)));
+        CUDA_CHECK_THROW(cudaMalloc(&m_d_k_pool, pool_elems * sizeof(kv_t)));
+        CUDA_CHECK_THROW(cudaMalloc(&m_d_v_pool, pool_elems * sizeof(kv_t)));
+        CUDA_CHECK_THROW(cudaMemset(m_d_k_pool, 0, pool_elems * sizeof(kv_t)));
+        CUDA_CHECK_THROW(cudaMemset(m_d_v_pool, 0, pool_elems * sizeof(kv_t)));
+        CUDA_CHECK_THROW(cudaMalloc(&m_d_block_scratch, max_blocks_per_seq * sizeof(int32_t)));
 
         // Pinned host mirror for the offloaded layers (page-indexed, identical
         // per-layer layout). cudaHostAlloc so stage/spill are true DMA transfers
@@ -113,8 +113,8 @@ public:
         // enforces for the continuous cache.
         if (m_offloaded > 0) {
             const size_t mirror_bytes = (size_t)m_offloaded * m_slab_elems * sizeof(kv_t);
-            CUDA_CHECK(cudaHostAlloc(&m_h_k_mirror, mirror_bytes, cudaHostAllocDefault));
-            CUDA_CHECK(cudaHostAlloc(&m_h_v_mirror, mirror_bytes, cudaHostAllocDefault));
+            CUDA_CHECK_THROW(cudaHostAlloc(&m_h_k_mirror, mirror_bytes, cudaHostAllocDefault));
+            CUDA_CHECK_THROW(cudaHostAlloc(&m_h_v_mirror, mirror_bytes, cudaHostAllocDefault));
             std::memset(m_h_k_mirror, 0, mirror_bytes);
             std::memset(m_h_v_mirror, 0, mirror_bytes);
         }
@@ -261,9 +261,9 @@ public:
             std::memcpy(h_k, host_k_base(layer) + off, bytes);
             std::memcpy(h_v, host_v_base(layer) + off, bytes);
         } else {
-            CUDA_CHECK(cudaMemcpyAsync(h_k, layer_k_pool(layer) + off, bytes,
+            CUDA_CHECK_THROW(cudaMemcpyAsync(h_k, layer_k_pool(layer) + off, bytes,
                                        cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(h_v, layer_v_pool(layer) + off, bytes,
+            CUDA_CHECK_THROW(cudaMemcpyAsync(h_v, layer_v_pool(layer) + off, bytes,
                                        cudaMemcpyDeviceToHost, stream));
         }
     }
@@ -275,9 +275,9 @@ public:
             std::memcpy(host_k_base(layer) + off, h_k, bytes);
             std::memcpy(host_v_base(layer) + off, h_v, bytes);
         } else {
-            CUDA_CHECK(cudaMemcpyAsync(layer_k_pool(layer) + off, h_k, bytes,
+            CUDA_CHECK_THROW(cudaMemcpyAsync(layer_k_pool(layer) + off, h_k, bytes,
                                        cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(layer_v_pool(layer) + off, h_v, bytes,
+            CUDA_CHECK_THROW(cudaMemcpyAsync(layer_v_pool(layer) + off, h_v, bytes,
                                        cudaMemcpyHostToDevice, stream));
         }
     }
@@ -288,7 +288,7 @@ public:
     // the next call (single reusable scratch buffer — fine for one active seq).
     const int32_t* device_block_table(SeqId s, cudaStream_t stream = 0) {
         const BlockTable& bt = seq(s);
-        CUDA_CHECK(cudaMemcpyAsync(m_d_block_scratch, bt.pages.data(),
+        CUDA_CHECK_THROW(cudaMemcpyAsync(m_d_block_scratch, bt.pages.data(),
                                    bt.pages.size() * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, stream));
         return m_d_block_scratch;
@@ -321,8 +321,8 @@ public:
         const size_t pp = per_page_elems(), page_bytes = pp * sizeof(kv_t);
         for (PageId p : bt.pages) {
             const size_t off = (size_t)p * pp;
-            CUDA_CHECK(cudaMemcpyAsync(d_k + off, h_k + off, page_bytes, cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(d_v + off, h_v + off, page_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK_THROW(cudaMemcpyAsync(d_k + off, h_k + off, page_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK_THROW(cudaMemcpyAsync(d_v + off, h_v + off, page_bytes, cudaMemcpyHostToDevice, stream));
         }
     }
 
@@ -332,9 +332,9 @@ public:
     void spill_out_page(int layer, PageId page, cudaStream_t stream = 0) {
         if (!layer_is_offloaded(layer)) return;
         const size_t pp = per_page_elems(), off = (size_t)page * pp, page_bytes = pp * sizeof(kv_t);
-        CUDA_CHECK(cudaMemcpyAsync(host_k_base(layer) + off, layer_k_pool(layer) + off,
+        CUDA_CHECK_THROW(cudaMemcpyAsync(host_k_base(layer) + off, layer_k_pool(layer) + off,
                                    page_bytes, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(host_v_base(layer) + off, layer_v_pool(layer) + off,
+        CUDA_CHECK_THROW(cudaMemcpyAsync(host_v_base(layer) + off, layer_v_pool(layer) + off,
                                    page_bytes, cudaMemcpyDeviceToHost, stream));
     }
 
@@ -365,7 +365,7 @@ private:
     // offloaded layer. CoW is a rare fork-boundary event, so the sync is cheap.
     void cow_copy_page_host(PageId src, PageId dst, cudaStream_t stream = 0) {
         if (m_offloaded <= 0) return;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
         const size_t pp = per_page_elems(), page_bytes = pp * sizeof(kv_t);
         for (int oi = 0; oi < m_offloaded; ++oi) {
             const size_t base = (size_t)oi * m_slab_elems;
