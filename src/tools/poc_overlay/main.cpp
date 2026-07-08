@@ -43,6 +43,7 @@
 #include "hook_manager.h"
 #include "overlay_window.h"
 #include "settings_dialog.h"
+#include "smoke_test.h"
 #include "translation_service.h"
 #include "tray_icon.h"
 
@@ -240,6 +241,14 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+    // Post-deploy smoke test: headless, self-contained, returns a process exit
+    // code and touches NONE of the normal startup state below. Must be the very
+    // first thing wWinMain does (before DPI/COM/window/engine setup) so CI and
+    // installer.iss get a clean, deterministic 0/>0 verdict.
+    if (smoke::WantsSmokeTest()) {
+        return smoke::RunSmokeTest();
+    }
+
     // Without this, the process defaults to DPI-unaware and Windows silently
     // virtualizes/rescales screen coordinates for it -- inconsistently across
     // monitors with different scale factors. That breaks the whole pipeline:

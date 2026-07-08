@@ -6,9 +6,54 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# 1. ПРАВИЛЬНАЯ настройка архитектуры Blackwell для Visual Studio
-# CMake сам корректно передаст нужные инструкции в NVCC
-set(CMAKE_CUDA_ARCHITECTURES 120)
+# ============================================================================
+# Static CRT (/MT, /MTd) -- enterprise-grade, dependency-free deployment.
+# Set BEFORE any target or FetchContent dependency so googletest/nlohmann and
+# every first-party target link the SAME runtime (a /MT<->/MD mismatch is a hard
+# LNK2038). CMP0091 (NEW under cmake>=3.28) routes this through the abstract
+# MSVC_RUNTIME_LIBRARY property instead of hand-patched CMAKE_*_FLAGS.
+#
+# Safe across the SHARED blackwell_core.dll boundary: the COM edge passes only
+# HRESULTs + POD across the DLL seam (no CRT objects -- FILE*, malloc'd blocks,
+# or C++ exceptions -- ever cross it), so the exe and the DLL each owning a
+# private static CRT copy is by design (see the hybrid error doctrine).
+# ============================================================================
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+# ============================================================================
+# CUDA AOT fatbinary matrix (deployment target coverage).
+#   <arch>-real    -> native SASS baked into the fatbinary for that GPU.
+#   <arch>-virtual -> PTX kept for forward JIT onto any newer, unlisted arch.
+# Turing..Hopper get native SASS; 90-virtual PTX JITs forward onto future parts.
+# 120-real is the project's PRIMARY target (Blackwell / RTX 50xx) -- keep native
+# SASS so the latency-critical hot path never pays a first-launch PTX-JIT stall
+# on the very hardware this engine exists for. (Drop 120-real ONLY for a build
+# that will never run on Blackwell; the 90-virtual PTX would then cover it.)
+#
+# GUARDED so the CMakePresets cache var wins: the x64-release preset pins THIS
+# matrix, while x64-debug stays single-arch (fast local iteration). This block is
+# the fallback for a raw, preset-less `cmake -S . -B ...` and the canonical record
+# of the shipping matrix. Keep it in lock-step with the release preset's
+# CMAKE_CUDA_ARCHITECTURES.
+#
+# TEMPORARILY single-arch (120-real only): the current kernels use Blackwell/
+# Hopper-specific instructions (sm_90+ intrinsics -- e.g. TMA / wgmma / cluster
+# ops) that do NOT compile for older SASS, so building 75/86/89 fails outright.
+# The broader matrix below is the INTENDED deployment target once those kernels
+# grow pre-sm_90 fallbacks; re-enable arch-by-arch as each is ported and its
+# build goes green. See the deployment matrix in deploy/README.md.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES
+        # --- intended future deployment matrix (disabled: pre-sm_90 kernels do
+        #     not yet compile -- Blackwell/Hopper-only intrinsics in use) ---
+        # 75-real       # Turing   (RTX 20xx / GTX 16xx)
+        # 86-real       # Ampere   (RTX 30xx, A-series)
+        # 89-real       # Ada      (RTX 40xx)
+        # 90-real       # Hopper   (H100 / H200)
+        # 90-virtual    # PTX fallback: forward-compatible JIT for any arch > sm_90
+        120-real      # Blackwell (RTX 50xx) -- primary target, native SASS
+    )
+endif()
 
 # 2. Оптимизации и флаги
 # Убираем -O3. В Visual Studio оптимизация включается выбором конфигурации "Release" в самой IDE.
@@ -51,6 +96,41 @@ if(MSVC)
         # so silence that one non-warning (CXX only -- CUDA TUs are untouched, so
         # they never recompile for it) rather than un-portably rewriting it.
         "$<$<COMPILE_LANGUAGE:CXX>:/D_CRT_SECURE_NO_WARNINGS>"
+    )
+endif()
+
+# ============================================================================
+# Release optimization profile (enterprise build).
+# Generator-expression gated on $<CONFIG:Release> so Debug/RelWithDebInfo are
+# untouched. NDEBUG + the Release CRT flags come from CMake's own
+# CMAKE_*_FLAGS_RELEASE; this block adds the AGGRESSIVE layer on top.
+#   CXX  : /O2 max speed, /Ob3 aggressive inlining, /Oi intrinsics, /Ot favor
+#          speed, /GL whole-program opt, /Gy COMDAT sections (feeds /OPT:ICF).
+#   LINK : /LTCG cross-module codegen (pairs with /GL), /OPT:REF strips unused
+#          code+data, /OPT:ICF folds identical COMDATs, /INCREMENTAL:NO (LTCG is
+#          incompatible with incremental linking).
+#   CUDA : /GL is deliberately NOT forwarded through nvcc (host-passthrough LTCG
+#          is unsupported); device code is tuned via ptxas -O3 instead. Mixed
+#          /GL (CXX) + non-/GL (CUDA) objects link cleanly -- LTCG applies to the
+#          /GL subset only.
+# ============================================================================
+if(MSVC)
+    add_compile_options(
+        "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2>"
+        "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Ob3>"
+        "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Oi>"
+        "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Ot>"
+        "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/GL>"
+        "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Gy>"
+        # Device-side optimization for the CUDA translation units.
+        "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>"
+        "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xptxas=-O3>"
+    )
+    add_link_options(
+        "$<$<CONFIG:Release>:/LTCG>"
+        "$<$<CONFIG:Release>:/OPT:REF>"
+        "$<$<CONFIG:Release>:/OPT:ICF>"
+        "$<$<CONFIG:Release>:/INCREMENTAL:NO>"
     )
 endif()
 

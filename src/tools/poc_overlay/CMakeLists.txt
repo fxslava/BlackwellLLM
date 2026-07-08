@@ -23,6 +23,7 @@ add_executable(poc_overlay WIN32
     config.cpp
     translation_service.cpp
     live_translation_tracker.cpp
+    smoke_test.cpp
     ../playground/blackwell_llm_adapter.cpp
 )
 
@@ -84,6 +85,13 @@ target_link_libraries(poc_overlay PRIVATE
     version            # required by the WebView2 static loader
     nlohmann_json::nlohmann_json                       # config.json + WebView2 IPC
     ${WV2_DIR}/build/native/x64/WebView2LoaderStatic.lib
+    CUDA::cudart_static  # smoke_test.cpp calls the CUDA Runtime API directly
+                         # (cudaGetDeviceCount/cudaSetDevice) from a CXX TU.
+                         # STATIC to match the rest of the build (-cudart static,
+                         # the CMake default): linking the dynamic CUDA::cudart
+                         # here duplicates cudaGetExportTable against the
+                         # transitively-linked cudart_static.lib (LNK2005) under
+                         # the MSBuild/VS CUDA integration.
     blackwell_core_obj   # white-box engine layer: the tracker/service drive the
                          # EnginePrefillCoordinator + paging C++ API, which the
                          # DLL's COM boundary does not (yet) cover

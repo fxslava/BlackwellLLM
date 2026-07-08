@@ -5,7 +5,8 @@
         {
             "name": "base",
             "hidden": true,
-            "generator": "Ninja",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64", "strategy": "set" },
             "cacheVariables": {
                 "CMAKE_CUDA_ARCHITECTURES": "120",
                 "USE_DIRECT_STORAGE": "ON"
@@ -23,7 +24,10 @@
             "displayName": "x64 Release",
             "inherits": "base",
             "binaryDir": "${sourceDir}/out/build/x64-Release",
-            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CUDA_ARCHITECTURES": "120-real"
+            }
         }
     ],
     "buildPresets": [
@@ -34,7 +38,7 @@
         {
             "name": "test-base",
             "hidden": true,
-            "configurePreset": "x64-debug",
+            "configurePreset": "x64-release",
             "output": { "outputOnFailure": true }
         },
         { "name": "validation",         "inherits": "test-base", "filter": { "include": { "label": "^validation$" } } },
