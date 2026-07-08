@@ -180,6 +180,10 @@ VRAMArena::~VRAMArena() {
 }
 
 void VRAMArena::allocate_weights_pool(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader) {
+    // Unused: with a multi-shard checkpoint the authoritative per-tensor path is
+    // entry.file_path (the loader resolves each shard itself); the index path is
+    // kept in the signature for symmetry with the ctor.
+    (void)safetensors_path;
     auto tensor_names = metadata_loader.list_tensors();
 
     // 1. Partition tensors: VRAM-resident (non-layer tensors + layers below the

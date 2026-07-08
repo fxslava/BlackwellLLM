@@ -29,6 +29,31 @@ include(cmake/BlackwellHelpers.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/DirectStorage.cmake)
 
+# ============================================================================
+# Compiler hygiene: zero-warning policy on our first-party CXX code.
+# Placed AFTER the dependency includes so already-defined FetchContent targets
+# (googletest, ...) keep their own warning level -- this directory property
+# only applies to targets created below (src/, tests/).
+#   - CXX only: nvcc host-passthrough of /W4 /WX over CUDA/CCCL headers is not
+#     viable, so CUDA (.cu) compilation is untouched.
+#   - /external:anglebrackets + /external:W0: <>-includes (CUDA toolkit, STL,
+#     Win32, deps) are "external" and drop to W0, so /W4 /WX fires ONLY on our
+#     own "..."-included code.
+# ============================================================================
+if(MSVC)
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:/W4>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/WX>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/external:anglebrackets>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/external:W0>"
+        # C4996 deprecates STANDARD C functions (getenv/fopen/...) in favour of
+        # MSVC's non-portable *_s variants. This code is cross-platform-standard,
+        # so silence that one non-warning (CXX only -- CUDA TUs are untouched, so
+        # they never recompile for it) rather than un-portably rewriting it.
+        "$<$<COMPILE_LANGUAGE:CXX>:/D_CRT_SECURE_NO_WARNINGS>"
+    )
+endif()
+
 # Подключаем поддиректории
 add_subdirectory(src)
 add_subdirectory(tests)

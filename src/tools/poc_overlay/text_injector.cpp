@@ -29,7 +29,11 @@ void AppendKey(std::vector<INPUT>& events, WORD vk, bool keyUp, bool extended = 
 // because the commit shortcut (e.g. Ctrl+Enter) may still have Ctrl down, which
 // would turn Shift+Left into Ctrl+Shift+Left (select-word) or corrupt the paste.
 void AppendModifierRelease(std::vector<INPUT>& events) {
-    for (WORD vk : {VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT, VK_LMENU, VK_RMENU}) {
+    // Typed constant list: the VK_* macros are int, so a bare braced-init would
+    // deduce initializer_list<int> and narrow to WORD per element (C4244).
+    static constexpr WORD kModifiers[] = {
+        VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT, VK_LMENU, VK_RMENU};
+    for (WORD vk : kModifiers) {
         AppendKey(events, vk, /*keyUp=*/true);
     }
 }

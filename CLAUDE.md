@@ -117,6 +117,12 @@ reference dumps the integration suite compares against: skill `golden-dumps`.
 - `docs/TRANSLATION_AGENT.md` — the translation agent product design.
 - `docs/REACT_1STEP_ASSESSMENT.md` — strict 1-step ReAct assessment (dense checkpoints only).
 
+**Architectural Atlas** (`docs/README.md` + numbered guides) — the cross-cutting
+architecture the subsystem docs above assume: [`docs/README.md`](docs/README.md) (repo map),
+`01_architecture_and_threading.md` (COM boundary + single-thread doctrine),
+`02_hybrid_error_doctrine.md` (error tiers + `EngineStatus`→`HRESULT` table),
+`03_memory_and_kv_modes.md` (`memory_pool`, Continuous vs Paged KV, `DeviceBuffer<T>`).
+
 ## Technical Debt & Refactoring Roadmap
 
 Ordered register. **Do not imitate these patterns in new code** — new code follows the
@@ -134,8 +140,10 @@ target state; existing code migrates opportunistically when you touch it.
 | 8 | ~~`TLS_VERIFY OFF` on the DirectStorage NuGet fetch; nvcomp vendored as raw binaries~~ | All fetches TLS-verified (`cmake/DirectStorage.cmake`); vendored nvcomp deleted | **done** |
 | 9 | ~~Thread-ownership doctrine enforced only by comments~~ | Debug thread-ID asserts (`BLACKWELL_VERIFY_OWNING_THREAD`) on every `EngineCom` operational method — `#ifndef NDEBUG`, `std::abort()` on violation, zero Release-build cost (see doctrine section) | **done** (2026-07) |
 | 10 | Sanitizers absent | ASan config for MSVC on the CUDA-free agent stack first; UBSan/TSan via clang-cl or Linux CI lane for `agent*` targets | idea |
+| 11 | ~~No warning enforcement~~ | Zero-warning policy: first-party CXX compiles under `/W4 /WX` with `/external:W0` quarantining `<>`-header noise (CUDA/Win32/STL/deps); `_CRT_SECURE_NO_WARNINGS` for the C4996 CRT nag. CUDA (`.cu`) untouched. Skill `compiler-hygiene` documents the fix conventions | **done** (2026-07) |
 
 When a row lands: flip its Status, update the affected section above, and follow the
 `<evolution_protocol>` in the corresponding skill (`engine-extension` for #1/#2/#3/#9,
 `cmake-hygiene` for #1's SHARED-library build work, `golden-dumps` for dump-path
-concerns, `build-and-test` for build-workflow changes).
+concerns, `build-and-test` for build-workflow changes, `compiler-hygiene` for #11's
+zero-warning policy).
