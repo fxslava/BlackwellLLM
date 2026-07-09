@@ -69,8 +69,8 @@ Source: "{#StagingDir}\cudart64_*.dll";           DestDir: "{app}"; Flags: ignor
 Source: "{#StagingDir}\cublas64_*.dll";           DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\cublasLt64_*.dll";         DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\cudnn64_*.dll";            DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-; ---- WebView2 frontend assets -> {app}\ui -------------------------------------
-Source: "{#StagingDir}\ui\*";                     DestDir: "{app}\ui"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; ---- WebView2 settings UI -> {app}\web (SettingsWindow serves <exe dir>\web) ---
+Source: "{#StagingDir}\web\*";                    DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; ---- WebView2 Evergreen bootstrapper (deployed on-demand in [Run]) -------------
 Source: "{#StagingDir}\{#WebView2Setup}";         DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 
@@ -107,7 +107,10 @@ const
   MEDIA_TYPE_SCM    = 5;          { storage-class memory / NVDIMM -- treat as fast }
 
 var
-  AIDataPage: TInputDirWizardPage;   { custom "where do the LLM weights live" page }
+  { Two-field custom page -- field 0 = folder containing the LLM model weights,
+    field 1 = folder for the KV/prefix cache + NVMe spill file. (Do not start a
+    line with '[' even in a comment: ISCC reads it as a section tag.) }
+  ModelPathPage: TInputDirWizardPage;
 
 { ------------------------------------------------------------------------- }
 {  Low-level helpers                                                         }
@@ -277,24 +280,45 @@ begin
   if not Found then
     Exit;
 
-  { PhysicalDisk whose DeviceId matches the disk number -> its MediaType. }
+  { PhysicalDisk whose DeviceId matches the disk number. MediaType is the primary
+    signal (4=SSD, 3=HDD, 5=SCM); SpindleSpeed is the fallback -- a rotational
+    speed of 0 means solid-state, which recovers SSDs on drivers that report
+    MediaType as 0/Unspecified. }
   DiskSet := Services.ExecQuery(Format(
-    'SELECT MediaType FROM MSFT_PhysicalDisk WHERE DeviceId=''%d''', [DiskNumber]));
+    'SELECT MediaType, SpindleSpeed FROM MSFT_PhysicalDisk WHERE DeviceId=''%d''', [DiskNumber]));
   for J := 0 to DiskSet.Count - 1 do
   begin
     Disk := DiskSet.ItemIndex(J);
-    if not VarIsNull(Disk.MediaType) then
+    if not VarIsNull(Disk.MediaType) and
+       (Integer(Disk.MediaType) <> 0) then
     begin
-      Result := Integer(Disk.MediaType);
+      Result := Integer(Disk.MediaType);   { authoritative classification }
       Exit;
+    end;
+    { MediaType Unspecified -> lean on SpindleSpeed. 0 rpm == SSD; a positive,
+      known speed == HDD; 0xFFFFFFFF (unknown) leaves it indeterminate. }
+    if not VarIsNull(Disk.SpindleSpeed) then
+    begin
+      if Disk.SpindleSpeed = 0 then
+      begin
+        Result := MEDIA_TYPE_SSD;
+        Exit;
+      end
+      else if Disk.SpindleSpeed <> 4294967295 then
+      begin
+        Result := MEDIA_TYPE_HDD;
+        Exit;
+      end;
     end;
   end;
 end;
 
-{ Returns True if the user may proceed with the chosen AI-data location.
-  Only an explicitly-identified HDD triggers a warning; unknown/SSD/SCM pass
-  silently so we never nag on hardware we cannot classify. }
-function ConfirmAIStorageMedia(const Path: string): Boolean;
+{ SSD recommendation for one chosen folder. Returns True if the wizard may
+  advance. An explicitly-identified HDD triggers a strong SSD recommendation with
+  a chance to go back; SSD/SCM proceed silently; unclassifiable hardware proceeds
+  silently (we never nag on drives we cannot read). `What` names the folder in the
+  prompt (e.g. "The model-weights folder"). }
+function RecommendSsdFor(const What, Path: string): Boolean;
 var
   MediaType: Integer;
 begin
@@ -307,16 +331,20 @@ begin
     MediaType := -1;
   end;
 
-  if MediaType = MEDIA_TYPE_HDD then
+  if MediaType = MEDIA_TYPE_SSD then
+    Log(What + ': SSD/NVMe detected -- optimal.')
+  else if MediaType = MEDIA_TYPE_HDD then
   begin
     Result := (MsgBox(
-      'The selected AI-data drive appears to be a mechanical hard disk (HDD).' + #13#10 + #13#10 +
-      'Blackwell Overlay streams model weights and performs speculative KV-cache ' +
-      'updates from this location on every generation step. On an HDD the seek ' +
-      'penalty causes multi-second stalls and visible micro-stutter in the live ' +
-      'translation overlay.' + #13#10 + #13#10 +
-      'An SSD or NVMe drive is strongly recommended.' + #13#10 + #13#10 +
-      'Choose a different location? (Select "No" to force-proceed on this HDD.)',
+      What + ' is on a mechanical hard disk (HDD).' + #13#10 + #13#10 +
+      'Blackwell Overlay streams multi-gigabyte model weights and performs ' +
+      'speculative KV-cache updates from this location on every generation step. ' +
+      'On an HDD the seek penalty causes multi-second stalls and visible ' +
+      'micro-stutter in the live translation overlay.' + #13#10 + #13#10 +
+      'Placing the app''s model/cache data on an SSD or NVMe partition is ' +
+      'strongly recommended.' + #13#10 + #13#10 +
+      'Go back and choose a different folder? ' +
+      '(Select "No" to keep this HDD location anyway.)',
       mbConfirmation, MB_YESNO) = IDNO);
   end;
 end;
@@ -371,29 +399,38 @@ begin
   end;
 end;
 
-{ Inject the custom AI-data directory page immediately after the standard
-  "Select Destination Location" page (wpSelectDir). }
+{ Inject the custom model/cache directory page immediately after the standard
+  "Select Destination Location" page (wpSelectDir). Two independently-browsable
+  folders: where the user's LLM weights already live, and where caches are written. }
 procedure InitializeWizard;
 begin
-  AIDataPage := CreateInputDirPage(
+  ModelPathPage := CreateInputDirPage(
     wpSelectDir,
-    'Select AI Data Location',
-    'Where should Blackwell Overlay store model weights and KV-caches?',
-    'The engine keeps multi-gigabyte LLM weights and persistent KV-cache/prefix ' +
-    'files separate from the application. Choose a fast, roomy volume (SSD/NVMe ' +
-    'strongly recommended), then click Next.',
+    'Model Weights & Cache Location',
+    'Where are your LLM model weights, and where should caches be stored?',
+    'Point the first box at the folder that CONTAINS your LLM model weights -- the ' +
+    'engine loads them from here at runtime. The second box is where the KV/prefix ' +
+    'cache and the NVMe spill file are written. An SSD or NVMe volume is strongly ' +
+    'recommended for both; browse to a fast, roomy location, then click Next.',
     False, '');
-  AIDataPage.Add('');
-  AIDataPage.Values[0] := ExpandConstant('{localappdata}\Blackwell\AI_Data');
+  ModelPathPage.Add('Model weights folder (your downloaded LLM checkpoints)');
+  ModelPathPage.Add('Cache folder (KV / prefix cache + spill file)');
+  ModelPathPage.Values[0] := ExpandConstant('{localappdata}\Blackwell\AI_Data\models');
+  ModelPathPage.Values[1] := ExpandConstant('{localappdata}\Blackwell\AI_Data\cache');
 end;
 
-{ Intercept "Next" on the AI-data page to run the SSD/HDD latency audit. Returning
-  False keeps the user on the page so they can pick a faster volume. }
+{ Intercept "Next" on the model/cache page to run the SSD recommendation on BOTH
+  chosen folders. Returning False keeps the user on the page so they can pick a
+  faster volume. The model folder is checked first (it is the hot read path). }
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if (AIDataPage <> nil) and (CurPageID = AIDataPage.ID) then
-    Result := ConfirmAIStorageMedia(AIDataPage.Values[0]);
+  if (ModelPathPage <> nil) and (CurPageID = ModelPathPage.ID) then
+  begin
+    Result := RecommendSsdFor('The model-weights folder', ModelPathPage.Values[0]);
+    if Result then
+      Result := RecommendSsdFor('The cache folder', ModelPathPage.Values[1]);
+  end;
 end;
 
 { ------------------------------------------------------------------------- }
@@ -402,28 +439,32 @@ end;
 
 procedure WriteRuntimeConfig;
 var
-  ConfigPath, AIData, AIDataEsc: string;
+  ConfigPath, ModelDir, CacheDir, ModelEsc, CacheEsc: string;
   Json: TArrayOfString;
 begin
-  AIData := AIDataPage.Values[0];
+  ModelDir := ModelPathPage.Values[0];   { user-selected model weights folder }
+  CacheDir := ModelPathPage.Values[1];   { user-selected cache folder }
 
-  { Materialize the AI-data directory now so the engine never races to mkdir it. }
-  if not DirExists(AIData) then
-    ForceDirectories(AIData);
+  { Materialize both folders now so the engine never races to mkdir them. }
+  if not DirExists(ModelDir) then
+    ForceDirectories(ModelDir);
+  if not DirExists(CacheDir) then
+    ForceDirectories(CacheDir);
 
-  AIDataEsc := JsonEscapePath(AIData);
+  ModelEsc := JsonEscapePath(ModelDir);
+  CacheEsc := JsonEscapePath(CacheDir);
   ConfigPath := ExpandConstant('{app}\config.json');
 
   { Keys MUST match the schema ConfigStore::Load() parses
     (src/tools/poc_overlay/config.cpp): the app reads "modelPath" (camelCase)
     and "spillFilePath" -- NOT "model_path". A mismatched key is silently
     ignored (nlohmann value()-with-default), leaving the engine with no model
-    directory. spillFilePath points at the NVMe KV-spill file inside the chosen
-    AI-data volume. }
+    directory. modelPath is the user's weights folder; spillFilePath is the NVMe
+    KV-spill file inside their chosen cache folder. }
   SetArrayLength(Json, 4);
   Json[0] := '{';
-  Json[1] := '  "modelPath": "'     + AIDataEsc + '",';
-  Json[2] := '  "spillFilePath": "' + AIDataEsc + '\\spill.bkv"';
+  Json[1] := '  "modelPath": "'     + ModelEsc + '",';
+  Json[2] := '  "spillFilePath": "' + CacheEsc + '\\spill.bkv"';
   Json[3] := '}';
 
   if not SaveStringsToFile(ConfigPath, Json, False) then

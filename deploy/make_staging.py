@@ -46,11 +46,18 @@ CORE_DLL_NAME      = "blackwell_core.dll"          # carries the CUDA fatbinarie
 WEBVIEW2_BOOTSTRAP = "MicrosoftEdgeWebview2Setup.exe"
 
 # Frontend asset sources, tried in order. `src/ui/dist/` is the target layout;
-# `src/tools/poc_overlay/web/` is where the current WebView2 assets actually live.
+# `src/tools/poc_overlay/web/` is where the current WebView2 settings assets live.
 UI_SOURCE_CANDIDATES = (
     Path("src") / "ui" / "dist",
     Path("src") / "tools" / "poc_overlay" / "web",
 )
+
+# Destination folder name for the settings UI INSIDE the staging root. MUST be
+# "web": SettingsWindow::AssetsDir() serves the WebView2 from "<exe dir>\web"
+# (src/tools/poc_overlay/settings_dialog.cpp), and CMake's POST_BUILD deploys the
+# assets there next to the dev exe. Staging to any other name yields a blank
+# settings window on the installed build.
+WEB_UI_DEST_DIR = "web"
 
 # CUDA runtime DLLs the engine may pull in. cudart is mandatory; the rest are
 # staged opportunistically only if the engine was linked against them.
@@ -284,17 +291,21 @@ def stage_cuda_runtime(staging: Path) -> None:
 
 
 def stage_frontend_assets(root: Path, staging: Path, strict: bool) -> None:
-    """Task 3: copy the compiled WebView2 frontend into build_staging/ui/."""
-    log(INFO, "Staging WebView2 frontend assets...")
+    """Task 3: copy the WebView2 settings UI into build_staging/web/.
+
+    The destination folder MUST be `web` -- that is what the app looks for at
+    runtime (see WEB_UI_DEST_DIR); the installer packs it to {app}\\web.
+    """
+    log(INFO, "Staging WebView2 settings UI...")
     for candidate in UI_SOURCE_CANDIDATES:
         src = root / candidate
         if src.is_dir() and any(src.iterdir()):
-            dst = staging / "ui"
+            dst = staging / WEB_UI_DEST_DIR
             if dst.exists():
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
             n = sum(1 for _ in dst.rglob("*") if _.is_file())
-            log(OK, f"frontend: {candidate}  ->  ui/  ({n} files)")
+            log(OK, f"settings UI: {candidate}  ->  {WEB_UI_DEST_DIR}/  ({n} files)")
             return
 
     msg = (f"no frontend assets found (looked in: "
