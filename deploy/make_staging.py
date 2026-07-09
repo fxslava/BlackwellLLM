@@ -36,12 +36,12 @@ from pathlib import Path
 
 # -----------------------------------------------------------------------------
 #  Deployment manifest -- the single source of truth for artifact naming.
-#  These names are the *product* (shipping) identities. The current dev target is
-#  historically `poc_overlay`; we accept it as a fallback so the pipeline works
-#  before the target is renamed, without hardcoding the transitional name.
+#  These names are the *product* (shipping) identities. The CMake target is still
+#  `poc_overlay` but its OUTPUT_NAME is TypeTranslate, so the emitted binary is
+#  TypeTranslate.exe; FALLBACK_EXE_NAMES stays empty now that the rebrand landed.
 # -----------------------------------------------------------------------------
-PRIMARY_EXE_NAME   = "blackwell_overlay.exe"
-FALLBACK_EXE_NAMES = ("poc_overlay.exe",)          # transitional dev-target name
+PRIMARY_EXE_NAME   = "TypeTranslate.exe"           # shipping product name
+FALLBACK_EXE_NAMES = ()                             # rebranded; no legacy names
 CORE_DLL_NAME      = "blackwell_core.dll"          # carries the CUDA fatbinaries
 WEBVIEW2_BOOTSTRAP = "MicrosoftEdgeWebview2Setup.exe"
 

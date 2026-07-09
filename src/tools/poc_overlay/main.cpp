@@ -42,6 +42,7 @@
 #include "config.h"
 #include "hook_manager.h"
 #include "overlay_window.h"
+#include "resource.h"
 #include "settings_dialog.h"
 #include "smoke_test.h"
 #include "translation_service.h"
@@ -249,6 +250,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return smoke::RunSmokeTest();
     }
 
+    // Single-instance guard. TypeTranslate is a background tray app; a second
+    // launch must not spin up a duplicate engine (it would double-book VRAM and
+    // fight over the global WH_KEYBOARD_LL hook). A named mutex in the per-session
+    // ("Local\\") namespace is the canonical Win32 idiom; the handle is left owned
+    // for the process lifetime and released by the OS on exit.
+    const HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\TypeTranslateSingleInstance");
+    if (instanceMutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+        return 0;  // another TypeTranslate instance already owns the session
+    }
+
     // Without this, the process defaults to DPI-unaware and Windows silently
     // virtualizes/rescales screen coordinates for it -- inconsistently across
     // monitors with different scale factors. That breaks the whole pipeline:
@@ -268,7 +279,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     OverlayWindow overlay;
     if (!overlay.Create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the overlay window (Direct2D/DirectWrite init failed).",
-                    L"poc_overlay", MB_ICONERROR);
+                    L"TypeTranslate", MB_ICONERROR);
         return 1;
     }
 
@@ -410,15 +421,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = &ControllerWndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"BlackwellPocOverlayController";
+    wc.lpszClassName = L"TypeTranslateController";
+    // Brand icon for the taskbar / alt-tab / window-association surfaces. Loaded
+    // from the embedded resource (app.rc / IDI_APP_ICON); nullptr on failure just
+    // yields the Windows default, so this never blocks startup.
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
 
-    HWND controller = CreateWindowExW(0, wc.lpszClassName, L"poc_overlay controller", WS_OVERLAPPED,
+    HWND controller = CreateWindowExW(0, wc.lpszClassName, L"TypeTranslate", WS_OVERLAPPED,
                                        0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
 
     TrayIcon trayIcon(controller, kTrayIconId);
     SetWindowLongPtrW(controller, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&trayIcon));
-    trayIcon.Create(L"Blackwell PoC: Translation Mode (Alt+Shift+T)");
+    trayIcon.Create(L"TypeTranslate: Translation Mode (Alt+Shift+T)");
 
     // The hook callbacks run inline in the global hook chain on THIS thread and
     // must stay fast. They only hand work to the caret tracker's queue (an O(1)

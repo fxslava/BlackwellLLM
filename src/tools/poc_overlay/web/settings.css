@@ -1,4 +1,4 @@
-/* Blackwell Overlay — Settings UI (Official Light Theme)
+/* TypeTranslate — Settings UI (Official Light Theme)
    White / light-gray surfaces, dark text, clean 1px borders, soft focus rings.
    The host window auto-sizes to document.body.scrollHeight, so the body itself
    never scrolls: only the active tab panel contributes height. */
@@ -38,8 +38,29 @@ body {
 }
 
 /* ---- header ---- */
-.app-header { margin-bottom: 14px; }
-h1 { font-size: 19px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+/* Height-driven sizing keeps any logo aspect ratio (square badge OR wide
+   wordmark) crisp; width auto-fits and is capped so a wide logo never crowds
+   the title. object-fit guards against non-uniform scaling. */
+.app-logo {
+  height: 44px;
+  width: auto;
+  max-width: 220px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.app-titles { min-width: 0; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: .2px; }
 .subtitle { color: var(--muted); font-size: 12px; margin: 3px 0 0; }
 
 /* ---- tabs ---- */

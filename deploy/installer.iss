@@ -20,11 +20,15 @@
 ;  (run deploy\make_staging.py first to populate build_staging\)
 ; =============================================================================
 
-#define AppName        "Blackwell Overlay"
-#define AppExeName     "blackwell_overlay.exe"
+#define AppName        "TypeTranslate"
+#define AppExeName     "TypeTranslate.exe"
 #define AppVersion     "1.0.0"
-#define AppPublisher   "Blackwell"
+#define AppPublisher   "MyLittleCompany"
 #define StagingDir     "..\build_staging"
+; Branding icon for the Setup wizard/exe. Points at the SOURCE asset (always
+; present) rather than the staged copy, so the installer's own icon does not
+; depend on make_staging.py having run first.
+#define AppIcon        "..\src\tools\poc_overlay\web\Icon.ico"
 ; WebView2 Evergreen Runtime GUID (client key under EdgeUpdate\Clients).
 #define WebView2Guid   "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 ; WebView2 bootstrapper filename -- defined here (before [Files]/[Run] use it);
@@ -39,7 +43,9 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 UninstallDisplayIcon={app}\{#AppExeName}
-OutputBaseFilename=BlackwellOverlaySetup-{#AppVersion}
+; Branding: the Setup wizard + generated Setup.exe carry the TypeTranslate icon.
+SetupIconFile={#AppIcon}
+OutputBaseFilename=TypeTranslateSetup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

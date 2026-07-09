@@ -2,9 +2,21 @@
 
 #include <shellapi.h>
 
+#include "resource.h"
+
 namespace {
 constexpr UINT kSettingsMenuId = 1;
 constexpr UINT kExitMenuId = 2;
+
+// Load the embedded TypeTranslate application icon (app.rc / IDI_APP_ICON) at
+// the small-icon size the notification area expects. Falls back to a stock icon
+// if the resource is missing so the tray entry always appears.
+HICON LoadTrayIcon() {
+    HICON icon = static_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    return icon ? icon : LoadIconW(nullptr, IDI_INFORMATION);
+}
 }  // namespace
 
 TrayIcon::TrayIcon(HWND ownerWindow, UINT iconId) : owner_(ownerWindow), iconId_(iconId) {}
@@ -24,7 +36,7 @@ bool TrayIcon::Create(const wchar_t* tooltip) {
     nid.uID = iconId_;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    nid.hIcon = LoadTrayIcon();
     wcsncpy_s(nid.szTip, tooltip, _TRUNCATE);
 
     added_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
@@ -42,7 +54,7 @@ TrayCommand TrayIcon::HandleMessage(WPARAM /*wParam*/, LPARAM lParam) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kSettingsMenuId, L"Settings...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kExitMenuId, L"Exit PoC");
+    AppendMenuW(menu, MF_STRING, kExitMenuId, L"Exit");
 
     // Required so the popup menu closes correctly when the user clicks away
     // from it (standard tray-icon menu dance).

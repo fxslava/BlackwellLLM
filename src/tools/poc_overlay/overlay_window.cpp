@@ -99,7 +99,7 @@ bool OverlayWindow::Create(HINSTANCE hInstance) {
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = &OverlayWindow::WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"BlackwellPocOverlayWindow";
+    wc.lpszClassName = L"TypeTranslateOverlayWindow";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
 
@@ -648,7 +648,7 @@ bool OverlayWindow::EnsureDebugWindow() {
     }
     if (!debugHwnd_) {
         static bool registered = false;
-        const wchar_t* kDebugClass = L"BlackwellPocOverlayDebugWindow";
+        const wchar_t* kDebugClass = L"TypeTranslateOverlayDebugWindow";
         if (!registered) {
             WNDCLASSEXW wc{sizeof(wc)};
             wc.lpfnWndProc = &DefWindowProcW;  // pure output surface; never handles input

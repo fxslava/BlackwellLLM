@@ -1,0 +1,49 @@
+// TypeTranslate -- Win32 resource script.
+// Embeds the application icon into the executable (taskbar / alt-tab / Explorer)
+// and stamps the exe's version-info block with the TypeTranslate branding.
+#include <windows.h>
+#include "resource.h"
+
+// The application icon. Windows shows the lowest-id ICON resource as the .exe's
+// file icon in Explorer; the window classes and tray load it by IDI_APP_ICON.
+// Path is relative to this .rc file (src/tools/poc_overlay/).
+IDI_APP_ICON ICON "web\\Icon.ico"
+
+// ---------------------------------------------------------------------------
+// Version information -- surfaces in Explorer's file "Details" tab and the
+// "Publisher" fields Windows reads from the binary.
+// ---------------------------------------------------------------------------
+#ifndef DEBUG
+#define VER_DEBUG 0
+#else
+#define VER_DEBUG VS_FF_DEBUG
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      VER_DEBUG
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"   // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "MyLittleCompany"
+            VALUE "FileDescription",  "TypeTranslate -- live translation overlay"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "TypeTranslate"
+            VALUE "LegalCopyright",   "Copyright (C) MyLittleCompany"
+            VALUE "OriginalFilename", "TypeTranslate.exe"
+            VALUE "ProductName",      "TypeTranslate"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200   // U.S. English, Unicode codepage
+    END
+END

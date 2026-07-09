@@ -24,8 +24,14 @@ add_executable(poc_overlay WIN32
     translation_service.cpp
     live_translation_tracker.cpp
     smoke_test.cpp
+    app.rc                 # embeds Icon.ico (taskbar/Explorer) + version info
     ../playground/blackwell_llm_adapter.cpp
 )
+
+# Product identity: the executable ships as TypeTranslate.exe. The CMake target
+# and source directory keep the historical `poc_overlay` name; only the emitted
+# binary is rebranded, so build scripts that reference the target are unaffected.
+set_target_properties(poc_overlay PROPERTIES OUTPUT_NAME "TypeTranslate")
 
 target_compile_features(poc_overlay PRIVATE cxx_std_20)
 
