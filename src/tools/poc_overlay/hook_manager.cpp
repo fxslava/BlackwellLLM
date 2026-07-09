@@ -225,9 +225,12 @@ bool HookManager::HandleKeyEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& info) {
     }
 
     // Configurable commit/trigger shortcut. Checked first so its modifier combo
-    // isn't mistaken for a context-breaking chord.
+    // isn't mistaken for a context-breaking chord. Suppressed while Companion Mode
+    // owns text entry (inline substitution is bypassed) -- the chord then falls
+    // through to the app untouched.
     const Shortcut commit = commitShortcut_;
-    if (commit.vk != 0 && vk == commit.vk && ModifiersMatch(commit.modifiers)) {
+    if (inlineSubstitution_ && commit.vk != 0 && vk == commit.vk &&
+        ModifiersMatch(commit.modifiers)) {
         std::wstring snapshot = fallbackBuffer_;
         fallbackBuffer_.clear();
         if (callbacks_.onCommit) {

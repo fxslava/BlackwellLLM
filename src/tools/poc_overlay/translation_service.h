@@ -174,6 +174,18 @@ public:
     // Thread-safe; remembered across the tracker handoff and applied live.
     void SetDeveloperMode(bool enabled);
 
+    // The live LiveTranslationTracker, or nullptr until the async load has
+    // constructed it (State::Ready). Companion Mode (SpotlightComposer) binds to
+    // it and drives it directly while the caret pipeline is suspended: the
+    // engine control plane is single-threaded, so exactly one of {caret path,
+    // composer} may drive the tracker at a time -- ReapplyInputArchitecture
+    // enforces that mutual exclusion. The tracker's own TrackUpdate/
+    // TriggerGeneration/Cancel are O(1) fire-and-forget and callable from any
+    // thread, so a UI-thread caller is safe. The returned pointer is owned by
+    // this service and stays valid until Shutdown(); do not store it past a
+    // teardown. Thread-safe (guarded by mutex_).
+    LiveTranslationTracker* LiveTracker();
+
     // Join the worker (and, once constructed, the tracker's own thread).
     // Called explicitly from wWinMain BEFORE stack unwinding so the sink can
     // never fire into an already-destroyed CaretTracker (the tracker is

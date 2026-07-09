@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <commctrl.h>  // HOTKEYF_*
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -93,6 +94,18 @@ struct Config {
     bool diskSpillEnabled = true;  // NVMe spill tier on/off
     int diskSpillBlocks = 8192;    // spill file capacity, in blocks
     std::wstring spillFilePath;    // empty = ConfigStore::DefaultSpillPath()
+
+    // Companion Mode (Spotlight Composer). When enabled, the inline caret-tracking
+    // pipeline is put to sleep and inline substitution is bypassed; a global
+    // RegisterHotKey summons a centered composer instead (see
+    // ReapplyInputArchitecture in main.cpp). UNLIKE the shortcuts above -- which
+    // are soft-matched inside the WH_KEYBOARD_LL hook via HOTKEYF_* masks -- this
+    // shortcut is handed to the OS through RegisterHotKey, so it uses the Win32
+    // MOD_* encoding (MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4, MOD_WIN=8). The JSON
+    // keys are enable_spotlight / spotlight_modifiers / spotlight_vk.
+    bool enableSpotlight = false;
+    std::uint32_t spotlightModifiers = MOD_ALT;  // MOD_* bitmask (RegisterHotKey)
+    std::uint32_t spotlightVk = VK_SPACE;        // Alt+Space by default
 };
 
 namespace ConfigStore {

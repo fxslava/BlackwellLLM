@@ -103,6 +103,18 @@ public:
         fallbackBuffer_.clear();
     }
 
+    // Current Translation-Mode state (the master toggle). Read on the UI thread to
+    // decide whether the caret pipeline should wake when Companion Mode releases
+    // it (see ReapplyInputArchitecture).
+    bool IsEnabled() const { return enabled_; }
+
+    // Gate for the inline commit/substitution shortcut (Ctrl+Enter surgical
+    // replace). Companion Mode turns this OFF so the caret-driven inline-replace
+    // path is fully bypassed while the Spotlight composer owns text entry, and
+    // restores it when Companion Mode is switched off. Hook-owning (UI) thread
+    // only -- same thread the hook procs run on -- so no locking is required.
+    void SetInlineSubstitutionEnabled(bool enabled) { inlineSubstitution_ = enabled; }
+
     // Guards a text-injection window: while set (and, more robustly, for any event
     // carrying TextInjector::kInjectedSignature), the keyboard hook passes input
     // straight through without treating it as user typing. Set it around a
@@ -148,6 +160,7 @@ private:
     Shortcut cycleLanguageShortcut_;
     int languagePairCount_ = 0;  // bounds the Alt+<N> force-override hotkeys
     bool enabled_ = false;  // Translation Mode: OFF until the master toggle fires
+    bool inlineSubstitution_ = true;  // Ctrl+Enter inline replace; OFF in Companion Mode
     std::atomic<bool> injecting_{false};
 
     RECT interactiveRect_{};            // overlay chrome (screen coords); see SetInteractiveRect

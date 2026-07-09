@@ -106,6 +106,15 @@ Config ConfigStore::Load() {
         if (config.vramCacheBlocks < 0) config.vramCacheBlocks = 0;
         if (config.ramTierBlocks < 0) config.ramTierBlocks = 0;
         if (config.diskSpillBlocks < 0) config.diskSpillBlocks = 0;
+        // Companion Mode (Spotlight). Absent keys keep the defaults (Alt+Space,
+        // MOD_* encoding) so pre-feature config.json files migrate silently.
+        config.enableSpotlight = j.value("enable_spotlight", config.enableSpotlight);
+        config.spotlightModifiers = j.value("spotlight_modifiers", config.spotlightModifiers);
+        config.spotlightVk = j.value("spotlight_vk", config.spotlightVk);
+        if (config.spotlightVk == 0) {  // an unbound key would make RegisterHotKey fail
+            config.spotlightModifiers = MOD_ALT;
+            config.spotlightVk = VK_SPACE;
+        }
     } catch (const std::exception&) {
         // Malformed file -> fall back to whatever defaults survived.
     }
@@ -141,6 +150,9 @@ bool ConfigStore::Save(const Config& config) {
     j["diskSpillEnabled"] = config.diskSpillEnabled;
     j["diskSpillBlocks"] = config.diskSpillBlocks;
     j["spillFilePath"] = ToUtf8(config.spillFilePath);
+    j["enable_spotlight"] = config.enableSpotlight;
+    j["spotlight_modifiers"] = config.spotlightModifiers;
+    j["spotlight_vk"] = config.spotlightVk;
 
     std::ofstream out(DefaultPath());
     if (!out) {

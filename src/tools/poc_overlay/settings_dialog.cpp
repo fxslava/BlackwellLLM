@@ -270,6 +270,10 @@ void SettingsWindow::PushConfigToJs() {
     j["spillFilePath"] = ToUtf8(config_.spillFilePath.empty()
                                     ? ConfigStore::DefaultSpillPath()
                                     : config_.spillFilePath);
+    // Companion Mode (Spotlight). MOD_* modifier encoding (see config.h).
+    j["enable_spotlight"] = config_.enableSpotlight;
+    j["spotlight_modifiers"] = config_.spotlightModifiers;
+    j["spotlight_vk"] = config_.spotlightVk;
     if (webview_) {
         webview_->PostWebMessageAsJson(FromUtf8(j.dump()).c_str());
     }
@@ -292,6 +296,24 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
         }
         if (type == "precache") {
             OnPrecacheRequest(j.value("id", 0), FromUtf8(j.value("target", std::string())));
+            return;
+        }
+        // Companion Mode live-apply: the page posts this the instant the checkbox
+        // or the Spotlight shortcut changes (envelope: {type, payload:{...}}), so
+        // the input architecture reconfigures WITHOUT waiting for a full Save.
+        // Persist immediately too, then run the standard reconfigure path.
+        if (type == "UPDATE_CONFIG") {
+            if (j.contains("payload") && j["payload"].is_object()) {
+                const json& p = j["payload"];
+                config_.enableSpotlight = p.value("enable_spotlight", config_.enableSpotlight);
+                config_.spotlightModifiers =
+                    p.value("spotlight_modifiers", config_.spotlightModifiers);
+                config_.spotlightVk = p.value("spotlight_vk", config_.spotlightVk);
+                ConfigStore::Save(config_);       // durable across restarts
+                if (onApply_) {
+                    onApply_(config_);            // -> ApplyConfig -> ReapplyInputArchitecture
+                }
+            }
             return;
         }
         if (type != "save") {
@@ -355,6 +377,11 @@ void SettingsWindow::OnWebMessage(const std::wstring& messageJson) {
         if (config_.vramCacheBlocks < 0) config_.vramCacheBlocks = 0;
         if (config_.ramTierBlocks < 0) config_.ramTierBlocks = 0;
         if (config_.diskSpillBlocks < 0) config_.diskSpillBlocks = 0;
+        // Companion Mode also rides the full Save (the UPDATE_CONFIG live channel
+        // is an optimization, not the sole source of truth).
+        config_.enableSpotlight = j.value("enable_spotlight", config_.enableSpotlight);
+        config_.spotlightModifiers = j.value("spotlight_modifiers", config_.spotlightModifiers);
+        config_.spotlightVk = j.value("spotlight_vk", config_.spotlightVk);
 
         ConfigStore::Save(config_);  // persist to config.json
         if (onApply_) {

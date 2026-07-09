@@ -45,6 +45,7 @@
 #include "resource.h"
 #include "settings_dialog.h"
 #include "smoke_test.h"
+#include "spotlight_composer.h"
 #include "translation_service.h"
 #include "tray_icon.h"
 
@@ -55,6 +56,9 @@ constexpr UINT_PTR kReadyTimerId = 1;      // polls engine readiness after Mode 
 constexpr UINT_PTR kLifecycleTimerId = 2;  // coarse inactivity tick (spill/hibernate)
 constexpr UINT kLifecycleTickMs = 2'000;   // timeouts have second granularity now; the
                                            // tick is two atomic reads -- 2s is cheap
+// Global OS hotkey id for Companion Mode (RegisterHotKey on the controller
+// window). A single app-unique id; WM_HOTKEY.wParam carries it back.
+constexpr int kSpotlightHotkeyId = 101;
 
 // The live, in-memory application config. Loaded at startup and rewritten by the
 // settings window; only ever touched on the UI thread.
@@ -77,6 +81,12 @@ CaretTracker* g_caretTracker = nullptr;
 TranslationService* g_translator = nullptr;
 // The overlay, for hot-reloading the header/dropdown labels on a Settings save.
 OverlayWindow* g_overlay = nullptr;
+// Companion Mode: the centered composer, summoned by the global hotkey, and the
+// invisible controller window that owns that RegisterHotKey / receives WM_HOTKEY.
+// Both are borrowed pointers to wWinMain-owned objects; only touched on the UI
+// thread. Null until wWinMain wires them.
+SpotlightComposer* g_spotlightComposer = nullptr;
+HWND g_messageWindow = nullptr;
 
 // Map the configured language pairs onto the CaretTracker's OS-aware routing
 // indices. The source language is auto-detected by the model, so we key off each
@@ -107,6 +117,67 @@ CaretTracker::LanguageRouting DeriveLanguageRouting(const std::vector<LanguagePa
     routing.typingCyrillic = (toEnglish >= 0) ? toEnglish : fallback;    // typing RU -> EN
     routing.selectionReading = (toRussian >= 0) ? toRussian : fallback;  // read foreign -> RU
     return routing;
+}
+
+// Choreographs the mutual exclusion between the inline caret-tracking pipeline
+// and Companion Mode -- the two cannot run at once because they drive the same
+// single-threaded LiveTranslationTracker. Authoritative and idempotent: called
+// from ApplyConfig on every config change (Save or the live UPDATE_CONFIG), and
+// once at startup after the consumers exist. UI thread only (RegisterHotKey and
+// the window/hook toggles below all belong to the message-window thread).
+//
+// Enabled  : caret STA thread sleeps (SetActive false), inline substitution off,
+//            the global Alt+Space-style hotkey registered on the controller
+//            window, and the composer bound to the live engine tracker.
+// Disabled : hotkey dropped, composer dismissed, caret woken to match the master
+//            Translation-Mode toggle, inline substitution restored.
+void ReapplyInputArchitecture() {
+    if (!g_messageWindow) {
+        return;  // controller window not created yet (startup ordering guard)
+    }
+
+    if (g_config.enableSpotlight) {
+        // (a) Put the caret-tracking STA thread to sleep -- it stops re-reading
+        // UIA (IUIAutomationTextPattern) on every keystroke.
+        if (g_caretTracker) {
+            g_caretTracker->SetActive(false);
+        }
+        // (b) Bypass the inline substitution trigger (Ctrl+Enter surgical replace).
+        HookManager::Instance().SetInlineSubstitutionEnabled(false);
+        // (c) (Re-)register the global OS hotkey. Drop any stale binding first so a
+        // just-changed shortcut takes effect; MOD_NOREPEAT so holding the chord
+        // fires exactly once. On failure (chord owned by another app / invalid vk)
+        // flash the reason rather than failing silently.
+        UnregisterHotKey(g_messageWindow, kSpotlightHotkeyId);
+        const UINT mods = g_config.spotlightModifiers | MOD_NOREPEAT;
+        if (!RegisterHotKey(g_messageWindow, kSpotlightHotkeyId, mods, g_config.spotlightVk)) {
+            if (g_caretTracker) {
+                g_caretTracker->ShowHud(
+                    L"Spotlight shortcut unavailable (already in use by another app)",
+                    /*fade=*/true);
+            }
+        }
+        // Bind the composer to the live engine tracker if the model has finished
+        // loading (nullptr-safe; this runs again from the readiness poll on Ready).
+        if (g_spotlightComposer && g_translator) {
+            g_spotlightComposer->BindTracker(g_translator->LiveTracker());
+        }
+    } else {
+        // (a) Drop the global hotkey (no-op if it was never registered).
+        UnregisterHotKey(g_messageWindow, kSpotlightHotkeyId);
+        // (b) Make sure the composer is down -- no injection on this transition.
+        if (g_spotlightComposer) {
+            g_spotlightComposer->Dismiss(/*should_inject=*/false);
+        }
+        // (c) Wake the caret pipeline to MATCH the master toggle: re-enabling it
+        // unconditionally would force Translation Mode on even if the user has the
+        // assistant switched off. HookManager::IsEnabled() is that gate.
+        if (g_caretTracker) {
+            g_caretTracker->SetActive(HookManager::Instance().IsEnabled());
+        }
+        // (d) Restore standard inline substitution behavior.
+        HookManager::Instance().SetInlineSubstitutionEnabled(true);
+    }
 }
 
 // Pushes a config into the running app: rebinds hotkeys, capture settings AND
@@ -156,6 +227,11 @@ void ApplyConfig(const Config& config) {
         // live tracker -- the engine serves the new set with no restart.
         g_translator->UpdateLanguagePairs(std::move(targets), g_sessionActive);
     }
+
+    // Apply the Companion-Mode / inline mutual exclusion last, so it observes the
+    // freshly-applied hook + tracker state. A no-op before the controller window
+    // exists (startup); wWinMain calls it once more after wiring everything.
+    ReapplyInputArchitecture();
 }
 
 LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -201,6 +277,10 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                         KillTimer(hwnd, kReadyTimerId);
                         g_caretTracker->SetActive(true);
                         g_caretTracker->ShowHud(L"Translation Mode: ACTIVE", /*fade=*/true);
+                        // The engine tracker exists now: (re)apply the input
+                        // architecture so Companion Mode binds it and, if enabled,
+                        // re-sleeps the caret we just activated above.
+                        ReapplyInputArchitecture();
                         break;
                     case TranslationService::State::Error:
                         KillTimer(hwnd, kReadyTimerId);
@@ -230,6 +310,15 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (wParam == kLifecycleTimerId && g_translator) {
                 g_translator->LifecycleTick(g_config.kvSpillTimeoutSec,
                                             g_config.hibernateTimeoutSec);
+            }
+            return 0;
+        case WM_HOTKEY:
+            // The global Companion-Mode hotkey fired (RegisterHotKey routes it
+            // here). Summon the centered composer: it caches the current
+            // foreground window, positions on the active monitor, and grabs
+            // keyboard focus via the AttachThreadInput handshake.
+            if (wParam == kSpotlightHotkeyId && g_spotlightComposer) {
+                g_spotlightComposer->Summon();
             }
             return 0;
         case WM_DESTROY:
@@ -357,6 +446,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                               g_config.idleTimerMs, DeriveLanguageRouting(g_sessionPairs));
     g_caretTracker = &caretTracker;
 
+    // Companion Mode composer. Window + Direct2D only here; the engine tracker is
+    // late-bound once TranslationService finishes loading (ReapplyInputArchitecture
+    // / the readiness poll). Declared AFTER translator + caretTracker so it is
+    // destroyed BEFORE them -- its dtor cancels in-flight tracker work, so the
+    // tracker it borrows must still be alive at that point.
+    SpotlightComposer composer;
+    if (!composer.Create(hInstance)) {
+        MessageBoxW(nullptr,
+                    L"Failed to create the Spotlight composer window (Direct2D/DirectWrite init failed).",
+                    L"TypeTranslate", MB_ICONERROR);
+        return 1;
+    }
+    g_spotlightComposer = &composer;
+
     // The overlay's header/dropdown chrome: give it the pair labels to display,
     // a sink to apply a manual override (dropdown or the Auto row), and a sink to
     // publish its clickable region so the global mouse hook lets those clicks
@@ -431,6 +534,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     HWND controller = CreateWindowExW(0, wc.lpszClassName, L"TypeTranslate", WS_OVERLAPPED,
                                        0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
+    // The controller is the app's message-pump window: it owns the Companion-Mode
+    // RegisterHotKey and receives WM_HOTKEY (see ControllerWndProc).
+    g_messageWindow = controller;
 
     TrayIcon trayIcon(controller, kTrayIconId);
     SetWindowLongPtrW(controller, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&trayIcon));
@@ -529,6 +635,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // engine is Ready; see LifecycleTick).
     SetTimer(controller, kLifecycleTimerId, kLifecycleTickMs, nullptr);
 
+    // Now that the controller window, composer, hook and caret tracker all exist,
+    // apply the Companion-Mode / inline mutual exclusion for the loaded config
+    // (the early ApplyConfig above ran before g_messageWindow existed, so its own
+    // ReapplyInputArchitecture was a deliberate no-op). If Companion Mode was left
+    // enabled in config.json, this registers the global hotkey and sleeps the
+    // caret pipeline right away.
+    ReapplyInputArchitecture();
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
@@ -536,6 +650,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
 
     HookManager::Instance().Uninstall();
+
+    // Companion Mode teardown: drop the global hotkey, hide the composer, and
+    // unbind it from the tracker BEFORE the service is shut down below (so no
+    // dangling tracker pointer survives into the composer's own destructor).
+    UnregisterHotKey(controller, kSpotlightHotkeyId);
+    if (g_spotlightComposer) {
+        g_spotlightComposer->Dismiss(/*should_inject=*/false);
+        g_spotlightComposer->BindTracker(nullptr);
+    }
+    g_spotlightComposer = nullptr;
+    g_messageWindow = nullptr;
     g_caretTracker = nullptr;
     g_translator = nullptr;
     g_overlay = nullptr;

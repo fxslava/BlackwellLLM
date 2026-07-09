@@ -5,7 +5,11 @@
    window.chrome.webview (postMessage / 'message' event). Every handler is
    wrapped so a single bad message can never blank the UI. */
 
-const HK = { SHIFT: 1, CONTROL: 2, ALT: 4 };
+const HK = { SHIFT: 1, CONTROL: 2, ALT: 4 };   // HOTKEYF_* (soft-matched in the LL hook)
+/* Win32 RegisterHotKey MOD_* encoding -- used ONLY by the Spotlight shortcut,
+   which the C++ side hands to the OS via RegisterHotKey (not the keyboard hook).
+   Note it differs from HK above: here Alt=1 (MOD_ALT), there Shift=1. */
+const MOD = { ALT: 1, CONTROL: 2, SHIFT: 4, WIN: 8 };
 const MOD_VK = [16, 17, 18, 91, 92]; // Shift / Ctrl / Alt / Win (left+right)
 const CLEAR_VK = [8, 46];            // Backspace / Delete clear a hotkey field
 const MAX_HOTKEY_PAIRS = 9;          // Alt+1 .. Alt+9
@@ -51,6 +55,8 @@ const state = {
   activation: { modifiers: 0, vk: 0 },
   commit:     { modifiers: 0, vk: 0 },
   cycle:      { modifiers: 0, vk: 0 },
+  spotlight:  { modifiers: MOD.ALT, vk: 32 }, // Companion Mode hotkey (MOD_* encoding)
+  enableSpotlight: false,
   pairs:      [],      // [{ label, target, source }] (source is UI-only)
   activeLanguage: 0,
   savedTargets: [],    // targets the C++ side currently serves (pre-cache gate)
@@ -103,6 +109,60 @@ function bindHotkey(id) {
     if (MOD_VK.includes(e.keyCode)) return; // wait for a real (non-modifier) key
     state[id] = { modifiers: modsFromEvent(e), vk: e.keyCode };
     el.value = hotkeyLabel(state[id]);
+  });
+}
+
+/* Spotlight shortcut: MOD_* encoding + a live UPDATE_CONFIG on every change (the
+   caret pipeline reconfigures the instant the user rebinds it, no Save needed). */
+function modsFromEventMOD(e) {
+  return (e.altKey ? MOD.ALT : 0)
+       | (e.ctrlKey ? MOD.CONTROL : 0)
+       | (e.shiftKey ? MOD.SHIFT : 0)
+       | ((e.metaKey || e.getModifierState('OS')) ? MOD.WIN : 0);
+}
+
+function hotkeyLabelMOD(sc) {
+  if (!sc || !sc.vk) return '';
+  const parts = [];
+  if (sc.modifiers & MOD.CONTROL) parts.push('Ctrl');
+  if (sc.modifiers & MOD.SHIFT)   parts.push('Shift');
+  if (sc.modifiers & MOD.ALT)     parts.push('Alt');
+  if (sc.modifiers & MOD.WIN)     parts.push('Win');
+  parts.push(vkName(sc.vk));
+  return parts.join(' + ');
+}
+
+/* Push the Companion Mode state to the host the moment it changes, using the
+   documented envelope { type:'UPDATE_CONFIG', payload:{ enable_spotlight,
+   spotlight_modifiers, spotlight_vk } }. Full Save also carries these fields. */
+function pushSpotlightUpdate() {
+  try {
+    if (bridge) bridge.postMessage({
+      type: 'UPDATE_CONFIG',
+      payload: {
+        enable_spotlight: !!state.enableSpotlight,
+        spotlight_modifiers: state.spotlight.modifiers | 0,
+        spotlight_vk: state.spotlight.vk | 0
+      }
+    });
+  } catch (err) { console.error('settings: failed to post UPDATE_CONFIG', err); }
+}
+
+function bindSpotlightHotkey() {
+  const el = $('spotlightShortcut');
+  el.addEventListener('keydown', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (CLEAR_VK.includes(e.keyCode)) {     // Backspace / Delete unbinds
+      state.spotlight = { modifiers: 0, vk: 0 };
+      el.value = '';
+      pushSpotlightUpdate();
+      return;
+    }
+    if (MOD_VK.includes(e.keyCode)) return; // wait for a real (non-modifier) key
+    state.spotlight = { modifiers: modsFromEventMOD(e), vk: e.keyCode };
+    el.value = hotkeyLabelMOD(state.spotlight);
+    pushSpotlightUpdate();
   });
 }
 
@@ -295,6 +355,14 @@ function applyConfig(cfg) {
   $('commit').value     = hotkeyLabel(state.commit);
   $('cycle').value      = hotkeyLabel(state.cycle);
 
+  // Companion Mode (Spotlight). MOD_* encoding; default Alt+Space if unset.
+  state.enableSpotlight = cfg.enable_spotlight === true;
+  state.spotlight = (cfg.spotlight_vk)
+    ? { modifiers: cfg.spotlight_modifiers | 0, vk: cfg.spotlight_vk | 0 }
+    : { modifiers: MOD.ALT, vk: 32 };
+  $('enableSpotlight').checked = state.enableSpotlight;
+  $('spotlightShortcut').value = hotkeyLabelMOD(state.spotlight);
+
   state.pairs = (Array.isArray(cfg.languagePairs) ? cfg.languagePairs : [])
     .map(function (p) {
       return { label: p.label || '', target: p.target || '',
@@ -356,7 +424,10 @@ function buildPayload() {
     vramCacheBlocks: parseInt($('vramCacheBlocks').value, 10) || 0,
     ramTierBlocks: parseInt($('ramTierBlocks').value, 10) || 0,
     diskSpillEnabled: $('diskSpillEnabled').checked,
-    diskSpillBlocks: parseInt($('diskSpillBlocks').value, 10) || 0
+    diskSpillBlocks: parseInt($('diskSpillBlocks').value, 10) || 0,
+    enable_spotlight: !!state.enableSpotlight,
+    spotlight_modifiers: state.spotlight.modifiers | 0,
+    spotlight_vk: state.spotlight.vk | 0
   };
 }
 
@@ -427,4 +498,12 @@ $('save').addEventListener('click', function () {
 bindHotkey('activation');
 bindHotkey('commit');
 bindHotkey('cycle');
+bindSpotlightHotkey();
+
+// Companion Mode toggle: live-apply the instant it flips (no Save required).
+$('enableSpotlight').addEventListener('change', function () {
+  state.enableSpotlight = $('enableSpotlight').checked;
+  pushSpotlightUpdate();
+});
+
 window.addEventListener('load', reportSize);

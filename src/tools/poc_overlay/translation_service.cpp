@@ -323,6 +323,11 @@ void TranslationService::Cancel() {
     if (tracker_) tracker_->Cancel();
 }
 
+LiveTranslationTracker* TranslationService::LiveTracker() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tracker_.get();  // nullptr until ThreadMain publishes it (State::Ready)
+}
+
 void TranslationService::ThreadMain() {
     LoadEngine();
     if (state_.load(std::memory_order_relaxed) != State::Ready) {

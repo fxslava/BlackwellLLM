@@ -20,6 +20,7 @@ add_executable(poc_overlay WIN32
     tray_icon.cpp
     settings_dialog.cpp
     text_injector.cpp
+    spotlight_composer.cpp    # Companion Mode: centered Tier-4 clipboard-inject composer
     config.cpp
     translation_service.cpp
     live_translation_tracker.cpp
