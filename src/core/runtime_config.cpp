@@ -103,6 +103,14 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
     if (rt.paged_branch_factor < 1)
         throw std::invalid_argument("RuntimeConfig: paged_branch_factor must be >= 1");
 
+    // Linear-projection GEMV<->batched-GEMM crossover (override wins over the
+    // tier-2 request default). A threshold of 1 means "always batch when
+    // num_tokens > 1"; larger values keep small deltas on the low-latency GEMV.
+    rt.batched_gemm_threshold =
+        overrides.batched_gemm_threshold.value_or(request.batched_gemm_threshold);
+    if (rt.batched_gemm_threshold < 1)
+        throw std::invalid_argument("RuntimeConfig: batched_gemm_threshold must be >= 1");
+
     // --- attention dispatch / head_dim validation -----------------------------
     // Qwen3.5 hybrid gated attention (head_dim 256) uses a dedicated naive path,
     // so the paged-flash 128-cap does not apply to it. For every other model the

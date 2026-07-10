@@ -9,7 +9,13 @@
 // so that callers remain oblivious to the quantization scheme in use.
 class LinearDispatcher {
 public:
-    LinearDispatcher(const VRAMArena& arena, const ModelConfig& config);
+    // batched_gemm_threshold: the num_tokens crossover at/above which forward()
+    // launches the Tensor-Core batched GEMM instead of sweeping the per-row GEMV
+    // (RuntimeConfig::batched_gemm_threshold; validated >= 1 upstream). The engine
+    // passes the resolved plan value; the default keeps stand-alone construction
+    // (tests/tools) on the batch-16 crossover.
+    LinearDispatcher(const VRAMArena& arena, const ModelConfig& config,
+                     int batched_gemm_threshold = 16);
     ~LinearDispatcher();
 
     LinearDispatcher(const LinearDispatcher&) = delete;
@@ -41,8 +47,6 @@ public:
 
 private:
     // One projection over a single activation row (the exact batch=1 kernels).
-    // forward() calls this once for num_tokens == 1 and, for quantized strategies,
-    // once per row when batched.
     void forward_row(const std::string& base_name,
                      const float* d_in,
                      float* d_out,
@@ -50,8 +54,22 @@ private:
                      size_t in_features,
                      float* d_residual_accum);
 
+    // The low-latency path: forward_row over each of num_tokens rows. Used below
+    // the batched-GEMM crossover and for strategies without a batched kernel.
+    void sweep_rows(const std::string& base_name,
+                    const float* d_in,
+                    float* d_out,
+                    size_t out_features,
+                    size_t in_features,
+                    float* d_residual_accum,
+                    size_t num_tokens);
+
     const VRAMArena& m_arena;
     const ModelConfig& m_config;
+
+    // num_tokens crossover: below it forward() loops the batch=1 GEMV, at/above it
+    // launches the batched GEMM (see forward()).
+    int m_batched_gemm_threshold;
 
     // Per-token scale buffer [scale, inv_scale]; owned and allocated only for ROWWISE_FP8.
     float* d_token_scale = nullptr;

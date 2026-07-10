@@ -155,3 +155,36 @@ TEST(RuntimeConfig, NumGpuLayersOverrideApplied) {
     const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req, ov);
     EXPECT_EQ(rt.num_gpu_layers, 8u);
 }
+
+// GEMV<->batched-GEMM crossover: default, tier-2 request value, override
+// precedence, and the >= 1 guard.
+TEST(RuntimeConfig, BatchedGemmThresholdResolution) {
+    const auto m = dense_model();
+    const auto caps = derive_capabilities(m);
+
+    // Default (nothing set) is 16.
+    EXPECT_EQ(build_and_validate_runtime(m, caps, InferenceConfig{}).batched_gemm_threshold, 16);
+
+    // Tier-2 request value flows through when no override is present.
+    InferenceConfig req;
+    req.batched_gemm_threshold = 8;
+    EXPECT_EQ(build_and_validate_runtime(m, caps, req).batched_gemm_threshold, 8);
+
+    // Override wins over the request.
+    RuntimeOverrides ov;
+    ov.batched_gemm_threshold = 32;
+    EXPECT_EQ(build_and_validate_runtime(m, caps, req, ov).batched_gemm_threshold, 32);
+
+    // A threshold of 1 is legal ("always batch when num_tokens > 1").
+    RuntimeOverrides ov1;
+    ov1.batched_gemm_threshold = 1;
+    EXPECT_EQ(build_and_validate_runtime(m, caps, InferenceConfig{}, ov1).batched_gemm_threshold, 1);
+}
+
+TEST(RuntimeConfig, BatchedGemmThresholdBelowOneRejected) {
+    const auto m = dense_model();
+    RuntimeOverrides ov;
+    ov.batched_gemm_threshold = 0;
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), InferenceConfig{}, ov),
+                 std::invalid_argument);
+}

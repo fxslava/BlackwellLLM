@@ -49,6 +49,14 @@ struct InferenceConfig {
     // linear-attention (SSM) state cannot be snapshot (hybrid Qwen3.5).
     bool require_branching = false;
 
+    // Crossover width at which a batched linear projection switches from the
+    // per-row GEMV sweep to the Tensor-Core batched GEMM. The GEMM wins on
+    // throughput for wide prefill chunks but carries higher fixed launch/setup
+    // latency (shared memory, wmma pipelining), so a small delta (e.g. 2-10
+    // tokens of live typing) is faster looping the GEMV. num_tokens < threshold
+    // uses the GEMV sweep; >= threshold uses the batched GEMM. Must be >= 1.
+    int batched_gemm_threshold = 16;
+
     // Default sampling knobs. Per-call forward() arguments still override these.
     float temperature = 0.6f;
     float top_p       = 0.9f;
@@ -78,6 +86,13 @@ struct RuntimeConfig {
     // correctly waived for these models).
     bool uses_dedicated_full_attention = false;
 
+    // --- linear-projection dispatch ---
+    // GEMV-sweep vs batched-GEMM crossover width (== InferenceConfig::
+    // batched_gemm_threshold, validated >= 1). The LinearDispatcher consults this
+    // to pick the lowest-latency path per projection: num_tokens below it loops
+    // the fast batch=1 GEMV, at/above it launches the Tensor-Core batched GEMM.
+    int batched_gemm_threshold = 16;
+
     // --- tiered KV prefix-cache substrate (Paged mode only; docs/TIERED_KV_AND_AOT.md §5.1) ---
     // One page = paging::PAGE_SIZE (16) tokens of KV across all layers.
     //
@@ -106,6 +121,7 @@ struct RuntimeOverrides {
     std::optional<BlackwellEngine::KVCacheMode> kv_mode;
     std::optional<size_t> num_gpu_layers;     // kAllLayersResident forces all-resident
     std::optional<int>    paged_branch_factor;
+    std::optional<int>    batched_gemm_threshold;  // GEMV<->batched-GEMM crossover (>= 1)
 
     // Tiered KV prefix-cache sizing (see the RuntimeConfig fields for semantics).
     std::optional<int>         kv_vram_cache_pages;

@@ -387,6 +387,12 @@ void TranslationService::LoadEngine() {
         };
         overrides.kv_vram_cache_pages = settings_.vramCacheBlocks;
         overrides.kv_ram_slots = settings_.ramTierBlocks;
+        // Live typing reconciles tiny deltas (a few tokens) each keystroke, so
+        // keep small chunks on the low-latency per-row GEMV sweep and only pay
+        // the batched-GEMM launch cost once a prefill chunk is wide enough. 16 is
+        // the default; pinned explicitly here so the overlay's latency contract is
+        // visible at the call site.
+        overrides.batched_gemm_threshold = 16;
         overrides.kv_disk_slots =
             settings_.diskSpillEnabled ? settings_.diskSpillBlocks : 0;
         if (settings_.diskSpillEnabled) {

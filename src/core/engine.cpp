@@ -102,7 +102,7 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
       loader(index_path),
       arena(index_path, loader, m_config, m_runtime.max_seq_len, m_runtime.num_gpu_layers,
             overrides.load_progress, m_token_capacity),
-      dispatcher(arena, m_config)
+      dispatcher(arena, m_config, m_runtime.batched_gemm_threshold)
 {
     // 1. Bind core activation buffers from the arena
     d_X_accum = arena.get_activation_buffer_A();
