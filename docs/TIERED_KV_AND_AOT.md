@@ -126,14 +126,26 @@ through the radix tree exactly like overlapping commits.
    remains open.
 2. **Production `IPrefillDriver`** — ✅ landed:
    `EnginePrefillCoordinator` (`src/engine_prefill_coordinator.h`) implements
-   the acquire → budget → bind → compute → commit prompt state machine over
-   the per-token decode sweep (lm_head GEMV skipped for non-final prompt
-   tokens), and serves `AOTCacheWarmer` via the `IPrefillDriver` facet
-   (tokenizer injected with `set_tokenizer()`). Still open: the
-   `blackwell_warmup` CLI target (`warmup.exe spec.json out_dir/`) and the
-   batched Tensor-Core prefill kernels behind
-   `prepare_prefill_step`/`attention_prefill` (the coordinator's `run_delta`
-   is the single swap point).
+   the acquire → budget → bind → compute → commit prompt state machine, and
+   serves `AOTCacheWarmer` via the `IPrefillDriver` facet (tokenizer injected
+   with `set_tokenizer()`). Still open: the `blackwell_warmup` CLI target
+   (`warmup.exe spec.json out_dir/`).
+
+   **Batched Tensor-Core prefill — ✅ landed.** The batched kernels behind
+   `PagedKVManager::prepare_prefill_step` / `attention_prefill` are now fully
+   implemented (batched RoPE, batched paged KV-append, chunked paged-flash
+   attention with an arbitrary `q_start_base`), and the COMPUTE phase runs
+   through `BlackwellEngine::Impl::run_chunk` — the whole delta is prefilled in
+   Tensor-Core chunks (up to the engine's token capacity), not swept
+   token-by-token. `run_delta` tiles the delta through `run_chunk` and falls
+   back to the old per-token `run_token` sweep only for a degenerate token
+   capacity of 1. The linear projections dispatch on
+   `RuntimeConfig::batched_gemm_threshold` (default 16): small chunks (live
+   typing) loop the low-latency batch=1 GEMV, wide chunks launch the batched
+   GEMM (BF16, AWQ int4, and FP8 E4M3 all have Tensor-Core batched kernels;
+   symmetric-int4 still sweeps). A batched prompt lands on the same logits as
+   the old per-token sweep — pinned by
+   `PagedEngineIntegration.BatchedPrefillMatchesSingleTokenLoop`.
 3. **GPU round-trip test** — standalone: build a branch, force it down to
    the spill file, fault it back, byte-compare via `read_page`; then the
    parity gate: logits after a disk-faulted prefix hit must equal a cold

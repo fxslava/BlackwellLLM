@@ -123,6 +123,30 @@ migration to `DeviceBuffer<T>` (section 2, `~Impl()` is `= default`), the Roadma
 Hybrid error doctrine for the engine core (section 3: INIT throws `cuda_error`, RUNTIME
 returns `EngineStatus`, both mapped at the DLL edge), and the Roadmap #9 thread-ownership
 asserts (section 1: `BLACKWELL_VERIFY_OWNING_THREAD()` on every `EngineCom` method).
+
+**True Batch Mode + Batched Prefill — ✅ landed (2026-07).** The engine now has a
+batched forward path (`Impl::run_chunk`) beside the single-token `run_token`:
+prompt prefill processes the uncached delta in Tensor-Core chunks (up to
+`Impl::m_token_capacity`) rather than sweeping token-by-token, and
+`EnginePrefillCoordinator::run_delta` tiles the delta through `run_chunk`
+(falling back to `run_token` only at token capacity 1). Load-bearing pieces:
+`VRAMArena` activation buffers + every `Impl` per-step scratch buffer size by a
+plan-derived token capacity (batch=1 decode is capacity 1 → byte-identical to
+before); `PagedKVManager::prepare_prefill_step`/`attention_prefill` are
+implemented over batched RoPE, batched paged KV-append, and a chunked
+paged-flash prefill kernel. **Dual-path dispatch:** `LinearDispatcher::forward`
+gained a `num_tokens` param and routes on `RuntimeConfig::batched_gemm_threshold`
+(tier-2 `InferenceConfig` knob, default 16, override-able) — below it the
+low-latency per-row GEMV sweep, at/above it the batched Tensor-Core GEMM. All
+three weight formats have batched GEMM kernels now (`batched_bf16_gemm`,
+`launch_batched_awq_gemm`, `launch_batched_fp8_gemm`, all TF32-accumulate);
+only `COMPRESSED_TENSORS_INT4` still sweeps. The batch=1 GEMV kernels are
+UNCHANGED. When extending: gate batching by capability (`requires_ssm_subsystem`
+rejects `max_batch_size > 1` and never batches — recurrent state has no rewind,
+section 5), keep new batched kernels numerically equal to the GEMV run per row
+(the `*MatchesSingleTokenLoop` / `BatchedAgreesWithGemvRowByRow` parity tests),
+and add a batched INT4 kernel when that path next needs the throughput.
+
 **Remaining debt this skill tracks:**
 - **Error-handling migration is COMPLETE for all production code (Roadmap #2 done,
   2026-07):** `memory_pool`, `paging/`, `ssm/` all converted `CUDA_CHECK` →

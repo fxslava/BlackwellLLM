@@ -128,6 +128,22 @@ Re-decoding at a `pos` you've already written silently overwrites that slot —
 this is how KV-cache reuse across turns works (see `reset_state` below for
 the one case where it *isn't* safe).
 
+**Prefill is no longer strictly token-by-token.** The `forward()`-per-token loop
+above is the simple, always-available path. On the Paged-mode prefix-cache path
+(dense full-attention models; `has_prefix_cache()`), `prefill_driver()` restores
+the longest cached prefix and prefills the remaining delta in **batched
+Tensor-Core chunks** instead of one token at a time: embedding, RMSNorm,
+projections, paged-flash attention and the MLP are all widened to the chunk
+width in a single pass. The linear projections route on
+`InferenceConfig::batched_gemm_threshold` (default 16) — a small chunk (a few
+tokens of live typing) loops the low-latency batch=1 GEMV, a wide chunk launches
+the high-throughput batched GEMM (BF16, AWQ int4, and FP8 E4M3 each have a
+Tensor-Core batched kernel). Both routes land on the same logits as the
+token-by-token sweep, so callers see identical results — just fewer kernel
+launches. Hybrid SSM checkpoints are excluded: their recurrent state advances
+one position at a time and cannot be batched (`max_batch_size > 1` is rejected
+for them, and they never get a prefix-cache coordinator).
+
 ---
 
 ## 2. Core API Reference
@@ -214,8 +230,9 @@ snapshotted — so tree-search-style apps should check
 ```cpp
 struct InferenceConfig {                 // tier 2: what you ask for
     size_t max_context_length = 2048;
-    size_t max_batch_size     = 1;
+    size_t max_batch_size     = 1;       // > 1 rejected for hybrid SSM models
     bool   require_branching  = false;
+    int    batched_gemm_threshold = 16;  // GEMV<->batched-GEMM crossover (>= 1)
     float  temperature = 0.6f;
     float  top_p       = 0.9f;
 };
@@ -227,12 +244,14 @@ struct RuntimeConfig {                   // tier 3: resolved execution plan
     int    paged_branch_factor = 4;
     size_t num_gpu_layers = RuntimeConfig::kAllLayersResident;
     bool   uses_dedicated_full_attention = false;
+    int    batched_gemm_threshold = 16;
 };
 
 struct RuntimeOverrides {                // optional low-level knobs
     std::optional<BlackwellEngine::KVCacheMode> kv_mode;
     std::optional<size_t> num_gpu_layers;
     std::optional<int>    paged_branch_factor;
+    std::optional<int>    batched_gemm_threshold;
 };
 
 ModelCapabilities derive_capabilities(const ModelConfig& model);
@@ -243,6 +262,15 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
 ```
 `num_gpu_layers` can also be forced globally via the `BLACKWELL_GPU_LAYERS`
 environment variable when left at its `SIZE_MAX` ("all resident") default.
+
+`batched_gemm_threshold` (default 16, must be `>= 1`) is the width at which a
+batched linear projection switches from the per-row GEMV sweep to the
+Tensor-Core batched GEMM: chunks narrower than it stay on the low-latency GEMV
+(ideal for a few tokens of live typing), chunks at/above it take the
+high-throughput GEMM. The override wins over the request; the overlay pins it to
+16 explicitly. `max_batch_size > 1` requests true batch width but are **rejected
+for hybrid SSM checkpoints** in `build_and_validate_runtime` — their recurrent
+linear-attention state advances one position at a time and cannot be batched.
 
 ### 2.4 `ModelConfig` / `ConfigLoader` — [`config.h`](../include/blackwell/config.h)
 
