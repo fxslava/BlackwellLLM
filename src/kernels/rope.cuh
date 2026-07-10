@@ -33,3 +33,16 @@ void launch_rope_inplace(
     size_t num_heads,
     size_t head_dim,
     float rope_theta = 500000.0f);
+
+// Batched rotate_half RoPE over a [num_tokens, num_heads, head_dim] buffer: row
+// t is rotated for logical position (start_pos + t). The num_tokens == 1 case is
+// exactly launch_rope_inplace(pos=start_pos). Batched-prefill counterpart of the
+// per-token in-place RoPE; the rotated K is then scatter-appended into the pages.
+//   HARD CONTRACT: head_dim even, head_dim/2 <= 1024.
+void launch_rope_inplace_batched(
+    float* d_X,
+    int start_pos,
+    size_t num_tokens,
+    size_t num_heads,
+    size_t head_dim,
+    float rope_theta = 500000.0f);

@@ -33,6 +33,12 @@ struct BlackwellEngine::Impl {
     ModelCapabilities m_caps;          // topology-derived; supports_cow_branching finalized in ctor body
     blackwell::RuntimeConfig m_runtime; // resolved + validated execution plan
 
+    // Batched-forward width: how many token rows one forward pass may process at
+    // once (batched prefill chunk / true-batch decode). 1 for the plain batch=1
+    // decode path. Sizes the arena ping-pong buffers and every per-step scratch
+    // buffer below, so it must precede `arena`. Computed once from the plan.
+    size_t m_token_capacity;
+
     SafetensorsLoader loader;
     VRAMArena arena;
     LinearDispatcher dispatcher;
@@ -111,6 +117,20 @@ struct BlackwellEngine::Impl {
     // decode chain reports failure by EngineStatus return, never by throw --
     // callers propagate with ENGINE_TRY (engine.cpp) or translate at the edge.
     blackwell::EngineStatus run_token(int token_id, int pos, int seq_id,
+                                      bool want_logits = true);
+
+    // Batched forward over a CHUNK of num_tokens prompt tokens at logical
+    // positions [start_pos, start_pos + num_tokens), in ONE pass: batched
+    // embedding -> per-layer batched RMSNorm + projections (Tensor-Core GEMM for
+    // BF16, per-row GEMV sweep for quantized) + batched paged-flash prefill
+    // attention -> batched MLP. want_logits runs the final norm + lm_head GEMV for
+    // the LAST token only (its logits are what a prompt needs). num_tokens must be
+    // <= m_token_capacity (the caller tiles longer deltas). Generic dense
+    // full-attention path only -- the batched-capable configuration the prefill
+    // coordinator is built for; returns InvalidConfig for SSM/gated models.
+    // RUNTIME error tier: reports by EngineStatus, never throws (mirrors run_token).
+    blackwell::EngineStatus run_chunk(const int* token_ids, int start_pos,
+                                      int num_tokens, int seq_id,
                                       bool want_logits = true);
 
     blackwell::EngineStatus step_embedding(int token_id);

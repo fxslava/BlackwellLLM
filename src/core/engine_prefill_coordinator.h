@@ -55,11 +55,14 @@
 //     commit() published (nothing, on failure). The KV pages an aborted sweep
 //     already wrote die with the sequence's page references either way.
 //
-// COMPUTE today is a per-token sweep over the engine's single-token GEMV
-// pipeline (Impl::run_token): correct and zero-copy, but O(n) kernel launches.
-// The batched Tensor-Core prefill (prepare_prefill_step + attention_prefill
-// on IKVCacheManager) is a drop-in replacement inside run_delta() once the
-// multi-token activation buffers and kernels exist — callers see no change.
+// COMPUTE processes the uncached delta in BATCHED Tensor-Core chunks
+// (Impl::run_chunk): per forward pass it widens embedding / RMSNorm /
+// projections / paged-flash attention / MLP to up to Impl::m_token_capacity
+// token rows, tiling longer deltas. It reproduces the old per-token
+// Impl::run_token sweep numerically (the quantized projections are the same
+// per-row GEMV, RoPE / KV-append / attention the same kernels per position), so
+// callers see identical logits — just far fewer kernel launches. run_delta falls
+// back to the run_token sweep only for a degenerate token capacity of 1.
 //
 // Scope guards (checked at construction): Paged KV mode on a DENSE uniform
 // full-attention model. Hybrid SSM checkpoints keep recurrent state outside

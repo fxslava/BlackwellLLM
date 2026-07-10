@@ -92,6 +92,31 @@ EngineStatus EnginePrefillCoordinator::run_delta(SeqId engine_seq, const TokenId
                                                  int n, int start_pos,
                                                  bool want_logits) noexcept {
     try {
+        // Batched path: process the delta in tiles of up to m_token_capacity tokens
+        // per forward pass (Tensor-Core GEMM projections + BLOCK_M paged-flash
+        // prefill attention), instead of sweeping run_token one position at a time.
+        // TokenId -> int for the engine's token id buffer. want_logits applies to
+        // the LAST token of the whole delta, i.e. the last token of the final tile.
+        const size_t cap = m_impl.m_token_capacity;
+        if (cap > 1) {
+            std::vector<int> ids;   // the engine takes int token ids
+            for (int pos = start_pos; pos < n; ) {
+                const int chunk = std::min(n - pos, static_cast<int>(cap));
+                ids.assign(tokens + pos, tokens + pos + chunk);
+                const bool last_tile = (pos + chunk == n);
+                const EngineStatus st = m_impl.run_chunk(
+                    ids.data(), pos, chunk, engine_seq, want_logits && last_tile);
+                if (st != EngineStatus::Success) {
+                    std::cerr << "[blackwell_core] run_delta: chunk [" << pos << ", "
+                              << (pos + chunk) << ") failed: " << to_string(st) << "\n";
+                    return st;
+                }
+                pos += chunk;
+            }
+            return EngineStatus::Success;
+        }
+
+        // Fallback (degenerate token capacity == 1): the original per-token sweep.
         for (int pos = start_pos; pos < n; ++pos) {
             const bool last = (pos + 1 == n);
             const EngineStatus st = m_impl.run_token(

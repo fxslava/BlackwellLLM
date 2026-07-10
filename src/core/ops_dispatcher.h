@@ -18,19 +18,38 @@ public:
     // Execute one linear projection: d_out = W * d_in.
     //
     // base_name        - weight tensor prefix, e.g. "model.layers.0.self_attn.q_proj"
-    // d_in             - raw (unquantized) float input vector on device
-    // d_out            - output buffer on device (ignored when d_residual_accum != nullptr)
+    // d_in             - raw (unquantized) float input, [num_tokens, in_features]
+    // d_out            - output buffer on device (ignored when d_residual_accum != nullptr),
+    //                    [num_tokens, out_features]
     // out_features     - output dimension M
     // in_features      - input dimension K (also the quantization domain for ROWWISE_FP8)
-    // d_residual_accum - if non-null, result is accumulated into this buffer in-place
+    // d_residual_accum - if non-null, result is accumulated into this buffer in-place,
+    //                    [num_tokens, out_features]
+    // num_tokens       - number of activation rows. 1 (default) keeps the exact,
+    //                    latency-critical batch=1 GEMV paths. > 1 (batched prefill /
+    //                    true batch mode) routes the unquantized BF16 path to the
+    //                    Tensor-Core batched GEMM; quantized paths fall back to a
+    //                    per-row GEMV sweep (bit-identical to batch=1) since no
+    //                    batched quantized kernel exists yet.
     void forward(const std::string& base_name,
                  const float* d_in,
                  float* d_out,
                  size_t out_features,
                  size_t in_features,
-                 float* d_residual_accum = nullptr);
+                 float* d_residual_accum = nullptr,
+                 size_t num_tokens = 1);
 
 private:
+    // One projection over a single activation row (the exact batch=1 kernels).
+    // forward() calls this once for num_tokens == 1 and, for quantized strategies,
+    // once per row when batched.
+    void forward_row(const std::string& base_name,
+                     const float* d_in,
+                     float* d_out,
+                     size_t out_features,
+                     size_t in_features,
+                     float* d_residual_accum);
+
     const VRAMArena& m_arena;
     const ModelConfig& m_config;
 

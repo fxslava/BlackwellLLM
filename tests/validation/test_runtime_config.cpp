@@ -88,6 +88,25 @@ TEST(RuntimeConfig, HybridBranchingRejected) {
                  std::runtime_error);
 }
 
+// Batched requests (max_batch_size > 1) on a hybrid SSM model -> rejected: the
+// recurrent linear-attention state cannot advance a tile of tokens in parallel.
+TEST(RuntimeConfig, HybridBatchingRejected) {
+    const auto m = hybrid_model();
+    InferenceConfig req;
+    req.max_batch_size = 4;                       // require_branching stays false
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::runtime_error);
+}
+
+// The same batched request on a dense model is accepted (no SSM state to serialize).
+TEST(RuntimeConfig, DenseBatchingAllowed) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.max_batch_size = 4;
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_EQ(rt.max_sequences, 4u);
+}
+
 // Hybrid model in (explicitly overridden) Paged mode is fine: its head_dim-256
 // gated layers use the dedicated path, so the paged-flash 128-cap is waived.
 TEST(RuntimeConfig, HybridPagedAllowedViaDedicatedPath) {

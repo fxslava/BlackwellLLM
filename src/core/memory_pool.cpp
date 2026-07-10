@@ -103,8 +103,9 @@ private:
 // ============================================================================
 VRAMArena::VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader,
                      const ModelConfig& config, size_t max_seq_len, size_t num_gpu_layers,
-                     LoadProgressFn load_progress)
+                     LoadProgressFn load_progress, size_t activation_token_capacity)
     : m_config(config), m_load_progress(std::move(load_progress)), m_max_seq_len(max_seq_len),
+      m_activation_token_capacity(std::max<size_t>(activation_token_capacity, 1)),
       m_num_gpu_layers(std::min(num_gpu_layers, config.num_layers))
 {
     std::cout << "[VRAM Arena] Initializing static memory pools...\n";
@@ -319,8 +320,11 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
     // Ping-Pong buffers (FP32 accumulation) sized for the widest vector they ever
     // hold. The engine stores hidden_dim activations in them; take the max with
     // intermediate_dim so the capacity contract holds for any config, not only
-    // for models where intermediate_dim > hidden_dim.
-    size_t ping_pong_bytes = std::max(intermediate_dim, m_config.hidden_dim) * sizeof(float);
+    // for models where intermediate_dim > hidden_dim. Multiplied by the activation
+    // token capacity so batched prefill / true batch mode can stage
+    // [num_tokens, hidden_dim] rows contiguously (capacity 1 == batch=1 decode).
+    size_t ping_pong_bytes = std::max(intermediate_dim, m_config.hidden_dim)
+                             * m_activation_token_capacity * sizeof(float);
     m_activation_bytes = ping_pong_bytes; // 🎯 Сохраняем размер буферов активации
 
     CUDA_CHECK_THROW(cudaMalloc(&d_activation_A, ping_pong_bytes));

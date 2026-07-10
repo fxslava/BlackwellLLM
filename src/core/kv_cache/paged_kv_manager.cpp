@@ -127,22 +127,74 @@ void PagedKVManager::attention_decode(int layer_idx, int pos,
     m_seqmgr->spill_out_page(layer_idx, m_append_page);
 }
 
-// Batched (BLOCK_M-tile) prefill needs multi-token activation buffers and a
-// Tensor-Core prefill kernel that do not exist yet. Prompt prefill runs through
-// EnginePrefillCoordinator (engine_prefill_coordinator.h), which sweeps the
-// uncached delta token-by-token over the standard decode path; when the batched
-// kernels land, the coordinator switches to these two calls and nothing above
-// it changes.
-void PagedKVManager::prepare_prefill_step(SeqId, int, int) {
-    throw std::runtime_error(
-        "PagedKVManager: batched prefill kernels are not implemented; drive prompts "
-        "through EnginePrefillCoordinator (per-token sweep) instead");
+// Batched (BLOCK_M-tile) prefill: reserve a whole chunk of append slots at once,
+// then RoPE + scatter-append + paged-flash-attention over all num_tokens query
+// rows in one launch each. The single-token decode path (prepare_decode_step +
+// attention_decode) is the num_tokens == 1 specialization; this is its widening
+// for prompt prefill / speculative verification.
+void PagedKVManager::prepare_prefill_step(SeqId seq, int start_pos, int num_tokens) {
+    if (num_tokens <= 0)
+        throw std::invalid_argument("PagedKVManager::prepare_prefill_step: num_tokens must be > 0");
+    const paging::SeqId internal = internal_id(seq);
+    ensure_resident(internal);
+
+    // Position-addressed, exactly like prepare_decode_step: writing at start_pos
+    // invalidates everything from start_pos on. start_pos <= length is legal
+    // (re-prefill / divergent retokenization); reconcile by truncating the stale
+    // tail so the reservations below land at start_pos. Only a forward gap errors.
+    const int len = m_seqmgr->length(internal);
+    if (start_pos > len)
+        throw std::runtime_error(
+            "PagedKVManager: prefill start_pos " + std::to_string(start_pos) +
+            " skips past sequence length " + std::to_string(len) + " (KV gap)");
+    if (start_pos < len)
+        m_seqmgr->rewind(internal, start_pos);
+
+    // Reserve one physical slot per token of the chunk (CoW-ing the boundary page
+    // on the first reservation if it is fork-shared, allocating fresh pages after).
+    for (int t = 0; t < num_tokens; ++t)
+        m_seqmgr->reserve_append_slot(internal);
+
+    m_seq_len     = m_seqmgr->length(internal);          // == start_pos + num_tokens
+    m_block_table = m_seqmgr->device_block_table(internal);
+    m_active      = internal;
+    // The per-token append slot latches are meaningless for a chunk; the batched
+    // append resolves each token's slot through the block table itself.
+    m_append_page = -1;
+    m_append_slot = -1;
 }
 
-void PagedKVManager::attention_prefill(int, int, int, float*, float*, float*, float*) {
-    throw std::runtime_error(
-        "PagedKVManager: batched prefill kernels are not implemented; drive prompts "
-        "through EnginePrefillCoordinator (per-token sweep) instead");
+void PagedKVManager::attention_prefill(int layer_idx, int start_pos, int num_tokens,
+                                       float* d_Q, float* d_K, float* d_V, float* d_O) {
+    if (m_active < 0)
+        throw std::runtime_error(
+            "PagedKVManager::attention_prefill called without a preceding prepare_prefill_step");
+
+    // Batched RoPE over all num_tokens rows: row t rotates for position start_pos+t.
+    launch_rope_inplace_batched(d_Q, start_pos, num_tokens, m_num_q_heads,  m_head_dim, m_rope_theta);
+    launch_rope_inplace_batched(d_K, start_pos, num_tokens, m_num_kv_heads, m_head_dim, m_rope_theta);
+
+    // Fault the layer's live pages in from the host mirror (no-op if resident).
+    m_seqmgr->stage_in_layer(layer_idx, m_active);
+
+    paging::kv_t* k_pool = m_seqmgr->layer_k_pool(layer_idx);
+    paging::kv_t* v_pool = m_seqmgr->layer_v_pool(layer_idx);
+
+    // Scatter all num_tokens rotated-K / raw-V rows into their page slots at once.
+    launch_paged_kv_append_batched(d_K, d_V, k_pool, v_pool, m_block_table,
+                                   start_pos, num_tokens, m_num_kv_heads, m_head_dim);
+
+    // Exact causal attention: the num_tokens query rows occupy [start_pos, seq_len)
+    // and each attends over its own prefix through the block table.
+    launch_paged_flash_attention_prefill(d_Q, k_pool, v_pool, d_O, m_block_table,
+                                         m_seq_len, num_tokens, m_num_q_heads,
+                                         m_num_kv_heads, m_head_dim);
+
+    // Spill every page the chunk touched back to the host mirror (no-op if resident).
+    const int first_block = start_pos / paging::PAGE_SIZE;
+    const int last_block  = (m_seq_len - 1) / paging::PAGE_SIZE;
+    for (int b = first_block; b <= last_block; ++b)
+        m_seqmgr->spill_out_page(layer_idx, m_seqmgr->block_page(m_active, b));
 }
 
 void* PagedKVManager::get_layer_k_ptr(int layer_idx) {

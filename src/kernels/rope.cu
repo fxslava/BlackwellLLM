@@ -112,3 +112,45 @@ void launch_rope_inplace(
     dim3 threads(head_dim / 2);
     rope_q_kernel<<<num_heads, threads>>>(d_X, pos, head_dim, rope_theta);
 }
+
+// Batched rotate_half over [num_tokens, num_heads, head_dim]: token t (row
+// blockIdx.y) rotates for position start_pos + t. Same rotate_half math as
+// rope_q_kernel, one block per (head, token).
+__global__ void rope_q_batched_kernel(float* __restrict__ X,
+                                      int start_pos,
+                                      size_t num_heads,
+                                      size_t head_dim,
+                                      float rope_theta)
+{
+    const size_t head_idx = blockIdx.x;
+    const size_t t        = blockIdx.y;
+    const size_t k        = threadIdx.x;
+    if (k >= head_dim / 2) return;
+
+    const int pos = start_pos + (int)t;
+    float* cur = X + (t * num_heads + head_idx) * head_dim;
+
+    float freq = __fdividef(1.0f, powf(rope_theta,
+                    __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
+    float angle = pos * freq;
+    float sin_val, cos_val;
+    sincosf(angle, &sin_val, &cos_val);
+
+    float x0 = cur[k];
+    float x1 = cur[k + head_dim / 2];
+    cur[k]                = x0 * cos_val - x1 * sin_val;
+    cur[k + head_dim / 2] = x0 * sin_val + x1 * cos_val;
+}
+
+void launch_rope_inplace_batched(
+    float* d_X,
+    int start_pos,
+    size_t num_tokens,
+    size_t num_heads,
+    size_t head_dim,
+    float rope_theta)
+{
+    dim3 grid((unsigned)num_heads, (unsigned)num_tokens);
+    dim3 threads((unsigned)(head_dim / 2));
+    rope_q_batched_kernel<<<grid, threads>>>(d_X, start_pos, num_heads, head_dim, rope_theta);
+}

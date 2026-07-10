@@ -4,6 +4,7 @@
 set(SOURCES
     attention.cu
     awq_linear.cu
+    batched_bf16_gemm.cu
     bf16_linear.cu
     bf16_linear_bias.cu
     bf16_linear_residual.cu

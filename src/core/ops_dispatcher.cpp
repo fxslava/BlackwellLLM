@@ -3,6 +3,7 @@
 #include "kernels/awq_linear.cuh"
 #include "kernels/bf16_linear.cuh"
 #include "kernels/bf16_linear_residual.cuh"
+#include "kernels/batched_bf16_gemm.cuh"
 #include "kernels/sym_int4_linear.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -27,12 +28,55 @@ LinearDispatcher::~LinearDispatcher() {
     if (d_token_scale) cudaFree(d_token_scale);
 }
 
+// ============================================================================
+// Dual-path entry point: batch=1 keeps the exact latency-critical GEMV kernels;
+// num_tokens > 1 routes the unquantized BF16 path to the Tensor-Core batched
+// GEMM (batched_bf16_gemm), and every quantized path to a per-row GEMV sweep
+// (numerically identical to running batch=1 num_tokens times) until batched
+// quantized kernels exist. The batch=1 GEMV kernels themselves are UNCHANGED.
+// ============================================================================
 void LinearDispatcher::forward(const std::string& base_name,
                                const float* d_in,
                                float* d_out,
                                size_t out_features,
                                size_t in_features,
-                               float* d_residual_accum)
+                               float* d_residual_accum,
+                               size_t num_tokens)
+{
+    if (num_tokens == 1) {
+        forward_row(base_name, d_in, d_out, out_features, in_features, d_residual_accum);
+        return;
+    }
+
+    // Unquantized BF16: one Tensor-Core GEMM over all rows. The biased q/k/v
+    // projections never reach the dispatcher (engine.cpp fast path), so only the
+    // plain and residual-accumulating variants are needed here, matching forward_row.
+    if (m_config.quant_strategy == QuantStrategy::NONE) {
+        const void* w = m_arena.get_weight_ptr(base_name + ".weight");
+        if (d_residual_accum == nullptr)
+            launch_bf16_gemm_batched(w, d_in, d_out, out_features, in_features, num_tokens);
+        else
+            launch_bf16_gemm_residual_batched(w, d_in, d_residual_accum,
+                                              out_features, in_features, num_tokens);
+        return;
+    }
+
+    // Quantized (AWQ / INT4 / FP8): no batched kernel yet — sweep the rows through
+    // the exact batch=1 path. d_in / d_out / d_residual_accum are [num_tokens, *].
+    for (size_t t = 0; t < num_tokens; ++t) {
+        const float* in_row  = d_in + t * in_features;
+        float* out_row       = d_out ? d_out + t * out_features : nullptr;
+        float* accum_row      = d_residual_accum ? d_residual_accum + t * out_features : nullptr;
+        forward_row(base_name, in_row, out_row, out_features, in_features, accum_row);
+    }
+}
+
+void LinearDispatcher::forward_row(const std::string& base_name,
+                                   const float* d_in,
+                                   float* d_out,
+                                   size_t out_features,
+                                   size_t in_features,
+                                   float* d_residual_accum)
 {
     switch (m_config.quant_strategy) {
 

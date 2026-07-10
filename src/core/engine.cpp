@@ -69,6 +69,25 @@ static uint64_t compute_kv_model_hash(const std::string& index_path, const Model
     return h;
 }
 
+// Batched-forward width from the resolved plan. Batched prefill (paged + dense,
+// where the coordinator sweeps prompt deltas) processes up to kPrefillTile tokens
+// per chunk; true-batch decode needs max_sequences rows. The tile is bounded so
+// the widened activation/scratch buffers stay small — they scale linearly with
+// it. Batch=1 continuous decode (no coordinator, single sequence) stays at 1 so
+// nothing is over-allocated and the decode path is byte-for-byte as before.
+// Hybrid SSM models can never batch (recurrent state), so they stay at 1 too.
+static size_t resolve_token_capacity(const ModelConfig& config,
+                                     const ModelCapabilities& caps,
+                                     const blackwell::RuntimeConfig& rt) {
+    constexpr size_t kPrefillTile = 64;
+    if (caps.requires_ssm_subsystem) return 1;
+    const bool paged_dense = rt.kv_mode == BlackwellEngine::KVCacheMode::Paged &&
+                             !config.attn_output_gate;
+    const bool will_batch = rt.max_sequences > 1 || paged_dense;
+    if (!will_batch) return 1;
+    return std::max(rt.max_sequences, std::min(rt.max_seq_len, kPrefillTile));
+}
+
 // Initializer list mirrors the declaration order in engine_impl.h: members are
 // constructed in declaration order regardless of the list. The tier-3 RuntimeConfig
 // (m_runtime) is built and validated FIRST so `arena` and the KV manager can size
@@ -79,9 +98,10 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
           (std::filesystem::path(index_path).parent_path() / "config.json").string())),
       m_caps(blackwell::derive_capabilities(m_config)),
       m_runtime(blackwell::build_and_validate_runtime(m_config, m_caps, request, overrides)),
+      m_token_capacity(resolve_token_capacity(m_config, m_caps, m_runtime)),
       loader(index_path),
       arena(index_path, loader, m_config, m_runtime.max_seq_len, m_runtime.num_gpu_layers,
-            overrides.load_progress),
+            overrides.load_progress, m_token_capacity),
       dispatcher(arena, m_config)
 {
     // 1. Bind core activation buffers from the arena
@@ -89,18 +109,22 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     d_X_norm  = arena.get_activation_buffer_B();
 
     // 2. Allocate layer-scoped compute buffers once (RAII: freed by the members
-    // themselves, in reverse declaration order -- no hand-maintained list).
-    d_Q.allocate(m_config.num_attention_heads * m_config.head_dim);
-    d_K.allocate(m_config.num_key_value_heads * m_config.head_dim);
-    d_V.allocate(m_config.num_key_value_heads * m_config.head_dim);
-    d_Attn_out.allocate(m_config.hidden_dim);
+    // themselves, in reverse declaration order -- no hand-maintained list). Each
+    // holds one row per active token: width == m_token_capacity * per-row size, so
+    // the batched-prefill / true-batch path can stage [num_tokens, *] contiguously.
+    // m_token_capacity == 1 reproduces the exact batch=1 decode allocation.
+    const size_t tc = m_token_capacity;
+    d_Q.allocate(tc * m_config.num_attention_heads * m_config.head_dim);
+    d_K.allocate(tc * m_config.num_key_value_heads * m_config.head_dim);
+    d_V.allocate(tc * m_config.num_key_value_heads * m_config.head_dim);
+    d_Attn_out.allocate(tc * m_config.hidden_dim);
 
-    d_Gate.allocate(m_config.intermediate_dim);
-    d_Up.allocate(m_config.intermediate_dim);
-    d_Swiglu_out.allocate(m_config.intermediate_dim);
+    d_Gate.allocate(tc * m_config.intermediate_dim);
+    d_Up.allocate(tc * m_config.intermediate_dim);
+    d_Swiglu_out.allocate(tc * m_config.intermediate_dim);
 
     d_logits.allocate(m_config.vocab_size);
-    d_next_token.allocate(1);
+    d_next_token.allocate(tc);
 
     // Resident pool may be empty when every layer is offloaded to host RAM.
     // INIT tier: a failure here throws and unwinds the RAII members above.
@@ -668,6 +692,148 @@ EngineStatus BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id,
 
     if (want_logits)
         ENGINE_TRY(impl->step_final_ops());
+    return EngineStatus::Success;
+}
+
+// ============================================================================
+// Batched prefill: one forward pass over num_tokens prompt tokens. Mirrors
+// run_token's generic dense path but every stage is widened to num_tokens rows,
+// staged contiguously in the m_token_capacity-sized activation/scratch buffers.
+// The heavy projections run through the dispatcher's num_tokens path (Tensor-
+// Core GEMM for BF16, per-row GEMV sweep for the quantized checkpoints); the
+// paged-flash attention runs the full BLOCK_M-tile prefill kernel. Only the
+// small per-channel epilogues (QKV bias) loop over rows.
+//
+// This is the drop-in the coordinator (run_delta) calls instead of sweeping
+// run_token token-by-token; numerically it reproduces that sweep (the quantized
+// projections are the SAME GEMV per row, RoPE/append/attention the same kernels
+// per position), so a batched prompt and a single-token prompt land on the same
+// logits. Generic dense full-attention only -- SSM/gated models never reach here
+// (the coordinator is not built for them); guarded defensively all the same.
+// ============================================================================
+EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_pos,
+                                              int num_tokens, int seq_id,
+                                              bool want_logits) {
+    const size_t H   = m_config.hidden_dim;
+    const size_t msl = arena.get_max_seq_len();
+    if (num_tokens <= 0 || token_ids == nullptr) return EngineStatus::InvalidArgument;
+    if (static_cast<size_t>(num_tokens) > m_token_capacity) {
+        std::cerr << "[blackwell_core] run_chunk: num_tokens " << num_tokens
+                  << " exceeds token capacity " << m_token_capacity
+                  << " (caller must tile the delta)\n";
+        return EngineStatus::InvalidArgument;
+    }
+    if (start_pos < 0 || static_cast<size_t>(start_pos + num_tokens) > msl) {
+        std::cerr << "[blackwell_core] run_chunk: positions [" << start_pos << ", "
+                  << (start_pos + num_tokens) << ") exceed KV capacity " << msl << "\n";
+        return EngineStatus::InvalidArgument;
+    }
+    // Batched path is the generic dense full-attention pipeline only.
+    if (!m_config.layer_types.empty() || m_config.attn_output_gate || ssm_state) {
+        std::cerr << "[blackwell_core] run_chunk: batched prefill is unsupported for "
+                     "SSM / gated full-attention models\n";
+        return EngineStatus::InvalidConfig;
+    }
+
+    const bool fp16_w = half_weights_are_fp16(m_config);
+
+    // 1. Batched embedding: num_tokens ids -> d_X_accum [num_tokens, H].
+    CUDA_CHECK_RETURN(cudaMemcpy(d_next_token, token_ids, num_tokens * sizeof(int),
+                                 cudaMemcpyHostToDevice));
+    CUDA_CHECK_RETURN(cudaMemset(d_X_accum, 0, num_tokens * H * sizeof(float)));
+    {
+        const void* d_embed = arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight");
+        if (fp16_w) launch_fp16_embedding_kernel(d_next_token, d_embed, d_X_accum, num_tokens, H);
+        else        launch_bf16_embedding_kernel(d_next_token, d_embed, d_X_accum, num_tokens, H);
+    }
+
+    // 2. Reserve the chunk's pages + stage the block table (may throw on a KV gap;
+    // the coordinator's run_delta owns the noexcept boundary).
+    kv_mgr->prepare_prefill_step(seq_id, start_pos, num_tokens);
+
+    const size_t q_dim  = m_config.num_attention_heads * m_config.head_dim;
+    const size_t kv_dim = m_config.num_key_value_heads * m_config.head_dim;
+    const int    L      = static_cast<int>(m_config.num_layers);
+
+    for (int i = 0; i < L; ++i) {
+        arena.prefetch_layer(i + 1, start_pos + num_tokens - 1);
+        const std::string lp = m_config.weight_prefix + "layers." + std::to_string(i) + ".";
+        const std::string sa = lp + "self_attn.";
+        arena.ensure_layer_ready(i);
+
+        // --- attention RMSNorm (batched) ---
+        {
+            const void* w = arena.get_weight_ptr(lp + "input_layernorm.weight");
+            if (fp16_w) launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, w, num_tokens, H,
+                                                   m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+            else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, num_tokens, H,
+                                              m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        }
+
+        // --- QKV projections (batched) + per-row bias epilogue ---
+        const void* d_bias_q = nullptr;
+        const void* d_bias_k = nullptr;
+        const void* d_bias_v = nullptr;
+        if (m_config.has_qkv_bias) {
+            d_bias_q = arena.get_weight_ptr_optional(sa + "q_proj.bias");
+            d_bias_k = arena.get_weight_ptr_optional(sa + "k_proj.bias");
+            d_bias_v = arena.get_weight_ptr_optional(sa + "v_proj.bias");
+            if ((d_bias_q != nullptr) != (d_bias_k != nullptr) ||
+                (d_bias_q != nullptr) != (d_bias_v != nullptr)) {
+                std::cerr << "[blackwell_core] run_chunk: QKV bias partially missing at layer "
+                          << i << "\n";
+                return EngineStatus::InvalidConfig;
+            }
+        }
+        dispatcher.forward(sa + "q_proj", d_X_norm, d_Q, q_dim,  H, nullptr, num_tokens);
+        dispatcher.forward(sa + "k_proj", d_X_norm, d_K, kv_dim, H, nullptr, num_tokens);
+        dispatcher.forward(sa + "v_proj", d_X_norm, d_V, kv_dim, H, nullptr, num_tokens);
+        if (d_bias_q) {
+            const BiasDType bt = (m_config.quant_strategy == QuantStrategy::WEIGHT_ONLY_PACKED)
+                                     ? BiasDType::FP16 : BiasDType::BF16;
+            for (int t = 0; t < num_tokens; ++t)
+                launch_fused_qkv_bias_kernel(d_Q + t * q_dim, d_K + t * kv_dim, d_V + t * kv_dim,
+                                             d_bias_q, d_bias_k, d_bias_v, q_dim, kv_dim, bt);
+        }
+
+        // --- batched paged-flash prefill attention (RoPE + append + attention) ---
+        kv_mgr->attention_prefill(i, start_pos, num_tokens, d_Q, d_K, d_V, d_Attn_out);
+
+        // --- o_proj, accumulate into the residual stream (batched) ---
+        dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, H, H, d_X_accum, num_tokens);
+
+        // --- MLP (batched) ---
+        {
+            const void* w = arena.get_weight_ptr(lp + "post_attention_layernorm.weight");
+            if (fp16_w) launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, w, num_tokens, H,
+                                                   m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+            else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, num_tokens, H,
+                                              m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        }
+        dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
+                           nullptr, num_tokens);
+        dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
+                           nullptr, num_tokens);
+        launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
+                                   static_cast<size_t>(num_tokens) * m_config.intermediate_dim);
+        dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
+                           m_config.intermediate_dim, d_X_accum, num_tokens);
+    }
+
+    // 3. Final norm + lm_head for the LAST token only (its logits drive sampling).
+    if (want_logits) {
+        float* last_hidden = d_X_accum + static_cast<size_t>(num_tokens - 1) * H;
+        const void* d_w = arena.get_weight_ptr(m_config.weight_prefix + "norm.weight");
+        if (fp16_w) launch_rmsnorm_fp16_kernel(last_hidden, d_X_norm, d_w, 1, H,
+                                               m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        else        launch_rmsnorm_kernel(last_hidden, d_X_norm, d_w, 1, H,
+                                          m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        const void* d_head_w = m_config.tie_word_embeddings
+            ? arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight")
+            : arena.get_weight_ptr("lm_head.weight");
+        if (fp16_w) launch_fp16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, H);
+        else        launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, H);
+    }
     return EngineStatus::Success;
 }
 

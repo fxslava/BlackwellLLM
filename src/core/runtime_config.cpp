@@ -65,6 +65,21 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
     rt.max_seq_len   = request.max_context_length;
     rt.max_sequences = request.max_batch_size;
 
+    // --- batching capability gate --------------------------------------------
+    // True batch mode (max_batch_size > 1) and batched prefill drive many token
+    // positions through one forward pass. Hybrid linear-attention (SSM) models
+    // carry a per-layer RECURRENT state that advances strictly one position at a
+    // time and cannot be evaluated across a tile of tokens in parallel -- so they
+    // are excluded from batching here, before any VRAM is sized against a width
+    // the SSM path can never honour.
+    if (request.max_batch_size > 1 && caps.requires_ssm_subsystem)
+        throw std::runtime_error(
+            "InferenceConfig: max_batch_size > 1 (requested " +
+            std::to_string(request.max_batch_size) + ") is unsupported for this model -- it "
+            "has " + std::to_string(caps.num_linear_attention_layers) +
+            " linear-attention (SSM) layer(s) whose recurrent state advances one "
+            "position at a time and cannot be batched. Run batch=1 (single sequence).");
+
     // --- branching capability gate -------------------------------------------
     // The model can branch at all only if it carries no recurrent linear-attention
     // (SSM) state -- that state is deliberately not snapshot-able. A request to

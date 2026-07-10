@@ -207,6 +207,30 @@ __global__ void paged_kv_append_kernel(
     v_pool_layer[off] = (kv_t)V[kvh * head_dim + d];
 }
 
+// Batched append: token blockIdx.y (logical pos start_pos + y) -> its page slot,
+// resolved through the shared block table. One thread per head_dim channel.
+__global__ void paged_kv_append_batched_kernel(
+    const float* __restrict__ K, const float* __restrict__ V,
+    kv_t* __restrict__ k_pool_layer, kv_t* __restrict__ v_pool_layer,
+    const int32_t* __restrict__ block_table, int start_pos,
+    int num_kv_heads, int head_dim)
+{
+    const int kvh = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (d >= head_dim) return;
+
+    const int pos  = start_pos + t;
+    const int page = block_table[pos / PAGE_SIZE];
+    const int slot = pos % PAGE_SIZE;
+
+    const size_t src = ((size_t)t * num_kv_heads + kvh) * head_dim + d;
+    const size_t dst =
+        (((size_t)page * num_kv_heads + kvh) * PAGE_SIZE + slot) * head_dim + d;
+    k_pool_layer[dst] = (kv_t)K[src];
+    v_pool_layer[dst] = (kv_t)V[src];
+}
+
 __global__ void cow_copy_page_kernel(
     kv_t* __restrict__ k_pool, kv_t* __restrict__ v_pool,
     int src_page, int dst_page, int total_pages, int per_page)
@@ -251,8 +275,11 @@ void launch_paged_flash_attention_prefill(
     float* d_O, const int32_t* d_block_table, int seq_len, int num_q_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, cudaStream_t stream) {
     const int num_q_tiles = (num_q_tokens + BLOCK_M - 1) / BLOCK_M;
+    // The query rows occupy the last num_q_tokens positions of the sequence:
+    // local row 0 sits at seq_len - num_q_tokens (0 for a fresh full prefill,
+    // start_pos for a chunked/append prefill over an existing prefix).
     launch_pfa(d_Q, d_k_pool_layer, d_v_pool_layer, d_O, d_block_table,
-               seq_len, /*q_start_base=*/0, num_q_tiles,
+               seq_len, /*q_start_base=*/seq_len - num_q_tokens, num_q_tiles,
                num_q_heads, num_kv_heads, head_dim, stream);
 }
 
@@ -261,6 +288,16 @@ void launch_paged_kv_append(
     int page, int slot, int num_kv_heads, int head_dim, cudaStream_t stream) {
     paged_kv_append_kernel<<<num_kv_heads, head_dim, 0, stream>>>(
         d_K, d_V, d_k_pool_layer, d_v_pool_layer, page, slot, num_kv_heads, head_dim);
+}
+
+void launch_paged_kv_append_batched(
+    const float* d_K, const float* d_V, kv_t* d_k_pool_layer, kv_t* d_v_pool_layer,
+    const int32_t* d_block_table, int start_pos, int num_tokens,
+    int num_kv_heads, int head_dim, cudaStream_t stream) {
+    dim3 grid(num_kv_heads, num_tokens);
+    paged_kv_append_batched_kernel<<<grid, head_dim, 0, stream>>>(
+        d_K, d_V, d_k_pool_layer, d_v_pool_layer, d_block_table, start_pos,
+        num_kv_heads, head_dim);
 }
 
 void launch_cow_copy_page(

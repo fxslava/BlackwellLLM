@@ -62,10 +62,16 @@ public:
     // so the bar may run ahead of the disk -- honest enough for a loading HUD.
     using LoadProgressFn = std::function<void(size_t bytes_done, size_t bytes_total)>;
 
+    // activation_token_capacity: how many token rows the ping-pong activation
+    // buffers must hold at once. 1 (default) is the batch=1 decode contract.
+    // Batched prefill / true batch mode raise it (max chunk width) so d_X_accum /
+    // d_X_norm can stage [num_tokens, hidden_dim]; the KV cache and weight arena
+    // are unaffected (KV is position-addressed, not batch-scaled).
     VRAMArena(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader,
               const ModelConfig& config, size_t max_seq_len = 2048,
               size_t num_gpu_layers = static_cast<size_t>(-1),
-              LoadProgressFn load_progress = {});
+              LoadProgressFn load_progress = {},
+              size_t activation_token_capacity = 1);
     ~VRAMArena();
 
     VRAMArena(const VRAMArena&) = delete;
@@ -92,6 +98,8 @@ public:
     size_t get_k_cache_size() const { return m_total_cache_bytes; }
     size_t get_v_cache_size() const { return m_total_cache_bytes; }
     size_t get_activation_buffer_size() const { return m_activation_bytes; }
+    // Token rows the ping-pong buffers can stage (>= 1); the batched-forward width.
+    size_t get_activation_token_capacity() const { return m_activation_token_capacity; }
 
     // ------------------------------------------------------------------
     // Soft hibernation (inactivity lifecycle, stage 2)
@@ -191,6 +199,7 @@ private:
     size_t m_max_seq_len = 0;
     size_t m_total_cache_bytes = 0;
     size_t m_activation_bytes = 0;
+    size_t m_activation_token_capacity = 1;
     size_t m_num_gpu_layers = 0;
 
     // Offset registry mapping tensor names to their absolute addresses in d_weights_arena

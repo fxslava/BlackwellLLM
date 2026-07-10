@@ -48,16 +48,20 @@ void launch_paged_flash_attention_decode(
     cudaStream_t stream = 0);
 
 // Chunked prefill / speculative verification: Q is [num_q_tokens, num_q_heads,
-// head_dim] occupying logical positions [0, num_q_tokens) (causal). This is the
-// full Tensor-Core path (BLOCK_M=16 live query rows per tile).
+// head_dim]. The num_q_tokens query rows occupy the LAST num_q_tokens logical
+// positions of the sequence, i.e. [seq_len - num_q_tokens, seq_len) (causal over
+// the whole seq_len-length prefix through the block table). A fresh full prefill
+// passes seq_len == num_q_tokens (rows at [0, num_q_tokens)); an append/chunked
+// prefill passes seq_len > num_q_tokens so the rows start at seq_len-num_q_tokens
+// and attend over the already-resident prefix. Full Tensor-Core path (BLOCK_M=16).
 void launch_paged_flash_attention_prefill(
     const float* d_Q,
     const blackwell::paging::kv_t* d_k_pool_layer,
     const blackwell::paging::kv_t* d_v_pool_layer,
     float* d_O,
     const int32_t* d_block_table,
-    int seq_len,            // total tokens resident for the sequence (== num_q_tokens for a fresh prefill)
-    int num_q_tokens,
+    int seq_len,            // total tokens resident for the sequence
+    int num_q_tokens,       // query rows, occupying [seq_len - num_q_tokens, seq_len)
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -72,6 +76,24 @@ void launch_paged_kv_append(
     blackwell::paging::kv_t* d_v_pool_layer,
     int page,
     int slot,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream = 0);
+
+// Batched scatter: num_tokens post-RoPE K/V rows into their physical page slots
+// for a single layer. d_K / d_V are [num_tokens, num_kv_heads, head_dim]; token t
+// lands at logical position (start_pos + t), whose page is d_block_table[pos /
+// PAGE_SIZE] and slot is pos % PAGE_SIZE. The block table must already name an
+// allocated page for every one of those positions (prepare_prefill_step reserves
+// them). The batched-prefill counterpart of launch_paged_kv_append.
+void launch_paged_kv_append_batched(
+    const float* d_K,
+    const float* d_V,
+    blackwell::paging::kv_t* d_k_pool_layer,
+    blackwell::paging::kv_t* d_v_pool_layer,
+    const int32_t* d_block_table,
+    int start_pos,
+    int num_tokens,
     int num_kv_heads,
     int head_dim,
     cudaStream_t stream = 0);
