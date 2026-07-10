@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <mma.h>
 #include <cmath>
 
 #define GEMV_BLOCK_SIZE 256
@@ -328,4 +329,134 @@ void launch_fp8_gemv_residual_kernel(const void* d_W_fp8,
     fp8_gemv_splitk_residual_kernel<<<blocks, threads>>>(
         (const uint8_t*)d_W_fp8, d_X, (const __nv_bfloat16*)d_weight_scales,
         (const __nv_bfloat16*)d_input_scale, d_token_scale, d_Y_accum, K, scale_stride);
+}
+
+// ============================================================================
+// 4. BATCHED FP8 GEMM (Tensor Cores) — the num_tokens > 1 path.
+// ============================================================================
+// One warp owns one [16 tokens x 16 output-rows] tile and marches K in 8-wide
+// steps. Per step it stages the (optionally E4M3-quantized) FP32 activation tile
+// and the dequantized-weight tile into shared memory, then runs a TF32 wmma —
+// same structure as batched_bf16_gemm / the AWQ batched kernel. Weight-row scale
+// and the optional per-tensor activation scale are applied in the epilogue, so
+// the result equals launch_fp8_gemv run row-by-row.
+namespace {
+
+constexpr int kFpM = 16, kFpN = 16, kFpK = 8;
+
+template <bool accumulate>
+__global__ void fp8_gemm_batched_kernel(const uint8_t*       __restrict__ W_fp8,
+                                        const float*         __restrict__ X,
+                                        const __nv_bfloat16* __restrict__ weight_scales,
+                                        const __nv_bfloat16* __restrict__ input_scale,
+                                        const float*         __restrict__ token_scale,
+                                        float*               __restrict__ Y,
+                                        int M, int K, int T, int scale_stride,
+                                        int apply_quant)
+{
+    const int tile_n = blockIdx.x * kFpN;   // first output row (weight row)
+    const int tile_m = blockIdx.y * kFpM;   // first token row
+    const int tid    = threadIdx.x;
+
+    // Activation scale: static per-tensor (input_scale) applied uniformly across
+    // the batch, or none. Mirrors fp8_gemv's d_scale / apply_quant exactly.
+    const float dscale = apply_quant ? __bfloat162float(input_scale[0]) : token_scale[0];
+    const float comb   = apply_quant ? dscale : 1.0f;
+
+    __shared__ float As[kFpM * kFpK];
+    __shared__ float Bs[kFpK * kFpN];
+    __shared__ float Cs[kFpM * kFpN];
+
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kFpM, kFpN, kFpK, float> c_frag;
+    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += kFpK) {
+        for (int i = tid; i < kFpM * kFpK; i += 32) {
+            const int m = i / kFpK, k = i % kFpK;
+            const int gm = tile_m + m, gk = k0 + k;
+            float xv = (gm < T && gk < K) ? X[(size_t)gm * K + gk] : 0.0f;
+            if (apply_quant && gm < T && gk < K)
+                xv = golden_hardware_quantize_e4m3(xv, dscale);
+            As[i] = xv;
+        }
+        for (int i = tid; i < kFpK * kFpN; i += 32) {
+            const int k = i / kFpN, n = i % kFpN;
+            const int gk = k0 + k, gn = tile_n + n;
+            Bs[i] = (gn < M && gk < K)
+                        ? device_unpack_fp8_e4m3(__ldg(W_fp8 + (size_t)gn * K + gk))
+                        : 0.0f;
+        }
+        __syncthreads();
+
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kFpM, kFpN, kFpK,
+                               nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kFpM, kFpN, kFpK,
+                               nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> b_frag;
+        nvcuda::wmma::load_matrix_sync(a_frag, As, kFpK);
+        nvcuda::wmma::load_matrix_sync(b_frag, Bs, kFpN);
+        #pragma unroll
+        for (int i = 0; i < a_frag.num_elements; ++i)
+            a_frag.x[i] = nvcuda::wmma::__float_to_tf32(a_frag.x[i]);
+        #pragma unroll
+        for (int i = 0; i < b_frag.num_elements; ++i)
+            b_frag.x[i] = nvcuda::wmma::__float_to_tf32(b_frag.x[i]);
+        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
+    }
+
+    nvcuda::wmma::store_matrix_sync(Cs, c_frag, kFpN, nvcuda::wmma::mem_row_major);
+    __syncthreads();
+
+    for (int i = tid; i < kFpM * kFpN; i += 32) {
+        const int m = i / kFpN, n = i % kFpN;
+        const int gm = tile_m + m, gn = tile_n + n;
+        if (gm < T && gn < M) {
+            const float w_scale = __bfloat162float(weight_scales[(size_t)gn * scale_stride]);
+            const float val = Cs[i] * w_scale * comb;
+            const size_t off = (size_t)gm * M + gn;
+            if (accumulate) Y[off] += val;
+            else            Y[off]  = val;
+        }
+    }
+}
+
+void launch_fp8_gemm_batched_impl(const void* d_W_fp8, const float* d_X,
+                                  const void* d_weight_scales, const void* d_input_scale,
+                                  const float* d_token_scale, float* d_Y,
+                                  size_t M, size_t K, int scale_stride,
+                                  size_t num_tokens, bool accumulate)
+{
+    if (M == 0 || K == 0 || num_tokens == 0) return;
+    dim3 grid((unsigned)((M + kFpN - 1) / kFpN),
+              (unsigned)((num_tokens + kFpM - 1) / kFpM));
+    const int apply_quant = (d_input_scale != nullptr) ? 1 : 0;
+    const auto* W  = static_cast<const uint8_t*>(d_W_fp8);
+    const auto* ws = static_cast<const __nv_bfloat16*>(d_weight_scales);
+    const auto* is = static_cast<const __nv_bfloat16*>(d_input_scale);
+    if (accumulate)
+        fp8_gemm_batched_kernel<true><<<grid, 32>>>(W, d_X, ws, is, d_token_scale, d_Y,
+            (int)M, (int)K, (int)num_tokens, scale_stride, apply_quant);
+    else
+        fp8_gemm_batched_kernel<false><<<grid, 32>>>(W, d_X, ws, is, d_token_scale, d_Y,
+            (int)M, (int)K, (int)num_tokens, scale_stride, apply_quant);
+}
+
+}  // namespace
+
+void launch_batched_fp8_gemm(const void* d_W_fp8, const float* d_X,
+                             const void* d_weight_scales, const void* d_input_scale,
+                             const float* d_token_scale, float* d_Y,
+                             size_t M, size_t K, int scale_stride, size_t num_tokens)
+{
+    launch_fp8_gemm_batched_impl(d_W_fp8, d_X, d_weight_scales, d_input_scale,
+                                 d_token_scale, d_Y, M, K, scale_stride, num_tokens, false);
+}
+
+void launch_batched_fp8_gemm_residual(const void* d_W_fp8, const float* d_X,
+                                      const void* d_weight_scales, const void* d_input_scale,
+                                      const float* d_token_scale, float* d_Y_accum,
+                                      size_t M, size_t K, int scale_stride, size_t num_tokens)
+{
+    launch_fp8_gemm_batched_impl(d_W_fp8, d_X, d_weight_scales, d_input_scale,
+                                 d_token_scale, d_Y_accum, M, K, scale_stride, num_tokens, true);
 }

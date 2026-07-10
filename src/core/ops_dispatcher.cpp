@@ -30,10 +30,10 @@ LinearDispatcher::~LinearDispatcher() {
 
 // ============================================================================
 // Dual-path entry point: batch=1 keeps the exact latency-critical GEMV kernels;
-// num_tokens > 1 routes the unquantized BF16 path to the Tensor-Core batched
-// GEMM (batched_bf16_gemm), and every quantized path to a per-row GEMV sweep
-// (numerically identical to running batch=1 num_tokens times) until batched
-// quantized kernels exist. The batch=1 GEMV kernels themselves are UNCHANGED.
+// num_tokens > 1 routes each strategy to its Tensor-Core batched GEMM (BF16 /
+// AWQ int4 / FP8 E4M3). Only COMPRESSED_TENSORS_INT4 still falls back to a
+// per-row GEMV sweep (no batched kernel yet). The batch=1 GEMV kernels
+// themselves are UNCHANGED.
 // ============================================================================
 void LinearDispatcher::forward(const std::string& base_name,
                                const float* d_in,
@@ -48,26 +48,65 @@ void LinearDispatcher::forward(const std::string& base_name,
         return;
     }
 
-    // Unquantized BF16: one Tensor-Core GEMM over all rows. The biased q/k/v
-    // projections never reach the dispatcher (engine.cpp fast path), so only the
-    // plain and residual-accumulating variants are needed here, matching forward_row.
-    if (m_config.quant_strategy == QuantStrategy::NONE) {
+    const bool residual = (d_residual_accum != nullptr);
+
+    switch (m_config.quant_strategy) {
+
+    case QuantStrategy::NONE: {
+        // Unquantized BF16: one Tensor-Core GEMM over all rows. The biased q/k/v
+        // projections never reach the dispatcher (engine.cpp fast path), so only
+        // plain and residual variants are needed, matching forward_row.
         const void* w = m_arena.get_weight_ptr(base_name + ".weight");
-        if (d_residual_accum == nullptr)
-            launch_bf16_gemm_batched(w, d_in, d_out, out_features, in_features, num_tokens);
-        else
+        if (residual)
             launch_bf16_gemm_residual_batched(w, d_in, d_residual_accum,
                                               out_features, in_features, num_tokens);
+        else
+            launch_bf16_gemm_batched(w, d_in, d_out, out_features, in_features, num_tokens);
         return;
     }
 
-    // Quantized (AWQ / INT4 / FP8): no batched kernel yet — sweep the rows through
-    // the exact batch=1 path. d_in / d_out / d_residual_accum are [num_tokens, *].
-    for (size_t t = 0; t < num_tokens; ++t) {
-        const float* in_row  = d_in + t * in_features;
-        float* out_row       = d_out ? d_out + t * out_features : nullptr;
-        float* accum_row      = d_residual_accum ? d_residual_accum + t * out_features : nullptr;
-        forward_row(base_name, in_row, out_row, out_features, in_features, accum_row);
+    case QuantStrategy::WEIGHT_ONLY_PACKED: {
+        // AWQ / GPTQ int4: unpack + dequant tiles into shared memory, Tensor-Core GEMM.
+        QuantizedTensorPtrs ptrs = m_arena.get_quantized_pointers(base_name);
+        if (residual)
+            launch_batched_awq_gemm_residual(ptrs.qweight, ptrs.scales, ptrs.qzeros,
+                                             d_in, d_residual_accum, out_features,
+                                             in_features, m_config.quant_group_size, num_tokens);
+        else
+            launch_batched_awq_gemm(ptrs.qweight, ptrs.scales, ptrs.qzeros,
+                                    d_in, d_out, out_features, in_features,
+                                    m_config.quant_group_size, num_tokens);
+        return;
+    }
+
+    case QuantStrategy::ROWWISE_FP8: {
+        // FP8 E4M3: row-wise weight scale + optional per-tensor activation scale,
+        // applied uniformly across the batch (matches the GEMV; see the kernel).
+        const void* w   = m_arena.get_weight_ptr(base_name + ".weight");
+        const void* w_s = m_arena.get_weight_ptr(base_name + ".weight_scale");
+        const void* i_s = m_arena.get_weight_ptr_optional(base_name + ".input_scale");
+        if (residual)
+            launch_batched_fp8_gemm_residual(w, d_in, w_s, i_s, d_token_scale,
+                                             d_residual_accum, out_features, in_features,
+                                             /*scale_stride=*/1, num_tokens);
+        else
+            launch_batched_fp8_gemm(w, d_in, w_s, i_s, d_token_scale, d_out,
+                                    out_features, in_features, /*scale_stride=*/1, num_tokens);
+        return;
+    }
+
+    case QuantStrategy::COMPRESSED_TENSORS_INT4:
+    default: {
+        // No batched symmetric-int4 kernel yet — sweep the rows through the exact
+        // batch=1 path. d_in / d_out / d_residual_accum are [num_tokens, *].
+        for (size_t t = 0; t < num_tokens; ++t) {
+            const float* in_row = d_in + t * in_features;
+            float* out_row      = d_out ? d_out + t * out_features : nullptr;
+            float* accum_row    = d_residual_accum ? d_residual_accum + t * out_features : nullptr;
+            forward_row(base_name, in_row, out_row, out_features, in_features, accum_row);
+        }
+        return;
+    }
     }
 }
 

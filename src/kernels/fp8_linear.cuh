@@ -41,3 +41,41 @@ void launch_fp8_gemv_residual_kernel(const void* d_W_fp8,
                                      size_t M,
                                      size_t K,
                                      int scale_stride);
+
+// ---------------------------------------------------------------------------
+// Batched FP8 GEMM (num_tokens > 1 path): Y[T, M] = X[T, K] @ Wdeq^T, where
+// Wdeq[oc, k] = unpack_e4m3(W_fp8[oc][k]) and the row-wise weight scale (plus the
+// optional activation scale) are applied in the epilogue -- numerically identical
+// to running launch_fp8_gemv per row. E4M3 weights are unpacked to FP32 in shared
+// memory and fed to Hardware Tensor Cores (nvcuda::wmma, TF32), like the BF16 /
+// AWQ batched kernels.
+//
+// Activation scaling matches the GEMV exactly and is applied UNIFORMLY across the
+// batch: with d_input_scale != nullptr, every token's activations are quantized
+// to E4M3 in x/input_scale domain (a per-tensor static scale, so each of the T
+// rows uses the same, correct scale) and the epilogue multiplies input_scale
+// back; with d_input_scale == nullptr the activations enter the dot product raw
+// (weight-only). d_X is [num_tokens, K], d_Y is [num_tokens, M]. K/T/M arbitrary
+// (tail tiles zero-padded).
+void launch_batched_fp8_gemm(const void* d_W_fp8,
+                             const float* d_X,
+                             const void* d_weight_scales,
+                             const void* d_input_scale,
+                             const float* d_token_scale,
+                             float* d_Y,
+                             size_t M,
+                             size_t K,
+                             int scale_stride,
+                             size_t num_tokens);
+
+// Residual variant: d_Y_accum[T, M] += batched GEMM result (o_proj / down_proj).
+void launch_batched_fp8_gemm_residual(const void* d_W_fp8,
+                                      const float* d_X,
+                                      const void* d_weight_scales,
+                                      const void* d_input_scale,
+                                      const float* d_token_scale,
+                                      float* d_Y_accum,
+                                      size_t M,
+                                      size_t K,
+                                      int scale_stride,
+                                      size_t num_tokens);
