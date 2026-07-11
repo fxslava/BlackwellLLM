@@ -14,9 +14,12 @@
 // Unlike the paged KV cache, the linear-attention (SSM) layers carry a state
 // whose size is INDEPENDENT of context length: a fixed [Dk x Dv] recurrent
 // matrix per head plus a tiny causal-conv1d ring buffer. We deliberately drop
-// Copy-on-Write here (see ModelCapabilities::supports_cow_branching == false for
-// hybrid models): each active sequence owns one flat, contiguous VRAM block that
-// evolves strictly linearly. No fork, no ref-counting, no page table.
+// Copy-on-Write here: each active sequence owns one flat, contiguous VRAM block
+// that evolves strictly linearly -- no ref-counting, no page table. Branching
+// (fork() for Tree-of-Thoughts) is supported by a PHYSICAL snapshot instead of
+// CoW: fork_sequence() D2D-copies the parent's dense slice into the child. That
+// is cheap precisely because the state is small and context-independent, so a
+// full duplicate costs the same regardless of how long the sequence is.
 //
 // Device layout, one flat cudaMalloc, per sequence stride = bytes_per_seq():
 //   [seq 0 | seq 1 | ... | seq N-1]
@@ -111,6 +114,30 @@ public:
             CUDA_CHECK_THROW(cudaMemsetAsync(conv_state(seq, 0), 0,
                                        m_conv_stride * sizeof(float), stream));
     }
+
+    // Physical SNAPSHOT: deep-copy the parent sequence's ENTIRE recurrent + conv
+    // state into the child (device-to-device). This is what lets a hybrid SSM
+    // model fork() for Tree-of-Thoughts branching. Unlike the paged KV cache there
+    // is no Copy-on-Write here: the recurrent state is dense and context-length-
+    // INDEPENDENT (a fixed [Dk x Dv] matrix per head + a tiny conv ring), so a
+    // straight D2D duplication of both per-sequence slices is both correct and
+    // cheap. The child is overwritten wholesale; both ids must be < max_sequences.
+    // Stream-ordered so it composes with the surrounding fork/decode work.
+    void fork_sequence(int parent_seq, int child_seq, cudaStream_t stream = 0) {
+        check(parent_seq, 0);
+        check(child_seq, 0);
+        if (parent_seq == child_seq) return;   // nothing to clone
+        if (m_d_rec)
+            CUDA_CHECK_THROW(cudaMemcpyAsync(
+                rec_state(child_seq, 0), rec_state(parent_seq, 0),
+                m_rec_stride * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        if (m_d_conv)
+            CUDA_CHECK_THROW(cudaMemcpyAsync(
+                conv_state(child_seq, 0), conv_state(parent_seq, 0),
+                m_conv_stride * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    }
+
+    int max_sequences() const { return m_max_seqs; }
 
     const SsmGeometry& geometry() const { return m_geo; }
     // Total resident VRAM (both sub-arenas, all sequences) — for budgeting/tests.

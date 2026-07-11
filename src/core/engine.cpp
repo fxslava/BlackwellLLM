@@ -153,10 +153,20 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     }
 
     // Finalize the one capability the topology alone could not decide: CoW
-    // branching needs BOTH a branching-capable cache (paged) AND the absence of a
-    // recurrent SSM state we cannot snapshot. derive_capabilities() filled the rest.
-    m_caps.supports_cow_branching =
-        kv_mgr->supports_branching() && m_caps.num_linear_attention_layers == 0;
+    // branching needs a branching-capable cache (paged). Hybrid SSM models now
+    // qualify too -- fork() PHYSICALLY snapshots the recurrent state
+    // (SsmStatePool::fork_sequence) and the dedicated gated full-attention KV
+    // cache, so the old "dense only" restriction is lifted. Continuous mode still
+    // has no fork. derive_capabilities() filled the rest.
+    m_caps.supports_cow_branching = kv_mgr->supports_branching();
+
+    // Concurrent-branch capacity for the physically-snapshotted hybrid state
+    // stores (the SSM recurrent/conv pool + the gated full-attention cache).
+    // Only branching-capable (paged) engines pay the multi-sequence VRAM; it
+    // mirrors the paged pool's own CoW branch headroom so the paged KV branches
+    // and the snapshotted stores share one budget. Continuous stays single-seq.
+    m_branch_capacity = m_caps.supports_cow_branching
+                            ? std::max(1, m_runtime.paged_branch_factor) : 1;
 
     // ---- Prefix-cache substrate composition root (Phase 3 wiring) ----------
     // SmVramPool -> CudaTierBackend -> TieredMemoryPager -> PrefixCacheManager
@@ -194,8 +204,9 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     }
 
     // Map absolute layer -> linear ordinal (-1 for full-attention layers), and
-    // allocate the SSM recurrent state for hybrid models. No CoW => a single
-    // active sequence (branching is vetoed above), so the pool holds one slot.
+    // allocate the SSM recurrent state for hybrid models. The pool holds
+    // m_branch_capacity sequence slots so fork() can physically snapshot the
+    // parent's recurrent state into a sibling branch (1 slot when branching is off).
     m_linear_layer_index.assign(m_config.num_layers, -1);
     if (m_caps.requires_ssm_subsystem) {
         int ord = 0;
@@ -203,7 +214,8 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
             if (m_config.layer_types[i] == AttnKind::Linear)
                 m_linear_layer_index[i] = ord++;
         ssm_state = std::make_unique<blackwell::ssm::SsmStatePool>(
-            blackwell::ssm::SsmGeometry::from_config(m_config), /*max_sequences=*/1);
+            blackwell::ssm::SsmGeometry::from_config(m_config),
+            /*max_sequences=*/m_branch_capacity);
 
         const auto& L = m_config.linear;
         const size_t conv_dim = 2 * L.num_key_heads * L.key_head_dim
@@ -240,7 +252,11 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
         }
         const size_t kv_dim = m_config.num_key_value_heads * m_config.head_dim;
         m_full_kv_layer_stride = kv_dim * arena.get_max_seq_len();
-        const size_t total = (size_t)m_caps.num_full_attention_layers * m_full_kv_layer_stride;
+        // Per-sequence slice spans all full-attn layers; the cache is laid out
+        // [seq][full-layer][pos][kv] so a hybrid fork D2D-copies one seq stride
+        // and step_full_attention offsets by seq_id * m_full_kv_seq_stride.
+        m_full_kv_seq_stride = (size_t)m_caps.num_full_attention_layers * m_full_kv_layer_stride;
+        const size_t total = (size_t)m_branch_capacity * m_full_kv_seq_stride;
         d_QG.allocate(m_config.num_attention_heads * m_config.head_dim * 2);
         d_gate.allocate(m_config.num_attention_heads * m_config.head_dim);
         d_full_k_cache.allocate(total);
@@ -379,16 +395,17 @@ EngineStatus BlackwellEngine::Impl::step_attention_out(int layer_idx) {
 // AttnKind::Linear layers of a hybrid model. Bypasses the KV cache entirely; the
 // per-layer recurrent state lives in SsmStatePool and evolves in place.
 // ============================================================================
-EngineStatus BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos) {
+EngineStatus BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos, int seq_id) {
     arena.ensure_layer_ready(layer_idx);
     const int li = m_linear_layer_index[layer_idx];
     const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const std::string la   = base + "linear_attn.";
 
-    // Per-(sequence, layer) recurrent state. Sequence 0 only: hybrid models forbid
-    // forks (ModelCapabilities::supports_cow_branching == false).
-    float* d_state = ssm_state->rec_state(0, li);
-    float* d_conv  = ssm_state->conv_state(0, li);
+    // Per-(sequence, layer) recurrent state. seq_id selects this branch's slice:
+    // a forked child owns an independent physical copy (SsmStatePool::fork_sequence),
+    // so decoding it never disturbs the parent's recurrent state.
+    float* d_state = ssm_state->rec_state(seq_id, li);
+    float* d_conv  = ssm_state->conv_state(seq_id, li);
     (void)pos;   // recurrence is position-implicit (state carries history)
 
     const auto& L = m_config.linear;
@@ -446,7 +463,7 @@ EngineStatus BlackwellEngine::Impl::step_linear_attention(int layer_idx, int pos
 // head_dim 256 exceeds the shared attention/KV kernel's 128-wide block. This is an
 // unoptimized "make it work" path over a dedicated continuous FP32 KV cache.
 // ============================================================================
-EngineStatus BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos) {
+EngineStatus BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos, int seq_id) {
     arena.ensure_layer_ready(layer_idx);
     const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
     const std::string sa   = base + "self_attn.";
@@ -484,9 +501,13 @@ EngineStatus BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos) 
     launch_rope_partial_inplace(d_K, pos, Hkv, Dh, rot, m_config.rope_theta);
 
     // 6. append K/V into this full-attn layer's dedicated cache, then decode.
+    // Offset by this sequence's per-branch slice so forked branches keep
+    // independent full-attention histories (the dedicated cache is NOT the paged
+    // pool, so fork() snapshots it separately; see Impl::fork).
     const int fo = m_full_layer_index[layer_idx];
-    float* d_k_cache = d_full_k_cache + (size_t)fo * m_full_kv_layer_stride;
-    float* d_v_cache = d_full_v_cache + (size_t)fo * m_full_kv_layer_stride;
+    const size_t seq_off = (size_t)seq_id * m_full_kv_seq_stride;
+    float* d_k_cache = d_full_k_cache + seq_off + (size_t)fo * m_full_kv_layer_stride;
+    float* d_v_cache = d_full_v_cache + seq_off + (size_t)fo * m_full_kv_layer_stride;
     const int msl = (int)arena.get_max_seq_len();
     launch_kv_append(d_K, d_V, d_k_cache, d_v_cache, pos, Hkv, Dh, msl);
     launch_full_attention_decode(d_Q, d_k_cache, d_v_cache, d_Attn_out, pos,
@@ -598,21 +619,70 @@ static void require_branching(const ModelCapabilities& caps, const char* op) {
     if (!caps.supports_cow_branching)
         throw std::runtime_error(
             std::string("BlackwellEngine::") + op + ": the loaded model does not support "
-            "CoW branching (" +
-            (caps.requires_ssm_subsystem
-                 ? "hybrid linear-attention/SSM checkpoint — recurrent state is not "
-                   "snapshot-able; run linear ReAct only"
-                 : "Continuous KV mode — construct with KVCacheMode::Paged for branching") +
-            ").");
+            "CoW branching (Continuous KV mode — construct with KVCacheMode::Paged for "
+            "branching; hybrid SSM models fork via physical state snapshot, but still "
+            "require Paged mode).");
+}
+
+// Clone every per-sequence state store parent owns into child. This is the single
+// place the three storage worlds a hybrid model keeps are snapshotted together, so
+// one logical fork() branches all of them atomically. A dense model exercises only
+// the paged KV path; the SSM and full-attention snapshots are no-ops it never has.
+void BlackwellEngine::Impl::fork(int parent_id, int child_id) {
+    // The hybrid physical stores are indexed directly by sequence id and sized to
+    // m_branch_capacity; reject ids that don't fit BEFORE any partial clone (a
+    // half-forked child would be worse than a clean failure).
+    if (ssm_state || d_full_k_cache) {
+        const auto in_range = [&](int id) { return id >= 0 && id < m_branch_capacity; };
+        if (!in_range(parent_id) || !in_range(child_id))
+            throw std::runtime_error(
+                "BlackwellEngine::fork: sequence id out of hybrid branch capacity [0, " +
+                std::to_string(m_branch_capacity) +
+                ") -- raise paged_branch_factor to hold more concurrent Tree-of-Thoughts "
+                "branches");
+    }
+
+    // 1. Attention KV pages: paged CoW share (O(blocks), no copy until first write).
+    //    For a dense model this is the whole fork; for a hybrid model these pages
+    //    are the (unused) placeholder the paged manager tracks per sequence.
+    kv_mgr->fork(parent_id, child_id);
+
+    // 2. Recurrent SSM state: physical device-to-device snapshot of the dense,
+    //    context-independent slice.
+    if (ssm_state) ssm_state->fork_sequence(parent_id, child_id);
+
+    // 3. Dedicated gated full-attention KV cache: the paged fork above does NOT
+    //    cover it (these head_dim-256 layers keep their own continuous cache), so
+    //    snapshot the parent's per-sequence slice into the child explicitly. D2D
+    //    on the default stream, ordered with the SSM copy and the later decode.
+    if (d_full_k_cache) {
+        const size_t off_p = (size_t)parent_id * m_full_kv_seq_stride;
+        const size_t off_c = (size_t)child_id  * m_full_kv_seq_stride;
+        const size_t bytes = m_full_kv_seq_stride * sizeof(float);
+        CUDA_CHECK_THROW(cudaMemcpy(d_full_k_cache + off_c, d_full_k_cache + off_p,
+                                    bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_THROW(cudaMemcpy(d_full_v_cache + off_c, d_full_v_cache + off_p,
+                                    bytes, cudaMemcpyDeviceToDevice));
+    }
 }
 
 void BlackwellEngine::fork(int parent_id, int child_id) {
     require_branching(pImpl->m_caps, "fork");
-    pImpl->kv_mgr->fork(parent_id, child_id);
+    pImpl->fork(parent_id, child_id);
 }
 
 void BlackwellEngine::rewind(int seq_id, int pos) {
     require_branching(pImpl->m_caps, "rewind");
+    // Recurrent SSM state cannot be rolled back to an arbitrary position: it
+    // accumulates with every decode and keeps no per-position history to restore
+    // (fork() snapshots forward; rewind() would need the inverse, which does not
+    // exist). Reject on hybrid models rather than silently rewinding only the
+    // (unused) paged pages and leaving the recurrent state ahead of `pos`.
+    if (pImpl->m_caps.requires_ssm_subsystem)
+        throw std::runtime_error(
+            "BlackwellEngine::rewind: unsupported for hybrid linear-attention/SSM "
+            "models — the recurrent state cannot be rolled back to an arbitrary "
+            "position (use fork() to branch, or reset_state() to restart at 0).");
     pImpl->kv_mgr->rewind(seq_id, pos);
 }
 
@@ -625,12 +695,10 @@ void BlackwellEngine::reset_state(int seq_id) {
     // and cannot be rewound -- so it must be zeroed explicitly on a sequence
     // restart. Dense models have no SSM state: this is then a no-op.
     if (!impl->ssm_state) return;
-    if (seq_id != 0)
-        throw std::runtime_error(
-            "BlackwellEngine::reset_state: hybrid SSM models are single-sequence "
-            "(seq_id must be 0)");
-    // reset() is stream-0 (the compute stream) ordered, so it composes with the
-    // subsequent decode kernels without an extra device sync.
+    // Hybrid models are multi-sequence now (fork() snapshots the recurrent state):
+    // reset the requested branch's slice. The pool bounds-checks seq_id against
+    // its branch capacity. reset() is stream-0 (the compute stream) ordered, so it
+    // composes with the subsequent decode kernels without an extra device sync.
     impl->ssm_state->reset(seq_id);
 }
 
@@ -676,10 +744,10 @@ EngineStatus BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id,
             impl->m_config.layer_types[i] == AttnKind::Linear;
 
         if (is_linear) {
-            ENGINE_TRY(impl->step_linear_attention(i, pos));
+            ENGINE_TRY(impl->step_linear_attention(i, pos, seq_id));
         } else if (impl->m_config.attn_output_gate) {
             // Qwen3.5 hybrid: gated head_dim-256 full-attention (dedicated path).
-            ENGINE_TRY(impl->step_full_attention(i, pos));
+            ENGINE_TRY(impl->step_full_attention(i, pos, seq_id));
         } else {
             ENGINE_TRY(impl->step_attention_norm(i));
             ENGINE_TRY(impl->step_attention_qkv_projections(i));

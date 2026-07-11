@@ -39,6 +39,15 @@ struct BlackwellEngine::Impl {
     // buffer below, so it must precede `arena`. Computed once from the plan.
     size_t m_token_capacity;
 
+    // Concurrent-branch capacity for the HYBRID per-sequence state stores (the SSM
+    // recurrent/conv pool and the dedicated gated full-attention KV cache). These
+    // stores are physically snapshotted on fork() (no CoW), so they must be sized
+    // for every branch that can be live at once. Paged mode sizes this to the
+    // branch factor; single-sequence (Continuous, no fork) keeps it 1. Distinct
+    // from m_token_capacity (tokens-per-pass): a hybrid model batches ONE token
+    // per forward but may hold several forked sequences.
+    int m_branch_capacity = 1;
+
     SafetensorsLoader loader;
     VRAMArena arena;
     LinearDispatcher dispatcher;
@@ -101,6 +110,10 @@ struct BlackwellEngine::Impl {
     blackwell::DeviceBuffer<float> d_QG, d_gate;
     blackwell::DeviceBuffer<float> d_full_k_cache, d_full_v_cache;
     size_t m_full_kv_layer_stride = 0;     // floats per layer in each of K/V cache
+    // Per-SEQUENCE stride: floats one branch owns across all full-attn layers
+    // (num_full_layers * m_full_kv_layer_stride). The cache is laid out
+    // [seq][full-layer][pos][kv]; forking a hybrid model D2D-copies one such slice.
+    size_t m_full_kv_seq_stride = 0;
 
     Impl(const std::string& index_path, const blackwell::InferenceConfig& request,
          const blackwell::RuntimeOverrides& overrides);
@@ -149,17 +162,29 @@ struct BlackwellEngine::Impl {
                                              const int* positions, int batch_size,
                                              int* out_next_tokens);
 
+    // Branch a sequence for Tree-of-Thoughts search (admin / exception tier).
+    // Clones EVERY per-sequence state store parent owns into child, in one place:
+    //   1. attention KV pages     -> kv_mgr->fork (paged CoW share)
+    //   2. recurrent SSM state    -> SsmStatePool::fork_sequence (physical D2D)
+    //   3. gated full-attn KV     -> D2D copy of the dedicated cache slice
+    // (2) and (3) are what make hybrid models forkable; a dense model exercises
+    // only (1). child_id must fit the branch capacity of the physical stores.
+    void fork(int parent_id, int child_id);
+
     blackwell::EngineStatus step_embedding(int token_id);
     blackwell::EngineStatus step_attention_norm(int layer_idx);
     blackwell::EngineStatus step_attention_qkv_projections(int layer_idx);
     blackwell::EngineStatus step_attention_math(int layer_idx, int pos);
     blackwell::EngineStatus step_attention_out(int layer_idx);
     // Linear-attention (SSM) layer: bypasses the KV cache, evolves the recurrent
-    // state in SsmStatePool via the conv1d + GatedDeltaNet kernels.
-    blackwell::EngineStatus step_linear_attention(int layer_idx, int pos);
+    // state in SsmStatePool via the conv1d + GatedDeltaNet kernels. seq_id selects
+    // this sequence's recurrent/conv slice (branching: a forked child owns its own
+    // slice; default 0 is the single-stream path, unchanged).
+    blackwell::EngineStatus step_linear_attention(int layer_idx, int pos, int seq_id = 0);
     // Qwen3.5 hybrid gated full-attention layer (head_dim 256, q_proj query|gate,
-    // q_norm/k_norm, partial RoPE). Uses the dedicated full-attn KV cache.
-    blackwell::EngineStatus step_full_attention(int layer_idx, int pos);
+    // q_norm/k_norm, partial RoPE). Uses the dedicated full-attn KV cache; seq_id
+    // selects this sequence's per-branch slice of that cache.
+    blackwell::EngineStatus step_full_attention(int layer_idx, int pos, int seq_id = 0);
     blackwell::EngineStatus step_mlp_norm(int layer_idx);
     blackwell::EngineStatus step_mlp_projections(int layer_idx);
     blackwell::EngineStatus step_mlp_out(int layer_idx);

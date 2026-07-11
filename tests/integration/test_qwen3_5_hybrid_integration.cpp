@@ -89,12 +89,12 @@ constexpr double kParityThreshold = 0.999;   // exact-parity bar for this stack
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Capabilities: this runs today (no dumps needed). It asserts the hybrid model
-// correctly refuses CoW branching. Construction needs the checkpoint to load,
-// which is itself gated on the int4/binding work — so if construction throws we
-// SKIP rather than fail (the contract is still documented and compiled).
+// Capabilities: this runs today (no dumps needed). The hybrid model now SUPPORTS
+// fork() (physical SSM + full-attention snapshot under Paged mode), but rewind()
+// stays unsupported -- a recurrent state cannot be rolled back to an arbitrary
+// position. Construction needs the checkpoint to load, so if it throws we SKIP.
 // ---------------------------------------------------------------------------
-TEST(Qwen35Hybrid, CapabilitiesRejectBranching) {
+TEST(Qwen35Hybrid, SupportsForkRejectsRewind) {
     if (!file_exists(model_index_path()))
         GTEST_SKIP() << "checkpoint absent: " << model_index_path();
 
@@ -111,12 +111,14 @@ TEST(Qwen35Hybrid, CapabilitiesRejectBranching) {
     const ModelCapabilities caps = engine->get_capabilities();
     EXPECT_TRUE(caps.requires_ssm_subsystem);
     EXPECT_TRUE(caps.is_hybrid);
-    EXPECT_FALSE(caps.supports_cow_branching);
+    EXPECT_TRUE(caps.supports_cow_branching)
+        << "hybrid models now branch via physical state snapshot under Paged mode";
     EXPECT_GT(caps.num_linear_attention_layers, 0);
     EXPECT_GT(caps.num_full_attention_layers, 0);
 
-    // The capability gate must reject branching with a clean, handled error.
-    EXPECT_THROW(engine->fork(0, 1), std::runtime_error);
+    // fork() is now supported (snapshots the recurrent SSM + gated full-attention
+    // state); rewind() is still rejected (recurrent state has no positional undo).
+    EXPECT_NO_THROW(engine->fork(0, 1));
     EXPECT_THROW(engine->rewind(0, 0), std::runtime_error);
 }
 
@@ -450,4 +452,106 @@ TEST(Qwen35Hybrid, LinearLayer0Parity) {
     }
 
     EXPECT_GT(mix_cos, kParityThreshold);
+}
+
+// ---------------------------------------------------------------------------
+// Tree-of-Thoughts branching for a HYBRID model. fork() must physically snapshot
+// BOTH the recurrent SSM state AND the dedicated gated full-attention KV cache,
+// so decoding a forked child never disturbs the parent (and vice versa).
+//
+// Proof of independence, no golden dumps needed: prime seq 0, fork it into four
+// identical branches, then show that decoding two of them INTERLEAVED reproduces,
+// to parity, what decoding them in ISOLATION does. If any per-sequence state were
+// shared (the pre-snapshot behaviour, where the SSM path was hardcoded to seq 0
+// and the full-attn cache had no seq dimension), the interleaved decode would
+// read a polluted state and diverge from the isolated reference.
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, HybridModelSupportsForking) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), /*max_seq_len=*/512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction pending: " << e.what();
+    }
+    ASSERT_TRUE(engine->get_capabilities().supports_cow_branching)
+        << "hybrid model must support fork() after the SSM/full-attn snapshot work";
+
+    BlackwellEngine::Impl* impl = engine->get_impl();
+    const size_t V = impl->m_config.vocab_size;
+
+    auto snapshot = [&]() {
+        std::vector<float> h(V);
+        EXPECT_EQ(cudaMemcpy(h.data(), impl->d_logits, V * sizeof(float),
+                             cudaMemcpyDeviceToHost), cudaSuccess);
+        return h;
+    };
+    // One decode step on `seq`; returns that step's logits. forward_status needs a
+    // non-null out pointer, so we always pass one.
+    auto decode = [&](int tok, int pos, int seq) {
+        int next = -1;
+        EXPECT_EQ(engine->forward_status(tok, pos, 0.6f, 0.9f, seq, &next),
+                  blackwell::EngineStatus::Success)
+            << "decode(tok=" << tok << ", pos=" << pos << ", seq=" << seq << ")";
+        return snapshot();
+    };
+    auto argmax = [](const std::vector<float>& v) {
+        return (int)(std::max_element(v.begin(), v.end()) - v.begin());
+    };
+
+    // Prime seq 0 with a short prompt from an empty recurrent state (positions 0..L-1).
+    if (impl->ssm_state) impl->ssm_state->reset(0);
+    const int prompt[] = {1, 2, 3};
+    const int L = (int)(sizeof(prompt) / sizeof(prompt[0]));
+    for (int pos = 0; pos < L; ++pos) (void)decode(prompt[pos], pos, /*seq=*/0);
+
+    // Fork into four identical branches at length L: seq 0 (parent) + 1 (child) are
+    // decoded INTERLEAVED; seq 2/3 hold the ISOLATED references. Needs branch
+    // capacity >= 4 (default paged_branch_factor).
+    ASSERT_NO_THROW(engine->fork(0, 1));
+    ASSERT_NO_THROW(engine->fork(0, 2));
+    ASSERT_NO_THROW(engine->fork(0, 3));
+
+    // Distinct continuations: parent follows Y, child follows X.
+    const int Ya = 100, Yb = 101;
+    const int Xa = 500, Xb = 501;
+    ASSERT_LT(Yb, (int)V);
+    ASSERT_LT(Xb, (int)V);
+
+    // Isolated references, each decoded alone on its own branch.
+    (void)decode(Ya, L,     /*seq=*/2);
+    const std::vector<float> ref_parent = decode(Yb, L + 1, /*seq=*/2);
+    (void)decode(Xa, L,     /*seq=*/3);
+    const std::vector<float> ref_child  = decode(Xb, L + 1, /*seq=*/3);
+
+    // Interleaved: alternate parent (seq 0, Y) and child (seq 1, X).
+    (void)decode(Ya, L,     /*seq=*/0);
+    (void)decode(Xa, L,     /*seq=*/1);
+    const std::vector<float> got_parent = decode(Yb, L + 1, /*seq=*/0);
+    const std::vector<float> got_child  = decode(Xb, L + 1, /*seq=*/1);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << "CUDA fault during hybrid fork decode";
+
+    // Independence: interleaving must reproduce the isolated references (same
+    // kernels over the same physically-forked state). A shared or leaking store
+    // would make got_* diverge from ref_*.
+    const double cos_parent = cosine_similarity(ref_parent, got_parent);
+    const double cos_child  = cosine_similarity(ref_child,  got_child);
+    std::cout << "[qwen3.5-hybrid fork] parent cos=" << cos_parent
+              << "  child cos=" << cos_child
+              << "  parent top-1=" << argmax(got_parent)
+              << "  child top-1="  << argmax(got_child) << "\n";
+    EXPECT_GT(cos_parent, kParityThreshold)
+        << "interleaved parent decode diverged from its isolated reference "
+           "(child branch leaked into the parent's SSM / full-attn state)";
+    EXPECT_GT(cos_child, kParityThreshold)
+        << "interleaved child decode diverged from its isolated reference "
+           "(parent branch leaked into the child's SSM / full-attn state)";
+    EXPECT_EQ(argmax(got_parent), argmax(ref_parent));
+    EXPECT_EQ(argmax(got_child),  argmax(ref_child));
+
+    SUCCEED() << "Hybrid fork produced independent parent/child branches.";
 }
