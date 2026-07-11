@@ -1,6 +1,11 @@
 # TranslationAgent — Architectural Proposal (R&D)
 
-Status: **proposal, no implementation yet**
+Status: **partially implemented** — the live-preview path has landed in
+poc_overlay (`live_translation_tracker`, `spotlight_composer`,
+`translation_service`, `caret_tracker`), riding the engine's Continuous
+Speculative Tracking primitive; preview debounce and divergence-point
+reprefill are done (see §6, §9). The commit-tier ReAct loop and per-app
+profiles remain proposal-stage.
 Scope: the integration layer between the poc_overlay UI pipeline
 (`HookManager` → `CaretTracker` → `OverlayWindow` / `TextInjector`) and the
 agent stack (`AgentOrchestrator` + `ToolRegistry` + `BlackwellLLMAdapter`).
@@ -206,14 +211,21 @@ Consequences, in decreasing order of comfort:
 
 - **Commits are cheap by construction.** Each commit extends the previous
   transcript, so prefill is O(new tokens).
-- **Consecutive previews diverge at the tail**, so today's adapter reprefills
-  from position 0 each time. Two mitigations, in order:
-  1. *Adapter enhancement (dense models):* reprefill from the divergence
-     point, not position 0 — the attention KV cache is position-addressed and
-     self-heals on overwrite, so this is legal for pure-attention checkpoints.
+- **Consecutive previews diverge at the tail.** The plain adapter path
+  reprefills from position 0 each time, but the live preview path no longer
+  uses it — mitigation 1 has **landed** as the engine's Continuous Speculative
+  Tracking primitive:
+  1. *Adapter enhancement (dense models) — DONE:* reprefill from the divergence
+     point, not position 0. `EnginePrefillCoordinator::update_sequence`
+     re-tokenizes the buffer, diffs it against the sequence's token mirror
+     (LCP), rewinds the KV cache to the divergence point (CoW page rewind), and
+     recomputes only the new suffix — the attention KV cache is
+     position-addressed and self-heals on overwrite, so this is legal for
+     pure-attention checkpoints. `LiveTranslationTracker` drives it per
+     keystroke (`live_translation_tracker.{h,cpp}`).
   2. *Paged-mode fork (dense models):* `fork_sequence(0, 1)` and decode
      previews on a throwaway seq 1 — the durable prefix on seq 0 is never
-     disturbed (CoW pages).
+     disturbed (CoW pages). Still available as an alternative.
 - **Hybrid SSM checkpoints (Qwen3.5) get neither**: recurrent state cannot be
   rewound or forked (`supports_cow_branching == false`), so every preview
   costs `reset_state()` + a full prefill. Mitigation is *policy*: keep the
@@ -261,14 +273,27 @@ reload pays one full prefill.
 
 ## 9. Open questions / future work
 
+### Landed
+
+- **Preview debounce** — implemented. A decode fires only after the user
+  pauses: `SpotlightComposer` re-arms a `kDebounceMs = 130` timer on every edit
+  (`spotlight_composer.{h,cpp}`), and the caret-driven path gates generation on
+  the configurable typing-idle `idleTimerMs` (default 700, exposed in
+  settings — `config.h`, `caret_tracker.cpp`). Restarting the timer on each
+  edit coalesces a burst into a single generation, on top of the latest-wins
+  coalescing.
+- **Divergence-point reprefill** — implemented as the engine's "Continuous
+  Speculative Tracking" primitive (see §6). `LiveTranslationTracker` drives
+  `EnginePrefillCoordinator::update_sequence`, which diffs the fresh
+  tokenization against the sequence's token mirror (LCP), rewinds the KV cache
+  to the divergence point, and recomputes only the new suffix — the preview
+  latency win on dense checkpoints, now live.
+
+### Still open
+
 - **Retro-editing committed text** (`revise_segment(id, new_text)` as an agent
   tool) — blocked on `TextInjector`, which can only replace text before the
   caret today. Park it.
-- **Preview debounce**: word boundaries can arrive faster than decode
-  completes; latest-wins coalescing handles correctness, but a ~150 ms
-  debounce may save wasted prefills on fast typists. Measure first.
-- **Divergence-point reprefill** in the adapter (§6.1) — the single highest-
-  value engine-side follow-up for preview latency on dense checkpoints.
 - **Per-app profiles** (chat vs. code editor vs. email) — `app_hint` is in the
   schema; deciding whether it selects a different `AgentProfile` (new session,
   new KV prefix) or just rides in the user turn needs usage data.

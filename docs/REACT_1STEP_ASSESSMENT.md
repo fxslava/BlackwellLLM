@@ -34,21 +34,21 @@ all five scenarios are covered by tests.
 
 ### 1.2 Findings that DO affect a strict 1-step design
 
-**F-1 — "tool_call then finish in the same completion" does not work.**
-`ToolParser::parse` returns only the *earliest* valid action. If the model
-obeys a prompt that says "call `translate_text`, then emit `<finish>`" in one
-completion, the parser returns the tool call, the orchestrator dispatches it,
-appends the observation, and *loops for a second generation* — the `<finish>`
-in the same turn is never seen. With `max_iterations = 1` the run therefore
-ends on the cap, not on a clean finish. Consequences:
-- The exact prompt shape "invoke the tool AND output `<finish>`" cannot
-  complete in one iteration on today's orchestrator.
-- Options: (a) **finish-only protocol** — no tool at all, translation rides in
-  `<finish>` (recommended, see §2); (b) a ~15-line orchestrator patch —
-  after dispatching a tool call, re-run `ToolParser::parse` on the remainder
-  of the same assistant turn (past `</tool_call>`) and honor a `Finish` found
-  there ("act-then-finish"); (c) accept `max_iterations = 2` (tool →
-  observation → finish), which is two generations, not one.
+**F-1 — "tool_call then finish in the same completion" — now supported
+(act-then-finish landed).** `ToolParser::parse` still returns only the
+*earliest* valid action, but the orchestrator no longer stops there: after
+dispatching a tool call it re-parses the remainder of the SAME assistant turn
+(past `</tool_call>`) and, if a `<finish>` is the remainder's earliest action,
+finishes cleanly in that one generation (`orchestrator.cpp:83-98`). So the
+prompt shape "invoke the tool AND output `<finish>`" now completes in a single
+iteration. A second `<tool_call>` ahead of the finish is treated as a protocol
+violation — not dispatched, and the finish behind it is not trusted; the model
+gets the observation and must produce a fresh turn. Options remain: (a)
+**finish-only protocol** — no tool at all, translation rides in `<finish>`
+(recommended, see §2); (b) **act-then-finish** — implemented (F-1b landed),
+"one tool call, then finish" costs one generation; (c) `max_iterations = 2`
+(tool → observation → finish), two generations, still available for
+multi-turn tool use.
 
 **F-2 — the cap-exit `answer` is a footgun at `max_iterations = 1`.**
 When the loop exits on the cap, `RunResult::answer` is the *raw last
@@ -59,12 +59,14 @@ policy (§3) rather than injecting/overlaying `answer` blindly. `RunResult`
 also doesn't record whether a tool was dispatched; if needed, scrape
 `history()` for an `Observation` entry or capture via the tool callback.
 
-**F-3 — no history-seeding API.** `AgentOrchestrator::history_` is private
-and `run()` only appends one user turn. The durable committed-context
-history from the TRANSLATION_AGENT design cannot be injected as prior
-USER/ASSISTANT turns today. *Prototype workaround:* inline the last K
-committed pairs inside the user prompt string. *Later:* add
-`seed_history(std::vector<Message>)`.
+**F-3 — history-seeding API — now supported (`seed_history` landed).**
+`AgentOrchestrator::seed_history(std::vector<Message>)` injects the durable
+committed-context history as prior USER/ASSISTANT turns before `run()`
+(`orchestrator.cpp:39-46`). A seed that carries its own leading System turn
+wins over the config prompt; otherwise `run()` inserts the config system
+prompt at the FRONT so seeded turns always sit behind it. The prototype
+workaround (inline the last K committed pairs into the user prompt) is no
+longer necessary — seed the transcript directly.
 
 **F-4 — no streaming or cancellation at the orchestrator seam.**
 `ILLMGenerator::generate` is whole-string. This is already solved one layer
@@ -77,14 +79,18 @@ contains `</finish>`** — the adapter's stop-string list is checkpoint-fixed
 with no public setter, so the callback is the supported way to stop decode at
 the protocol boundary and save every token after the close tag.
 
-**F-5 — consecutive previews reprefill from position 0 on today's adapter.**
-KV reuse requires a *strict extension*; preview N+1 diverges from preview N at
-the user turn, and divergence falls back to a full reprefill from position 0
-(`blackwell_llm_adapter.h`). Two implications for today: keep the system
-prompt very short (it is re-prefilled on every preview), and the
-divergence-point-reprefill adapter enhancement (legal on dense checkpoints —
-attention KV is position-addressed and self-heals) is the highest-value
-follow-up once the prototype works.
+**F-5 — divergence-point reprefill — now landed (Continuous Speculative
+Tracking).** The plain `blackwell_llm_adapter.h` path still reprefills from
+position 0 on any divergence (KV reuse requires a strict extension), but the
+live preview path no longer uses it: the engine grew a
+`EnginePrefillCoordinator::begin_sequence / update_sequence / commit_sequence`
+primitive that re-tokenizes the buffer, diffs it against the sequence's own
+token mirror (LCP), rewinds the KV cache to the divergence point via
+Copy-on-Write page rewind, and recomputes only the new suffix. In poc_overlay
+`LiveTranslationTracker` drives it, so consecutive previews of "t" → "th" →
+"the" cost only the new-suffix prefill instead of a from-scratch reprefill.
+The predicted enhancement (legal on dense checkpoints — attention KV is
+position-addressed and self-heals) is exactly what shipped.
 
 **F-6 — pick a non-thinking dense checkpoint for preview.** The parser
 *tolerates* `<think>` blocks, but a reasoning model will happily burn the
@@ -98,15 +104,16 @@ choice / chat-template guard, not a code change.
 | Infinite loop on misbehaving model | Safe — cap always honored, tested |
 | Parser crash on garbage/truncation | Safe — total, tested |
 | Hallucinated / throwing tools | Safe — error observations, tested |
-| Tool call + finish in one completion | **Not supported (F-1)** — drives protocol choice |
+| Tool call + finish in one completion | **Supported** — act-then-finish landed (F-1b) |
 | Clean result at `max_iterations = 1` | **Caller must gate on `finished` (F-2)** |
-| Context history seeding | Missing API (F-3) — inline in user prompt for now |
+| Context history seeding | **Supported** — `seed_history()` landed (F-3) |
 | Streaming / cancel / early stop | Use adapter `StreamCallback` (F-4) |
 
 **Conclusion: no orchestrator changes are required to ship the prototype
-today** — provided the protocol is finish-only (§2). The act-then-finish
-patch (F-1b) and `seed_history` (F-3) are the two small enhancements worth
-queuing right after.
+today** — provided the protocol is finish-only (§2). The two enhancements
+once queued right after — the act-then-finish patch (F-1b) and `seed_history`
+(F-3) — have both since landed (`orchestrator.cpp`), so the act-then-finish
+and durable-history-seeding paths are now available as well.
 
 ---
 
@@ -309,14 +316,24 @@ Deliberate prototype shortcuts, acknowledged:
 
 ---
 
-## 4. Queued follow-ups (explicitly NOT today)
+## 4. Follow-ups
 
-1. **Act-then-finish orchestrator patch** (F-1b) — enables true
-   "one generation, one tool, clean finish".
-2. **`seed_history()`** (F-3) — durable committed-context turns instead of
-   inlining into the user prompt.
-3. **Divergence-point reprefill in the adapter** (F-5) — the preview latency
+### Landed
+
+1. ✅ **Act-then-finish orchestrator patch** (F-1b) — enables true
+   "one generation, one tool, clean finish" (`orchestrator.cpp:83-98`).
+2. ✅ **`seed_history()`** (F-3) — durable committed-context turns instead of
+   inlining into the user prompt (`orchestrator.cpp:39-46`).
+3. ✅ **Divergence-point reprefill** (F-5) — landed engine-side as the
+   "Continuous Speculative Tracking" primitive
+   (`EnginePrefillCoordinator::update_sequence`, driven by
+   `LiveTranslationTracker` in poc_overlay): re-tokenizes the buffer, diffs it
+   against the sequence's token mirror (LCP), rewinds the KV cache to the
+   divergence point, and recomputes only the new suffix — the preview latency
    win on dense checkpoints.
+
+### Still queued (explicitly NOT today)
+
 4. Two-phase async commit (kill the STA-blocking shortcut).
 5. `RunResult` enrichment: `tools_dispatched` count, so callers stop scraping
    `history()`.
