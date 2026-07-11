@@ -123,7 +123,10 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     d_Up.allocate(tc * m_config.intermediate_dim);
     d_Swiglu_out.allocate(tc * m_config.intermediate_dim);
 
-    d_logits.allocate(m_config.vocab_size);
+    // One logits row per active token: batched decode leaves [batch, vocab] here
+    // and samples each row; every single-row path (run_token, run_chunk,
+    // last_token_probability) uses row 0, so widening is transparent to them.
+    d_logits.allocate(tc * m_config.vocab_size);
     d_next_token.allocate(tc);
 
     // Resident pool may be empty when every layer is offloaded to host RAM.
@@ -838,6 +841,168 @@ EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_po
 }
 
 // ============================================================================
+// TRUE-batch decode: one forward pass over batch_size INDEPENDENT sequences,
+// one new token each. The wavefront primitive for parallel code-agent
+// orchestration (Tree-of-Thoughts): N branches advance together instead of via
+// N sequential run_token passes, so the weight reads amortize over the batch
+// through the dispatcher's num_tokens>1 Tensor-Core GEMM path.
+//
+// Contrast with run_chunk: run_chunk widens over consecutive positions of ONE
+// sequence (shared block table, causal tile); this widens over SEQUENCES, each
+// carrying its own block table, length and position -- so RoPE, KV append and
+// attention all route through the sequence-aware batched kernels
+// (attention_decode_batch), while the projections/MLP/embedding reuse the exact
+// same batched primitives run_chunk uses. Every per-row/per-seq kernel does the
+// identical math its batch=1 counterpart does, so a batched step reproduces the
+// sequential decode loop's logits (BatchedDecodeMatchesSequential).
+// ============================================================================
+EngineStatus BlackwellEngine::Impl::run_decode_batch(const int* token_ids, const int* seqs,
+                                                     const int* positions, int batch_size,
+                                                     int* out_next_tokens) {
+    const size_t H   = m_config.hidden_dim;
+    const size_t V   = m_config.vocab_size;
+    const size_t msl = arena.get_max_seq_len();
+    if (batch_size <= 0 || !token_ids || !seqs || !positions || !out_next_tokens)
+        return EngineStatus::InvalidArgument;
+    if (static_cast<size_t>(batch_size) > m_token_capacity) {
+        std::cerr << "[blackwell_core] run_decode_batch: batch_size " << batch_size
+                  << " exceeds token capacity " << m_token_capacity << "\n";
+        return EngineStatus::InvalidArgument;
+    }
+    // Batched decode is the generic dense full-attention pipeline only (same
+    // restriction as run_chunk: SSM recurrent state and the gated full-attention
+    // cache live outside the batched paged path).
+    if (!m_config.layer_types.empty() || m_config.attn_output_gate || ssm_state) {
+        std::cerr << "[blackwell_core] run_decode_batch: batched decode is unsupported "
+                     "for SSM / gated full-attention models\n";
+        return EngineStatus::InvalidConfig;
+    }
+    int max_pos = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        if (positions[b] < 0 || static_cast<size_t>(positions[b]) >= msl) {
+            std::cerr << "[blackwell_core] run_decode_batch: pos " << positions[b]
+                      << " (row " << b << ") exceeds KV capacity " << msl << "\n";
+            return EngineStatus::InvalidArgument;
+        }
+        max_pos = std::max(max_pos, positions[b]);
+    }
+
+    const bool fp16_w = half_weights_are_fp16(m_config);
+
+    // 1. Batched embedding: batch_size ids -> d_X_accum [batch, H].
+    CUDA_CHECK_RETURN(cudaMemcpy(d_next_token, token_ids, batch_size * sizeof(int),
+                                 cudaMemcpyHostToDevice));
+    CUDA_CHECK_RETURN(cudaMemset(d_X_accum, 0, static_cast<size_t>(batch_size) * H * sizeof(float)));
+    {
+        const void* d_embed = arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight");
+        if (fp16_w) launch_fp16_embedding_kernel(d_next_token, d_embed, d_X_accum, batch_size, H);
+        else        launch_bf16_embedding_kernel(d_next_token, d_embed, d_X_accum, batch_size, H);
+    }
+
+    // 2. Latch the batched control plane: resolve each sequence's append slot (CoW
+    // fork-shared boundary pages) + stage the per-sequence device arrays. May
+    // throw on an unknown seq id / KV gap -- the forward_batch facade owns that
+    // exception-tier boundary (like run_chunk delegating to the coordinator).
+    kv_mgr->prepare_decode_batch(seqs, positions, batch_size);
+
+    const size_t q_dim  = m_config.num_attention_heads * m_config.head_dim;
+    const size_t kv_dim = m_config.num_key_value_heads * m_config.head_dim;
+    const int    L      = static_cast<int>(m_config.num_layers);
+
+    for (int i = 0; i < L; ++i) {
+        arena.prefetch_layer(i + 1, max_pos);
+        const std::string lp = m_config.weight_prefix + "layers." + std::to_string(i) + ".";
+        const std::string sa = lp + "self_attn.";
+        arena.ensure_layer_ready(i);
+
+        // --- attention RMSNorm (batched over rows) ---
+        {
+            const void* w = arena.get_weight_ptr(lp + "input_layernorm.weight");
+            if (fp16_w) launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, w, batch_size, H,
+                                                   m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+            else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, batch_size, H,
+                                              m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        }
+
+        // --- QKV projections (batched) + per-row bias epilogue ---
+        const void* d_bias_q = nullptr;
+        const void* d_bias_k = nullptr;
+        const void* d_bias_v = nullptr;
+        if (m_config.has_qkv_bias) {
+            d_bias_q = arena.get_weight_ptr_optional(sa + "q_proj.bias");
+            d_bias_k = arena.get_weight_ptr_optional(sa + "k_proj.bias");
+            d_bias_v = arena.get_weight_ptr_optional(sa + "v_proj.bias");
+            if ((d_bias_q != nullptr) != (d_bias_k != nullptr) ||
+                (d_bias_q != nullptr) != (d_bias_v != nullptr)) {
+                std::cerr << "[blackwell_core] run_decode_batch: QKV bias partially missing at layer "
+                          << i << "\n";
+                return EngineStatus::InvalidConfig;
+            }
+        }
+        dispatcher.forward(sa + "q_proj", d_X_norm, d_Q, q_dim,  H, nullptr, batch_size);
+        dispatcher.forward(sa + "k_proj", d_X_norm, d_K, kv_dim, H, nullptr, batch_size);
+        dispatcher.forward(sa + "v_proj", d_X_norm, d_V, kv_dim, H, nullptr, batch_size);
+        if (d_bias_q) {
+            const BiasDType bt = (m_config.quant_strategy == QuantStrategy::WEIGHT_ONLY_PACKED)
+                                     ? BiasDType::FP16 : BiasDType::BF16;
+            for (int b = 0; b < batch_size; ++b)
+                launch_fused_qkv_bias_kernel(d_Q + b * q_dim, d_K + b * kv_dim, d_V + b * kv_dim,
+                                             d_bias_q, d_bias_k, d_bias_v, q_dim, kv_dim, bt);
+        }
+
+        // --- batched paged-flash decode (per-seq RoPE + append + attention) ---
+        kv_mgr->attention_decode_batch(i, batch_size, d_Q, d_K, d_V, d_Attn_out);
+
+        // --- o_proj, accumulate into the residual stream (batched) ---
+        dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, H, H, d_X_accum, batch_size);
+
+        // --- MLP (batched) ---
+        {
+            const void* w = arena.get_weight_ptr(lp + "post_attention_layernorm.weight");
+            if (fp16_w) launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, w, batch_size, H,
+                                                   m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+            else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, batch_size, H,
+                                              m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        }
+        dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
+                           nullptr, batch_size);
+        dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
+                           nullptr, batch_size);
+        launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
+                                   static_cast<size_t>(batch_size) * m_config.intermediate_dim);
+        dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
+                           m_config.intermediate_dim, d_X_accum, batch_size);
+    }
+
+    // 3. Batched final norm over ALL rows -> d_X_norm [batch, H].
+    {
+        const void* d_w = arena.get_weight_ptr(m_config.weight_prefix + "norm.weight");
+        if (fp16_w) launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, d_w, batch_size, H,
+                                               m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, d_w, batch_size, H,
+                                          m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+    }
+
+    // 4. lm_head + argmax PER ROW. The head GEMV stays per-row (not the dispatcher,
+    // exactly like run_token/run_chunk): one row's head projection is bit-identical
+    // to the single-sequence decode, which is what makes batched logits match the
+    // sequential loop exactly. Each row's greedy token lands in d_next_token[b].
+    const void* d_head_w = m_config.tie_word_embeddings
+        ? arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight")
+        : arena.get_weight_ptr("lm_head.weight");
+    for (int b = 0; b < batch_size; ++b) {
+        float* row_hidden = d_X_norm + static_cast<size_t>(b) * H;
+        float* row_logits = d_logits + static_cast<size_t>(b) * V;
+        if (fp16_w) launch_fp16_gemv_kernel(d_head_w, row_hidden, row_logits, V, H);
+        else        launch_bf16_gemv_kernel(d_head_w, row_hidden, row_logits, V, H);
+        launch_argmax_kernel(row_logits, d_next_token + b, V);
+    }
+    CUDA_CHECK_RETURN(cudaMemcpy(out_next_tokens, d_next_token, batch_size * sizeof(int),
+                                 cudaMemcpyDeviceToHost));
+    return EngineStatus::Success;
+}
+
+// ============================================================================
 // Full Engine Inference -- runtime status tier ONLY (the throwing wrappers
 // were purged; no exception leaves these endpoints).
 // ============================================================================
@@ -896,6 +1061,52 @@ blackwell::EngineStatus BlackwellEngine::forward_eval_status(int token_id, int p
     } catch (...) {
         return status_from_current_exception("forward_eval_status");
     }
+}
+
+// TRUE-batch decode facade (exception tier, like fork/rewind -- an orchestration
+// entry point, not the noexcept single-stream hot loop). Capability-gates, then
+// delegates to Impl::run_decode_batch and repackages the greedy tokens as
+// DecodeResults in request order.
+std::vector<blackwell::DecodeResult> BlackwellEngine::forward_batch(
+    const std::vector<blackwell::DecodeRequest>& requests) {
+    // Same gate as fork/rewind: batched decode needs the paged CoW cache (the
+    // sibling sequences come from fork()), and a snapshot-able (non-SSM) state.
+    require_branching(pImpl->m_caps, "forward_batch");
+
+    const int batch_size = static_cast<int>(requests.size());
+    if (batch_size == 0)
+        throw std::invalid_argument("BlackwellEngine::forward_batch: empty request batch");
+
+    // Unpack into contiguous host arrays; reject duplicate seq_ids in the same
+    // batch (two rows targeting one sequence would double-append it). O(n^2) is
+    // fine -- a decode wavefront is a handful of branches.
+    std::vector<int> token_ids(batch_size), seqs(batch_size), positions(batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+        token_ids[b] = requests[b].token_id;
+        seqs[b]      = requests[b].seq_id;
+        positions[b] = requests[b].pos;
+        for (int p = 0; p < b; ++p)
+            if (seqs[p] == seqs[b])
+                throw std::invalid_argument(
+                    "BlackwellEngine::forward_batch: duplicate seq_id " +
+                    std::to_string(seqs[b]) + " in the batch (each sequence may "
+                    "appear at most once per step)");
+    }
+
+    std::vector<int> next_tokens(batch_size, -1);
+    const EngineStatus st = pImpl->run_decode_batch(token_ids.data(), seqs.data(),
+                                                    positions.data(), batch_size,
+                                                    next_tokens.data());
+    if (st != EngineStatus::Success)
+        throw blackwell::engine_error(
+            st, std::string("BlackwellEngine::forward_batch: ") + blackwell::to_string(st));
+
+    std::vector<blackwell::DecodeResult> results(batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+        results[b].seq_id        = seqs[b];
+        results[b].next_token_id = next_tokens[b];
+    }
+    return results;
 }
 
 float BlackwellEngine::last_token_probability(int token_id) const {

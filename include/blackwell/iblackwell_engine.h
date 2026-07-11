@@ -66,6 +66,19 @@ struct BLACKWELL_CAPABILITIES {
     int32_t num_linear_attention_layers;
 };
 
+// ABI-safe mirrors of blackwell::DecodeRequest / DecodeResult (fixed-width POD,
+// no std::vector across the edge — the caller owns both arrays). One batched
+// decode step advances `count` INDEPENDENT sequences by one token each.
+struct BLACKWELL_DECODE_REQUEST {
+    int32_t seq_id;     // target sequence (unique within the batch)
+    int32_t token_id;   // token to consume
+    int32_t pos;        // logical position of token_id
+};
+struct BLACKWELL_DECODE_RESULT {
+    int32_t seq_id;         // echoes the request seq_id (results are request-ordered)
+    int32_t next_token_id;  // greedy (argmax) continuation
+};
+
 // The engine boundary. Semantics of each method are those of the matching
 // BlackwellEngine member (include/blackwell/engine.h) -- capability gating
 // included: Fork/Rewind on a non-branching model fail with an HRESULT instead
@@ -102,6 +115,19 @@ struct IBlackwellEngine {
     virtual HRESULT STDMETHODCALLTYPE Hibernate() = 0;
     virtual HRESULT STDMETHODCALLTYPE Wakeup() = 0;
     virtual HRESULT STDMETHODCALLTYPE IsHibernated(BOOL* pHibernated) = 0;
+
+    // TRUE batched decode: advance `count` INDEPENDENT sequences by one token in a
+    // single forward pass (BlackwellEngine::forward_batch). The caller supplies
+    // pRequests[count] and a pResults buffer of at least `count` entries; results
+    // are written in request order (pResults[i].seq_id == pRequests[i].seq_id).
+    // Single-call, not the two-call size protocol: `count` IS the result count.
+    // Paged mode + branching-capable dense model, unique seq_ids, count <= the
+    // engine's token capacity — otherwise E_INVALIDARG / E_NOT_VALID_STATE.
+    // Appended at the END of the vtable: existing method ordinals are unchanged,
+    // so binaries built against the prior interface keep their ABI.
+    virtual HRESULT STDMETHODCALLTYPE ForwardBatch(const BLACKWELL_DECODE_REQUEST* pRequests,
+                                                   uint32_t count,
+                                                   BLACKWELL_DECODE_RESULT* pResults) = 0;
 };
 
 // The tokenizer boundary: everything a chat/eval loop needs. Configured

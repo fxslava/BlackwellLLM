@@ -18,6 +18,7 @@ PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
 {
     const int max_blocks =
         static_cast<int>((max_seq_len + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE);
+    m_max_blocks = max_blocks;   // block-table row stride for batched decode
     // Headroom for concurrent fork branches (RuntimeConfig::paged_branch_factor).
     // Device-pool VRAM now scales with the RESIDENT layer count (offloaded layers
     // cost only host RAM + 2 staging slabs), so this factor inflates the host
@@ -94,6 +95,7 @@ void PagedKVManager::prepare_decode_step(SeqId seq, int pos) {
     m_seq_len     = m_seqmgr->length(internal);          // == pos + 1
     m_block_table = m_seqmgr->device_block_table(internal);
     m_active      = internal;
+    m_batch_size  = 0;   // a single-token step supersedes any latched batch
 }
 
 void PagedKVManager::attention_decode(int layer_idx, int pos,
@@ -158,6 +160,7 @@ void PagedKVManager::prepare_prefill_step(SeqId seq, int start_pos, int num_toke
     m_seq_len     = m_seqmgr->length(internal);          // == start_pos + num_tokens
     m_block_table = m_seqmgr->device_block_table(internal);
     m_active      = internal;
+    m_batch_size  = 0;   // a prefill step supersedes any latched batch
     // The per-token append slot latches are meaningless for a chunk; the batched
     // append resolves each token's slot through the block table itself.
     m_append_page = -1;
@@ -195,6 +198,124 @@ void PagedKVManager::attention_prefill(int layer_idx, int start_pos, int num_tok
     const int last_block  = (m_seq_len - 1) / paging::PAGE_SIZE;
     for (int b = first_block; b <= last_block; ++b)
         m_seqmgr->spill_out_page(layer_idx, m_seqmgr->block_page(m_active, b));
+}
+
+// ============================================================================
+// TRUE-batch decode: resolve every sequence's append slot + stage the per-
+// sequence device arrays (block tables, seq_lens, positions, page/slot), then
+// run batched RoPE + append + paged-flash decode. The single-token decode path
+// (prepare_decode_step + attention_decode) is the batch_size == 1 specialization
+// over ONE sequence; this widens it across INDEPENDENT sequences, each with its
+// own block table / length / position.
+// ============================================================================
+void PagedKVManager::prepare_decode_batch(const SeqId* seqs, const int* positions,
+                                          int batch_size) {
+    if (batch_size <= 0)
+        throw std::invalid_argument("PagedKVManager::prepare_decode_batch: batch_size must be > 0");
+    // KV offloading across a batch (staging each sequence's pages into a shared
+    // slab per layer) is not implemented; batched decode requires all resident.
+    if (m_seqmgr->num_gpu_layers() < static_cast<int>(m_config.num_layers))
+        throw std::runtime_error(
+            "PagedKVManager::prepare_decode_batch: batched decode requires all layers "
+            "resident (KV offloading is single-sequence only)");
+
+    // A batch supersedes any latched single-token context; drop it so a stray
+    // attention_decode cannot consume a block table this step is about to rebuild.
+    m_active      = -1;
+    m_block_table = nullptr;
+
+    // (Re)size the host staging + device mirror arrays to fit this batch.
+    m_batch_internal.resize(batch_size);
+    m_h_batch_seq_lens.resize(batch_size);
+    m_h_batch_positions.resize(batch_size);
+    m_h_batch_pages.resize(batch_size);
+    m_h_batch_slots.resize(batch_size);
+    m_h_batch_block_tables.assign((size_t)batch_size * m_max_blocks, 0);
+
+    auto ensure = [](DeviceBuffer<int32_t>& buf, size_t n) {
+        if (buf.count() < n) buf.allocate(n);
+    };
+    ensure(m_d_batch_seq_lens,     batch_size);
+    ensure(m_d_batch_positions,    batch_size);
+    ensure(m_d_batch_pages,        batch_size);
+    ensure(m_d_batch_slots,        batch_size);
+    ensure(m_d_batch_block_tables, (size_t)batch_size * m_max_blocks);
+
+    for (int b = 0; b < batch_size; ++b) {
+        const paging::SeqId internal = internal_id(seqs[b]);
+        ensure_resident(internal);
+        m_batch_internal[b] = internal;
+
+        // Position-addressed, exactly like prepare_decode_step: re-decoding an
+        // existing position reconciles by truncating the stale tail; only a
+        // forward gap (pos beyond the end) is a real error.
+        const int pos = positions[b];
+        const int len = m_seqmgr->length(internal);
+        if (pos > len)
+            throw std::runtime_error(
+                "PagedKVManager::prepare_decode_batch: decode pos " + std::to_string(pos) +
+                " skips past sequence " + std::to_string(seqs[b]) + " length " +
+                std::to_string(len) + " (KV gap)");
+        if (pos < len)
+            m_seqmgr->rewind(internal, pos);
+
+        // Resolve this sequence's physical append slot (CoW-ing the boundary page
+        // if it is fork-shared -- sibling ToT branches share pages until first
+        // write, and each sibling gets its own copy here).
+        const paging::AppendSlot slot = m_seqmgr->reserve_append_slot(internal);
+        m_h_batch_pages[b]     = slot.page;
+        m_h_batch_slots[b]     = slot.slot;
+        m_h_batch_positions[b] = pos;
+        m_h_batch_seq_lens[b]  = m_seqmgr->length(internal);   // == pos + 1
+
+        // Flatten this sequence's block table into row b. The batched attention
+        // kernel reads ceil(seq_len/PAGE_SIZE) entries of the row (<= num_blocks).
+        const int nb = m_seqmgr->num_blocks(internal);
+        int32_t* row = m_h_batch_block_tables.data() + (size_t)b * m_max_blocks;
+        for (int i = 0; i < nb; ++i) row[i] = m_seqmgr->block_page(internal, i);
+    }
+
+    // Upload the staged arrays. Default stream: ordered AFTER any CoW page copies
+    // reserve_append_slot enqueued above and BEFORE the layer-sweep kernels.
+    CUDA_CHECK_THROW(cudaMemcpy(m_d_batch_seq_lens, m_h_batch_seq_lens.data(),
+                                batch_size * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK_THROW(cudaMemcpy(m_d_batch_positions, m_h_batch_positions.data(),
+                                batch_size * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK_THROW(cudaMemcpy(m_d_batch_pages, m_h_batch_pages.data(),
+                                batch_size * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK_THROW(cudaMemcpy(m_d_batch_slots, m_h_batch_slots.data(),
+                                batch_size * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK_THROW(cudaMemcpy(m_d_batch_block_tables, m_h_batch_block_tables.data(),
+                                (size_t)batch_size * m_max_blocks * sizeof(int32_t),
+                                cudaMemcpyHostToDevice));
+    m_batch_size = batch_size;
+}
+
+void PagedKVManager::attention_decode_batch(int layer_idx, int batch_size,
+                                            float* d_Q, float* d_K, float* d_V, float* d_O) {
+    if (m_batch_size <= 0 || batch_size != m_batch_size)
+        throw std::runtime_error(
+            "PagedKVManager::attention_decode_batch called without a matching "
+            "prepare_decode_batch");
+
+    // Batched RoPE in place: each query/key row rotates for its OWN position.
+    launch_batched_rope(d_Q, m_d_batch_positions, batch_size, m_num_q_heads,  m_head_dim, m_rope_theta);
+    launch_batched_rope(d_K, m_d_batch_positions, batch_size, m_num_kv_heads, m_head_dim, m_rope_theta);
+
+    // All layers resident (enforced in prepare_decode_batch), so the pools are
+    // the layer's own device slabs -- no stage-in / spill round-trip.
+    paging::kv_t* k_pool = m_seqmgr->layer_k_pool(layer_idx);
+    paging::kv_t* v_pool = m_seqmgr->layer_v_pool(layer_idx);
+
+    // Scatter each sequence's rotated K / raw V into its resolved (page, slot).
+    launch_paged_kv_append_batched_seqs(d_K, d_V, k_pool, v_pool,
+                                        m_d_batch_pages, m_d_batch_slots, batch_size,
+                                        m_num_kv_heads, m_head_dim);
+
+    // Exact per-sequence causal attention over each block table (blockIdx.z=batch).
+    launch_batched_paged_flash_attention_decode(
+        d_Q, k_pool, v_pool, d_O, m_d_batch_block_tables, m_d_batch_seq_lens,
+        batch_size, m_max_blocks, m_num_q_heads, m_num_kv_heads, m_head_dim);
 }
 
 void* PagedKVManager::get_layer_k_ptr(int layer_idx) {

@@ -63,6 +63,19 @@ std::vector<float> snapshot_logits(BlackwellEngine& e) {
     return h;
 }
 
+// Copy ROW `b` of the batched logits buffer ([batch, vocab]) to host -- the
+// per-sequence logits forward_batch leaves after a batched decode step.
+std::vector<float> snapshot_logits_row(BlackwellEngine& e, int b) {
+    auto* impl = e.get_impl();
+    const size_t V = impl->m_config.vocab_size;
+    std::vector<float> h(V);
+    EXPECT_EQ(cudaMemcpy(h.data(),
+                         static_cast<const float*>(impl->d_logits) + (size_t)b * V,
+                         V * sizeof(float), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    return h;
+}
+
 int argmax(const std::vector<float>& v) {
     int best = 0;
     for (int i = 1; i < (int)v.size(); ++i) if (v[i] > v[best]) best = i;
@@ -147,6 +160,84 @@ TEST(PagedEngineIntegration, BatchedPrefillMatchesSingleTokenLoop) {
     }
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     SUCCEED() << "Batched prefill logits match the single-token loop.";
+}
+
+// Step 5: TRUE batched decode across INDEPENDENT sequences must reproduce the
+// sequential single-forward() loop. Fork one primed sequence into 4 branches,
+// feed each a DIFFERENT next token, and decode the wavefront two ways:
+//   Path A -- four separate forward_status() calls (run_token), one per branch.
+//   Path B -- one forward_batch() over all four (run_decode_batch).
+// The per-branch logits (and thus the greedy next token) must agree: every
+// per-row/per-seq kernel on the batched path does the identical math its batch=1
+// counterpart does, so the two paths are numerically the same up to bf16 rounding.
+TEST(PagedEngineIntegration, BatchedDecodeMatchesSequential) {
+    if (!file_exists(qwen_index_path())) {
+        GTEST_SKIP() << "Model checkpoint not found at " << qwen_index_path();
+    }
+    BlackwellEngine engine(qwen_index_path(), /*max_seq_len=*/128,
+                           /*num_gpu_layers=*/static_cast<size_t>(-1),
+                           BlackwellEngine::KVCacheMode::Paged);
+    ASSERT_TRUE(engine.get_capabilities().supports_cow_branching)
+        << "dense paged model must support branching for batched decode";
+
+    const int vocab = (int)engine.get_impl()->m_config.vocab_size;
+
+    // Prime sequence 0 with a short prefix. Length 6 is NOT page-aligned
+    // (PAGE_SIZE 16), so every fork shares a partial boundary page -- the first
+    // append on each branch triggers Copy-on-Write, exactly the tree-search path.
+    constexpr int L = 6;
+    int t = kQwenBos;
+    for (int pos = 0; pos < L; ++pos) t = fwd(engine, t, pos, 0.6f, 0.9f, /*seq=*/0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << "CUDA fault priming seq 0";
+
+    // Four branches, each fed a DISTINCT token at position L. Base seq 0 stays at
+    // length L (never decoded past it), so every fork sees identical KV.
+    constexpr int B = 4;
+    const int branch_tok[B] = {100, 1000, 5000, 12345};
+    for (int b = 0; b < B; ++b) ASSERT_LT(branch_tok[b], vocab);
+
+    // --- Path A: sequential single-token decode, one fresh fork per branch. ---
+    std::vector<std::vector<float>> logits_single(B);
+    for (int b = 0; b < B; ++b) {
+        const int seq = 10 + b;
+        ASSERT_NO_THROW(engine.fork(/*parent=*/0, /*child=*/seq));
+        int next = -1;
+        const auto st = engine.forward_status(branch_tok[b], L, 0.6f, 0.9f, seq, &next);
+        ASSERT_EQ(st, blackwell::EngineStatus::Success) << "single branch " << b;
+        logits_single[b] = snapshot_logits(engine);   // row 0: this branch's logits
+    }
+
+    // --- Path B: one batched decode over four independent fresh forks. ---
+    std::vector<blackwell::DecodeRequest> reqs(B);
+    for (int b = 0; b < B; ++b) {
+        const int seq = 20 + b;
+        ASSERT_NO_THROW(engine.fork(/*parent=*/0, /*child=*/seq));
+        reqs[b] = {seq, branch_tok[b], L};
+    }
+    std::vector<blackwell::DecodeResult> res;
+    ASSERT_NO_THROW(res = engine.forward_batch(reqs));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << "CUDA fault during batched decode";
+    ASSERT_EQ((int)res.size(), B);
+
+    // Parity, per branch: same greedy next token AND tiny relative logit distance.
+    for (int b = 0; b < B; ++b) {
+        EXPECT_EQ(res[b].seq_id, 20 + b) << "result order must echo request order";
+        const std::vector<float> logits_batched = snapshot_logits_row(engine, b);
+
+        const int am_single  = argmax(logits_single[b]);
+        const int am_batched = argmax(logits_batched);
+        // The engine's own greedy pick (run_decode_batch argmax) must match the
+        // host argmax of the row it produced...
+        EXPECT_EQ(res[b].next_token_id, am_batched) << "branch " << b << " self-consistency";
+        // ...and both must equal the sequential path's greedy prediction.
+        EXPECT_EQ(am_batched, am_single)
+            << "branch " << b << " greedy next-token disagrees (batched vs sequential)";
+
+        const float rl2 = rel_l2(logits_batched, logits_single[b]);
+        EXPECT_LE(rl2, 2e-2f) << "branch " << b << " batched-vs-sequential logits rel_l2=" << rl2;
+    }
+
+    SUCCEED() << "Batched decode reproduces the sequential single-forward loop.";
 }
 
 TEST(PagedEngineIntegration, ForwardForkRewindNoThrow) {

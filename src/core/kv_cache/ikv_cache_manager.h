@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 // ============================================================================
 // IKVCacheManager — KV-cache strategy abstraction for BlackwellEngine.
@@ -72,6 +73,33 @@ public:
     virtual void attention_prefill(int layer_idx, int start_pos, int num_tokens,
                                    float* d_Q, float* d_K, float* d_V,
                                    float* d_O) = 0;
+
+    // ---------------------------------------------------------------------
+    // TRUE-batch decode control plane (parallel multi-sequence wavefront).
+    // ---------------------------------------------------------------------
+    // Decode `batch_size` INDEPENDENT sequences by one token each in a single
+    // forward pass. prepare_decode_batch resolves every sequence's append slot
+    // (CoW-ing fork-shared boundary pages) and stages the per-sequence device
+    // arrays (flattened block tables, seq_lens, positions, append page/slot);
+    // attention_decode_batch then runs batched RoPE (per-row positions) + batched
+    // multi-sequence append + batched paged-flash decode over that latched state.
+    // `seqs`/`positions` are host arrays of batch_size ints; d_Q/d_K/d_V/d_O are
+    // the engine's [batch_size, *] scratch buffers. Only the branching-capable
+    // paged strategy implements these; the single-sequence continuous cache
+    // rejects them (capability gating, like fork/rewind on IKVCacheManager).
+    virtual void prepare_decode_batch(const SeqId* /*seqs*/, const int* /*positions*/,
+                                      int /*batch_size*/) {
+        throw std::runtime_error(
+            "IKVCacheManager: batched decode requires the Paged KV strategy "
+            "(construct the engine with KVCacheMode::Paged)");
+    }
+    virtual void attention_decode_batch(int /*layer_idx*/, int /*batch_size*/,
+                                        float* /*d_Q*/, float* /*d_K*/, float* /*d_V*/,
+                                        float* /*d_O*/) {
+        throw std::runtime_error(
+            "IKVCacheManager: batched decode requires the Paged KV strategy "
+            "(construct the engine with KVCacheMode::Paged)");
+    }
 
     // ---------------------------------------------------------------------
     // Cache base pointers — diagnostics / tests / adapter-internal use ONLY.

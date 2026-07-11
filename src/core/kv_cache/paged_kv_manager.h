@@ -2,8 +2,10 @@
 #include "ikv_cache_manager.h"
 #include "blackwell/config.h"          // ModelConfig
 #include "paging/paged_kv_cache.h"     // paging::SequenceManager
+#include "device_buffer.h"             // DeviceBuffer (batched-decode staging arrays)
 #include <unordered_map>
 #include <memory>
+#include <vector>
 
 namespace blackwell {
 
@@ -42,6 +44,16 @@ public:
                           float* d_Q, float* d_K, float* d_V, float* d_O) override;
     void attention_prefill(int layer_idx, int start_pos, int num_tokens,
                            float* d_Q, float* d_K, float* d_V, float* d_O) override;
+
+    // TRUE-batch decode (parallel multi-sequence wavefront): see IKVCacheManager.
+    // Resolves each sequence's append slot + stages the per-sequence device arrays
+    // (prepare), then batched RoPE + append + paged-flash decode (attention).
+    // Requires all layers resident (KV offloading across a batch is not staged
+    // yet); throws otherwise, matching the capability-gating doctrine.
+    void prepare_decode_batch(const SeqId* seqs, const int* positions,
+                              int batch_size) override;
+    void attention_decode_batch(int layer_idx, int batch_size,
+                                float* d_Q, float* d_K, float* d_V, float* d_O) override;
 
     void* get_layer_k_ptr(int layer_idx) override;
     void* get_layer_v_ptr(int layer_idx) override;
@@ -117,6 +129,27 @@ private:
     int            m_seq_len       = 0;     // tokens incl. the current one
     int            m_append_page   = -1;
     int            m_append_slot   = -1;
+
+    // --- TRUE-batch decode context (latched by prepare_decode_batch) -------
+    // Max logical blocks per sequence == the block-table row stride handed to the
+    // batched attention kernel (cached from the ctor's max_seq_len sizing).
+    int m_max_blocks = 0;
+    // Batch width latched this step; 0 when no batch is active.
+    int m_batch_size = 0;
+    // Internal sequence ids of the active batch (row order), for stage/spill hooks.
+    std::vector<paging::SeqId> m_batch_internal;
+    // Host staging buffers filled per step, then uploaded to the device arrays.
+    std::vector<int32_t> m_h_batch_block_tables;   // [batch * m_max_blocks], row-major
+    std::vector<int32_t> m_h_batch_seq_lens;       // [batch]
+    std::vector<int32_t> m_h_batch_positions;      // [batch]
+    std::vector<int32_t> m_h_batch_pages;          // [batch] resolved append page
+    std::vector<int32_t> m_h_batch_slots;          // [batch] resolved append slot
+    // Device mirrors (grown to fit the batch on demand; the kernels read these).
+    DeviceBuffer<int32_t> m_d_batch_block_tables;
+    DeviceBuffer<int32_t> m_d_batch_seq_lens;
+    DeviceBuffer<int32_t> m_d_batch_positions;
+    DeviceBuffer<int32_t> m_d_batch_pages;
+    DeviceBuffer<int32_t> m_d_batch_slots;
 };
 
 } // namespace blackwell

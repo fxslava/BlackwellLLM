@@ -231,6 +231,196 @@ __global__ void paged_kv_append_batched_kernel(
     v_pool_layer[dst] = (kv_t)V[src];
 }
 
+// Multi-sequence append: row blockIdx.y (== sequence b) lands at the slot its
+// control plane reserved this step, (d_pages[b], d_slots[b]). One thread per
+// head_dim channel. The sequence-aware sibling of paged_kv_append_batched_kernel
+// (which walks ONE sequence's consecutive positions through a shared block table).
+__global__ void paged_kv_append_batched_seqs_kernel(
+    const float* __restrict__ K, const float* __restrict__ V,
+    kv_t* __restrict__ k_pool_layer, kv_t* __restrict__ v_pool_layer,
+    const int32_t* __restrict__ pages, const int32_t* __restrict__ slots,
+    int num_kv_heads, int head_dim)
+{
+    const int kvh = blockIdx.x;
+    const int b   = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (d >= head_dim) return;
+
+    const int page = pages[b];
+    const int slot = slots[b];
+
+    const size_t src = ((size_t)b * num_kv_heads + kvh) * head_dim + d;
+    const size_t dst =
+        (((size_t)page * num_kv_heads + kvh) * PAGE_SIZE + slot) * head_dim + d;
+    k_pool_layer[dst] = (kv_t)K[src];
+    v_pool_layer[dst] = (kv_t)V[src];
+}
+
+// ============================================================================
+// TRUE-batch paged flash-attention DECODE (one query per independent sequence)
+// ============================================================================
+// Grid : (num_q_heads, 1, batch_size)      Block : 32 threads (one warp)
+//   blockIdx.x = query head
+//   blockIdx.z = batch row  -> sequence b, with its OWN block table + seq_len
+// Structurally identical to paged_flash_attention_kernel with a single query tile
+// (decode) — the ONLY differences are the per-sequence Q/O slab base, block table
+// (d_block_tables row b) and seq_len (d_seq_lens[b]). The online-softmax math is
+// byte-for-byte the single-sequence kernel, so a batched step equals the
+// sequential decode loop. New kernel beside the batch=1 path (Dual-Path doctrine).
+__global__ void batched_paged_flash_attention_decode_kernel(
+    const float*   __restrict__ Q,              // [batch, num_q_heads, head_dim]
+    const kv_t*    __restrict__ k_pool_layer,   // [total_pages, num_kv_heads, PAGE_SIZE, head_dim]
+    const kv_t*    __restrict__ v_pool_layer,
+    float*         __restrict__ O,              // [batch, num_q_heads, head_dim]
+    const int32_t* __restrict__ block_tables,   // [batch, block_table_stride]
+    const int32_t* __restrict__ seq_lens,       // [batch]
+    int   block_table_stride,
+    int   num_q_heads,
+    int   num_kv_heads,
+    int   head_dim,
+    float scale)
+{
+    const int q_head  = blockIdx.x;
+    const int b       = blockIdx.z;
+    const int tid     = threadIdx.x;            // 0..31
+
+    // Per-sequence context: its block table row, its length, its Q/O slab. One
+    // query row per sequence at the last position (decode), so q_start_base is
+    // seq_len-1 and the single valid tile row sits there.
+    const int   seq_len     = seq_lens[b];
+    const int32_t* block_table = block_tables + (size_t)b * block_table_stride;
+    const int   q_start_base = seq_len - 1;
+    const int   q_row_stride = num_q_heads * head_dim;
+    const float* Qb = Q + (size_t)b * q_row_stride;   // this sequence's query slab
+    float*       Ob = O + (size_t)b * q_row_stride;
+
+    const int gqa_ratio = num_q_heads / num_kv_heads;
+    const int kvh       = q_head / gqa_ratio;
+
+    const int q_row0  = 0;                       // single query tile for decode
+    const int q_start = q_start_base + q_row0;
+    const int num_valid = max(0, min(BLOCK_M, seq_len - q_start));
+    if (num_valid <= 0) return;
+
+    const int n_dtiles = head_dim / WMMA_T;
+
+    // ---- shared memory (same footprint as the single-sequence kernel) -----
+    __shared__ kv_t  q_smem[BLOCK_M * HD_PAD];
+    __shared__ kv_t  k_smem[BLOCK_N * HD_PAD];
+    __shared__ kv_t  v_smem[BLOCK_N * HD_PAD];
+    __shared__ kv_t  p_smem[BLOCK_M * S_PAD];
+    __shared__ float s_smem[BLOCK_M * S_PAD];
+    __shared__ float o_smem[BLOCK_M * HEAD_DIM_MAX];
+    __shared__ float m_smem[BLOCK_M];
+    __shared__ float l_smem[BLOCK_M];
+    __shared__ float corr_smem[BLOCK_M];
+
+    // ---- load Q tile -> bf16 smem (zero-pad invalid rows) -----------------
+    for (int i = tid; i < BLOCK_M * head_dim; i += 32) {
+        int r = i / head_dim, d = i % head_dim;
+        float qv = (r < num_valid)
+                 ? Qb[(q_row0 + r) * q_row_stride + q_head * head_dim + d]
+                 : 0.0f;
+        q_smem[r * HD_PAD + d] = (kv_t)qv;
+    }
+    for (int r = tid; r < BLOCK_M; r += 32) {
+        m_smem[r] = -CUDART_INF_F;
+        l_smem[r] = 0.0f;
+    }
+    for (int i = tid; i < BLOCK_M * head_dim; i += 32) o_smem[i] = 0.0f;
+    __syncthreads();
+
+    const int num_pages = (seq_len + PAGE_SIZE - 1) / PAGE_SIZE;
+    const int per_page   = num_kv_heads * PAGE_SIZE * head_dim;
+
+    for (int pg = 0; pg < num_pages; ++pg) {
+        const int page_start = pg * PAGE_SIZE;
+        if (page_start > q_start + num_valid - 1) break;   // fully future (causal)
+
+        const int page = block_table[pg];
+        const int toks = min(PAGE_SIZE, seq_len - page_start);
+        const kv_t* kbase = k_pool_layer + (size_t)page * per_page + (size_t)kvh * PAGE_SIZE * head_dim;
+        const kv_t* vbase = v_pool_layer + (size_t)page * per_page + (size_t)kvh * PAGE_SIZE * head_dim;
+
+        for (int i = tid; i < PAGE_SIZE * head_dim; i += 32) {
+            int t = i / head_dim, d = i % head_dim;
+            kv_t kv = (t < toks) ? kbase[t * head_dim + d] : (kv_t)0.0f;
+            kv_t vv = (t < toks) ? vbase[t * head_dim + d] : (kv_t)0.0f;
+            k_smem[t * HD_PAD + d] = kv;
+            v_smem[t * HD_PAD + d] = vv;
+        }
+        __syncthreads();
+
+        // ---- S = Q . K^T  (Tensor Cores) ----------------------------------
+        wmma::fragment<wmma::accumulator, WMMA_T, WMMA_T, WMMA_T, float> s_frag;
+        wmma::fill_fragment(s_frag, 0.0f);
+        for (int dt = 0; dt < n_dtiles; ++dt) {
+            wmma::fragment<wmma::matrix_a, WMMA_T, WMMA_T, WMMA_T, kv_t, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_T, WMMA_T, WMMA_T, kv_t, wmma::col_major> b_frag;
+            wmma::load_matrix_sync(a_frag, q_smem + dt * WMMA_T, HD_PAD);
+            wmma::load_matrix_sync(b_frag, k_smem + dt * WMMA_T, HD_PAD);
+            wmma::mma_sync(s_frag, a_frag, b_frag, s_frag);
+        }
+        wmma::store_matrix_sync(s_smem, s_frag, S_PAD, wmma::mem_row_major);
+        __syncthreads();
+
+        // ---- online softmax update (one lane per row) ---------------------
+        if (tid < num_valid) {
+            const int r = tid;
+            const int q_pos = q_start + r;
+            float rmax = -CUDART_INF_F;
+            for (int n = 0; n < PAGE_SIZE; ++n) {
+                const int k_pos = page_start + n;
+                float s = (n < toks && k_pos <= q_pos)
+                        ? s_smem[r * S_PAD + n] * scale
+                        : -CUDART_INF_F;
+                s_smem[r * S_PAD + n] = s;
+                rmax = fmaxf(rmax, s);
+            }
+            const float m_old = m_smem[r];
+            const float m_new = fmaxf(m_old, rmax);
+            const float corr  = (m_old == -CUDART_INF_F) ? 0.0f : __expf(m_old - m_new);
+            float rowsum = 0.0f;
+            for (int n = 0; n < PAGE_SIZE; ++n) {
+                float p = (s_smem[r * S_PAD + n] == -CUDART_INF_F)
+                        ? 0.0f : __expf(s_smem[r * S_PAD + n] - m_new);
+                p_smem[r * S_PAD + n] = (kv_t)p;
+                rowsum += p;
+            }
+            l_smem[r]   = l_smem[r] * corr + rowsum;
+            m_smem[r]   = m_new;
+            corr_smem[r] = corr;
+        }
+        __syncthreads();
+
+        for (int i = tid; i < num_valid * head_dim; i += 32) {
+            int r = i / head_dim;
+            o_smem[i] *= corr_smem[r];
+        }
+        __syncthreads();
+
+        // ---- O += P . V  (Tensor Cores) -----------------------------------
+        for (int dt = 0; dt < n_dtiles; ++dt) {
+            wmma::fragment<wmma::matrix_a, WMMA_T, WMMA_T, WMMA_T, kv_t, wmma::row_major> p_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_T, WMMA_T, WMMA_T, kv_t, wmma::row_major> v_frag;
+            wmma::fragment<wmma::accumulator, WMMA_T, WMMA_T, WMMA_T, float> o_frag;
+            wmma::load_matrix_sync(p_frag, p_smem, S_PAD);
+            wmma::load_matrix_sync(v_frag, v_smem + dt * WMMA_T, HD_PAD);
+            wmma::load_matrix_sync(o_frag, o_smem + dt * WMMA_T, head_dim, wmma::mem_row_major);
+            wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
+            wmma::store_matrix_sync(o_smem + dt * WMMA_T, o_frag, head_dim, wmma::mem_row_major);
+        }
+        __syncthreads();
+    }
+
+    // ---- epilogue: normalize + bf16-parity truncate -> O ------------------
+    for (int i = tid; i < num_valid * head_dim; i += 32) {
+        int r = i / head_dim, d = i % head_dim;
+        float out = o_smem[i] / l_smem[r];
+        Ob[(q_row0 + r) * q_row_stride + q_head * head_dim + d] = trunc_bf16(out);
+    }
+}
+
 __global__ void cow_copy_page_kernel(
     kv_t* __restrict__ k_pool, kv_t* __restrict__ v_pool,
     int src_page, int dst_page, int total_pages, int per_page)
@@ -298,6 +488,30 @@ void launch_paged_kv_append_batched(
     paged_kv_append_batched_kernel<<<grid, head_dim, 0, stream>>>(
         d_K, d_V, d_k_pool_layer, d_v_pool_layer, d_block_table, start_pos,
         num_kv_heads, head_dim);
+}
+
+void launch_paged_kv_append_batched_seqs(
+    const float* d_K, const float* d_V, kv_t* d_k_pool_layer, kv_t* d_v_pool_layer,
+    const int32_t* d_pages, const int32_t* d_slots, int batch_size,
+    int num_kv_heads, int head_dim, cudaStream_t stream) {
+    dim3 grid(num_kv_heads, batch_size);
+    paged_kv_append_batched_seqs_kernel<<<grid, head_dim, 0, stream>>>(
+        d_K, d_V, d_k_pool_layer, d_v_pool_layer, d_pages, d_slots,
+        num_kv_heads, head_dim);
+}
+
+void launch_batched_paged_flash_attention_decode(
+    const float* d_Q, const kv_t* d_k_pool_layer, const kv_t* d_v_pool_layer,
+    float* d_O, const int32_t* d_block_tables, const int32_t* d_seq_lens,
+    int batch_size, int block_table_stride, int num_q_heads, int num_kv_heads,
+    int head_dim, cudaStream_t stream) {
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+    // blockIdx.z carries the batch: every sequence's single query tile runs
+    // concurrently, each over its own block-table row and seq_len.
+    dim3 grid(num_q_heads, 1, batch_size);
+    batched_paged_flash_attention_decode_kernel<<<grid, 32, 0, stream>>>(
+        d_Q, d_k_pool_layer, d_v_pool_layer, d_O, d_block_tables, d_seq_lens,
+        block_table_stride, num_q_heads, num_kv_heads, head_dim, scale);
 }
 
 void launch_cow_copy_page(

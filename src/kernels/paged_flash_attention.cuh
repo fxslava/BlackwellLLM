@@ -98,6 +98,54 @@ void launch_paged_kv_append_batched(
     int head_dim,
     cudaStream_t stream = 0);
 
+// TRUE-batch (multi-sequence) scatter: batch_size post-RoPE K/V rows, one per
+// INDEPENDENT sequence, into their resolved page slots for a single layer. Unlike
+// launch_paged_kv_append_batched (consecutive positions of ONE sequence through a
+// shared block table), each row b lands at (d_pages[b], d_slots[b]) — the append
+// slot the control plane reserved for sequence b this step. d_K / d_V are
+// [batch_size, num_kv_heads, head_dim]; d_pages / d_slots are device arrays of
+// batch_size ints. The sequence-aware sibling of the batched-prefill append.
+void launch_paged_kv_append_batched_seqs(
+    const float* d_K,
+    const float* d_V,
+    blackwell::paging::kv_t* d_k_pool_layer,
+    blackwell::paging::kv_t* d_v_pool_layer,
+    const int32_t* d_pages,     // [batch_size] resolved physical page per sequence
+    const int32_t* d_slots,     // [batch_size] resolved slot within that page
+    int batch_size,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream = 0);
+
+// TRUE-batch paged flash-attention DECODE: one query per INDEPENDENT sequence,
+// batch_size sequences processed in parallel in a single launch. Q is
+// [batch_size, num_q_heads, head_dim] (sequence b's single query at its own last
+// position). Each sequence carries its OWN block table and length:
+//   * d_block_tables is a FLATTENED [batch_size, max_blocks] int32 array (row b is
+//     sequence b's page ids; block_table_stride == max_blocks selects the row).
+//   * d_seq_lens[b] is sequence b's resident token count (its query sits at
+//     position seq_len-1 and attends causally over [0, seq_len)).
+// Output O is [batch_size, num_q_heads, head_dim]. Grid maps the batch onto
+// blockIdx.z so sequences run concurrently; the per-sequence online-softmax math
+// is bit-for-bit the single-sequence launch_paged_flash_attention_decode, so a
+// batched step reproduces the sequential decode loop exactly (see the
+// BatchedDecodeMatchesSequential parity test). This is a NEW kernel beside the
+// single-sequence decode path (Dual-Path doctrine): the latency-critical batch=1
+// kernel is left untouched.
+void launch_batched_paged_flash_attention_decode(
+    const float* d_Q,
+    const blackwell::paging::kv_t* d_k_pool_layer,
+    const blackwell::paging::kv_t* d_v_pool_layer,
+    float* d_O,
+    const int32_t* d_block_tables,   // [batch_size, max_blocks], row-major
+    const int32_t* d_seq_lens,       // [batch_size]
+    int batch_size,
+    int block_table_stride,          // == max_blocks (row stride of d_block_tables)
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream = 0);
+
 // Copy-on-Write: duplicate one physical page across EVERY layer (src -> dst).
 // Invoked by SequenceManager the first time a fork-shared partial page is
 // written. Pools are the full [num_layers][total_pages]... arenas.

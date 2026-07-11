@@ -133,6 +133,22 @@ struct BlackwellEngine::Impl {
                                       int num_tokens, int seq_id,
                                       bool want_logits = true);
 
+    // TRUE-batch decode: advance batch_size INDEPENDENT sequences by one token
+    // each in ONE forward pass. token_ids / seqs / positions are host arrays of
+    // batch_size ints; the greedy (argmax) continuations land in out_next_tokens.
+    // Mirrors run_chunk's batched widening but across SEQUENCES (each with its own
+    // block table, length and position) rather than consecutive positions of one
+    // sequence: batched embedding -> per-layer batched RMSNorm + Tensor-Core
+    // projections + batched paged-flash decode (attention_decode_batch) -> batched
+    // final norm -> per-row lm_head + argmax. Leaves [batch, vocab] in d_logits.
+    // Generic dense paged full-attention only (returns InvalidConfig for SSM /
+    // gated / continuous). RUNTIME error tier for CUDA (status by return); the KV
+    // control plane may still throw (unknown seq id / KV gap), which the
+    // forward_batch facade -- the exception-tier boundary -- catches.
+    blackwell::EngineStatus run_decode_batch(const int* token_ids, const int* seqs,
+                                             const int* positions, int batch_size,
+                                             int* out_next_tokens);
+
     blackwell::EngineStatus step_embedding(int token_id);
     blackwell::EngineStatus step_attention_norm(int layer_idx);
     blackwell::EngineStatus step_attention_qkv_projections(int layer_idx);

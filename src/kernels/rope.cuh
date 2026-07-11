@@ -46,3 +46,18 @@ void launch_rope_inplace_batched(
     size_t num_heads,
     size_t head_dim,
     float rope_theta = 500000.0f);
+
+// TRUE-batch (multi-sequence) rotate_half RoPE over a [batch_size, num_heads,
+// head_dim] buffer: row b is rotated for its OWN logical position d_positions[b].
+// This is the sequence-aware sibling of launch_rope_inplace_batched — the batched
+// decode path packs one query row per INDEPENDENT sequence, and sequences sit at
+// different generation steps, so the position is per-row rather than start_pos+t.
+// d_positions is a device array of batch_size ints. Apply once to Q, once to K.
+//   HARD CONTRACT: head_dim even, head_dim/2 <= 1024.
+void launch_batched_rope(
+    float* d_X,
+    const int* d_positions,
+    int batch_size,
+    size_t num_heads,
+    size_t head_dim,
+    float rope_theta = 500000.0f);

@@ -154,3 +154,46 @@ void launch_rope_inplace_batched(
     dim3 threads((unsigned)(head_dim / 2));
     rope_q_batched_kernel<<<grid, threads>>>(d_X, start_pos, num_heads, head_dim, rope_theta);
 }
+
+// Multi-sequence rotate_half over [batch_size, num_heads, head_dim]: row b
+// (blockIdx.y) rotates for its OWN position positions[b] (read from device),
+// NOT start_pos + b -- independent sequences are at independent generation
+// steps. Same rotate_half math as rope_q_kernel, one block per (head, batch row).
+__global__ void rope_batched_positions_kernel(float* __restrict__ X,
+                                             const int* __restrict__ positions,
+                                             size_t num_heads,
+                                             size_t head_dim,
+                                             float rope_theta)
+{
+    const size_t head_idx = blockIdx.x;
+    const size_t b        = blockIdx.y;
+    const size_t k        = threadIdx.x;
+    if (k >= head_dim / 2) return;
+
+    const int pos = positions[b];
+    float* cur = X + (b * num_heads + head_idx) * head_dim;
+
+    float freq = __fdividef(1.0f, powf(rope_theta,
+                    __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
+    float angle = pos * freq;
+    float sin_val, cos_val;
+    sincosf(angle, &sin_val, &cos_val);
+
+    float x0 = cur[k];
+    float x1 = cur[k + head_dim / 2];
+    cur[k]                = x0 * cos_val - x1 * sin_val;
+    cur[k + head_dim / 2] = x0 * sin_val + x1 * cos_val;
+}
+
+void launch_batched_rope(
+    float* d_X,
+    const int* d_positions,
+    int batch_size,
+    size_t num_heads,
+    size_t head_dim,
+    float rope_theta)
+{
+    dim3 grid((unsigned)num_heads, (unsigned)batch_size);
+    dim3 threads((unsigned)(head_dim / 2));
+    rope_batched_positions_kernel<<<grid, threads>>>(d_X, d_positions, num_heads, head_dim, rope_theta);
+}

@@ -276,6 +276,28 @@ public:
         return S_OK;
     }
 
+    HRESULT STDMETHODCALLTYPE ForwardBatch(const BLACKWELL_DECODE_REQUEST* pRequests,
+                                           uint32_t count,
+                                           BLACKWELL_DECODE_RESULT* pResults) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
+        if (!pRequests || !pResults) return E_POINTER;
+        if (count == 0) return E_INVALIDARG;
+        // Exception tier (forward_batch throws like fork/rewind): boundary() maps
+        // engine_error -> the carried status' HRESULT, invalid_argument -> E_INVALIDARG.
+        return boundary("ForwardBatch", [&] {
+            std::vector<blackwell::DecodeRequest> requests(count);
+            for (uint32_t i = 0; i < count; ++i)
+                requests[i] = {pRequests[i].seq_id, pRequests[i].token_id, pRequests[i].pos};
+            const std::vector<blackwell::DecodeResult> results =
+                engine_->forward_batch(requests);
+            for (uint32_t i = 0; i < count && i < results.size(); ++i) {
+                pResults[i].seq_id        = results[i].seq_id;
+                pResults[i].next_token_id = results[i].next_token_id;
+            }
+            return S_OK;
+        });
+    }
+
 private:
     std::unique_ptr<BlackwellEngine> engine_;
     // The doctrine's checked invariant: set once at creation, compared by

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <string>
 #include <memory>
+#include <vector>
 
 #include "blackwell/engine_status.h"
 
@@ -35,6 +36,30 @@ struct ModelCapabilities {
     int  num_full_attention_layers   = 0;
     int  num_linear_attention_layers = 0;
 };
+
+namespace blackwell {
+
+// One entry of a TRUE-batched decode step: sequence `seq_id` consumes `token_id`
+// at logical position `pos`. The sequences in a batch are INDEPENDENT (distinct
+// block tables, distinct positions) — this is the primitive parallel code-agent
+// orchestration (Tree-of-Thoughts) decodes N branches on, one forward pass per
+// wavefront instead of N sequential ones. Paged mode + a branching-capable model
+// only (fork() produces the sibling sequences); mirrors DecodeRequest 1:1 onto a
+// DecodeResult by seq_id.
+struct DecodeRequest {
+    int seq_id;     // target sequence (Paged; 0 or a fork() child); unique per batch
+    int token_id;   // token to consume this step
+    int pos;        // logical position of token_id in the sequence
+};
+
+// The sampled continuation for one DecodeRequest, matched back by seq_id (the
+// results vector preserves the request order, so index-parity holds too).
+struct DecodeResult {
+    int seq_id;         // echoes the request's seq_id
+    int next_token_id;  // greedy (argmax) continuation — see forward_batch
+};
+
+} // namespace blackwell
 
 class BlackwellEngine {
 public:
@@ -82,6 +107,31 @@ public:
     blackwell::EngineStatus forward_eval_status(int token_id, int pos,
                                                 int target_token_id, int seq_id,
                                                 float* log_prob) noexcept;
+
+    // TRUE batched decode: advance `requests.size()` INDEPENDENT sequences by one
+    // token each in a SINGLE forward pass (batched embedding -> per-layer batched
+    // RMSNorm + Tensor-Core projections + batched paged-flash attention over
+    // per-sequence block tables -> batched lm_head), then argmax-sample each row.
+    // Returns one DecodeResult per request, in request order (result[i].seq_id ==
+    // requests[i].seq_id). This is the wavefront primitive for parallel code-agent
+    // orchestration (Tree-of-Thoughts): N branches decode together rather than in
+    // N sequential forward() calls, amortizing the weight reads over the batch via
+    // the dispatcher's num_tokens>1 Tensor-Core GEMM path.
+    //
+    // Requirements (capability-gated; a violation throws std::runtime_error with
+    // the remedy, like fork()): Paged KV mode on a branching-capable dense model,
+    // every seq_id known and UNIQUE within the batch, batch size <= the resolved
+    // token capacity. Sampling is deterministic greedy (argmax) — the parallel
+    // branches of a search each want their top continuation, and determinism keeps
+    // the batched path bit-checkable against the single-sequence forward() loop
+    // (see the BatchedDecodeMatchesSequential parity test). A caller that needs
+    // temperature/top-p samples from the per-row logits itself.
+    //
+    // Unlike forward_status this stays on the exception tier (like fork/rewind):
+    // it is an orchestration/admin entry point, not part of the live single-stream
+    // decode hot loop the noexcept status endpoints protect.
+    std::vector<blackwell::DecodeResult> forward_batch(
+        const std::vector<blackwell::DecodeRequest>& requests);
 
     // Softmax probability, in [0, 1], of `token_id` under the CURRENT logits --
     // the distribution the most recent forward()/prefill left in the device
