@@ -392,4 +392,34 @@ void PagedKVManager::rewind(SeqId seq, int target_pos) {
     m_seqmgr->truncate(internal, target_pos);
 }
 
+void PagedKVManager::release_sequence(SeqId seq) {
+    // Only caller-assigned fork ids (>= 0) are released here. The reserved
+    // negative range is the prefix-cache substrate's: its sequences are torn
+    // down by PrefixCacheManager::release() (unpin + unlock + destroy), and
+    // this adapter only ever unbind_external()s their mapping.
+    if (seq < 0)
+        throw std::runtime_error("PagedKVManager::release_sequence: id " +
+                                 std::to_string(seq) +
+                                 " is in the reserved external range (use "
+                                 "unbind_external + PrefixCacheManager::release)");
+    auto it = m_id_map.find(seq);
+    if (it == m_id_map.end())
+        throw std::runtime_error("PagedKVManager::release_sequence: unknown id " +
+                                 std::to_string(seq));
+    // Drop the latched per-token context if it names this sequence: its staged
+    // block table must not be consumed by a later layer sweep after the pages
+    // it references are handed back to the allocator (same guard as truncate /
+    // unbind_external).
+    if (m_active == it->second) {
+        m_active      = -1;
+        m_block_table = nullptr;
+    }
+    // destroy_sequence decrefs every page this block table held (last-reference
+    // pages free; fork-/tree-shared pages just lose this ref) and erases the
+    // internal sequence -- so the id is free for a future fork() into it.
+    m_seqmgr->destroy_sequence(it->second);
+    m_residency.erase(it->second);
+    m_id_map.erase(it);
+}
+
 } // namespace blackwell

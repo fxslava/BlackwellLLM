@@ -99,6 +99,21 @@ attention cache live *outside* the paged pools, so a radix "prefix hit" would si
 state those models need. The engine simply does not construct a coordinator for them
 (`has_prefix_cache()` returns false; the overlay/adapter fall back to ordinary generate).
 
+**Rewind — physical vs. virtual.** A dense paged sequence rolls back *physically*:
+`rewind`/`truncate_sequence` drop trailing pages and the position-addressed cache
+self-heals. A hybrid SSM sequence **cannot** — its recurrent state advances every
+`forward()` with no positional inverse — so `rewind()` throws for it. Instead, hybrid
+models rewind *virtually* via `HybridSnapshotRing` (`src/core/hybrid_snapshot_ring.*`):
+`fork()` physically snapshots all three state stores (SSM recurrent/conv, gated
+full-attention KV, paged CoW pool) into a ring of checkpoint slots every K tokens, and a
+backtrack restores the nearest snapshot (`release_sequence` + `fork` back into the pinned
+active slot 0, allocation-free) and replays the retained token tail. Slot budget is the
+shared `branch_capacity()` (`paged_branch_factor`, default 4 → ~(B-1)·K token horizon);
+`release_sequence` is the primitive that recycles a fork id (fork rejects a live id). The
+overlay's `LiveTranslationTracker` selects this path for hybrids that fork; the
+`Qwen35Hybrid.VirtualRewindMatchesFreshDecode` test pins the restored state to
+bit-parity with a fresh decode.
+
 ### Why tests map to modes
 
 Integration suites pick the mode that exercises what they assert:
@@ -112,7 +127,9 @@ Integration suites pick the mode that exercises what they assert:
   (parity cosine).
 - `QwenEngineIntegration` / `test_llama_engine` — Continuous mode, per-layer numeric parity
   against PyTorch golden dumps (driving `step_*` directly).
-- `Qwen35Hybrid.*` — the hybrid SSM path (Continuous; recurrent state, no branching).
+- `Qwen35Hybrid.*` — the hybrid SSM path under `KVCacheMode::Paged`: recurrent-state decode
+  parity, `reset_state`, and *virtual rewind* (physical `fork` snapshot + `release_sequence`
+  recycle + `HybridSnapshotRing` restore-to-bit-parity). `rewind()` stays rejected.
 - `AsyncOffload.*` (validation) — `VRAMArena` offloading: ping-pong double-buffering and
   strided KV-column spill.
 

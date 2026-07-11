@@ -14,6 +14,7 @@
 #include "blackwell_llm_adapter.h"              // playground::BlackwellLLMAdapter
 #include "config.h"                              // ToUtf8 / FromUtf8
 #include "engine_prefill_coordinator.h"    // EnginePrefillCoordinator, EngineSequence
+#include "hybrid_snapshot_ring.h"          // HybridSnapshotRing (hybrid virtual rewind)
 
 // The opaque holder promised by the header: keeps engine/CUDA includes out of
 // live_translation_tracker.h, mirroring BlackwellEngine::Impl's own pImpl.
@@ -22,6 +23,12 @@ struct LiveTranslationTracker::TrackedSession {
 };
 
 namespace {
+
+// Hybrid virtual-rewind checkpoint stride (K): one fork snapshot every K decoded
+// tokens. With the paged pool's default branch_factor B=4 this yields a ~(B-1)*K
+// = 24-token backtrack horizon -- latency-first, matching the overlay's batch=1
+// doctrine (small ring, few D2D copies, tight static VRAM footprint).
+constexpr int kHybridCheckpointStride = 8;
 
 void Log(const std::wstring& message) {
     OutputDebugStringW((L"[live_tracker] " + message + L"\n").c_str());
@@ -177,6 +184,10 @@ LiveTranslationTracker::~LiveTranslationTracker() {
         } catch (...) {
         }
     }
+    // Release the hybrid snapshot ring's fork slots too (its destructor calls
+    // engine.release_sequence on each). Same post-join safety as session_: the
+    // worker is gone, so this destructor's thread is the sole engine toucher.
+    rewind_ring_.reset();
 }
 
 void LiveTranslationTracker::TrackUpdate(std::wstring current_text, std::wstring context) {
@@ -219,6 +230,16 @@ void LiveTranslationTracker::Cancel() {
     current_gen_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.reset();
+}
+
+void LiveTranslationTracker::RequestVirtualRewind(int tokens_back) {
+    if (tokens_back <= 0 || stop_.load(std::memory_order_relaxed)) return;
+    // Latest-wins signal, deliberately NOT the pending_ job slot: the hybrid
+    // decode loop polls this each token and rolls back IN PLACE, so it must not
+    // bump current_gen_ (which would abort the very generation it is steering).
+    // A request that arrives while nothing is decoding is harmlessly cleared at
+    // the next generation's start.
+    pendingRewind_.store(tokens_back, std::memory_order_relaxed);
 }
 
 void LiveTranslationTracker::SetLifecycleSink(LifecycleSink sink) {
@@ -291,6 +312,11 @@ void LiveTranslationTracker::RunLifecycle(LifecycleOp op) {
             adapter_.engine().prefill_driver().finish(session_->seq);
         }
         session_.reset();
+        // Release the hybrid snapshot ring too: its forked slots hold paged pages
+        // that a KV spill / weight offload would strand. It self-heals -- the next
+        // hybrid generation lazily recreates it from a fresh prefill (its dtor
+        // release_sequence()s each slot; harmless if the pool is already gone).
+        rewind_ring_.reset();
 
         // Stage 1 either way: hibernation without the KV spill would strand
         // the radix tree's VRAM pages while the weights leave.
@@ -438,11 +464,20 @@ void LiveTranslationTracker::RunTrack(const Job& job) {
 
 void LiveTranslationTracker::RunGenerate(const Job& job) {
     if (!adapter_.engine().has_prefix_cache()) {
+        // A hybrid SSM model has no prefix-cache substrate (recurrent + gated
+        // state lives outside the paged pools), but if it can fork with branch
+        // headroom it gets the snapshot-driven virtual-rewind path instead of the
+        // plain fallback -- same reprefill cost, plus in-flight backtrack.
+        if (blackwell::HybridSnapshotRing::supported(adapter_.engine())) {
+            RunGenerateHybridSnapshot(job);
+            return;
+        }
         if (!logged_fallback_.exchange(true, std::memory_order_relaxed)) {
             Log(L"this model has no prefix-cache substrate (hybrid SSM / gated "
-                L"attention / Continuous mode); live tracker falls back to the "
-                L"adapter's ordinary generate() -- correct, just without "
-                L"speculative tracking");
+                L"attention / Continuous mode) and no fork/branch headroom for "
+                L"virtual rewind; live tracker falls back to the adapter's "
+                L"ordinary generate() -- correct, just without speculative "
+                L"tracking");
         }
         RunGenerateFallback(job);
         return;
@@ -563,6 +598,157 @@ void LiveTranslationTracker::RunGenerate(const Job& job) {
         finished ? ExtractFinishBody(acc, /*require_close=*/true) : std::wstring();
     const TokenHeatmap heatmap =
         (collectProbs && finished) ? BuildHeatmap(acc, pieceEnds) : TokenHeatmap{};
+    job.callback(final_text, heatmap, /*done=*/true);
+}
+
+void LiveTranslationTracker::RunGenerateHybridSnapshot(const Job& job) {
+    auto& engine = adapter_.engine();
+
+    std::vector<int> prompt;
+    try {
+        prompt = BuildTokens(job.text, job.context);
+    } catch (const std::exception& e) {
+        Log(L"hybrid generation aborted (token build): " + FromUtf8(e.what()));
+        if (job.callback) job.callback(L"", {}, true);
+        return;
+    }
+    const size_t cap = adapter_.max_seq_len();
+    if (prompt.empty() || prompt.size() >= cap) {
+        if (job.callback) job.callback(L"", {}, true);
+        return;
+    }
+
+    // Cold prefill on the pinned active head (slot 0). A recurrent SSM state has
+    // no rewind, so a fresh prompt must zero it and reprefill from pos 0 (exactly
+    // the adapter fallback's contract) -- we just drive it here so we own the
+    // sequence for snapshotting. Deterministic (temperature 0), like every
+    // prefill: only the final forward yields the first generated token.
+    engine.reset_state(0);
+    pendingRewind_.store(0, std::memory_order_relaxed);  // drop any stale request
+
+    int pos = 0;
+    int next = -1;
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        if (engine.forward_status(prompt[i], pos, 0.0f, 1.0f, /*seq_id=*/0, &next) !=
+            blackwell::EngineStatus::Success) {
+            Log(L"hybrid generation aborted (prefill fault)");
+            if (job.callback) job.callback(L"", {}, true);
+            return;
+        }
+        ++pos;
+    }
+    // pos == prompt.size(); `next` = first generated token, from prompt[N-1]'s
+    // live logits (no extra forward, like the coordinator/adapter convention).
+
+    // Snapshot ring: anchor at the prompt boundary, then one checkpoint every K
+    // decoded tokens. Lazily created and reused across generations; begin()
+    // clears any prior session's snapshots.
+    if (!rewind_ring_) {
+        rewind_ring_ =
+            std::make_unique<blackwell::HybridSnapshotRing>(engine, kHybridCheckpointStride);
+    }
+    rewind_ring_->begin(static_cast<int>(prompt.size()));
+
+    const bool collectProbs = collect_probs_.load(std::memory_order_relaxed);
+    // Host mirrors the ring/heatmap diff against: `mirror` is the absolute token
+    // stream (prompt + generated) virtual_rewind replays from; `genByteEnds` is
+    // acc's byte length after each GENERATED token (so a rewind truncates acc at
+    // a token boundary and BuildHeatmap can slice pieces), with parallel probs.
+    std::vector<int> mirror = prompt;
+    std::vector<size_t> genByteEnds;
+    std::vector<float> genProbs;
+    std::string acc;
+    std::wstring last_posted;
+    int generated = 0;
+    bool finished = false;
+    bool interrupted = false;
+
+    while (static_cast<size_t>(pos) < cap && generated < max_new_tokens_) {
+        if (job.gen != current_gen_.load(std::memory_order_relaxed)) {
+            interrupted = true;  // a newer TrackUpdate/TriggerGeneration superseded us
+            break;
+        }
+
+        // Virtual-rewind request (manual/API trigger): roll the stream back N
+        // generated tokens and resume from the nearest snapshot, IN PLACE -- the
+        // job is not superseded (see RequestVirtualRewind).
+        if (const int back = pendingRewind_.exchange(0, std::memory_order_relaxed);
+            back > 0) {
+            const int target = pos - back;
+            blackwell::EngineStatus rst = blackwell::EngineStatus::Success;
+            const int landed = rewind_ring_->virtual_rewind(target, mirror, temperature_,
+                                                            top_p_, &next, &rst);
+            if (landed < 0) {
+                if (rst != blackwell::EngineStatus::Success) {
+                    std::wcerr << L"[tracker] hybrid virtual rewind faulted: "
+                               << blackwell::to_string(rst) << L"\n";
+                    break;  // dead stream -> the empty-text failure delivery below
+                }
+                // Below the snapshot horizon: keep streaming (the caller can
+                // reissue a full TriggerGeneration to regenerate from scratch).
+            } else {
+                const int keep_gen = landed - static_cast<int>(prompt.size());
+                mirror.resize(landed);
+                acc.resize(keep_gen == 0 ? 0 : genByteEnds[keep_gen - 1]);
+                genByteEnds.resize(keep_gen);
+                if (collectProbs) genProbs.resize(keep_gen);
+                pos = landed;
+                generated = keep_gen;
+                finished = false;
+                last_posted.clear();
+                StreamPartial(acc, job.callback, last_posted);  // re-post truncated body
+                continue;  // `next` is the resampled resume token; consume it below
+            }
+        }
+
+        if (adapter_.tokenizer().is_stop(next)) break;  // real eos, no <finish> closed
+
+        float prob = 1.0f;
+        if (collectProbs) {
+            try {
+                prob = engine.last_token_probability(next);
+            } catch (const std::exception&) {
+                prob = 1.0f;  // never let a debug read break the decode
+            }
+        }
+
+        acc += adapter_.tokenizer().decode(next);
+        mirror.push_back(next);
+        genByteEnds.push_back(acc.size());
+        if (collectProbs) genProbs.push_back(prob);
+        if (acc.find("</finish>") != std::string::npos) finished = true;
+
+        StreamPartial(acc, job.callback, last_posted);
+        if (finished) break;
+
+        const auto fwd_st =
+            engine.forward_status(next, pos, temperature_, top_p_, /*seq_id=*/0, &next);
+        if (fwd_st != blackwell::EngineStatus::Success) {
+            std::wcerr << L"[tracker] hybrid decode step faulted: "
+                       << blackwell::to_string(fwd_st) << L"\n";
+            break;
+        }
+        ++pos;
+        ++generated;
+        // Capture-on-arrival (I1): fork slot 0 into a fresh ring slot every K
+        // tokens. Best-effort -- a snapshot fault only shortens the horizon.
+        rewind_ring_->on_token(pos);
+    }
+
+    if (interrupted || !job.callback) {
+        return;  // superseded: the interrupting call owns the next delivery
+    }
+    const std::wstring final_text =
+        finished ? ExtractFinishBody(acc, /*require_close=*/true) : std::wstring();
+    TokenHeatmap heatmap;
+    if (collectProbs && finished) {
+        std::vector<std::pair<size_t, float>> pieceEnds;
+        pieceEnds.reserve(genByteEnds.size());
+        for (size_t i = 0; i < genByteEnds.size(); ++i) {
+            pieceEnds.emplace_back(genByteEnds[i], genProbs[i]);
+        }
+        heatmap = BuildHeatmap(acc, pieceEnds);
+    }
     job.callback(final_text, heatmap, /*done=*/true);
 }
 

@@ -79,6 +79,9 @@
 namespace playground {
 class BlackwellLLMAdapter;
 }
+namespace blackwell {
+class HybridSnapshotRing;
+}
 
 class LiveTranslationTracker {
 public:
@@ -150,6 +153,19 @@ public:
     // how different it is from what came before.
     void Cancel();
 
+    // Virtual rewind (hybrid SSM models only): ask an IN-FLIGHT hybrid generation
+    // to roll its decode head back `tokens_back` generated tokens and resume from
+    // the nearest snapshot, streaming the corrected continuation on the SAME job.
+    // Fire-and-forget, callable from any thread (a critic/UI action). Rides a
+    // dedicated latest-wins signal, NOT the pending_ slot: a backtrack MUTATES the
+    // running generation rather than superseding it, so it must not displace the
+    // job the way a fresh TrackUpdate/TriggerGeneration does. A no-op when no
+    // hybrid generation is decoding, when the model is dense (dense uses the
+    // coordinator's physical micro-rewind, not this), or when the target predates
+    // the snapshot horizon (the decode simply keeps streaming). tokens_back <= 0
+    // is ignored.
+    void RequestVirtualRewind(int tokens_back);
+
     // Switch the active translation direction (index into the CURRENT prompt
     // set). Thread-safe (atomic); out-of-range indices are clamped. The next
     // request builds tokens from the new prompt -- update_sequence simply
@@ -219,6 +235,13 @@ private:
     void ThreadMain();
     void RunTrack(const Job& job);
     void RunGenerate(const Job& job);
+    // Hybrid-SSM decode with snapshot-driven virtual rewind. Selected instead of
+    // the coordinator path (which needs a prefix-cache substrate hybrids lack)
+    // and instead of the plain fallback when the model forks and has branch
+    // headroom (HybridSnapshotRing::supported). Reprefills the whole prompt on
+    // slot 0 (recurrent state has no rewind), then decodes while checkpointing
+    // every K tokens, honoring RequestVirtualRewind() in-loop.
+    void RunGenerateHybridSnapshot(const Job& job);
     // Worker thread: execute a Spill/Hibernate request (release session ->
     // spill -> optionally offload weights) and fire the lifecycle sink.
     void RunLifecycle(LifecycleOp op);
@@ -274,8 +297,20 @@ private:
     // destructor's calling thread -- see the destructor).
     std::unique_ptr<TrackedSession> session_;
 
+    // Worker-thread-only: the hybrid-SSM virtual-rewind snapshot ring (fork-based
+    // checkpoints on slot 0). Lazily created on the first hybrid generation and
+    // reused; released in the destructor after the worker join, alongside
+    // session_. Null for dense models (they use session_'s physical micro-rewind)
+    // and for hybrids without branch headroom (plain fallback).
+    std::unique_ptr<blackwell::HybridSnapshotRing> rewind_ring_;
+
     std::atomic<std::uint64_t> current_gen_{0};
     std::atomic<bool> stop_{false};
+    // Latest-wins virtual-rewind request (generated tokens to roll back); 0 =
+    // none. Set by RequestVirtualRewind() from any thread, consumed at the
+    // hybrid decode loop's per-token boundary. Separate from pending_ on purpose
+    // (see RequestVirtualRewind): it edits the running job, never supersedes it.
+    std::atomic<int> pendingRewind_{0};
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;

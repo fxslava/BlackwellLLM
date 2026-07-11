@@ -157,6 +157,25 @@ public:
     // single-sequence, so seq_id must be 0 for them.
     void reset_state(int seq_id = 0);
 
+    // Destroy a forked branch and recycle its sequence id: return the branch's
+    // KV pages to the allocator and drop its id mapping, so a later fork() may
+    // reuse `seq_id`. Paged (branching) models only -- throws under Continuous /
+    // hybrid-without-branching, like fork(). The hybrid physical state stores
+    // (SSM recurrent/conv, gated full-attention KV) are statically allocated per
+    // slot and are simply left for the next fork() to overwrite wholesale, so
+    // this frees only the paged pool; it is the recycling primitive a snapshot
+    // ring needs (fork() rejects an id that still exists). seq_id 0 may be
+    // released (e.g. to restore a snapshot INTO the active head), but the caller
+    // must re-establish it via fork() before decoding it again.
+    void release_sequence(int seq_id);
+
+    // Number of physically-addressable concurrent sequence slots [0,
+    // branch_capacity): the shared budget of the paged CoW pool and the hybrid
+    // physical state stores, resolved from RuntimeConfig::paged_branch_factor at
+    // construction (1 when the model cannot branch). A snapshot ring sizes its
+    // slot set from this.
+    int branch_capacity() const noexcept;
+
     // Capabilities of the loaded model. fork()/rewind() throw std::runtime_error
     // when supports_cow_branching is false (hybrid SSM models, or Continuous mode).
     ModelCapabilities get_capabilities() const;

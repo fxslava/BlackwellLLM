@@ -121,6 +121,20 @@ public:
     // Roll `seq` back to `target_pos` tokens; paged frees now-unreachable pages.
     virtual void rewind(SeqId seq, int target_pos) = 0;
 
+    // Destroy a caller-assigned (>= 0) sequence: drop its engine-id mapping and
+    // return its pages to the allocator (last-reference pages free; fork-/tree-
+    // shared pages just lose this sequence's ref). REQUIRED to recycle a fork
+    // child id -- fork() rejects an id that already exists, so a snapshot ring
+    // that reuses a fixed slot set (HybridSnapshotRing) must release() a slot
+    // before re-forking into it. Continuous is single-sequence and has no fork
+    // to release, so the base throws (capability gating, like the batched-decode
+    // control plane above); only the branching-capable paged strategy overrides.
+    virtual void release_sequence(SeqId /*seq*/) {
+        throw std::runtime_error(
+            "IKVCacheManager: release_sequence requires the Paged KV strategy "
+            "(construct the engine with KVCacheMode::Paged)");
+    }
+
     // ---------------------------------------------------------------------
     // Capability / identity.
     // ---------------------------------------------------------------------

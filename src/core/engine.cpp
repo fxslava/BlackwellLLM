@@ -734,6 +734,22 @@ void BlackwellEngine::reset_state(int seq_id) {
     impl->ssm_state->reset(seq_id);
 }
 
+void BlackwellEngine::release_sequence(int seq_id) {
+    // Same gate as fork/rewind: recycling a branch id only means anything on the
+    // branching-capable paged cache. Under Continuous / hybrid-without-branching
+    // there are no fork children to free.
+    require_branching(pImpl->m_caps, "release_sequence");
+    // Only the paged pool holds per-branch allocations to reclaim. The hybrid
+    // physical stores (SSM recurrent/conv slice, gated full-attention KV slice)
+    // are statically sized to m_branch_capacity and indexed directly by seq_id,
+    // so nothing is freed there -- the next fork() into this id overwrites the
+    // slice wholesale (fork_sequence / the D2D copy in Impl::fork). Leaving stale
+    // bytes behind is harmless: a slot is only ever decoded after a fork seeds it.
+    pImpl->kv_mgr->release_sequence(seq_id);
+}
+
+int BlackwellEngine::branch_capacity() const noexcept { return pImpl->m_branch_capacity; }
+
 // ============================================================================
 // Shared decoder pipeline: embedding -> N transformer layers -> final norm/head.
 // With want_logits, leaves the logits for token `pos` in d_logits; without, the

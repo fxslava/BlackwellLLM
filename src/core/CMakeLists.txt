@@ -18,6 +18,7 @@
 set(CORE_SOURCES
     engine.cpp
     engine_prefill_coordinator.cpp
+    hybrid_snapshot_ring.cpp
     runtime_config.cpp
     ops_dispatcher.cpp
     safetensors.cpp

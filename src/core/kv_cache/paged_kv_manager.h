@@ -60,6 +60,7 @@ public:
 
     void fork(SeqId parent, SeqId child) override;
     void rewind(SeqId seq, int target_pos) override;
+    void release_sequence(SeqId seq) override;
 
     // --- micro-rewind (Continuous Speculative Tracking) --------------------
     // Truncate the sequence so exactly keep_tokens remain, freeing trailing

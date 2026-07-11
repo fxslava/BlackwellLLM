@@ -48,6 +48,7 @@
 #include "blackwell/engine.h"
 #include "blackwell/config.h"
 #include "engine_impl.h"
+#include "hybrid_snapshot_ring.h"
 
 namespace {
 
@@ -121,6 +122,38 @@ TEST(Qwen35Hybrid, SupportsForkRejectsRewind) {
     // state); rewind() is still rejected (recurrent state has no positional undo).
     EXPECT_NO_THROW(engine->fork(0, 1));
     EXPECT_THROW(engine->rewind(0, 0), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// release_sequence() recycles a fork id: fork() rejects an id that already
+// exists, so the snapshot ring's slot reuse depends on being able to destroy a
+// branch and fork the same id again. This is the primitive that makes the ring
+// possible (no dumps / decode needed -- pure branch-lifecycle bookkeeping).
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, ReleaseSequenceRecyclesForkId) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), /*max_seq_len=*/512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction pending: " << e.what();
+    }
+    ASSERT_GE(engine->branch_capacity(), 2)
+        << "hybrid paged model must expose >= 2 branch slots for virtual rewind";
+
+    EXPECT_NO_THROW(engine->fork(0, 1));
+    // Re-forking the live id 1 must fail (the guard the ring relies on)...
+    EXPECT_THROW(engine->fork(0, 1), std::runtime_error);
+    // ...until it is released, after which the same id forks cleanly again.
+    EXPECT_NO_THROW(engine->release_sequence(1));
+    EXPECT_NO_THROW(engine->fork(0, 1));
+    EXPECT_NO_THROW(engine->release_sequence(1));
+    // Releasing an unknown id is a caller error (loud, not silent).
+    EXPECT_THROW(engine->release_sequence(1), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +402,113 @@ TEST(Qwen35Hybrid, ResetStateClearsRecurrentPollution) {
     // worse (proving the recurrent state actually leaked across the restart).
     EXPECT_GT(cos_clean, kParityThreshold);
     EXPECT_LT(cos_polluted, cos_clean);
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot-driven VIRTUAL rewind parity: the hybrid analogue of the dense
+// BatchedDecodeMatchesSequential gate. A recurrent SSM state cannot be rolled
+// back physically, so HybridSnapshotRing forks checkpoints and, on a rewind,
+// restores the nearest one and replays the retained tail. The claim under test:
+// the restored+replayed state at length T decodes BIT-IDENTICALLY (to bf16
+// rounding) to a fresh, uninterrupted decode that reached T -- i.e. the fork
+// snapshot really is the state at that point, and the replay reproduces it.
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, VirtualRewindMatchesFreshDecode) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+    if (!file_exists(dumps_dir() + "/multistep_tokens.bin"))
+        GTEST_SKIP() << "multi-step token dump absent (run generate_qwen35_multistep.py).";
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), 512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction pending: " << e.what();
+    }
+    if (!blackwell::HybridSnapshotRing::supported(*engine))
+        GTEST_SKIP() << "model has no branch headroom for virtual rewind";
+
+    BlackwellEngine::Impl* impl = engine->get_impl();
+    const ModelConfig& cfg = impl->m_config;
+
+    std::vector<int> tokens;
+    {
+        std::ifstream f(dumps_dir() + "/multistep_tokens.bin", std::ios::binary | std::ios::ate);
+        ASSERT_TRUE(f.good());
+        const std::streamsize bytes = f.tellg();
+        f.seekg(0);
+        std::vector<int32_t> raw(bytes / sizeof(int32_t));
+        f.read(reinterpret_cast<char*>(raw.data()), bytes);
+        tokens.assign(raw.begin(), raw.end());
+    }
+    const int M = std::min<int>(static_cast<int>(tokens.size()), 12);
+    ASSERT_GE(M, 10) << "need >= 10 tokens to exercise a mid-stream rewind";
+
+    auto snapshot_logits = [&]() {
+        std::vector<float> v(cfg.vocab_size);
+        CUDA_CHECK(cudaMemcpy(v.data(), impl->d_logits, cfg.vocab_size * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        return v;
+    };
+
+    // Reference: a fresh, uninterrupted decode of tokens[0..M). ref[p] = the
+    // logits AFTER consuming tokens[p] (the distribution for position p+1).
+    engine->reset_state(0);
+    std::vector<std::vector<float>> ref(M);
+    for (int p = 0; p < M; ++p) {
+        int next = -1;
+        const auto st = engine->forward_status(tokens[p], p, 0.0f, 1.0f, 0, &next);
+        if (st != blackwell::EngineStatus::Success)
+            GTEST_SKIP() << "SSM decode path not yet wired: " << blackwell::to_string(st);
+        ref[p] = snapshot_logits();
+    }
+
+    // Ring run: prefill P tokens as the "prompt", checkpoint every K, decode to M,
+    // then virtually rewind to T and prove the head decodes identically to the
+    // fresh reference from T onward.
+    const int P = 3, K = 4, T = 8;
+    blackwell::HybridSnapshotRing ring(*engine, K);
+    engine->reset_state(0);
+    int next = -1;
+    for (int p = 0; p < P; ++p)
+        ASSERT_EQ(engine->forward_status(tokens[p], p, 0.0f, 1.0f, 0, &next),
+                  blackwell::EngineStatus::Success);
+    ASSERT_EQ(ring.begin(P), blackwell::EngineStatus::Success);
+    for (int p = P; p < M; ++p) {
+        ASSERT_EQ(engine->forward_status(tokens[p], p, 0.0f, 1.0f, 0, &next),
+                  blackwell::EngineStatus::Success);
+        ring.on_token(p + 1);
+    }
+
+    // Virtual rewind to length T -> the head must hold the SAME logits the fresh
+    // decode had after tokens[T-1], and out_next the greedy resample of them.
+    blackwell::EngineStatus rst = blackwell::EngineStatus::Success;
+    int out_next = -1;
+    const int landed = ring.virtual_rewind(T, tokens, 0.0f, 1.0f, &out_next, &rst);
+    ASSERT_EQ(rst, blackwell::EngineStatus::Success);
+    ASSERT_EQ(landed, T);
+
+    const double cos_at_T = cosine_similarity(ref[T - 1], snapshot_logits());
+    std::cout << "[qwen3.5-hybrid] virtual_rewind logits cos@T = " << cos_at_T << "\n";
+    EXPECT_GT(cos_at_T, kParityThreshold);
+    const int ref_argmax =
+        static_cast<int>(std::max_element(ref[T - 1].begin(), ref[T - 1].end()) -
+                         ref[T - 1].begin());
+    EXPECT_EQ(out_next, ref_argmax);
+
+    // Continue decoding the retained tail from T; every position must stay in
+    // lockstep with the fresh reference (the restored recurrent + full-attn state
+    // is the fresh state, so this is exact parity, not approximate).
+    double min_cos = cos_at_T;
+    for (int p = T; p < M; ++p) {
+        ASSERT_EQ(engine->forward_status(tokens[p], p, 0.0f, 1.0f, 0, &next),
+                  blackwell::EngineStatus::Success);
+        min_cos = std::min(min_cos, cosine_similarity(ref[p], snapshot_logits()));
+    }
+    std::cout << "[qwen3.5-hybrid] post-rewind decode min cos = " << min_cos << "\n";
+    EXPECT_GT(min_cos, kParityThreshold);
 }
 
 // ---------------------------------------------------------------------------
