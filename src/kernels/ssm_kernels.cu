@@ -130,6 +130,188 @@ void launch_selective_scan_update(const float* d_q, const float* d_k,
 }
 
 // ============================================================================
+// 2b. CHUNKED delta rule — parallel prefill over a chunk of tokens.
+//     One block per head; the O(C·Dk·Dv) intra-chunk work is spread across the
+//     block, chunks (of up to CHUNK tokens) are processed sequentially so the
+//     recurrent state S carries forward. This is the direct production port of
+//     the verified sandbox (tests/standalone/test_gated_delta_chunk.cu); the math
+//     is byte-for-byte that reference, generalized to runtime dims, a token-major
+//     layout, and a partial final chunk (cur_C < CHUNK). See the header contract.
+// ============================================================================
+namespace { constexpr int kDeltaChunk = 64; }   // C: intra-chunk token tile
+
+// token-major index helpers (runtime dims passed in).
+__device__ __forceinline__ size_t gd_idxKD(int t, int h, int i, int H, int Dk) {
+    return ((size_t)t * H + h) * Dk + i;              // q,k : [T,H,Dk]
+}
+__device__ __forceinline__ size_t gd_idxVD(int t, int h, int d, int H, int Dv) {
+    return ((size_t)t * H + h) * Dv + d;              // v,o : [T,H,Dv]
+}
+__device__ __forceinline__ size_t gd_idxS(int i, int d, int Dv) {
+    return (size_t)i * Dv + d;                        // S(i,d) within a head block
+}
+
+// NUMERICALLY STABLE chunked delta rule. The naive form absorbs the cumulative
+// decay by dividing v_t / b_t (b_t = Π_{j<=t} a_j); with real GatedDeltaNet decays
+// b_t underflows to 0 and v/b_t blows up to inf/NaN (the per-token recurrence
+// never divides). We instead carry the cumulative LOG-decay ℓ_t = Σ_{j<=t} log a_j
+// (≤ 0) and use ONLY bounded factors: exp(ℓ_t) ∈ (0,1] and the pair ratios
+// exp(ℓ_t − ℓ_s) ∈ (0,1] for t ≥ s. Rescaling the corrected writes to ũ_t = b_t u_t
+// gives the same outputs and state with every intermediate bounded:
+//     Ã[t,s] = β_t exp(ℓ_t−ℓ_s)(k_t·k_s)          (s<t; unit diagonal)
+//     ũ_t    = β_t v_t − β_t exp(ℓ_t)(k_t·S_0),   solve (I+Ã)Ũ = RHS
+//     o_t    = exp(ℓ_t)(q_t·S_0) + Σ_{s<=t} exp(ℓ_t−ℓ_s)(q_t·k_s) ũ_s
+//     S_C    = exp(ℓ_{C-1}) S_0 + Σ_s exp(ℓ_{C-1}−ℓ_s) k_s ũ_s^T
+// At C=1 this collapses to the single-token recurrence (β(v−a·k·S_0) etc.). The
+// `logdecay` input already IS ℓ per token (= dt·(−exp(A_log)), summed here) so no
+// log(exp()) round-trip. See the header contract for layouts.
+__global__ void gated_delta_chunked_prefill_kernel(const float* __restrict__ k,
+                                                   const float* __restrict__ q,
+                                                   const float* __restrict__ v,
+                                                   const float* __restrict__ logdecay,
+                                                   const float* __restrict__ beta,
+                                                   const float* h_prev,   // may alias h_out
+                                                   float* __restrict__ o_out,
+                                                   float* h_out,          // may alias h_prev
+                                                   float* __restrict__ u_scratch,
+                                                   int H, int L, int Dk, int Dv) {
+    const int h  = blockIdx.x;
+    const int tx = threadIdx.x;
+    const int NT = blockDim.x;
+    const int C  = kDeltaChunk;
+
+    __shared__ float s_ld[kDeltaChunk];       // per-token log-decay ℓ (then cumsum)
+    __shared__ float s_beta[kDeltaChunk];
+    __shared__ float s_M[kDeltaChunk * kDeltaChunk];   // (I + Ã), unit lower-tri
+
+    // Persistent per-head state lives in h_out (seeded from h_prev, carried, and
+    // finally IS the chunk-C state). Seed once (h_prev==h_out => self-copy).
+    for (int e = tx; e < Dk * Dv; e += NT)
+        h_out[(size_t)h * Dk * Dv + e] = h_prev[(size_t)h * Dk * Dv + e];
+    __syncthreads();
+    float* __restrict__ S = h_out + (size_t)h * Dk * Dv;
+    float* __restrict__ U = u_scratch + (size_t)h * C * Dv;
+
+    for (int base = 0; base < L; base += C) {
+        const int cur = min(C, L - base);          // partial final chunk allowed
+
+        // -- per-token log-decay + write strength, then inclusive cumulative sum of
+        //    the log-decays into s_ld (== ℓ_t; exp(ℓ_t) is the bounded decay b_t).
+        for (int t = tx; t < cur; t += NT) {
+            s_ld[t]   = logdecay[(size_t)(base + t) * H + h];
+            s_beta[t] = beta    [(size_t)(base + t) * H + h];
+        }
+        __syncthreads();
+        if (tx == 0) {
+            float acc = 0.f;
+            for (int t = 0; t < cur; ++t) { acc += s_ld[t]; s_ld[t] = acc; }
+        }
+        __syncthreads();
+
+        // -- unit lower-tri system Ã[t,s] = β_t exp(ℓ_t−ℓ_s)(k_t·k_s) for s<t.
+        for (int p = tx; p < cur * cur; p += NT) {
+            const int t = p / cur, s = p % cur;
+            float m;
+            if (s > t)       m = 0.f;
+            else if (s == t) m = 1.f;
+            else {
+                float dot = 0.f;
+                for (int i = 0; i < Dk; ++i)
+                    dot += k[gd_idxKD(base + t, h, i, H, Dk)] * k[gd_idxKD(base + s, h, i, H, Dk)];
+                m = s_beta[t] * __expf(s_ld[t] - s_ld[s]) * dot;
+            }
+            s_M[t * C + s] = m;
+        }
+        __syncthreads();
+
+        // -- RHS (rescaled): ũ_t = β_t v_t − β_t exp(ℓ_t)(k_t·S_0)   (no division)
+        for (int p = tx; p < cur * Dv; p += NT) {
+            const int t = p / Dv, d = p % Dv;
+            float kS = 0.f;
+            for (int i = 0; i < Dk; ++i)
+                kS += k[gd_idxKD(base + t, h, i, H, Dk)] * S[gd_idxS(i, d, Dv)];
+            const float vt = v[gd_idxVD(base + t, h, d, H, Dv)];
+            U[(size_t)t * Dv + d] = s_beta[t] * (vt - __expf(s_ld[t]) * kS);
+        }
+        __syncthreads();
+
+        // -- forward substitution: ũ_t -= Σ_{s<t} Ã[t,s] ũ_s  (sequential in t)
+        for (int t = 1; t < cur; ++t) {
+            for (int d = tx; d < Dv; d += NT) {
+                float acc = 0.f;
+                for (int s = 0; s < t; ++s) acc += s_M[t * C + s] * U[(size_t)s * Dv + d];
+                U[(size_t)t * Dv + d] -= acc;
+            }
+            __syncthreads();
+        }
+
+        // -- outputs: o_t = exp(ℓ_t)(q_t·S_0) + Σ_{s<=t} exp(ℓ_t−ℓ_s)(q_t·k_s) ũ_s
+        for (int p = tx; p < cur * Dv; p += NT) {
+            const int t = p / Dv, d = p % Dv;
+            float qS = 0.f;
+            for (int i = 0; i < Dk; ++i)
+                qS += q[gd_idxKD(base + t, h, i, H, Dk)] * S[gd_idxS(i, d, Dv)];
+            float cross = 0.f;
+            for (int s = 0; s <= t; ++s) {
+                float qk = 0.f;
+                for (int i = 0; i < Dk; ++i)
+                    qk += q[gd_idxKD(base + t, h, i, H, Dk)] * k[gd_idxKD(base + s, h, i, H, Dk)];
+                cross += __expf(s_ld[t] - s_ld[s]) * qk * U[(size_t)s * Dv + d];
+            }
+            o_out[gd_idxVD(base + t, h, d, H, Dv)] = __expf(s_ld[t]) * qS + cross;
+        }
+        __syncthreads();                           // outputs consumed S_0 before overwrite
+
+        // -- state carry: S_C = exp(ℓ_{cur-1}) S_0 + Σ_s exp(ℓ_{cur-1}−ℓ_s) k_s ũ_s^T
+        const float bC = __expf(s_ld[cur - 1]);
+        for (int p = tx; p < Dk * Dv; p += NT) {
+            const int i = p / Dv, d = p % Dv;
+            float ku = 0.f;
+            for (int s = 0; s < cur; ++s)
+                ku += __expf(s_ld[cur - 1] - s_ld[s]) * k[gd_idxKD(base + s, h, i, H, Dk)]
+                          * U[(size_t)s * Dv + d];
+            S[gd_idxS(i, d, Dv)] = bC * S[gd_idxS(i, d, Dv)] + ku;
+        }
+        __syncthreads();                           // S_C visible as S_0 for next chunk
+    }
+}
+
+// Per-head LOG-decay ℓ = dt·(−exp(A_log)) with dt = softplus(a_raw + dt_bias). This
+// is exactly log(a) of selective_scan_update's decay a, but kept in log space so
+// the chunk kernel's cumulative sum never underflows (feeds `logdecay`).
+__global__ void gated_delta_logdecay_kernel(const float* __restrict__ a_raw,
+                                           const float* __restrict__ dt_bias,
+                                           const float* __restrict__ A_log,
+                                           float* __restrict__ logdecay_out, int H) {
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= H) return;
+    const float dt = softplus_stable(a_raw[h] + dt_bias[h]);
+    logdecay_out[h] = dt * (-__expf(A_log[h]));
+}
+
+void launch_gated_delta_chunked_prefill(const float* d_k, const float* d_q, const float* d_v,
+                                        const float* d_logdecay, const float* d_beta,
+                                        const float* d_h_prev, float* d_o_out, float* d_h_out,
+                                        float* d_u_scratch, int num_heads, int num_tokens,
+                                        int key_head_dim, int value_head_dim,
+                                        cudaStream_t stream) {
+    // One block per head; 256 threads spread the intra-chunk work. Shared memory
+    // (s_ld/s_beta/s_M) is statically sized to the CHUNK tile.
+    if (num_tokens <= 0) return;
+    gated_delta_chunked_prefill_kernel<<<num_heads, 256, 0, stream>>>(
+        d_k, d_q, d_v, d_logdecay, d_beta, d_h_prev, d_o_out, d_h_out, d_u_scratch,
+        num_heads, num_tokens, key_head_dim, value_head_dim);
+}
+
+void launch_gated_delta_logdecay(const float* d_a_raw, const float* d_dt_bias,
+                                 const float* d_A_log, float* d_logdecay_out,
+                                 int num_heads, cudaStream_t stream) {
+    const int threads = 256, blocks = (num_heads + threads - 1) / threads;
+    gated_delta_logdecay_kernel<<<blocks, threads, 0, stream>>>(
+        d_a_raw, d_dt_bias, d_A_log, d_logdecay_out, num_heads);
+}
+
+// ============================================================================
 // 3. GatedDeltaNet assembly helpers
 // ============================================================================
 __global__ void bf16_to_f32_kernel(const __nv_bfloat16* __restrict__ in,

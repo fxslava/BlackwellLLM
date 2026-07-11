@@ -89,6 +89,16 @@ struct BlackwellEngine::Impl {
     blackwell::DeviceBuffer<float> d_ssm_core, d_ssm_o;
     blackwell::DeviceBuffer<float> d_dt_bias_f32, d_A_log_f32;
     blackwell::DeviceBuffer<float> d_norm_f32, d_conv_w_f32;
+    // CHUNKED-prefill scratch (hybrid + m_token_capacity>1 only). The per-token
+    // in_proj outputs are staged batched (d_ssm_qkv_batch/d_ssm_z_batch), the conv
+    // + split are still swept per token into the single-token d_ssm_* above and
+    // scattered into these token-major chunk buffers, then one chunked-delta kernel
+    // launch evolves the recurrent state over the whole chunk. Widths scale with
+    // m_token_capacity; d_ssm_u_scratch is the per-head [64][Dv] UT-solve scratch.
+    blackwell::DeviceBuffer<float> d_ssm_qkv_batch, d_ssm_z_batch, d_ssm_o_batch;
+    blackwell::DeviceBuffer<float> d_ssm_chunk_q, d_ssm_chunk_k, d_ssm_chunk_v, d_ssm_chunk_o;
+    blackwell::DeviceBuffer<float> d_ssm_chunk_logdecay, d_ssm_chunk_beta;
+    blackwell::DeviceBuffer<float> d_ssm_u_scratch;
 
     // NON-owning views into the arena's ping-pong activation pool (bound in the
     // ctor body; the arena frees them) -- the only raw device pointers left here.
@@ -138,10 +148,11 @@ struct BlackwellEngine::Impl {
     // BF16, per-row GEMV sweep for quantized) + batched paged-flash prefill
     // attention -> batched MLP. want_logits runs the final norm + lm_head GEMV for
     // the LAST token only (its logits are what a prompt needs). num_tokens must be
-    // <= m_token_capacity (the caller tiles longer deltas). Generic dense
-    // full-attention path only -- the batched-capable configuration the prefill
-    // coordinator is built for; returns InvalidConfig for SSM/gated models.
-    // RUNTIME error tier: reports by EngineStatus, never throws (mirrors run_token).
+    // <= m_token_capacity (the caller tiles longer deltas). Dense uniform
+    // full-attention runs the batched paged pipeline here; SSM / gated-full hybrid
+    // models delegate to run_chunk_hybrid (chunked delta rule + dedicated cache).
+    // RUNTIME error tier: reports by EngineStatus (prepare_prefill_step may throw a
+    // KV-gap at the caller/coordinator boundary, as before).
     blackwell::EngineStatus run_chunk(const int* token_ids, int start_pos,
                                       int num_tokens, int seq_id,
                                       bool want_logits = true);
@@ -185,6 +196,27 @@ struct BlackwellEngine::Impl {
     // q_norm/k_norm, partial RoPE). Uses the dedicated full-attn KV cache; seq_id
     // selects this sequence's per-branch slice of that cache.
     blackwell::EngineStatus step_full_attention(int layer_idx, int pos, int seq_id = 0);
+
+    // Hybrid True Batched Prefill. run_chunk delegates here when the model is
+    // SSM/gated (ssm_state or attn_output_gate); it widens the residual stream to
+    // num_tokens rows and dispatches each layer to the batched linear/full-attn
+    // chunk steps below. The two step_*_chunk helpers mirror their per-token
+    // siblings but process the whole [start_pos, start_pos+num_tokens) window:
+    //   - linear: batched norm/proj, per-token conv+split+alpha swept and scattered
+    //     into token-major chunk buffers, ONE launch_gated_delta_chunked_prefill
+    //     carries the recurrent state, then batched gated-RMSNorm + out_proj;
+    //   - full:   batched proj, per-token qg_split/norm/RoPE/append/decode/gate over
+    //     the dedicated cache (positions are per-token), then batched o_proj.
+    // seq_id selects the branch's SSM / full-attn slice (fork branching). Every
+    // per-token/per-head kernel does the identical math its decode sibling does, so
+    // a batched prefill reproduces the run_token sweep to fp32 rounding.
+    blackwell::EngineStatus run_chunk_hybrid(const int* token_ids, int start_pos,
+                                             int num_tokens, int seq_id, bool want_logits);
+    blackwell::EngineStatus step_linear_attention_chunk(int layer_idx, int start_pos,
+                                                        int num_tokens, int seq_id);
+    blackwell::EngineStatus step_full_attention_chunk(int layer_idx, int start_pos,
+                                                      int num_tokens, int seq_id);
+
     blackwell::EngineStatus step_mlp_norm(int layer_idx);
     blackwell::EngineStatus step_mlp_projections(int layer_idx);
     blackwell::EngineStatus step_mlp_out(int layer_idx);

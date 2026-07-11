@@ -72,6 +72,56 @@ void launch_selective_scan_update(
     bool gate_silu,
     cudaStream_t stream = 0);
 
+// ---- CHUNKED prefill (True Batched Prefill for the linear layers) ----------
+//
+// The per-token launch_selective_scan_update above advances S one token at a
+// time — a strictly sequential recurrence. For prefill we instead process a
+// whole CHUNK of tokens in parallel via the STABLE chunked delta rule (the
+// primitive verified in tests/standalone/test_gated_delta_chunk.cu, hardened
+// against decay underflow). It carries the cumulative LOG-decay ℓ_t = Σ_{j<=t}
+// log a_j (≤0) and uses only bounded factors exp(ℓ_t), exp(ℓ_t−ℓ_s) ∈ (0,1]:
+//   (1) Ã[t,s] = β_t exp(ℓ_t−ℓ_s)(k_t·k_s) for s<t (unit lower-tri);
+//   (2) ũ_t = β_t v_t − β_t exp(ℓ_t)(k_t·S_0); solve (I+Ã)Ũ = RHS (forward subst);
+//   (3) o_t = exp(ℓ_t)(q_t·S_0) + Σ_{s<=t} exp(ℓ_t−ℓ_s)(q_t·k_s) ũ_s, and carry
+//       S_C = exp(ℓ_{C-1}) S_0 + Σ_s exp(ℓ_{C-1}−ℓ_s) k_s ũ_s^T.
+// At C=1 this collapses back to the single-token recurrence above (analytically
+// proven), so a chunked prefill and a per-token sweep land on the same state and
+// the same outputs (to fp32 rounding). One launch handles all num_tokens via an
+// internal loop over ceil(num_tokens/64) sub-chunks, carrying S forward. The naive
+// v/b_t form is avoided precisely because real GatedDeltaNet decays drive b_t to 0.
+//
+// LAYOUTS (fp32 throughout):
+//   q,k:      [num_tokens, num_heads, key_head_dim]     (token-major)
+//   v,o_out:  [num_tokens, num_heads, value_head_dim]   (token-major)
+//   logdecay: [num_tokens, num_heads]   per-(token,head) LOG-decay ℓ_t ≤ 0
+//                                       (= dt·(−exp(A_log)); see launch below)
+//   beta:     [num_tokens, num_heads]   per-(token,head) write strength ∈ (0,1)
+//   h_prev:   [num_heads, key_head_dim, value_head_dim]  incoming state S_0
+//   h_out:    [num_heads, key_head_dim, value_head_dim]  carried state S_C
+//             (h_prev == h_out is allowed — the kernel seeds then evolves in place)
+//   u_scratch:[num_heads, 64, value_head_dim]  device scratch (per-head chunk Ũ)
+// The token-major layout is deliberate: it makes the engine's per-token split
+// output a contiguous [num_heads, head_dim] block that the chunk assembler drops
+// in at row t with a single copy. key_head_dim == value_head_dim for Qwen3.5, but
+// the kernel keeps them distinct. STABILITY PRECONDITION on k is unchanged (k must
+// be L2-normalized per head, exactly as the per-token path requires).
+void launch_gated_delta_chunked_prefill(
+    const float* d_k, const float* d_q, const float* d_v,
+    const float* d_logdecay, const float* d_beta,
+    const float* d_h_prev, float* d_o_out, float* d_h_out, float* d_u_scratch,
+    int num_heads, int num_tokens, int key_head_dim, int value_head_dim,
+    cudaStream_t stream = 0);
+
+// Per-head LOG-decay ℓ = log a for the chunk kernel, computed directly (no
+// log(exp())): ℓ[h] = softplus(a_raw[h] + dt_bias[h]) · (−exp(A_log[h])). This is
+// log of selective_scan_update's decay a; kept in log space so the kernel's
+// cumulative sum never underflows. Feeds the `logdecay` array above (beta =
+// sigmoid(b) is produced by launch_sigmoid_inplace as in the decode path).
+// a_raw/dt_bias/A_log are [num_heads]; logdecay_out is [num_heads].
+void launch_gated_delta_logdecay(const float* d_a_raw, const float* d_dt_bias,
+                                 const float* d_A_log, float* d_logdecay_out,
+                                 int num_heads, cudaStream_t stream = 0);
+
 // ---- assembly helpers for the GatedDeltaNet decode step --------------------
 
 // bf16 -> fp32 elementwise cast (for per-layer params consumed by fp32 kernels).

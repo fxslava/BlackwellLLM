@@ -1,7 +1,8 @@
 // ============================================================================
 // Golden-dump parity SCAFFOLD for the Qwen3.5 hybrid (linear-attn + full-attn)
-// checkpoint. Single-token DECODE phase only (chunked prefill is a later
-// milestone). Mirrors test_qwen_engine.cpp's dump/skip conventions.
+// checkpoint. Covers single-token DECODE parity, fork branching, AND True Batched
+// Prefill (BatchedPrefillMatchesSequential, self-referential vs the run_token
+// sweep). Mirrors test_qwen_engine.cpp's dump/skip conventions.
 // ============================================================================
 // STATUS: this is intentionally a scaffold. The capability test runs today; the
 // numerical-parity test is wired end-to-end but SKIPs until the remaining decode
@@ -554,4 +555,102 @@ TEST(Qwen35Hybrid, HybridModelSupportsForking) {
     EXPECT_EQ(argmax(got_child),  argmax(ref_child));
 
     SUCCEED() << "Hybrid fork produced independent parent/child branches.";
+}
+
+// ---------------------------------------------------------------------------
+// TRUE BATCHED PREFILL parity. The chunked delta-rule kernel
+// (launch_gated_delta_chunked_prefill) graduated into run_chunk must reproduce
+// the token-by-token run_token sweep it replaces. This test is SELF-REFERENTIAL
+// -- no golden dumps -- because run_token IS the reference: we prefill the same
+// synthetic prompt two ways on the SAME engine/sequence and compare the final
+// logits.
+//   Path A (reference): run_token for each position 0..N-1 (the per-token
+//     GatedDeltaNet recurrence + per-token full-attention).
+//   Path B (batched):   run_chunk tiled into m_token_capacity blocks -- each a
+//     ONE-pass batched prefill: chunked delta rule for the linear layers, a
+//     per-token cache sweep for the gated full-attention layers, batched
+//     projections/MLP. The recurrent SSM state + conv ring + full-attn cache
+//     carry across tiles exactly as they carry across run_token steps.
+// If the chunked kernel, the state carry across chunk boundaries, or the
+// seq-id offsets were wrong, Path B's logits would diverge from Path A's.
+// ---------------------------------------------------------------------------
+TEST(Qwen35Hybrid, BatchedPrefillMatchesSequential) {
+    if (!file_exists(model_index_path()))
+        GTEST_SKIP() << "checkpoint absent: " << model_index_path();
+
+    std::unique_ptr<BlackwellEngine> engine;
+    try {
+        engine = std::make_unique<BlackwellEngine>(model_index_path(), /*max_seq_len=*/512,
+                                                   static_cast<size_t>(-1),
+                                                   BlackwellEngine::KVCacheMode::Paged);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "engine construction pending: " << e.what();
+    }
+    BlackwellEngine::Impl* impl = engine->get_impl();
+    const size_t V = impl->m_config.vocab_size;
+    const int tile = (int)impl->m_token_capacity;   // hybrid Paged prefill tile (64)
+    ASSERT_GT(tile, 1) << "hybrid Paged model must expose a batched prefill tile";
+
+    // A deliberately long prompt whose length is NOT a multiple of the tile, so the
+    // final chunk exercises the kernel's partial-chunk (cur_C < 64) path and the
+    // run reaches across several chunk boundaries (state carry). Kept modest because
+    // the reference (Path A) is an O(N) run_token sweep. Any valid ids work -- the
+    // comparison is engine-vs-engine, not against HF.
+    const int N = 2 * tile + 2;          // e.g. 130 tokens -> 3 chunks (64,64,2)
+    std::vector<int> tokens(N);
+    for (int i = 0; i < N; ++i) tokens[i] = (int)((i * 1103515245u + 12345u) % (V / 2)) + 1;
+
+    auto logits_now = [&]() {
+        std::vector<float> h(V);
+        EXPECT_EQ(cudaMemcpy(h.data(), impl->d_logits, V * sizeof(float),
+                             cudaMemcpyDeviceToHost), cudaSuccess);
+        return h;
+    };
+
+    // ---- Path A: sequential run_token (the reference) -------------------------
+    engine->reset_state(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (int i = 0; i < N; ++i) {
+        const bool last = (i == N - 1);
+        ASSERT_EQ(impl->run_token(tokens[i], i, /*seq_id=*/0, /*want_logits=*/last),
+                  blackwell::EngineStatus::Success) << "run_token pos " << i;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const std::vector<float> ref = logits_now();
+
+    // ---- Path B: batched prefill via run_chunk, tiled into <=tile blocks -------
+    engine->reset_state(0);   // zero recurrent/conv state; KV caches self-heal on re-prefill
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (int pos = 0; pos < N; ) {
+        const int len  = std::min(tile, N - pos);
+        const bool last = (pos + len == N);
+        ASSERT_EQ(impl->run_chunk(tokens.data() + pos, pos, len, /*seq_id=*/0,
+                                  /*want_logits=*/last),
+                  blackwell::EngineStatus::Success)
+            << "run_chunk [" << pos << ", " << (pos + len) << ")";
+        pos += len;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const std::vector<float> got = logits_now();
+
+    // ---- Parity ---------------------------------------------------------------
+    double max_abs = 0.0;
+    for (size_t i = 0; i < V; ++i) max_abs = std::max(max_abs, (double)std::fabs(ref[i] - got[i]));
+    const double cos = cosine_similarity(ref, got);
+    auto argmax = [](const std::vector<float>& v) {
+        return (int)(std::max_element(v.begin(), v.end()) - v.begin());
+    };
+    std::cout << "[qwen3.5-hybrid prefill] N=" << N << " tile=" << tile
+              << "  cosine=" << cos << "  max|dlogit|=" << max_abs
+              << "  argmax batched=" << argmax(got) << " seq=" << argmax(ref) << "\n";
+
+    // The chunked delta rule reproduces the per-token recurrence to fp32 rounding,
+    // and the (int4) projections / full-attention are the same kernels per row, so
+    // the two paths land on the same distribution. Cosine + argmax are the parity
+    // bar this suite uses (near-tied top-2 logits can flip argmax on rounding, but
+    // a real batched-prefill bug collapses cosine).
+    EXPECT_GT(cos, kParityThreshold)
+        << "batched prefill diverged from the sequential run_token reference";
+    EXPECT_EQ(argmax(got), argmax(ref))
+        << "batched prefill predicted a different top-1 token than the sequential sweep";
 }

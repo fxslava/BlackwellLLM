@@ -80,7 +80,16 @@ static size_t resolve_token_capacity(const ModelConfig& config,
                                      const ModelCapabilities& caps,
                                      const blackwell::RuntimeConfig& rt) {
     constexpr size_t kPrefillTile = 64;
-    if (caps.requires_ssm_subsystem) return 1;
+    if (caps.requires_ssm_subsystem) {
+        // Hybrid True Batched Prefill (chunked delta rule) widens the residual
+        // stream to a token tile the same way the dense path does, but only under
+        // Paged mode (the branching-capable configuration prefill/fork target).
+        // The chunk kernel's own tile is 64, so the tile matches it. Continuous /
+        // batch=1 hybrid decode keeps width 1 (no batched buffers allocated).
+        if (rt.kv_mode == BlackwellEngine::KVCacheMode::Paged)
+            return std::max<size_t>(1, std::min(rt.max_seq_len, kPrefillTile));
+        return 1;
+    }
     const bool paged_dense = rt.kv_mode == BlackwellEngine::KVCacheMode::Paged &&
                              !config.attn_output_gate;
     const bool will_batch = rt.max_sequences > 1 || paged_dense;
@@ -236,6 +245,25 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
         d_A_log_f32.allocate(H);
         d_norm_f32.allocate(L.value_head_dim);
         d_conv_w_f32.allocate(conv_dim * L.conv_kernel_dim);
+
+        // Chunked-prefill staging. Sized to the token tile (m_token_capacity) so
+        // run_chunk_hybrid holds a whole chunk: the batched in_proj outputs
+        // (qkv/z), the token-major q/k/v/o chunk buffers the delta kernel reads,
+        // the per-(token,head) decay/write scalars, and the per-head UT-solve
+        // scratch (64 == the kernel's intra-chunk tile). Width 1 when batching is
+        // off, so this is a negligible allocation for the batch=1 decode build.
+        constexpr size_t kDeltaChunk = 64;
+        const size_t kdim = L.key_head_dim, vdim = L.value_head_dim;
+        d_ssm_qkv_batch.allocate(tc * conv_dim);
+        d_ssm_z_batch.allocate(tc * v_dim);
+        d_ssm_o_batch.allocate(tc * v_dim);
+        d_ssm_chunk_q.allocate(tc * H * kdim);
+        d_ssm_chunk_k.allocate(tc * H * kdim);
+        d_ssm_chunk_v.allocate(tc * H * vdim);
+        d_ssm_chunk_o.allocate(tc * H * vdim);
+        d_ssm_chunk_logdecay.allocate(tc * H);
+        d_ssm_chunk_beta.allocate(tc * H);
+        d_ssm_u_scratch.allocate(H * kDeltaChunk * vdim);
     }
 
     // Qwen3.5 hybrid gated full-attention layers (head_dim 256). These cannot use
@@ -257,7 +285,11 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
         // and step_full_attention offsets by seq_id * m_full_kv_seq_stride.
         m_full_kv_seq_stride = (size_t)m_caps.num_full_attention_layers * m_full_kv_layer_stride;
         const size_t total = (size_t)m_branch_capacity * m_full_kv_seq_stride;
-        d_QG.allocate(m_config.num_attention_heads * m_config.head_dim * 2);
+        // d_QG holds the [num_heads, 2*head_dim] q_proj output; widened to the
+        // token tile so run_chunk_hybrid stages the whole chunk's query|gate pair
+        // batched (per-token qg_split then reads row t). d_gate stays single-row —
+        // the full-attn chunk sweep gates one token at a time.
+        d_QG.allocate(m_token_capacity * m_config.num_attention_heads * m_config.head_dim * 2);
         d_gate.allocate(m_config.num_attention_heads * m_config.head_dim);
         d_full_k_cache.allocate(total);
         d_full_v_cache.allocate(total);
@@ -779,8 +811,8 @@ EngineStatus BlackwellEngine::Impl::run_token(int token_id, int pos, int seq_id,
 // run_token token-by-token; numerically it reproduces that sweep (the quantized
 // projections are the SAME GEMV per row, RoPE/append/attention the same kernels
 // per position), so a batched prompt and a single-token prompt land on the same
-// logits. Generic dense full-attention only -- SSM/gated models never reach here
-// (the coordinator is not built for them); guarded defensively all the same.
+// logits. Dense uniform full-attention runs the pipeline below; SSM / gated-full
+// hybrid models delegate to run_chunk_hybrid (chunked delta rule) at the top.
 // ============================================================================
 EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_pos,
                                               int num_tokens, int seq_id,
@@ -799,12 +831,11 @@ EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_po
                   << (start_pos + num_tokens) << ") exceed KV capacity " << msl << "\n";
         return EngineStatus::InvalidArgument;
     }
-    // Batched path is the generic dense full-attention pipeline only.
-    if (!m_config.layer_types.empty() || m_config.attn_output_gate || ssm_state) {
-        std::cerr << "[blackwell_core] run_chunk: batched prefill is unsupported for "
-                     "SSM / gated full-attention models\n";
-        return EngineStatus::InvalidConfig;
-    }
+    // Hybrid (SSM / gated full-attention) models take the dedicated chunked path:
+    // the generic dense body below cannot express the linear-attention recurrence
+    // or the head_dim-256 gated cache. Dense uniform full-attention falls through.
+    if (m_caps.requires_ssm_subsystem || m_config.attn_output_gate)
+        return run_chunk_hybrid(token_ids, start_pos, num_tokens, seq_id, want_logits);
 
     const bool fp16_w = half_weights_are_fp16(m_config);
 
@@ -905,6 +936,249 @@ EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_po
         if (fp16_w) launch_fp16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, H);
         else        launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, H);
     }
+    return EngineStatus::Success;
+}
+
+// ============================================================================
+// HYBRID True Batched Prefill. run_chunk delegates here for SSM / gated-full
+// models: the generic dense body cannot express the linear-attention recurrence
+// (chunked delta rule) or the head_dim-256 gated cache. Structure mirrors the
+// dense run_chunk -- batched embedding, per-layer mixer, batched MLP, final norm
+// + lm_head for the last token -- but the per-layer mixer dispatches to the two
+// chunk steps below. Numerically it reproduces run_token's token-by-token sweep
+// (each per-token/per-head kernel does the identical math), so a batched prompt
+// and a single-token sweep land on the same logits, to fp32 rounding.
+// ============================================================================
+EngineStatus BlackwellEngine::Impl::run_chunk_hybrid(const int* token_ids, int start_pos,
+                                                     int num_tokens, int seq_id,
+                                                     bool want_logits) {
+    const size_t H = m_config.hidden_dim;
+    const bool fp16_w = half_weights_are_fp16(m_config);
+    const int N = num_tokens;
+
+    // 1. Batched embedding: N ids -> d_X_accum [N, H].
+    CUDA_CHECK_RETURN(cudaMemcpy(d_next_token, token_ids, N * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK_RETURN(cudaMemset(d_X_accum, 0, (size_t)N * H * sizeof(float)));
+    {
+        const void* d_embed = arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight");
+        if (fp16_w) launch_fp16_embedding_kernel(d_next_token, d_embed, d_X_accum, N, H);
+        else        launch_bf16_embedding_kernel(d_next_token, d_embed, d_X_accum, N, H);
+    }
+
+    // 2. Keep the paged manager's per-seq length consistent with the prefill
+    //    positions. The linear/full-attn layers hold their own state stores, but a
+    //    later decode/fork on this seq resolves its slot through the paged length
+    //    bookkeeping. May throw on a forward KV gap -- the caller (coordinator or
+    //    test) owns that exception boundary, exactly as the dense run_chunk does.
+    kv_mgr->prepare_prefill_step(seq_id, start_pos, num_tokens);
+
+    const int L = static_cast<int>(m_config.num_layers);
+    for (int i = 0; i < L; ++i) {
+        arena.prefetch_layer(i + 1, start_pos + num_tokens - 1);
+        arena.ensure_layer_ready(i);
+        const std::string lp = m_config.weight_prefix + "layers." + std::to_string(i) + ".";
+
+        // --- attention mixer over the chunk (linear recurrence or gated cache) ---
+        const bool is_linear = !m_config.layer_types.empty() &&
+                               m_config.layer_types[i] == AttnKind::Linear;
+        if (is_linear) {
+            ENGINE_TRY(step_linear_attention_chunk(i, start_pos, num_tokens, seq_id));
+        } else if (m_config.attn_output_gate) {
+            ENGINE_TRY(step_full_attention_chunk(i, start_pos, num_tokens, seq_id));
+        } else {
+            // A plain dense full-attention layer inside a hybrid stack is not a
+            // configuration Qwen3.5 produces (every layer is linear or gated); fail
+            // loudly rather than silently miscompute through the wrong path.
+            std::cerr << "[blackwell_core] run_chunk_hybrid: unexpected dense "
+                         "full-attention layer " << i << " in a hybrid model\n";
+            return EngineStatus::InvalidConfig;
+        }
+
+        // --- MLP (batched), byte-for-byte the dense run_chunk MLP block ---
+        {
+            const void* w = arena.get_weight_ptr(lp + "post_attention_layernorm.weight");
+            if (fp16_w) launch_rmsnorm_fp16_kernel(d_X_accum, d_X_norm, w, N, H,
+                                                   m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+            else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, N, H,
+                                              m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        }
+        dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
+                           nullptr, N);
+        dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
+                           nullptr, N);
+        launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
+                                   static_cast<size_t>(N) * m_config.intermediate_dim);
+        dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
+                           m_config.intermediate_dim, d_X_accum, N);
+    }
+
+    // 3. Final norm + lm_head for the LAST token only (its logits drive sampling).
+    if (want_logits) {
+        float* last_hidden = d_X_accum + static_cast<size_t>(N - 1) * H;
+        const void* d_w = arena.get_weight_ptr(m_config.weight_prefix + "norm.weight");
+        if (fp16_w) launch_rmsnorm_fp16_kernel(last_hidden, d_X_norm, d_w, 1, H,
+                                               m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        else        launch_rmsnorm_kernel(last_hidden, d_X_norm, d_w, 1, H,
+                                          m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        const void* d_head_w = m_config.tie_word_embeddings
+            ? arena.get_weight_ptr(m_config.weight_prefix + "embed_tokens.weight")
+            : arena.get_weight_ptr("lm_head.weight");
+        if (fp16_w) launch_fp16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, H);
+        else        launch_bf16_gemv_kernel(d_head_w, d_X_norm, d_logits, m_config.vocab_size, H);
+    }
+    return EngineStatus::Success;
+}
+
+// ----------------------------------------------------------------------------
+// Linear-attention layer over a CHUNK. Mirrors step_linear_attention but widens
+// the whole layer to num_tokens rows: batched norm/in-proj, a per-token sweep for
+// the strictly-sequential conv1d ring + split/normalize (scattered token-major
+// into the chunk buffers), ONE chunked delta-rule launch to carry the recurrent
+// state across the chunk, then batched gated-RMSNorm + out_proj. seq_id selects
+// the branch's recurrent/conv slice; the state carries across chunks via the pool.
+// ----------------------------------------------------------------------------
+EngineStatus BlackwellEngine::Impl::step_linear_attention_chunk(int layer_idx, int start_pos,
+                                                                int num_tokens, int seq_id) {
+    arena.ensure_layer_ready(layer_idx);
+    const int li = m_linear_layer_index[layer_idx];
+    const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
+    const std::string la   = base + "linear_attn.";
+    const int N = num_tokens;
+    (void)start_pos;   // recurrence is position-implicit (state carries history)
+
+    float* d_state = ssm_state->rec_state(seq_id, li);
+    float* d_conv  = ssm_state->conv_state(seq_id, li);
+
+    const auto& Lc = m_config.linear;
+    const int Kh = (int)Lc.num_key_heads, Hh = (int)Lc.num_value_heads;
+    const int Dk = (int)Lc.key_head_dim,  Dv = (int)Lc.value_head_dim, Kw = (int)Lc.conv_kernel_dim;
+    const size_t conv_dim = 2 * (size_t)Kh * Dk + (size_t)Hh * Dv;
+    const size_t v_dim    = (size_t)Hh * Dv;
+    const size_t hidden   = m_config.hidden_dim;
+
+    // 1. batched input RMSNorm (bf16 weight, exactly as step_linear_attention).
+    launch_rmsnorm_kernel(d_X_accum, d_X_norm,
+                          arena.get_weight_ptr(base + "input_layernorm.weight"),
+                          N, hidden, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+
+    // 2. batched in-projections (qkv/z via the dispatcher; a/b are small bf16 GEMVs
+    //    swept per row below). Per-layer params cast to fp32 once for the chunk.
+    dispatcher.forward(la + "in_proj_qkv", d_X_norm, d_ssm_qkv_batch, conv_dim, hidden, nullptr, N);
+    dispatcher.forward(la + "in_proj_z",   d_X_norm, d_ssm_z_batch,   v_dim,    hidden, nullptr, N);
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "conv1d.weight"),
+                                       d_conv_w_f32, (int)conv_dim * Kw);
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "dt_bias"), d_dt_bias_f32, Hh);
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "A_log"),   d_A_log_f32,   Hh);
+
+    // 3. per token: conv1d ring advance (sequential -- the ring carries within AND
+    //    across chunks), split+L2-normalize, decay a and write-strength beta,
+    //    scattered token-major into the chunk buffers the delta kernel consumes.
+    //    Everything runs on the default stream, so the async copies are ordered
+    //    with the kernels that produce the single-token d_ssm_* they read.
+    for (int t = 0; t < N; ++t) {
+        const float* xn = d_X_norm + (size_t)t * hidden;
+        launch_bf16_gemv_kernel(arena.get_weight_ptr(la + "in_proj_a.weight"), xn, d_ssm_a, Hh, (int)hidden);
+        launch_bf16_gemv_kernel(arena.get_weight_ptr(la + "in_proj_b.weight"), xn, d_ssm_b, Hh, (int)hidden);
+        blackwell::ssm::launch_sigmoid_inplace(d_ssm_b, Hh);                  // b -> beta
+        blackwell::ssm::launch_gated_delta_logdecay(d_ssm_a, d_dt_bias_f32, d_A_log_f32,
+                                                    d_ssm_chunk_logdecay + (size_t)t * Hh, Hh);
+        CUDA_CHECK_RETURN(cudaMemcpyAsync(d_ssm_chunk_beta + (size_t)t * Hh, d_ssm_b,
+                                          (size_t)Hh * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        float* qkv_row = d_ssm_qkv_batch + (size_t)t * conv_dim;
+        blackwell::ssm::launch_causal_conv1d_update(qkv_row, d_conv, d_conv_w_f32, /*bias=*/nullptr,
+                                                    d_ssm_qkv_conv, (int)conv_dim, Kw, /*silu=*/true);
+        blackwell::ssm::launch_ssm_split_norm_broadcast(d_ssm_qkv_conv, d_ssm_q, d_ssm_k, d_ssm_v,
+                                                        Kh, Hh, Dk);
+        CUDA_CHECK_RETURN(cudaMemcpyAsync(d_ssm_chunk_q + (size_t)t * Hh * Dk, d_ssm_q,
+                                          (size_t)Hh * Dk * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_RETURN(cudaMemcpyAsync(d_ssm_chunk_k + (size_t)t * Hh * Dk, d_ssm_k,
+                                          (size_t)Hh * Dk * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_RETURN(cudaMemcpyAsync(d_ssm_chunk_v + (size_t)t * Hh * Dv, d_ssm_v,
+                                          (size_t)Hh * Dv * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+
+    // 4. ONE chunked delta-rule launch carries S over the chunk. h_prev == h_out ==
+    //    the pool slice, so the kernel seeds from and writes back the same state.
+    blackwell::ssm::launch_gated_delta_chunked_prefill(
+        d_ssm_chunk_k, d_ssm_chunk_q, d_ssm_chunk_v, d_ssm_chunk_logdecay, d_ssm_chunk_beta,
+        d_state, d_ssm_chunk_o, d_state, d_ssm_u_scratch, Hh, N, Dk, Dv);
+
+    // 5. batched per-head gated RMSNorm: o = rmsnorm(o * silu(z)) * norm.weight[Dv].
+    //    chunk-o and z_batch are both [N*Hh][Dv] token-major, so a single call over
+    //    N*Hh "heads" (gamma repeats per Dv channel) reproduces the per-token norm.
+    blackwell::ssm::launch_bf16_to_f32(arena.get_weight_ptr(la + "norm.weight"), d_norm_f32, Dv);
+    blackwell::ssm::launch_gated_rmsnorm_per_head(d_ssm_chunk_o, d_ssm_z_batch, d_norm_f32,
+                                                  d_ssm_o_batch, N * Hh, Dv, m_config.rms_norm_eps);
+
+    // 6. batched out_proj, accumulating into the residual stream.
+    dispatcher.forward(la + "out_proj", d_ssm_o_batch, nullptr, hidden, v_dim, d_X_accum, N);
+    return EngineStatus::Success;
+}
+
+// ----------------------------------------------------------------------------
+// Gated full-attention layer over a CHUNK (Qwen3.5 head_dim 256). Batched
+// projections, then a per-token sweep for the inherently position-serial stages
+// (de-interleave query|gate, q/k norm, partial RoPE at the token's position,
+// append into the dedicated cache, decode over 0..pos, gate) -- each reproducing
+// step_full_attention exactly -- then batched o_proj. seq_id selects the branch's
+// slice of the dedicated cache.
+// ----------------------------------------------------------------------------
+EngineStatus BlackwellEngine::Impl::step_full_attention_chunk(int layer_idx, int start_pos,
+                                                              int num_tokens, int seq_id) {
+    arena.ensure_layer_ready(layer_idx);
+    const std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
+    const std::string sa   = base + "self_attn.";
+    const int N = num_tokens;
+
+    const int Hq  = (int)m_config.num_attention_heads;
+    const int Hkv = (int)m_config.num_key_value_heads;
+    const int Dh  = (int)m_config.head_dim;
+    const int rot = (int)m_config.rotary_dim;
+    const size_t q_dim  = (size_t)Hq * Dh;
+    const size_t kv_dim = (size_t)Hkv * Dh;
+    const size_t hidden = m_config.hidden_dim;
+
+    // 1. batched input RMSNorm (bf16 weight, exactly as step_full_attention).
+    launch_rmsnorm_kernel(d_X_accum, d_X_norm,
+                          arena.get_weight_ptr(base + "input_layernorm.weight"),
+                          N, hidden, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+
+    // 2. batched projections. q_proj emits [N, 2*q_dim] (query|gate); k/v [N, kv_dim].
+    dispatcher.forward(sa + "q_proj", d_X_norm, d_QG, q_dim * 2, hidden, nullptr, N);
+    dispatcher.forward(sa + "k_proj", d_X_norm, d_K,  kv_dim,    hidden, nullptr, N);
+    dispatcher.forward(sa + "v_proj", d_X_norm, d_V,  kv_dim,    hidden, nullptr, N);
+
+    // Per-branch slice of the dedicated gated full-attention KV cache.
+    const int fo = m_full_layer_index[layer_idx];
+    const size_t seq_off = (size_t)seq_id * m_full_kv_seq_stride;
+    float* d_k_cache = d_full_k_cache + seq_off + (size_t)fo * m_full_kv_layer_stride;
+    float* d_v_cache = d_full_v_cache + seq_off + (size_t)fo * m_full_kv_layer_stride;
+    const int msl = (int)arena.get_max_seq_len();
+
+    // 3. per token: the position-serial stages, each identical to the decode step.
+    for (int t = 0; t < N; ++t) {
+        const int pos = start_pos + t;
+        float* qg = d_QG       + (size_t)t * q_dim * 2;
+        float* qr = d_Q        + (size_t)t * q_dim;
+        float* kr = d_K        + (size_t)t * kv_dim;
+        float* vr = d_V        + (size_t)t * kv_dim;
+        float* ar = d_Attn_out + (size_t)t * q_dim;
+
+        launch_qg_split(qg, qr, d_gate, Hq, Dh);
+        launch_rmsnorm_kernel(qr, qr, arena.get_weight_ptr(sa + "q_norm.weight"),
+                              Hq, Dh, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        launch_rmsnorm_kernel(kr, kr, arena.get_weight_ptr(sa + "k_norm.weight"),
+                              Hkv, Dh, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
+        launch_rope_partial_inplace(qr, pos, Hq,  Dh, rot, m_config.rope_theta);
+        launch_rope_partial_inplace(kr, pos, Hkv, Dh, rot, m_config.rope_theta);
+        launch_kv_append(kr, vr, d_k_cache, d_v_cache, pos, Hkv, Dh, msl);
+        launch_full_attention_decode(qr, d_k_cache, d_v_cache, ar, pos, Hq, Hkv, Dh, msl);
+        launch_gate_sigmoid_mul(ar, d_gate, (int)q_dim);
+    }
+
+    // 4. batched o_proj, accumulating into the residual stream.
+    dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, hidden, q_dim, d_X_accum, N);
     return EngineStatus::Success;
 }
 
