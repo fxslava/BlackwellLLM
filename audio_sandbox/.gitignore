@@ -1,0 +1,7 @@
+# Build tree(s)
+out/
+build/
+
+# Generated golden artifacts (reproduce via scripts/export_whisper_dsp.py)
+data/*.wav
+data/*.bin
