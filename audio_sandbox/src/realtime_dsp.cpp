@@ -69,6 +69,10 @@ void RealTimeDSP::run() {
         // callback thread (WAV I/O here never stalls the realtime capture).
         if (recorder_ != nullptr) recorder_->process(chunk.data(), got);
 
+        // Same in-order feed to the speech pipeline (push_pcm runs its own VAD and
+        // marshals engine work). This worker is that pipeline's single producer.
+        if (pcm_tap_) pcm_tap_(chunk.data(), got);
+
         window_.insert(window_.end(), chunk.begin(), chunk.begin() + got);
 
         // Emit one column per FULL hop only. We advance while a full 400-sample

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -64,6 +65,15 @@ public:
     void start();
     void stop();
 
+    // Optional PCM tap: invoked on the worker thread with every contiguous block
+    // of samples popped from the capture ring, in order, BEFORE windowing — the
+    // single-producer feed the speech pipeline's push_pcm() expects. Set once
+    // before start(); null (the default) means the visualiser ignores it. Must be
+    // wait-free (it runs inline in the capture-drain loop): it should only forward
+    // to a lock-free ring / atomic, never block on I/O or a lock.
+    using PcmTap = std::function<void(const float*, size_t)>;
+    void set_pcm_tap(PcmTap tap) { pcm_tap_ = std::move(tap); }
+
 private:
     void run();  // worker-thread loop
 
@@ -71,6 +81,7 @@ private:
     SampleRing& ring_;
     SpectrogramBuffer& out_;
     AudioRecorder* recorder_;    // optional VAD recorder fed from the worker
+    PcmTap pcm_tap_;             // optional speech-pipeline feed (null in the visualiser)
     std::vector<float> window_;  // sliding analysis buffer (owned by the worker)
     // Exact count of samples advanced on the hop grid (worker-thread only, no
     // sync needed). Drives the per-column timestamp; immune to wall-clock jitter.

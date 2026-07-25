@@ -232,11 +232,14 @@ void EngineControlBridge::stop() noexcept {
 EngineStatus EngineControlBridge::do_rewind(const Command& cmd) {
     if (engine_ == nullptr) return EngineStatus::InvalidConfig;
     try {
-        // Micro-rewind: drop KV/SSM state past the verified prefix, keeping exactly
-        // keep_prompt_tokens. BlackwellEngine::rewind is capability-gated (throws
-        // under Continuous / hybrid-without-branching) — runtime tier folds that to
-        // a status so the pump never unwinds.
-        engine_->rewind(cfg_.seq_id, static_cast<int>(cmd.keep_prompt_tokens));
+        // Micro-rewind: drop KV/SSM state past the verified prefix, keeping at
+        // least keep_prompt_tokens — but NEVER below the frozen system-prompt
+        // prefix (effective_keep_tokens clamps up to that floor), so the cached
+        // system prefix survives every barge-in. BlackwellEngine::rewind is
+        // capability-gated (throws under Continuous / hybrid-without-branching) —
+        // runtime tier folds that to a status so the pump never unwinds.
+        engine_->rewind(cfg_.seq_id,
+                        static_cast<int>(effective_keep_tokens(cmd.keep_prompt_tokens)));
         return EngineStatus::Success;
     } catch (const std::exception&) {
         return EngineStatus::StateMismatch;

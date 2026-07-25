@@ -110,6 +110,21 @@ public:
         projector_ = projector;
     }
 
+    // ---- System-prompt prefix-cache floor (frozen KV boundary) ---------------
+    // The system prompt is prefilled ONCE at startup and frozen; its KV must never
+    // be truncated by a barge-in micro-rewind. Publishing the prefix length here
+    // makes every do_rewind clamp keep_prompt_tokens UP to this floor, so the
+    // rewind can drop speculative/decode state but never the system prefix. Set
+    // once during setup (engine thread) after the system-prompt prefill; 0 (the
+    // default) means "no floor" and leaves rewind semantics unchanged. Callable
+    // from any thread (atomic publish).
+    void set_system_prefix_tokens(uint32_t n) noexcept {
+        system_prefix_tokens_.store(n, std::memory_order_release);
+    }
+    uint32_t system_prefix_tokens() const noexcept {
+        return system_prefix_tokens_.load(std::memory_order_acquire);
+    }
+
     // ---- IEngineControl: PRODUCER edge (audio / VAD / event thread) ----------
     // Every method here is wait-free and never touches CUDA. The speculative ones
     // are noexcept (they only bump an atomic + append a POD); a superseded op
@@ -208,6 +223,15 @@ protected:
     // available to an override that finishes decode by another path).
     void clear_in_flight() noexcept { decoding_.store(false, std::memory_order_release); }
 
+    // Apply the system-prompt prefix-cache floor: a rewind may keep MORE than the
+    // requested prefix but never LESS than the frozen system prefix. Shared by the
+    // base do_rewind and any engine-assembly / mock override so the frozen-prefix
+    // invariant holds no matter which override executes the rewind.
+    uint32_t effective_keep_tokens(uint32_t requested) const noexcept {
+        const uint32_t floor = system_prefix_tokens_.load(std::memory_order_acquire);
+        return requested > floor ? requested : floor;
+    }
+
     BlackwellEngine*                     engine_ = nullptr;    // non-owning; the single-thread engine
     blackwell::audio::UltravoxProjector* projector_ = nullptr; // non-owning; bound by the engine assembly
     Config                               cfg_;
@@ -237,6 +261,12 @@ private:
     // Monotone barge-in epoch: cancel_generation() advances it; the whole system
     // reads it to drop stale work / abort stale decode.
     alignas(64) std::atomic<uint64_t> active_gen_{0};
+
+    // Frozen system-prompt prefix length (tokens). The KV rewind floor: do_rewind
+    // never truncates below this. 0 = no floor. Published once at setup; read on
+    // the engine thread by every rewind. Its own cache line: read on the hot
+    // barge-in path, so keep it off the SPSC cursors' lines (no false sharing).
+    alignas(64) std::atomic<uint32_t> system_prefix_tokens_{0};
 
     // Doorbell: a free-running counter the producer bumps + notifies on every
     // enqueue / cancel; wait_and_pump() blocks on it (0% CPU) and wakes on change.

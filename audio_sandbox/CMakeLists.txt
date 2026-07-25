@@ -101,6 +101,64 @@ if(MSVC)
         VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+# --- audio_translator: real-time speech translation on the LIVE speech pipeline --
+# (include/bridge/speculative_bridge_api.h). UNLIKE audio_realtime, this links the
+# engine control plane (blackwell_bridge) + the engine white-box tier
+# (blackwell_core_obj, which pulls CUDA), so it is built ONLY in the integrated
+# (root) build where those targets already exist. A standalone `cmake -S
+# audio_sandbox` skips it and stays CUDA-free. A GPU-free MockEngineControl drives
+# the REAL EngineControlBridge (SPSC command ring + barge-in epoch + wait/pump), so
+# the full streaming + interruption path runs with no FP8 Llama weights present.
+if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
+    add_executable(audio_translator
+        translator/main.cpp
+        # Reuse the sandbox capture/DSP/GUI sources by recompiling them into this
+        # target, so audio_realtime's own target stays byte-for-byte untouched. The
+        # optional PCM-tap / extra-panel hooks in these files are inert unless a
+        # consumer sets them (audio_realtime never does).
+        src/audio_capture.cpp
+        src/audio_recorder.cpp
+        src/realtime_dsp.cpp
+        src/window_d2d.cpp)
+
+    # Public bridge headers arrive via blackwell_bridge (PUBLIC include/); the
+    # white-box bridge/engine headers it consumes are PRIVATE, so declare them here
+    # (mirrors tests/bridge). translator/ holds the app-local mock + transcript view.
+    target_include_directories(audio_translator PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/translator  # transcript_view.hpp, mock_engine_control.hpp
+        ${CMAKE_SOURCE_DIR}/src                  # common.h
+        ${CMAKE_SOURCE_DIR}/src/core             # device_buffer.h (transitive)
+        ${CMAKE_SOURCE_DIR}/src/bridge)          # engine_control_bridge.hpp, bridge_internal.hpp
+
+    # whisper_dsp/sandbox_headers/imgui = the sandbox front-end (SYSTEM includes
+    # quarantined from /W4); blackwell_bridge + blackwell_kernels + blackwell_core_obj
+    # = the speech C-ABI and the engine symbols its control plane references (the
+    # same trio tests/bridge links; the engine is never invoked by the mock).
+    target_link_libraries(audio_translator PRIVATE
+        whisper_dsp blackwell::sandbox_headers imgui
+        d3d11 dxgi d2d1 d3dcompiler user32 ole32
+        blackwell_bridge blackwell_kernels blackwell_core_obj)
+
+    target_compile_definitions(audio_translator PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+        target_compile_definitions(audio_translator PRIVATE _CRT_SECURE_NO_WARNINGS)
+        # The mock's canned Russian translations are UTF-8 string literals: tell
+        # MSVC the source AND execution charset is UTF-8 so ImGui receives correct
+        # bytes and /WX never trips C4819 on the non-ASCII source.
+        target_compile_options(audio_translator PRIVATE /utf-8)
+    endif()
+
+    # DirectStorage runtime DLLs next to the exe (blackwell_core_obj may load them).
+    blackwell_copy_dstorage_dlls(audio_translator)
+
+    if(MSVC)
+        # Anchor the debugger working dir so the default "data" arg (mel_filters.bin)
+        # resolves under F5, matching audio_realtime.
+        set_target_properties(audio_translator PROPERTIES
+            VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+endif()
+
 # --- warnings: strict /W4 /WX on ALL first-party code, quarantining third-party -
 # When integrated, the root CMakeLists already imposes /W4 /WX /external:W0 as a
 # directory property (audio_sandbox is added after that block), so we add nothing.

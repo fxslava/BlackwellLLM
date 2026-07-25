@@ -176,7 +176,7 @@ blackwell_set_folder("Engine/Agent"  treesitter agent_core agent_env agent_orche
 blackwell_set_folder("Apps"          blackwell_llm blackwell_bench agent_playground poc_overlay)
 blackwell_set_folder("Experiments"   awq_benchmark)
 # --- Audio sandbox ---
-blackwell_set_folder("Audio"         whisper_dsp parity_check audio_realtime)
+blackwell_set_folder("Audio"         whisper_dsp parity_check audio_realtime audio_translator)
 # --- Tests ---
 blackwell_set_folder("Tests"
     validation_tests benchmark_tests integration_tests

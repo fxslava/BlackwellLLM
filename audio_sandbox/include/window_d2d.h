@@ -20,6 +20,7 @@
 #include <d2d1_1.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,13 @@ public:
 
     bool create(int client_w, int client_h);  // false on failure
     void run_message_loop();
+
+    // Optional: an extra ImGui panel drawn every frame AFTER the built-in control
+    // panel (inside the same ImGui NewFrame/Render pair, on the UI thread). The
+    // audio_realtime visualiser leaves this null (behaviour unchanged); the
+    // audio_translator sets it to render the "Live Transcription & Translation"
+    // window. The callback must issue only ImGui:: calls (no engine/COM/CUDA).
+    void set_extra_panel(std::function<void()> panel) { extra_panel_ = std::move(panel); }
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -76,6 +84,9 @@ private:
     // Spectrogram time-scale control (UI-thread only): visible history width.
     float visible_time_window_sec_ = 10.0f;    // 1.0 .. 10.0 s  (100 .. 1000 cols)
     bool imgui_ready_ = false;
+
+    // Optional extra ImGui panel (null in the plain visualiser). UI-thread only.
+    std::function<void()> extra_panel_;
 };
 
 }  // namespace rt

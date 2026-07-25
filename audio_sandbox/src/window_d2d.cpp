@@ -373,6 +373,7 @@ void WindowD2D::render() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
     draw_ui_panel();
+    if (extra_panel_) extra_panel_();  // optional consumer panel (e.g. live transcript)
     ImGui::Render();
 
     // ImGui (DX11) draws on top of the D2D result; do NOT clear the RTV here.
