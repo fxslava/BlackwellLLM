@@ -52,7 +52,7 @@ int main() {
     std::cout << "==================================================\n\n";
 
     try {
-        const std::string model_dir = "F:/AI/llama3-8b-fp8";
+        const std::string model_dir = "F:/AI/llama-3.1-8B-Instruct-AWQ-INT4";
         const std::string index_path = model_dir + "/model.safetensors.index.json";
 
         IBlackwellTokenizer* tok_raw = nullptr;

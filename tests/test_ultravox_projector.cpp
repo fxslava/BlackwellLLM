@@ -134,7 +134,8 @@ int run_projector_parity(const std::string& base) {
         expect_size("w_ln_mid", w_ln_mid, (size_t)kSwigluDim);
         expect_size("w_linear_2", w_linear_2, (size_t)kSwigluDim * kSwigluDim);
 
-        ProjectorConfig cfg;  // defaults match the v0_5-llama-3_2-1b geometry
+        ProjectorConfig cfg;            // default text_hidden is now 4096 (8B);
+        cfg.text_hidden = kSwigluDim;   // pin to 2048 for the committed 1B dumps
         UltravoxProjector projector(cfg, /*max_input_frames=*/kNumFrames);
         projector.load_weights(w_ln_pre, w_linear_1, w_ln_mid, w_linear_2);
 

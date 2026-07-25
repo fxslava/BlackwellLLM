@@ -3,8 +3,10 @@
 An **independent, preprocessor-only** subsystem. It converts raw audio into
 *audio embeddings* (rows in the text model's embedding space) that the engine
 splices into `<|audio|>` placeholder slots (token id **128256**) before the
-ordinary text decode. Target model: `fixie-ai/ultravox-v0_5-llama-3_2-1b`
-(whisper-large-v3-turbo encoder + Ultravox SwiGLU projector + Llama-3.2-1B).
+ordinary text decode. Shipping target: `fixie-ai/ultravox-v0_5-llama-3_1-8b`
+(whisper-large-v3-turbo encoder + Ultravox SwiGLU projector + Llama-3.1-8B; the
+projector's `text_hidden` is 4096). The `v0_5-llama-3_2-1b` variant (`text_hidden`
+2048) is retained by the kernel parity tests.
 
 ## The two hard rules
 

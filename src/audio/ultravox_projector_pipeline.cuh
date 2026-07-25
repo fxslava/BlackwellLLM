@@ -8,11 +8,14 @@
 //     -> Linear_1          [T', 4096]         (W1 = [4096, 10240], bias-free)
 //     -> SwiGLU            [T', 2048]         (Ultravox: gate = 2nd half)
 //     -> RMSNorm(ln_mid)   [T', 2048]         (eps 1e-6, projector_ln_mid=True)
-//     -> Linear_2          [T', 2048]         (W2 = [2048, 2048], bias-free)
+//     -> Linear_2          [T', 4096]         (W2 = [4096, 2048], bias-free)
 //
-// Geometry note: proj_hidden = 4096 (linear_1 out); SwiGLU halves it to 2048;
-// linear_2 maps 2048 -> text_hidden (2048 for Llama-3.2-1B). This matches the
-// verified weight shapes and audio_embeds.bin [188, 2048].
+// Geometry note: the SHIPPING default is ultravox-v0_5-llama-3_1-8b. Per the real
+// safetensors header (scripts/dump_ultravox8b_pipeline.py), the 8B projector keeps
+// the 1B intermediate dims and only widens linear_2's OUTPUT to the 4096 backbone
+// hidden: proj_hidden = 4096 (linear_1 out); SwiGLU halves it to 2048; linear_2
+// maps 2048 -> text_hidden. text_hidden defaults to 4096 (8B); the v0_5-llama-3_2-1b
+// variant sets text_hidden = 2048 (audio_embeds.bin [188, 2048]).
 //
 // STRICT: zero allocation in forward(). Every intermediate lives in
 // ProjectorWorkspace, allocated once at construction; weights are uploaded once
@@ -33,8 +36,9 @@ namespace blackwell::audio {
 struct ProjectorConfig {
     int hidden_dim = 1280;      // whisper d_model
     int stack_factor = 8;
-    int proj_hidden = 4096;     // linear_1 output
-    int text_hidden = 2048;     // linear_2 output (== host LLM hidden)
+    int proj_hidden = 4096;     // linear_1 output (shared by 1B and 8B)
+    int text_hidden = 4096;     // linear_2 output (== host LLM hidden); 8B default,
+                                // set to 2048 for the v0_5-llama-3_2-1b variant
     float eps = 1e-6f;          // LlamaRMSNorm epsilon
 
     int stacked_dim() const { return hidden_dim * stack_factor; }  // 10240

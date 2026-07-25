@@ -121,7 +121,7 @@ const float* UltravoxProjector::forward(const float* d_whisper_out, int num_fram
     launch_swiglu(ws_.linear1, ws_.swiglu, T, cfg_.proj_hidden);
     // 5. RMSNorm(ln_mid)   -> [T,2048]
     launch_rmsnorm_f32(ws_.swiglu, w_ln_mid_, ws_.norm1, T, mid, cfg_.eps);
-    // 6. Linear_2          -> [T,2048]
+    // 6. Linear_2          -> [T, text_hidden]  (4096 for the 8B default, 2048 for 1B)
     launch_linear_wt_f32(ws_.norm1, w_linear_2_, ws_.out, T, mid, cfg_.text_hidden);
 
     return ws_.out.get();

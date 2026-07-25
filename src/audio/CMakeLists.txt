@@ -1,6 +1,7 @@
 # =============================================================================
 # blackwell_audio — Ultravox multimodal frontend (preprocessor only).
-# Target: fixie-ai/ultravox-v0_5-llama-3_2-1b.
+# Shipping target: fixie-ai/ultravox-v0_5-llama-3_1-8b (projector text_hidden 4096).
+# The v0_5-llama-3_2-1b variant (text_hidden 2048) is retained by the parity tests.
 #
 # ACTIVATED (Phase 0): the first real sources now exist, so this builds as a leaf
 # static library. Nothing in the engine links it yet; the parity tests

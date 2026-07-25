@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         // The checkpoint directory fully describes the model: weights, config
         // and tokenizer all come from it, so any supported model (Llama-3,
         // Qwen2.5/ChatML, ...) runs through the same code path.
-        const std::string model_dir = argc > 1 ? argv[1] : "F:/AI/llama3-8b-fp8";
+        const std::string model_dir = argc > 1 ? argv[1] : "F:/AI/llama-3.1-8B-Instruct-AWQ-INT4";
         const std::string index_path = model_dir + "/model.safetensors.index.json";
         const uint32_t max_context = 16384;
 
