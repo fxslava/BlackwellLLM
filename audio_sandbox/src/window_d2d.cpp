@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 
 #include <d2d1.h>       // D2D1:: helper namespace (RectF, ColorF, ...)
 #include <dxgi.h>
@@ -158,8 +159,38 @@ bool WindowD2D::init_pipeline() {
     // Dear ImGui (Win32 + DX11 backends).
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::GetIO().IniFilename = nullptr;  // no imgui.ini clutter in the sandbox
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;  // no imgui.ini clutter in the sandbox
     ImGui::StyleColorsDark();
+
+    // The default embedded font atlas only covers Basic Latin (0x20-0xFF), so the
+    // translator's Russian output renders as '?' boxes. Load a Windows system TTF
+    // with the Cyrillic ranges BEFORE the DX11 backend builds the font texture
+    // (that upload happens in ImGui_ImplDX11_Init/NewFrame, so it must be set up
+    // here first). The ranges array MUST outlive the atlas Build() — ImGui only
+    // stores the pointer — hence `static`.
+    static const ImWchar cyrillic_ranges[] = {
+        0x0020, 0x00FF,  // Basic Latin + Latin-1 Supplement
+        0x0400, 0x052F,  // Cyrillic + Cyrillic Supplement
+        0x2DE0, 0x2DFF,  // Cyrillic Extended-A
+        0xA640, 0xA69F,  // Cyrillic Extended-B
+        0,
+    };
+    const char* const system_fonts[] = {
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    };
+    bool font_loaded = false;
+    for (const char* path : system_fonts) {
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec) &&
+            io.Fonts->AddFontFromFileTTF(path, 18.0f, nullptr, cyrillic_ranges) != nullptr) {
+            font_loaded = true;
+            break;
+        }
+    }
+    if (!font_loaded) io.Fonts->AddFontDefault();  // ASCII-only fallback
+
     if (!ImGui_ImplWin32_Init(hwnd_)) return false;
     if (!ImGui_ImplDX11_Init(d3d_device_, d3d_context_)) return false;
     imgui_ready_ = true;
