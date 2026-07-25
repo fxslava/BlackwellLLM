@@ -41,3 +41,9 @@ logits_comparison.csv
 #  ui/ assets or the Output/ dir itself -- ignore the whole trees explicitly.)
 /build_staging/
 /deploy/Output/
+
+# Repomix full-codebase dump (regenerated on demand)
+/blackwell_llm.xml
+
+# audio_sandbox microphone capture output
+audio_sandbox/recordings/
