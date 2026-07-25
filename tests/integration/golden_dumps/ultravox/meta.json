@@ -1,0 +1,16 @@
+{
+  "model_dir": "F:/AI\\ultravox-v0_5-llama-3_2-1b",
+  "audio_source": "hf-internal-testing/librispeech_asr_dummy[validation][0]",
+  "transcript": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+  "sample_rate": 16000,
+  "num_mel_bins": 128,
+  "mel_filters_shape": [
+    128,
+    201
+  ],
+  "log_mel_shape": [
+    1,
+    128,
+    3000
+  ]
+}

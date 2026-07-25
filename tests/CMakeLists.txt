@@ -55,6 +55,34 @@ blackwell_add_test_suite(validation_tests  "${CMAKE_CURRENT_SOURCE_DIR}/validati
 blackwell_add_test_suite(benchmark_tests   "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"  benchmark)
 blackwell_add_test_suite(integration_tests "${CMAKE_CURRENT_SOURCE_DIR}/integration" integration)
 
+# Ultravox audio-frontend parity tests. Unlike the suites above these are
+# STANDALONE mains (each its own main(), NOT gtest) that drive the blackwell_audio
+# kernels against the FP32 PyTorch golden dumps (cosine > 0.999) -- kept standalone
+# to preserve their self-documenting nvcc build headers. Wired here so they are
+# real solution targets and run under CTest (`ctest -L audio`). They link
+# blackwell_audio only (no engine / no gtest) and declare their own PRIVATE
+# src/ includes (no target exports src/ -- skill cmake-hygiene rule #2).
+if(TARGET blackwell_audio)
+    set(_ultravox_dumps "${CMAKE_SOURCE_DIR}/tests/integration/golden_dumps/ultravox")
+
+    function(blackwell_add_audio_test target source)
+        add_executable(${target} "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}      # audio_test_utils.h
+            ${CMAKE_SOURCE_DIR}/src          # common.h
+            ${CMAKE_SOURCE_DIR}/src/core     # device_buffer.h
+            ${CMAKE_SOURCE_DIR}/src/audio)   # ultravox_projector*.cuh, prompt_injector.cuh
+        target_link_libraries(${target} PRIVATE blackwell_audio)
+        # Pass the golden-dumps dir explicitly so the test is CWD-independent.
+        add_test(NAME ${target} COMMAND ${target} "${_ultravox_dumps}")
+        set_tests_properties(${target} PROPERTIES LABELS audio)
+    endfunction()
+
+    blackwell_add_audio_test(ultravox_projector_test         test_ultravox_projector.cpp)
+    blackwell_add_audio_test(prompt_injector_test            test_prompt_injector.cpp)
+    blackwell_add_audio_test(ultravox_model_integration_test test_ultravox_model_integration.cpp)
+endif()
+
 # Agent-core suite: pure C++ (tree-sitter), no CUDA / no blackwell_kernels, so
 # it gets its own minimal target rather than going through the macro above.
 if(TARGET agent_core)

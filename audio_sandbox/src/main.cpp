@@ -5,9 +5,10 @@
 //     <data_dir>/mel_filters.bin     the VERIFIED Whisper filterbank (loaded, not
 //                                    recomputed — same as the parity sandbox).
 //
-// Pipeline (three concerns, three threads):
-//   miniaudio callback ─push─▶ SampleRing ─pop─▶ RealTimeDSP worker ─push─▶
-//   SpectrogramBuffer ─snapshot─▶ Direct2D UI (this thread).
+// Pipeline (concerns split across threads):
+//   miniaudio callback ─push─▶ SampleRing ─pop─▶ RealTimeDSP worker ─┬─push─▶
+//   SpectrogramBuffer ─snapshot─▶ Direct2D + ImGui UI (this thread)  │
+//                                                                    └─▶ AudioRecorder (VAD)
 //
 // The offline parity tester is preserved as `parity_check` (src/parity_check.cpp).
 // -----------------------------------------------------------------------------
@@ -17,6 +18,7 @@
 #include <string>
 
 #include "audio_capture.h"
+#include "audio_recorder.h"
 #include "realtime_dsp.h"
 #include "whisper_dsp.h"
 #include "window_d2d.h"
@@ -44,21 +46,24 @@ int main(int argc, char** argv) {
 
         rt::SpectrogramBuffer spectrogram(cfg.n_mels, /*max_frames=*/1000);
 
+        rt::AudioRecorder recorder(cfg.sample_rate, /*out_dir=*/"recordings");
+
         rt::AudioCapture capture;
         capture.start(mode);
         std::printf("capture started (backend: %s, 16 kHz mono f32)\n",
                     capture.backend_name().c_str());
 
-        rt::RealTimeDSP realtime(dsp, capture.ring(), spectrogram);
+        rt::RealTimeDSP realtime(dsp, capture.ring(), spectrogram, &recorder);
         realtime.start();
 
-        rt::WindowD2D window(spectrogram, L"Whisper Log-Mel (real-time)");
+        rt::WindowD2D window(spectrogram, recorder, L"Whisper Log-Mel (real-time)");
         if (!window.create(/*client_w=*/1000, /*client_h=*/512)) {
             throw std::runtime_error("failed to create Direct2D window");
         }
         std::printf("rendering... close the window to quit.\n");
         window.run_message_loop();
 
+        // Stop feeding the recorder (join the worker) before it is destroyed.
         realtime.stop();
         capture.stop();
         return 0;

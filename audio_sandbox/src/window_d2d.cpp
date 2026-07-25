@@ -1,20 +1,34 @@
 // -----------------------------------------------------------------------------
-// window_d2d.cpp — see window_d2d.h.
+// window_d2d.cpp — see window_d2d.h. DX11 swap chain shared by a Direct2D
+// spectrogram pass and a Dear ImGui (DX11) control-panel pass.
 // -----------------------------------------------------------------------------
 #include "window_d2d.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
+#include <d2d1.h>       // D2D1:: helper namespace (RectF, ColorF, ...)
+#include <dxgi.h>
+
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+
+#include "audio_recorder.h"
 #include "realtime_dsp.h"
+
+// ImGui's Win32 message handler (declared in imgui_impl_win32.h).
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace rt {
 namespace {
 
 constexpr wchar_t kClassName[] = L"WhisperD2DSpectrogram";
 constexpr UINT kTimerId = 1;
-constexpr UINT kTimerMs = 33;              // ~30 FPS
+constexpr UINT kTimerMs = 16;              // ~60 FPS UI tick
 constexpr float kDynamicRangeDb = 8.0f;    // Whisper's (max - 8) display window
+constexpr int kColsPerSecond = 100;        // 10 ms hop -> 100 columns / second
 
 template <class T>
 void safe_release(T*& p) {
@@ -22,8 +36,7 @@ void safe_release(T*& p) {
 }
 
 // Inferno colormap via linear interpolation over 9 evenly-spaced anchors. t in
-// [0, 1] -> (b, g, r) bytes (D2D bitmap is BGRA). Perceptually-uniform-ish and
-// self-contained (no external LUT file).
+// [0, 1] -> (b, g, r) bytes (D2D bitmap is BGRA).
 void inferno(float t, uint8_t& b, uint8_t& g, uint8_t& r) {
     static const float A[9][3] = {  // R, G, B in [0, 1]
         {0.0010f, 0.0004f, 0.0140f}, {0.1220f, 0.0470f, 0.2830f},
@@ -32,7 +45,7 @@ void inferno(float t, uint8_t& b, uint8_t& g, uint8_t& r) {
         {0.9760f, 0.5490f, 0.0390f}, {0.9780f, 0.7980f, 0.1980f},
         {0.9880f, 0.9980f, 0.6440f},
     };
-    t = std::clamp(t, 0.0f, 1.0f) * 8.0f;   // scale onto [0, 8] anchor span
+    t = std::clamp(t, 0.0f, 1.0f) * 8.0f;
     const int i = std::min(static_cast<int>(t), 7);
     const float f = t - static_cast<float>(i);
     const float rr = A[i][0] + f * (A[i + 1][0] - A[i][0]);
@@ -45,16 +58,27 @@ void inferno(float t, uint8_t& b, uint8_t& g, uint8_t& r) {
 
 }  // namespace
 
-WindowD2D::WindowD2D(SpectrogramBuffer& spec, const wchar_t* title)
-    : spec_(spec), title_(title) {
+WindowD2D::WindowD2D(SpectrogramBuffer& spec, AudioRecorder& recorder, const wchar_t* title)
+    : spec_(spec), recorder_(recorder), title_(title) {
     bmp_w_ = spec_.max_frames();
     bmp_h_ = spec_.n_mels();
     pixels_.assign(static_cast<size_t>(bmp_w_) * bmp_h_ * 4, 0);
 }
 
 WindowD2D::~WindowD2D() {
-    discard_device_resources();
-    safe_release(factory_);
+    if (imgui_ready_) {
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+    }
+    safe_release(spectro_bitmap_);
+    release_swapchain_resources();
+    safe_release(d2d_context_);
+    safe_release(d2d_device_);
+    safe_release(d2d_factory_);
+    safe_release(swap_chain_);
+    safe_release(d3d_context_);
+    safe_release(d3d_device_);
     if (hwnd_) DestroyWindow(hwnd_);
 }
 
@@ -73,13 +97,110 @@ bool WindowD2D::create(int client_w, int client_h) {
                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                             nullptr, nullptr, wc.hInstance, this);
     if (!hwnd_) return false;
-
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &factory_))) return false;
+    if (!init_pipeline()) return false;
 
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
     SetTimer(hwnd_, kTimerId, kTimerMs, nullptr);
     return true;
+}
+
+bool WindowD2D::init_pipeline() {
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = static_cast<UINT>(rc.right - rc.left);
+    sd.BufferDesc.Height = static_cast<UINT>(rc.bottom - rc.top);
+    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;  // D2D interop requires BGRA
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hwnd_;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;  // required for D2D on DXGI
+    D3D_FEATURE_LEVEL got_level = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
+            &sd, &swap_chain_, &d3d_device_, &got_level, &d3d_context_))) {
+        return false;
+    }
+
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d_factory_))) return false;
+
+    IDXGIDevice* dxgi_device = nullptr;
+    if (FAILED(d3d_device_->QueryInterface(__uuidof(IDXGIDevice),
+                                           reinterpret_cast<void**>(&dxgi_device)))) {
+        return false;
+    }
+    HRESULT hr = d2d_factory_->CreateDevice(dxgi_device, &d2d_device_);
+    dxgi_device->Release();
+    if (FAILED(hr)) return false;
+    if (FAILED(d2d_device_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2d_context_)))
+        return false;
+
+    if (!create_swapchain_resources()) return false;
+
+    // CPU-updated mel heatmap bitmap (device-independent of the backbuffer).
+    const D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    if (FAILED(d2d_context_->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(bmp_w_), static_cast<UINT32>(bmp_h_)),
+            nullptr, 0, &bp, &spectro_bitmap_))) {
+        return false;
+    }
+
+    // Dear ImGui (Win32 + DX11 backends).
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;  // no imgui.ini clutter in the sandbox
+    ImGui::StyleColorsDark();
+    if (!ImGui_ImplWin32_Init(hwnd_)) return false;
+    if (!ImGui_ImplDX11_Init(d3d_device_, d3d_context_)) return false;
+    imgui_ready_ = true;
+    return true;
+}
+
+bool WindowD2D::create_swapchain_resources() {
+    ID3D11Texture2D* backbuffer = nullptr;
+    if (FAILED(swap_chain_->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                      reinterpret_cast<void**>(&backbuffer)))) {
+        return false;
+    }
+    HRESULT hr = d3d_device_->CreateRenderTargetView(backbuffer, nullptr, &rtv_);
+    if (SUCCEEDED(hr)) {
+        IDXGISurface* surface = nullptr;
+        hr = backbuffer->QueryInterface(__uuidof(IDXGISurface),
+                                        reinterpret_cast<void**>(&surface));
+        if (SUCCEEDED(hr)) {
+            const D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+            hr = d2d_context_->CreateBitmapFromDxgiSurface(surface, &bp, &d2d_target_);
+            surface->Release();
+            if (SUCCEEDED(hr)) d2d_context_->SetTarget(d2d_target_);
+        }
+    }
+    backbuffer->Release();
+    return SUCCEEDED(hr);
+}
+
+void WindowD2D::release_swapchain_resources() {
+    if (d2d_context_) d2d_context_->SetTarget(nullptr);
+    safe_release(d2d_target_);
+    safe_release(rtv_);
+}
+
+void WindowD2D::on_resize(UINT w, UINT h) {
+    if (!swap_chain_ || w == 0 || h == 0) return;
+    release_swapchain_resources();
+    swap_chain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    create_swapchain_resources();
 }
 
 void WindowD2D::run_message_loop() {
@@ -100,6 +221,8 @@ LRESULT CALLBACK WindowD2D::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 LRESULT WindowD2D::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (imgui_ready_ && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
+
     switch (msg) {
         case WM_TIMER:
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -112,7 +235,7 @@ LRESULT WindowD2D::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_SIZE:
-            on_resize(LOWORD(lp), HIWORD(lp));
+            if (wp != SIZE_MINIMIZED) on_resize(LOWORD(lp), HIWORD(lp));
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kTimerId);
@@ -123,60 +246,22 @@ LRESULT WindowD2D::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
-HRESULT WindowD2D::ensure_device_resources() {
-    if (target_) return S_OK;
-
-    RECT rc;
-    GetClientRect(hwnd_, &rc);
-    const D2D1_SIZE_U size = D2D1::SizeU(static_cast<UINT32>(rc.right - rc.left),
-                                         static_cast<UINT32>(rc.bottom - rc.top));
-    HRESULT hr = factory_->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(hwnd_, size), &target_);
-    if (FAILED(hr)) return hr;
-
-    // Bitmap is exactly [max_frames wide x n_mels tall]; DrawBitmap stretches it
-    // to the client area, so window resizes cost nothing here.
-    const D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-    hr = target_->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(bmp_w_),
-                                           static_cast<UINT32>(bmp_h_)),
-                               nullptr, 0, &bp, &bitmap_);
-    return hr;
-}
-
-void WindowD2D::discard_device_resources() {
-    safe_release(bitmap_);
-    safe_release(target_);
-}
-
-void WindowD2D::on_resize(UINT w, UINT h) {
-    if (target_) target_->Resize(D2D1::SizeU(w, h));
-}
-
-void WindowD2D::render() {
-    if (FAILED(ensure_device_resources())) return;
-
+void WindowD2D::draw_spectrogram() {
     spec_.snapshot(scratch_);
     const int n_cols = static_cast<int>(scratch_.size());
 
-    // Rolling normalisation: map [global_max - 8 dB, global_max] -> [0, 1] over
-    // the VISIBLE history. This reproduces Whisper's dynamic-range shape without
-    // needing a whole-clip max (impossible in a stream); it is a VIZ-ONLY step
-    // and does not touch the parity-preserving DSP.
+    // Rolling normalisation over the visible history (viz-only; never touches the
+    // parity-preserving DSP): map [global_max - 8 dB, global_max] -> [0, 1].
     float vmax = -1e30f;
     for (const auto& col : scratch_)
         for (float v : col) vmax = std::max(vmax, v);
     const float vmin = vmax - kDynamicRangeDb;
     const float inv_range = (vmax > vmin) ? 1.0f / (vmax - vmin) : 0.0f;
 
-    // Background (inferno's near-black floor).
-    for (size_t i = 0; i < pixels_.size(); i += 4) {
+    for (size_t i = 0; i < pixels_.size(); i += 4) {  // inferno near-black floor
         pixels_[i + 0] = 3; pixels_[i + 1] = 0; pixels_[i + 2] = 0; pixels_[i + 3] = 255;
     }
-
-    // Newest column pinned to the right edge; older columns scroll left.
-    const int start = std::max(0, bmp_w_ - n_cols);
+    const int start = std::max(0, bmp_w_ - n_cols);  // newest column at the right
     for (int c = 0; c < n_cols && (start + c) < bmp_w_; ++c) {
         const std::vector<float>& col = scratch_[static_cast<size_t>(c)];
         const int x = start + c;
@@ -193,30 +278,108 @@ void WindowD2D::render() {
 
     const D2D1_RECT_U rect = D2D1::RectU(0, 0, static_cast<UINT32>(bmp_w_),
                                          static_cast<UINT32>(bmp_h_));
-    bitmap_->CopyFromMemory(&rect, pixels_.data(), static_cast<UINT32>(bmp_w_) * 4);
+    spectro_bitmap_->CopyFromMemory(&rect, pixels_.data(), static_cast<UINT32>(bmp_w_) * 4);
 
-    target_->BeginDraw();
-    target_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f));
+    d2d_context_->BeginDraw();
+    d2d_context_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f));
     if (n_cols > 0) {
-        const D2D1_SIZE_F sz = target_->GetSize();
-        // Source = ONLY the populated columns [start, bmp_w_); destination = a
-        // right-aligned slab of the client area whose width is proportional to
-        // the fill. Every mel column therefore keeps a constant on-screen width
-        // (client_w / bmp_w_) and the 128-tall bitmap stretches to the full
-        // client height. LINEAR interpolation smooths both the 128->height
-        // vertical scale and the horizontal scale. (HIGH_QUALITY_CUBIC needs an
-        // ID2D1DeviceContext; this is an ID2D1HwndRenderTarget, so LINEAR is the
-        // best mode available here.)
-        const D2D1_RECT_F src = D2D1::RectF(static_cast<float>(start), 0.0f,
-                                            static_cast<float>(bmp_w_),
-                                            static_cast<float>(bmp_h_));
-        const float fill = static_cast<float>(bmp_w_ - start) / static_cast<float>(bmp_w_);
+        const D2D1_SIZE_F sz = d2d_context_->GetSize();
+        // Time-scale zoom: show only the most recent `visible_cols` columns across
+        // the window. Fewer columns -> faster scroll + wider columns (zoom in);
+        // more columns -> slower scroll + compressed time (zoom out).
+        const int visible_cols =
+            std::clamp(static_cast<int>(visible_time_window_sec_ * kColsPerSecond), 1, bmp_w_);
+        const int shown = std::min(visible_cols, n_cols);
+        const D2D1_RECT_F src = D2D1::RectF(static_cast<float>(bmp_w_ - shown), 0.0f,
+                                            static_cast<float>(bmp_w_), static_cast<float>(bmp_h_));
+        const float fill = static_cast<float>(shown) / static_cast<float>(visible_cols);
         const D2D1_RECT_F dst = D2D1::RectF(sz.width * (1.0f - fill), 0.0f, sz.width, sz.height);
-        target_->DrawBitmap(bitmap_, &dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+        d2d_context_->DrawBitmap(spectro_bitmap_, &dst, 1.0f,
+                                 D2D1_INTERPOLATION_MODE_LINEAR, &src);
     }
-    if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
-        discard_device_resources();  // rebuilt on the next render
+    d2d_context_->EndDraw();
+}
+
+void WindowD2D::draw_ui_panel() {
+    const AudioRecorder::Status st = recorder_.snapshot();
+
+    ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(420, 300), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Audio & Spectrogram Control Panel");
+
+    // --- Audio level meter with a threshold marker line ----------------------
+    ImGui::TextUnformatted("Input level");
+    const float lvl = std::clamp((st.level_db + 60.0f) / 60.0f, 0.0f, 1.0f);  // -60..0 dB
+    char lvl_text[32];
+    std::snprintf(lvl_text, sizeof(lvl_text), "%.1f dBFS", st.level_db);
+    ImGui::ProgressBar(lvl, ImVec2(-1.0f, 0.0f), lvl_text);
+    {
+        float thr = recorder_.threshold_db.load();
+        const ImVec2 p0 = ImGui::GetItemRectMin();
+        const ImVec2 p1 = ImGui::GetItemRectMax();
+        const float tx = p0.x + (p1.x - p0.x) * std::clamp((thr + 60.0f) / 60.0f, 0.0f, 1.0f);
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(tx, p0.y), ImVec2(tx, p1.y),
+                                            IM_COL32(255, 80, 80, 255), 2.0f);
     }
+
+    ImGui::Separator();
+
+    // --- VAD controls --------------------------------------------------------
+    bool enabled = recorder_.enabled.load();
+    if (ImGui::Checkbox("Auto-Record (VAD)", &enabled)) recorder_.enabled.store(enabled);
+
+    float thr = recorder_.threshold_db.load();
+    if (ImGui::SliderFloat("Threshold (dB)", &thr, -60.0f, 0.0f, "%.1f"))
+        recorder_.threshold_db.store(thr);
+
+    float hang = recorder_.hangover_sec.load();
+    if (ImGui::SliderFloat("Silence hangover (s)", &hang, 0.2f, 3.0f, "%.2f"))
+        recorder_.hangover_sec.store(hang);
+
+    ImGui::Separator();
+
+    // --- Recording status ----------------------------------------------------
+    switch (st.state) {
+        case AudioRecorder::State::Idle:
+            ImGui::TextUnformatted("Status: [IDLE]");
+            break;
+        case AudioRecorder::State::Recording:
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                               "Status: [RECORDING %05.1fs]", st.record_seconds);
+            break;
+        case AudioRecorder::State::Hangover:
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+                               "Status: [HANGOVER %05.1fs]", st.record_seconds);
+            break;
+    }
+    if (!st.last_saved.empty()) ImGui::Text("Last saved: %s", st.last_saved.c_str());
+
+    ImGui::Separator();
+
+    // --- Spectrogram time-scale / speed --------------------------------------
+    ImGui::SliderFloat("Time window (s)", &visible_time_window_sec_, 1.0f, 10.0f, "%.1f");
+    ImGui::TextDisabled("%d columns (%d ms hop)", static_cast<int>(visible_time_window_sec_ * kColsPerSecond),
+                        1000 / kColsPerSecond);
+
+    ImGui::End();
+}
+
+void WindowD2D::render() {
+    if (!d2d_context_ || !d2d_target_ || !rtv_) return;
+
+    draw_spectrogram();  // Direct2D pass onto the shared backbuffer
+
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    draw_ui_panel();
+    ImGui::Render();
+
+    // ImGui (DX11) draws on top of the D2D result; do NOT clear the RTV here.
+    d3d_context_->OMSetRenderTargets(1, &rtv_, nullptr);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    swap_chain_->Present(1, 0);
 }
 
 }  // namespace rt

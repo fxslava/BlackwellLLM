@@ -6,6 +6,7 @@
 #include <chrono>
 
 #include "audio_capture.h"
+#include "audio_recorder.h"
 
 namespace rt {
 
@@ -31,8 +32,9 @@ double SpectrogramBuffer::latest_timestamp() const {
 }
 
 // --- RealTimeDSP -------------------------------------------------------------
-RealTimeDSP::RealTimeDSP(const whisper::WhisperDSP& dsp, SampleRing& ring, SpectrogramBuffer& out)
-    : dsp_(dsp), ring_(ring), out_(out) {}
+RealTimeDSP::RealTimeDSP(const whisper::WhisperDSP& dsp, SampleRing& ring, SpectrogramBuffer& out,
+                         AudioRecorder* recorder)
+    : dsp_(dsp), ring_(ring), out_(out), recorder_(recorder) {}
 
 RealTimeDSP::~RealTimeDSP() { stop(); }
 
@@ -63,6 +65,10 @@ void RealTimeDSP::run() {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+        // Feed the VAD recorder every popped sample, in order, off the audio
+        // callback thread (WAV I/O here never stalls the realtime capture).
+        if (recorder_ != nullptr) recorder_->process(chunk.data(), got);
+
         window_.insert(window_.end(), chunk.begin(), chunk.begin() + got);
 
         // Emit one column per FULL hop only. We advance while a full 400-sample

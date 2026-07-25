@@ -23,6 +23,7 @@
 namespace rt {
 
 class SampleRing;
+class AudioRecorder;
 
 // Fixed-width rolling spectrogram: mel-major columns, newest at the back, capped
 // at `max_frames`. Mutex-guarded; written by the DSP worker, read by the UI.
@@ -52,7 +53,10 @@ private:
 
 class RealTimeDSP {
 public:
-    RealTimeDSP(const whisper::WhisperDSP& dsp, SampleRing& ring, SpectrogramBuffer& out);
+    // `recorder` is optional (nullable): when present, the worker forwards every
+    // popped sample to it for VAD recording, off the audio-callback thread.
+    RealTimeDSP(const whisper::WhisperDSP& dsp, SampleRing& ring, SpectrogramBuffer& out,
+                AudioRecorder* recorder = nullptr);
     ~RealTimeDSP();
     RealTimeDSP(const RealTimeDSP&) = delete;
     RealTimeDSP& operator=(const RealTimeDSP&) = delete;
@@ -66,6 +70,7 @@ private:
     const whisper::WhisperDSP& dsp_;
     SampleRing& ring_;
     SpectrogramBuffer& out_;
+    AudioRecorder* recorder_;    // optional VAD recorder fed from the worker
     std::vector<float> window_;  // sliding analysis buffer (owned by the worker)
     // Exact count of samples advanced on the hop grid (worker-thread only, no
     // sync needed). Drives the per-column timestamp; immune to wall-clock jitter.

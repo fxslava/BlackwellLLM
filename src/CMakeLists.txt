@@ -27,6 +27,8 @@ endif()
 # 1. ДВИЖОК И ИСПОЛНЯЕМЫЕ ФАЙЛЫ
 # ==============================================================================
 add_subdirectory(core)   # blackwell_core (см. src/core/CMakeLists.txt)
+add_subdirectory(audio)  # blackwell_audio (Ultravox projector + prompt-injector kernels)
+add_subdirectory(bridge) # blackwell_bridge (app<->engine SPSC audio + prompt splice + C-ABI)
 add_subdirectory(apps)   # blackwell_llm, blackwell_bench
 
 # ==============================================================================
