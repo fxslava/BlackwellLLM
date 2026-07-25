@@ -32,6 +32,16 @@ struct ModelConfig {
     float rope_theta;
     float rms_norm_eps;
 
+    // Llama-3 RoPE frequency rescaling (config "rope_scaling", rope_type "llama3").
+    // rope_scaling_type: 0 == none/vanilla (default), 1 == llama3. Defaults keep
+    // every non-llama3 checkpoint on the identity path. Consumed by the RoPE
+    // launchers via RopeScaling (src/core/rope_config.h bridges the two).
+    int   rope_scaling_type = 0;
+    float rope_scaling_factor = 1.0f;
+    float rope_low_freq_factor = 1.0f;
+    float rope_high_freq_factor = 1.0f;
+    float rope_orig_max_pos = 0.0f;   // rope_scaling.original_max_position_embeddings
+
     bool has_qkv_bias;
     bool tie_word_embeddings;
     // Qwen3.5 plain RMSNorm is zero-centered: output = x_norm * (1 + weight), with

@@ -14,6 +14,7 @@
 #include "kernels/ssm_kernels.cuh"
 #include "kv_cache/continuous_kv_manager.h"
 #include "kv_cache/paged_kv_manager.h"
+#include "rope_config.h"                   // rope_scaling_from(ModelConfig)
 #include "paging/cuda_tier_backend.h"      // SmVramPool, CudaTierBackend
 #include "paging/prefix_cache_manager.h"   // TieredMemoryPager, PrefixCacheManager
 #include "engine_prefill_coordinator.h"
@@ -529,8 +530,8 @@ EngineStatus BlackwellEngine::Impl::step_full_attention(int layer_idx, int pos, 
     // 5. partial rotate_half RoPE on Q and K (identity at pos 0). NOTE: the config
     //    requests interleaved M-RoPE, which this 1D kernel does not implement, so
     //    positions >= 1 are NOT faithful (already warned at config load).
-    launch_rope_partial_inplace(d_Q, pos, Hq,  Dh, rot, m_config.rope_theta);
-    launch_rope_partial_inplace(d_K, pos, Hkv, Dh, rot, m_config.rope_theta);
+    launch_rope_partial_inplace(d_Q, pos, Hq,  Dh, rot, m_config.rope_theta, rope_scaling_from(m_config));
+    launch_rope_partial_inplace(d_K, pos, Hkv, Dh, rot, m_config.rope_theta, rope_scaling_from(m_config));
 
     // 6. append K/V into this full-attn layer's dedicated cache, then decode.
     // Offset by this sequence's per-branch slice so forked branches keep
@@ -1186,8 +1187,8 @@ EngineStatus BlackwellEngine::Impl::step_full_attention_chunk(int layer_idx, int
                               Hq, Dh, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
         launch_rmsnorm_kernel(kr, kr, arena.get_weight_ptr(sa + "k_norm.weight"),
                               Hkv, Dh, m_config.rms_norm_eps, m_config.norm_add_unit_offset);
-        launch_rope_partial_inplace(qr, pos, Hq,  Dh, rot, m_config.rope_theta);
-        launch_rope_partial_inplace(kr, pos, Hkv, Dh, rot, m_config.rope_theta);
+        launch_rope_partial_inplace(qr, pos, Hq,  Dh, rot, m_config.rope_theta, rope_scaling_from(m_config));
+        launch_rope_partial_inplace(kr, pos, Hkv, Dh, rot, m_config.rope_theta, rope_scaling_from(m_config));
         launch_kv_append(kr, vr, d_k_cache, d_v_cache, pos, Hkv, Dh, msl);
         launch_full_attention_decode(qr, d_k_cache, d_v_cache, ar, pos, Hq, Hkv, Dh, msl);
         launch_gate_sigmoid_mul(ar, d_gate, (int)q_dim);

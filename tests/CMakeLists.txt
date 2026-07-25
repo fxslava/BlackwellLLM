@@ -55,6 +55,17 @@ blackwell_add_test_suite(validation_tests  "${CMAKE_CURRENT_SOURCE_DIR}/validati
 blackwell_add_test_suite(benchmark_tests   "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"  benchmark)
 blackwell_add_test_suite(integration_tests "${CMAKE_CURRENT_SOURCE_DIR}/integration" integration)
 
+# The Ultravox-8B full-pipeline test (integration/test_ultravox8b_full_pipeline.cpp)
+# drives the audio-frontend kernels (projector + prompt injector) ON TOP of the
+# engine, so the integration suite -- and ONLY it (validation/benchmark do not use
+# them) -- links blackwell_audio and sees its *.cuh. No symbol clash: the audio
+# launchers (launch_swiglu/launch_stack_audio_frames) are distinct from the kernels'
+# launch_fused_swiglu_kernel/launch_*_embedding_kernel.
+if(TARGET blackwell_audio)
+    target_link_libraries(integration_tests PRIVATE blackwell_audio)
+    target_include_directories(integration_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/audio)
+endif()
+
 # Ultravox audio-frontend parity tests. Unlike the suites above these are
 # STANDALONE mains (each its own main(), NOT gtest) that drive the blackwell_audio
 # kernels against the FP32 PyTorch golden dumps (cosine > 0.999) -- kept standalone

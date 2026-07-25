@@ -1,6 +1,43 @@
 #pragma once
 #include <cstddef>
 
+// ---------------------------------------------------------------------------
+// RoPE frequency rescaling (Llama-3 "rope_scaling"). Default-constructed => OFF,
+// so every existing launcher call is byte-identical vanilla rotate_half. Plain
+// POD (no CUDA types) so core .cpp TUs compiled by MSVC can include this header;
+// the device-side apply_rope_scaling helper is guarded to nvcc only.
+//
+// enabled==0  -> inv_freq unchanged (vanilla).
+// enabled==1  -> Llama-3 wavelength-band rescaling (transformers
+//                _compute_llama3_parameters): high-freq band unchanged, low-freq
+//                band divided by `factor`, medium band smoothly interpolated.
+// ---------------------------------------------------------------------------
+struct RopeScaling {
+    int   enabled = 0;
+    float factor = 1.0f;
+    float low_freq_factor = 1.0f;
+    float high_freq_factor = 1.0f;
+    float orig_ctx = 0.0f;   // original_max_position_embeddings
+};
+
+#ifdef __CUDACC__
+__device__ __forceinline__ float apply_rope_scaling(float inv_freq, RopeScaling s) {
+    if (!s.enabled) return inv_freq;
+    const float kTwoPi = 6.28318530717958647692f;
+    const float low_wavelen  = s.orig_ctx / s.low_freq_factor;   // long-wavelength bound
+    const float high_wavelen = s.orig_ctx / s.high_freq_factor;  // short-wavelength bound
+    const float wavelen = __fdividef(kTwoPi, inv_freq);
+    if (wavelen < high_wavelen)                       // high-frequency band: unchanged
+        return inv_freq;
+    if (wavelen > low_wavelen)                         // low-frequency band: /factor
+        return __fdividef(inv_freq, s.factor);
+    // medium band: smooth interpolation between /factor and unchanged
+    const float smooth = (s.orig_ctx / wavelen - s.low_freq_factor) /
+                         (s.high_freq_factor - s.low_freq_factor);
+    return (1.0f - smooth) * __fdividef(inv_freq, s.factor) + smooth * inv_freq;
+}
+#endif
+
 // rotate_half RoPE on Q and K plus append of rotated K / raw V into the
 // KV cache slot for `pos`.
 //
@@ -20,7 +57,8 @@ void launch_fused_rope_kv_kernel(
     size_t kv_heads,
     size_t head_dim,
     size_t max_seq_len,
-    float rope_theta = 500000.0f);
+    float rope_theta = 500000.0f,
+    RopeScaling scaling = {});
 
 // rotate_half RoPE applied IN PLACE to a [num_heads, head_dim] buffer, with no
 // cache write. Used by the paged KV path, which appends the rotated K/V into a
@@ -32,7 +70,8 @@ void launch_rope_inplace(
     int pos,
     size_t num_heads,
     size_t head_dim,
-    float rope_theta = 500000.0f);
+    float rope_theta = 500000.0f,
+    RopeScaling scaling = {});
 
 // Batched rotate_half RoPE over a [num_tokens, num_heads, head_dim] buffer: row
 // t is rotated for logical position (start_pos + t). The num_tokens == 1 case is
@@ -45,7 +84,8 @@ void launch_rope_inplace_batched(
     size_t num_tokens,
     size_t num_heads,
     size_t head_dim,
-    float rope_theta = 500000.0f);
+    float rope_theta = 500000.0f,
+    RopeScaling scaling = {});
 
 // TRUE-batch (multi-sequence) rotate_half RoPE over a [batch_size, num_heads,
 // head_dim] buffer: row b is rotated for its OWN logical position d_positions[b].
@@ -60,4 +100,5 @@ void launch_batched_rope(
     int batch_size,
     size_t num_heads,
     size_t head_dim,
-    float rope_theta = 500000.0f);
+    float rope_theta = 500000.0f,
+    RopeScaling scaling = {});

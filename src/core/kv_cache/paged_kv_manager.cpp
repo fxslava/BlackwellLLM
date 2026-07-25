@@ -1,6 +1,7 @@
 #include "kv_cache/paged_kv_manager.h"
 #include "kernels/rope.cuh"
 #include "kernels/paged_flash_attention.cuh"
+#include "rope_config.h"   // rope_scaling_from(ModelConfig)
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -105,8 +106,8 @@ void PagedKVManager::attention_decode(int layer_idx, int pos,
             "PagedKVManager::attention_decode called without a preceding prepare_decode_step");
 
     // RoPE in place on this layer's freshly projected Q and K (rotate_half).
-    launch_rope_inplace(d_Q, pos, m_num_q_heads,  m_head_dim, m_rope_theta);
-    launch_rope_inplace(d_K, pos, m_num_kv_heads, m_head_dim, m_rope_theta);
+    launch_rope_inplace(d_Q, pos, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    launch_rope_inplace(d_K, pos, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
 
     // KV-offloaded layer: fault its live pages back from the pinned host mirror
     // into its device staging slab BEFORE the append/attention read it (no-op for
@@ -174,8 +175,8 @@ void PagedKVManager::attention_prefill(int layer_idx, int start_pos, int num_tok
             "PagedKVManager::attention_prefill called without a preceding prepare_prefill_step");
 
     // Batched RoPE over all num_tokens rows: row t rotates for position start_pos+t.
-    launch_rope_inplace_batched(d_Q, start_pos, num_tokens, m_num_q_heads,  m_head_dim, m_rope_theta);
-    launch_rope_inplace_batched(d_K, start_pos, num_tokens, m_num_kv_heads, m_head_dim, m_rope_theta);
+    launch_rope_inplace_batched(d_Q, start_pos, num_tokens, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    launch_rope_inplace_batched(d_K, start_pos, num_tokens, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
 
     // Fault the layer's live pages in from the host mirror (no-op if resident).
     m_seqmgr->stage_in_layer(layer_idx, m_active);
@@ -299,8 +300,8 @@ void PagedKVManager::attention_decode_batch(int layer_idx, int batch_size,
             "prepare_decode_batch");
 
     // Batched RoPE in place: each query/key row rotates for its OWN position.
-    launch_batched_rope(d_Q, m_d_batch_positions, batch_size, m_num_q_heads,  m_head_dim, m_rope_theta);
-    launch_batched_rope(d_K, m_d_batch_positions, batch_size, m_num_kv_heads, m_head_dim, m_rope_theta);
+    launch_batched_rope(d_Q, m_d_batch_positions, batch_size, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    launch_batched_rope(d_K, m_d_batch_positions, batch_size, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
 
     // All layers resident (enforced in prepare_decode_batch), so the pools are
     // the layer's own device slabs -- no stage-in / spill round-trip.

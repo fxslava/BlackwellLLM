@@ -1,6 +1,7 @@
 #include "kv_cache/continuous_kv_manager.h"
 #include "kernels/rope.cuh"
 #include "kernels/attention.cuh"
+#include "rope_config.h"   // rope_scaling_from(ModelConfig)
 #include <stdexcept>
 
 namespace blackwell {
@@ -30,7 +31,7 @@ void ContinuousKVManager::attention_decode(int layer_idx, int pos,
     launch_fused_rope_kv_kernel(
         d_Q, d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos,
         m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
-        m_arena.get_max_seq_len(), m_config.rope_theta);
+        m_arena.get_max_seq_len(), m_config.rope_theta, rope_scaling_from(m_config));
 
     launch_attention_decoding_kernel(
         d_Q, d_layer_k_cache, d_layer_v_cache, d_O, pos,

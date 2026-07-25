@@ -4,10 +4,11 @@
 // ============================================================================
 // 1. ВРАЩЕНИЕ QUERY ГОЛОВ (Стандарт Hugging Face / rotate_half)
 // ============================================================================
-__global__ void rope_q_kernel(float* __restrict__ Q, 
-                              int pos, 
-                              size_t head_dim, 
-                              float rope_theta) 
+__global__ void rope_q_kernel(float* __restrict__ Q,
+                              int pos,
+                              size_t head_dim,
+                              float rope_theta,
+                              RopeScaling scaling)
 {
     size_t head_idx = blockIdx.x;
     size_t k = threadIdx.x; // Индекс канала от 0 до (head_dim / 2 - 1)
@@ -18,6 +19,7 @@ __global__ void rope_q_kernel(float* __restrict__ Q,
 
     // Базовая частота для пары k (эквивалентно исходному шагу 2 * k)
     float freq = __fdividef(1.0f, powf(rope_theta, __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
+    freq = apply_rope_scaling(freq, scaling);
     float angle = pos * freq;
 
     float sin_val, cos_val;
@@ -42,7 +44,8 @@ __global__ void rope_kv_append_kernel(float* __restrict__ K,
                                       int pos,
                                       size_t head_dim,
                                       size_t max_seq_len,
-                                      float rope_theta)
+                                      float rope_theta,
+                                      RopeScaling scaling)
 {
     size_t head_idx = blockIdx.x;
     size_t k = threadIdx.x;
@@ -57,6 +60,7 @@ __global__ void rope_kv_append_kernel(float* __restrict__ K,
     float* v_slot = V_cache + (head_idx * max_seq_len + pos) * head_dim;
 
     float freq = __fdividef(1.0f, powf(rope_theta, __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
+    freq = apply_rope_scaling(freq, scaling);
     float angle = pos * freq;
 
     float sin_val, cos_val;
@@ -91,12 +95,13 @@ void launch_fused_rope_kv_kernel(
     size_t kv_heads,
     size_t head_dim,
     size_t max_seq_len,
-    float rope_theta)
+    float rope_theta,
+    RopeScaling scaling)
 {
     dim3 threads(head_dim / 2);
 
-    rope_q_kernel<<<q_heads, threads>>>(d_Q, pos, head_dim, rope_theta);
-    rope_kv_append_kernel<<<kv_heads, threads>>>(d_K, d_V, d_K_cache, d_V_cache, pos, head_dim, max_seq_len, rope_theta);
+    rope_q_kernel<<<q_heads, threads>>>(d_Q, pos, head_dim, rope_theta, scaling);
+    rope_kv_append_kernel<<<kv_heads, threads>>>(d_K, d_V, d_K_cache, d_V_cache, pos, head_dim, max_seq_len, rope_theta, scaling);
 }
 
 // In-place rotate_half over a [num_heads, head_dim] buffer (no cache write).
@@ -107,10 +112,11 @@ void launch_rope_inplace(
     int pos,
     size_t num_heads,
     size_t head_dim,
-    float rope_theta)
+    float rope_theta,
+    RopeScaling scaling)
 {
     dim3 threads(head_dim / 2);
-    rope_q_kernel<<<num_heads, threads>>>(d_X, pos, head_dim, rope_theta);
+    rope_q_kernel<<<num_heads, threads>>>(d_X, pos, head_dim, rope_theta, scaling);
 }
 
 // Batched rotate_half over [num_tokens, num_heads, head_dim]: token t (row
@@ -120,7 +126,8 @@ __global__ void rope_q_batched_kernel(float* __restrict__ X,
                                       int start_pos,
                                       size_t num_heads,
                                       size_t head_dim,
-                                      float rope_theta)
+                                      float rope_theta,
+                                      RopeScaling scaling)
 {
     const size_t head_idx = blockIdx.x;
     const size_t t        = blockIdx.y;
@@ -132,6 +139,7 @@ __global__ void rope_q_batched_kernel(float* __restrict__ X,
 
     float freq = __fdividef(1.0f, powf(rope_theta,
                     __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
+    freq = apply_rope_scaling(freq, scaling);
     float angle = pos * freq;
     float sin_val, cos_val;
     sincosf(angle, &sin_val, &cos_val);
@@ -148,11 +156,12 @@ void launch_rope_inplace_batched(
     size_t num_tokens,
     size_t num_heads,
     size_t head_dim,
-    float rope_theta)
+    float rope_theta,
+    RopeScaling scaling)
 {
     dim3 grid((unsigned)num_heads, (unsigned)num_tokens);
     dim3 threads((unsigned)(head_dim / 2));
-    rope_q_batched_kernel<<<grid, threads>>>(d_X, start_pos, num_heads, head_dim, rope_theta);
+    rope_q_batched_kernel<<<grid, threads>>>(d_X, start_pos, num_heads, head_dim, rope_theta, scaling);
 }
 
 // Multi-sequence rotate_half over [batch_size, num_heads, head_dim]: row b
@@ -163,7 +172,8 @@ __global__ void rope_batched_positions_kernel(float* __restrict__ X,
                                              const int* __restrict__ positions,
                                              size_t num_heads,
                                              size_t head_dim,
-                                             float rope_theta)
+                                             float rope_theta,
+                                             RopeScaling scaling)
 {
     const size_t head_idx = blockIdx.x;
     const size_t b        = blockIdx.y;
@@ -175,6 +185,7 @@ __global__ void rope_batched_positions_kernel(float* __restrict__ X,
 
     float freq = __fdividef(1.0f, powf(rope_theta,
                     __fdividef(static_cast<float>(2 * k), static_cast<float>(head_dim))));
+    freq = apply_rope_scaling(freq, scaling);
     float angle = pos * freq;
     float sin_val, cos_val;
     sincosf(angle, &sin_val, &cos_val);
@@ -191,9 +202,10 @@ void launch_batched_rope(
     int batch_size,
     size_t num_heads,
     size_t head_dim,
-    float rope_theta)
+    float rope_theta,
+    RopeScaling scaling)
 {
     dim3 grid((unsigned)num_heads, (unsigned)batch_size);
     dim3 threads((unsigned)(head_dim / 2));
-    rope_batched_positions_kernel<<<grid, threads>>>(d_X, d_positions, num_heads, head_dim, rope_theta);
+    rope_batched_positions_kernel<<<grid, threads>>>(d_X, d_positions, num_heads, head_dim, rope_theta, scaling);
 }

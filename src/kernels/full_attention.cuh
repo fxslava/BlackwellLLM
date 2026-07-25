@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include "rope.cuh"   // RopeScaling (shared frequency-rescaling POD)
 
 // ============================================================================
 // Qwen3.5 hybrid FULL-attention primitives (head_dim == 256, gated output).
@@ -27,7 +28,8 @@ void launch_qg_split(const float* d_QG, float* d_Q, float* d_gate,
 // once to K. At pos == 0 this is the identity (sin == 0).
 //   HARD CONTRACT: rotary_dim even, rotary_dim <= head_dim, rotary_dim/2 <= 1024.
 void launch_rope_partial_inplace(float* d_X, int pos, int num_heads,
-                                 int head_dim, int rotary_dim, float rope_theta);
+                                 int head_dim, int rotary_dim, float rope_theta,
+                                 RopeScaling scaling = {});
 
 // Append the (already RoPE'd) K and raw V for the current token into a dedicated
 // contiguous FP32 cache: float[kv_heads][max_seq_len][head_dim]. No rotation here.

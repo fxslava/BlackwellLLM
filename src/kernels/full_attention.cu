@@ -62,7 +62,8 @@ void launch_qg_split(const float* d_QG, float* d_Q, float* d_gate,
 // Partial rotate_half RoPE, in place over the first rotary_dim channels.
 // ---------------------------------------------------------------------------
 __global__ void rope_partial_kernel(float* __restrict__ X, int pos,
-                                    int head_dim, int rotary_dim, float rope_theta) {
+                                    int head_dim, int rotary_dim, float rope_theta,
+                                    RopeScaling scaling) {
     const int head = blockIdx.x;
     const int k = threadIdx.x;             // 0 .. rotary_dim/2 - 1
     const int half = rotary_dim / 2;
@@ -71,8 +72,9 @@ __global__ void rope_partial_kernel(float* __restrict__ X, int pos,
     float* cur = X + head * head_dim;
 
     // inv_freq[k] = theta^-(2k/rotary_dim); HF builds cos/sin from this base.
-    const float freq = __fdividef(1.0f,
+    float freq = __fdividef(1.0f,
         powf(rope_theta, __fdividef((float)(2 * k), (float)rotary_dim)));
+    freq = apply_rope_scaling(freq, scaling);
     const float angle = pos * freq;
     float s, c;
     sincosf(angle, &s, &c);
@@ -84,8 +86,9 @@ __global__ void rope_partial_kernel(float* __restrict__ X, int pos,
 }
 
 void launch_rope_partial_inplace(float* d_X, int pos, int num_heads,
-                                 int head_dim, int rotary_dim, float rope_theta) {
-    rope_partial_kernel<<<num_heads, rotary_dim / 2>>>(d_X, pos, head_dim, rotary_dim, rope_theta);
+                                 int head_dim, int rotary_dim, float rope_theta,
+                                 RopeScaling scaling) {
+    rope_partial_kernel<<<num_heads, rotary_dim / 2>>>(d_X, pos, head_dim, rotary_dim, rope_theta, scaling);
 }
 
 // ---------------------------------------------------------------------------

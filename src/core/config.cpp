@@ -163,15 +163,26 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
     cfg.linear.value_head_dim  = t.value("linear_value_head_dim",  size_t{0});
     cfg.linear.conv_kernel_dim = t.value("linear_conv_kernel_dim", size_t{0});
 
-    // The RoPE kernel implements vanilla rotate_half only; a rope_scaling block
-    // (llama3 / YaRN / linear) is NOT honored. The angles coincide at pos=0 but
-    // diverge for every later position, so warn loudly instead of failing hard.
+    // RoPE frequency rescaling. The "llama3" wavelength-band rescaling IS honored
+    // by the RoPE kernels (apply_rope_scaling, gated by cfg.rope_scaling_type).
+    // Other schemes (YaRN / linear) are not yet implemented, so warn loudly for
+    // those -- their angles coincide at pos=0 but diverge for every later position.
     if (t.contains("rope_scaling") && !t.at("rope_scaling").is_null()) {
+        const auto& rs = t.at("rope_scaling");
         const std::string rope_type =
-            t.at("rope_scaling").value("rope_type", t.at("rope_scaling").value("type", "unknown"));
-        std::cerr << "[ConfigLoader] WARNING: config declares rope_scaling (rope_type=\""
-                  << rope_type << "\") but the RoPE kernel applies vanilla rotate_half "
-                  << "frequencies; positional encoding is WRONG for pos >= 1.\n";
+            rs.value("rope_type", rs.value("type", "unknown"));
+        if (rope_type == "llama3") {
+            cfg.rope_scaling_type      = 1;
+            cfg.rope_scaling_factor    = rs.value("factor", 8.0f);
+            cfg.rope_low_freq_factor   = rs.value("low_freq_factor", 1.0f);
+            cfg.rope_high_freq_factor  = rs.value("high_freq_factor", 4.0f);
+            cfg.rope_orig_max_pos =
+                static_cast<float>(rs.value("original_max_position_embeddings", 8192));
+        } else {
+            std::cerr << "[ConfigLoader] WARNING: config declares rope_scaling (rope_type=\""
+                      << rope_type << "\") which is NOT implemented (only \"llama3\" is); "
+                      << "the RoPE kernel falls back to vanilla rotate_half, WRONG for pos >= 1.\n";
+        }
     }
 
     // The decode attention kernel attends over the full causal prefix.
