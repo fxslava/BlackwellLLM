@@ -11,7 +11,8 @@ add_library(blackwell_bridge STATIC
     audio_ring_buffer.cpp             # SPSC lock-free ring (pinned+mapped)
     prompt_injector.cu                # splice_audio_embeddings_kernel + launcher
     engine_api.cpp                    # C-ABI wrappers + exception/status translation
-    speech_pipeline_controller.cpp)   # speculative speech state machine + C-ABI
+    speech_pipeline_controller.cpp    # speculative speech state machine + C-ABI
+    engine_control_bridge.cpp)        # IEngineControl impl: command ring + epoch + pump
 
 # Public bridge headers in include/bridge; engine white-box deps are PRIVATE.
 target_include_directories(blackwell_bridge
@@ -35,6 +36,11 @@ target_compile_options(blackwell_bridge PRIVATE
     >)
 
 # Wired into the engine build via `add_subdirectory(bridge)` in src/CMakeLists.txt.
-# It builds as a leaf static lib (nothing links it yet); the engine assembly will
-# link it and provide the IEngineControl implementor (bridge_internal.hpp) that
-# closes the seam.
+# It builds as a static archive. engine_control_bridge.cpp is the IEngineControl
+# implementor (bridge_internal.hpp): it #includes the engine's white-box header
+# (blackwell/engine.h) to compile, but the archive is deliberately NOT linked
+# against blackwell_core_obj — that is an OBJECT library, so pulling it in here
+# would duplicate every engine object in any consumer that also links it (the
+# tests do). The engine symbols (BlackwellEngine::rewind / forward_status) stay
+# UNRESOLVED in the archive and are satisfied at the final executable link, where
+# the consumer links blackwell_core_obj. Dependency direction stays bridge -> core.

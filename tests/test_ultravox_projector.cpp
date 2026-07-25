@@ -1,12 +1,10 @@
-// Standalone parity test for the Ultravox projector CUDA kernels
+// Parity test for the Ultravox projector CUDA kernels
 // (launch_stack_audio_frames, launch_swiglu) against the FP32 PyTorch golden
 // dumps, using cosine similarity > 0.999.
 //
-// Build (from a VS/vcvars64 shell so nvcc finds cl.exe):
-//   nvcc -std=c++17 -arch=sm_120 \
-//        tests/test_ultravox_projector.cpp src/audio/ultravox_projector.cu \
-//        -I src -I src/core -I src/audio -o test_ultravox_projector.exe
-//   ./test_ultravox_projector.exe [golden_dumps/ultravox dir]
+// One of the checks compiled into the consolidated `kernel_unit_tests` binary:
+// the entry point is run_projector_parity(base) (see tests/kernel_unit_tests_main.cpp),
+// not a main() -- this TU is linked alongside test_prompt_injector.cpp.
 //
 // RECONCILIATION WITH THE BRIEF:
 //   * The dumps are FP32, not FP16 (see scripts/generate_ultravox_audio_dumps.py
@@ -18,11 +16,9 @@
 //       03_linear_1     -> proj_linear_1.bin         (swiglu input)
 //       04_swiglu_out   -> proj_swiglu.bin           (swiglu expected)
 
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -30,12 +26,15 @@
 
 #include "common.h"             // CUDA_CHECK_THROW
 #include "device_buffer.h"      // blackwell::DeviceBuffer
+#include "audio_test_utils.h"   // load_bin_file, compute_cosine_similarity (shared)
 #include "ultravox_projector.cuh"
 #include "ultravox_projector_pipeline.cuh"
 
 using blackwell::DeviceBuffer;
 using blackwell::audio::ProjectorConfig;
 using blackwell::audio::UltravoxProjector;
+using audio_test::compute_cosine_similarity;
+using audio_test::load_bin_file;
 
 // --- Geometry (Ultravox v0_5-llama-3_2-1b; cross-checked against dump sizes) --
 static constexpr int kNumFrames = 1500;   // whisper encoder frames (30 s)
@@ -46,37 +45,6 @@ static constexpr int kStackedDim = kHidden * kStack;                   // 10240
 static constexpr int kTokens    = kOutFrames;                          // 188
 static constexpr int kLin1Dim   = 4096;   // projector hidden (linear_1 out)
 static constexpr int kSwigluDim = kLin1Dim / 2;                        // 2048
-
-// --- FP32 raw dump loader -----------------------------------------------------
-std::vector<float> load_bin_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        std::fprintf(stderr, "FATAL: cannot open %s\n", path.c_str());
-        std::exit(2);
-    }
-    const std::streamsize bytes = f.tellg();
-    f.seekg(0);
-    std::vector<float> v(static_cast<size_t>(bytes) / sizeof(float));
-    f.read(reinterpret_cast<char*>(v.data()), bytes);
-    return v;
-}
-
-// Cosine similarity, accumulated in double to avoid overflow / precision loss.
-double compute_cosine_similarity(const std::vector<float>& a,
-                                 const std::vector<float>& b) {
-    if (a.size() != b.size()) {
-        std::fprintf(stderr, "FATAL: size mismatch %zu vs %zu\n", a.size(), b.size());
-        std::exit(2);
-    }
-    double dot = 0.0, na = 0.0, nb = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        const double x = a[i], y = b[i];
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    return dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
-}
 
 static DeviceBuffer<float> to_device(const std::vector<float>& h) {
     DeviceBuffer<float> d(h.size());
@@ -100,10 +68,10 @@ static void expect_size(const char* name, const std::vector<float>& v, size_t wa
     }
 }
 
-int main(int argc, char** argv) {
-    const std::string base = (argc > 1)
-        ? argv[1]
-        : std::string("tests/integration/golden_dumps/ultravox");
+// Runs the three projector-kernel parity checks against the dumps under `base`.
+// Returns the number of FAILED checks (0 == all passed). Called from the
+// consolidated kernel_unit_tests dispatcher.
+int run_projector_parity(const std::string& base) {
     const std::string sep = "/";
 
     constexpr double kThreshold = 0.999;
@@ -187,8 +155,8 @@ int main(int argc, char** argv) {
     }
 
     constexpr int kNumTests = 3;
-    std::printf("\n%s: %d/%d checks passed the cosine>%.3f parity bar.\n",
+    std::printf("%s: %d/%d projector checks passed the cosine>%.3f parity bar.\n",
                 failures == 0 ? "SUCCESS" : "FAILURE",
                 kNumTests - failures, kNumTests, kThreshold);
-    return failures == 0 ? 0 : 1;
+    return failures;  // # of failed checks; aggregated by kernel_unit_tests
 }

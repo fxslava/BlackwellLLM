@@ -9,7 +9,13 @@
 // Exit 0 iff cosine similarity vs the golden exceeds the parity bar.
 // -----------------------------------------------------------------------------
 #define DR_WAV_IMPLEMENTATION
+// dr_wav.h is third-party (SYSTEM include), but C4701 "potentially uninitialized
+// local" is emitted late in codegen and slips past /external:W0, so /WX would
+// flag it. Quarantine only this third-party #include (skill compiler-hygiene).
+#pragma warning(push)
+#pragma warning(disable: 4701)  // potentially uninitialized local variable
 #include "dr_wav.h"
+#pragma warning(pop)
 
 #include <algorithm>
 #include <cmath>

@@ -66,32 +66,73 @@ if(TARGET blackwell_audio)
     target_include_directories(integration_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/audio)
 endif()
 
-# Ultravox audio-frontend parity tests. Unlike the suites above these are
-# STANDALONE mains (each its own main(), NOT gtest) that drive the blackwell_audio
-# kernels against the FP32 PyTorch golden dumps (cosine > 0.999) -- kept standalone
-# to preserve their self-documenting nvcc build headers. Wired here so they are
-# real solution targets and run under CTest (`ctest -L audio`). They link
-# blackwell_audio only (no engine / no gtest) and declare their own PRIVATE
-# src/ includes (no target exports src/ -- skill cmake-hygiene rule #2).
+# Ultravox audio-frontend parity tests. Unlike the gtest suites above these are
+# STANDALONE mains (NOT gtest) that drive the blackwell_audio kernels against the
+# FP32 PyTorch golden dumps (cosine > 0.999) -- kept standalone to preserve their
+# self-documenting parity output. Wired here so they are real solution targets and
+# run under CTest (`ctest -L audio`). They link blackwell_audio only (no engine /
+# no gtest) and declare their own PRIVATE src/ includes (no target exports src/ --
+# skill cmake-hygiene rule #2).
 if(TARGET blackwell_audio)
     set(_ultravox_dumps "${CMAKE_SOURCE_DIR}/tests/integration/golden_dumps/ultravox")
 
-    function(blackwell_add_audio_test target source)
-        add_executable(${target} "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+    # Common wiring for a standalone audio parity executable: includes, link, the
+    # CWD-independent CTest COMMAND (dumps dir as argv[1]) and the matching VS
+    # debugger args (F5 bypasses the CTest COMMAND, so mirror them here).
+    function(blackwell_wire_audio_test target)
         target_include_directories(${target} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}      # audio_test_utils.h
             ${CMAKE_SOURCE_DIR}/src          # common.h
             ${CMAKE_SOURCE_DIR}/src/core     # device_buffer.h
             ${CMAKE_SOURCE_DIR}/src/audio)   # ultravox_projector*.cuh, prompt_injector.cuh
         target_link_libraries(${target} PRIVATE blackwell_audio)
-        # Pass the golden-dumps dir explicitly so the test is CWD-independent.
         add_test(NAME ${target} COMMAND ${target} "${_ultravox_dumps}")
         set_tests_properties(${target} PROPERTIES LABELS audio)
+        set_target_properties(${target} PROPERTIES
+            VS_DEBUGGER_COMMAND_ARGUMENTS "\"${_ultravox_dumps}\""
+            VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endfunction()
 
-    blackwell_add_audio_test(ultravox_projector_test         test_ultravox_projector.cpp)
-    blackwell_add_audio_test(prompt_injector_test            test_prompt_injector.cpp)
-    blackwell_add_audio_test(ultravox_model_integration_test test_ultravox_model_integration.cpp)
+    # Consolidated per-kernel unit suite: the former ultravox_projector_test and
+    # prompt_injector_test micro-executables now compile into ONE binary (each
+    # check keeps its own TU + entry point; kernel_unit_tests_main.cpp dispatches).
+    # One link + one CTest process instead of two -> less linker/discovery overhead.
+    add_executable(kernel_unit_tests
+        kernel_unit_tests_main.cpp
+        test_ultravox_projector.cpp
+        test_prompt_injector.cpp)
+    blackwell_wire_audio_test(kernel_unit_tests)
+
+    # The full end-to-end chain (projector -> injector -> Llama seam) stays its own
+    # standalone target -- it is an integration-shaped parity harness, not a unit.
+    add_executable(ultravox_model_integration_test test_ultravox_model_integration.cpp)
+    blackwell_wire_audio_test(ultravox_model_integration_test)
+endif()
+
+# Bridge suite: CPU-only control-plane test for EngineControlBridge (SPSC command
+# ring, barge-in epoch, wait/notify). It links blackwell_bridge for the bridge
+# under test plus blackwell_core_obj to satisfy the engine symbols the bridge's
+# execute hooks reference (BlackwellEngine::rewind / forward_status) — the test
+# overrides those hooks, so they are never called, but must resolve at link. Runs
+# under the fast `validation` label (no GPU needed).
+if(TARGET blackwell_bridge)
+    add_executable(bridge_tests "${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_control_bridge_test.cpp")
+    target_include_directories(bridge_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
+        ${CMAKE_SOURCE_DIR}/src          # common.h
+        ${CMAKE_SOURCE_DIR}/src/core     # device_buffer.h (transitive)
+        ${CMAKE_SOURCE_DIR}/src/bridge)  # engine_control_bridge.hpp, bridge_internal.hpp
+    target_link_libraries(bridge_tests PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        blackwell_bridge
+        blackwell_kernels
+        blackwell_core_obj)
+    blackwell_copy_dstorage_dlls(bridge_tests)
+    gtest_discover_tests(bridge_tests
+        PROPERTIES LABELS validation
+        DISCOVERY_TIMEOUT 120
+    )
 endif()
 
 # Agent-core suite: pure C++ (tree-sitter), no CUDA / no blackwell_kernels, so

@@ -2,13 +2,12 @@
 // splice 188 audio embeddings into the text sequence at the <|audio|> position
 // and match the PyTorch reference (spliced_embeds_ref.bin) via cosine similarity.
 //
-// Build (from a VS/vcvars64 shell):
-//   nvcc -std=c++17 -arch=sm_120 \
-//        tests/test_prompt_injector.cpp src/audio/prompt_injector.cu \
-//        -I src -I src/core -I src/audio -I tests -o test_prompt_injector.exe
-//   ./test_prompt_injector.exe [golden_dumps/ultravox dir]
+// One of the checks compiled into the consolidated `kernel_unit_tests` binary:
+// the entry point is run_prompt_injector_parity(base) (see
+// tests/kernel_unit_tests_main.cpp), not a main().
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -30,17 +29,17 @@ static DeviceBuffer<float> to_device(const std::vector<float>& h) {
     return d;
 }
 
-int main(int argc, char** argv) {
-    const std::string base = (argc > 1)
-        ? argv[1] : std::string("tests/integration/golden_dumps/ultravox");
-
+// Runs the prompt-injector splice parity check against the dumps under `base`.
+// Returns the number of FAILED checks (0 == passed). Called from the
+// consolidated kernel_unit_tests dispatcher.
+int run_prompt_injector_parity(const std::string& base) {
     // Geometry sidecar written by dump_injector_tensors(): "seq_len audio_pos num_audio hidden".
     int seq_len = 0, audio_pos = 0, num_audio = 0, hidden = 0;
     {
         std::ifstream m(base + "/injector_meta.txt");
         if (!(m >> seq_len >> audio_pos >> num_audio >> hidden)) {
             std::fprintf(stderr, "FATAL: cannot read injector_meta.txt\n");
-            return 2;
+            return 1;
         }
     }
     const int out_rows = seq_len - 1 + num_audio;
@@ -52,7 +51,7 @@ int main(int argc, char** argv) {
         audio.size() != (size_t)num_audio * hidden ||
         expected.size() != (size_t)out_rows * hidden) {
         std::fprintf(stderr, "FATAL: input size mismatch\n");
-        return 2;
+        return 1;
     }
 
     DeviceBuffer<float> d_text = to_device(text);
@@ -72,5 +71,5 @@ int main(int argc, char** argv) {
     std::printf("[%s] PromptInjector splice [%d,%d]->[%d,%d]  cosine = %.8f  (> 0.999)\n",
                 ok ? "PASS" : "FAIL", seq_len, hidden, out_rows, hidden, cos);
     std::printf("%s: prompt-injector parity.\n", ok ? "SUCCESS" : "FAILURE");
-    return ok ? 0 : 1;
+    return ok ? 0 : 1;  // # of failed checks; aggregated by kernel_unit_tests
 }

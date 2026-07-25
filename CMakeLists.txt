@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
 project(BlackwellLLM LANGUAGES CXX CUDA)
 
+# Group targets into Visual Studio Solution Explorer folders (see the FOLDER
+# assignments at the bottom of this file). Also tucks the CMake-generated
+# ALL_BUILD / ZERO_CHECK utility projects under "CMakePredefinedTargets".
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
@@ -137,3 +142,45 @@ endif()
 # Подключаем поддиректории
 add_subdirectory(src)
 add_subdirectory(tests)
+
+# audio_sandbox — standalone Whisper log-mel front-end (parity tester + real-time
+# visualiser). CUDA-free, no engine deps; its third-party libs (imgui, dr_libs,
+# pocketfft, miniaudio) are the SHARED root targets from cmake/Dependencies.cmake.
+# Added AFTER the /W4 /WX block so its first-party sources inherit the same
+# zero-warning budget. Gated so an engine-only build can skip the GUI/audio libs.
+option(BUILD_AUDIO_SANDBOX "Build the standalone Whisper log-mel audio_sandbox (parity + realtime GUI)" ON)
+if(BUILD_AUDIO_SANDBOX)
+    add_subdirectory(audio_sandbox)
+endif()
+
+# ============================================================================
+# Solution-folder assignments (USE_FOLDERS is ON above). Centralised here --
+# after every add_subdirectory -- so all targets exist and the taxonomy lives in
+# one readable place instead of scattered set_target_properties calls. Each is
+# guarded by if(TARGET ...) because most subdirectories are option-gated.
+# ============================================================================
+function(blackwell_set_folder folder)
+    foreach(tgt ${ARGN})
+        if(TARGET ${tgt})
+            set_target_properties(${tgt} PROPERTIES FOLDER "${folder}")
+        endif()
+    endforeach()
+endfunction()
+
+# --- Engine (CUDA inference stack) ---
+blackwell_set_folder("Engine/Core"   blackwell_kernels blackwell_core_obj blackwell_core blackwell_audio)
+blackwell_set_folder("Engine/Bridge" blackwell_bridge)
+# --- Agent stack (CUDA-free) ---
+blackwell_set_folder("Engine/Agent"  treesitter agent_core agent_env agent_orchestrator)
+# --- Apps & tools ---
+blackwell_set_folder("Apps"          blackwell_llm blackwell_bench agent_playground poc_overlay)
+blackwell_set_folder("Experiments"   awq_benchmark)
+# --- Audio sandbox ---
+blackwell_set_folder("Audio"         whisper_dsp parity_check audio_realtime)
+# --- Tests ---
+blackwell_set_folder("Tests"
+    validation_tests benchmark_tests integration_tests
+    bridge_tests kernel_unit_tests ultravox_model_integration_test
+    agent_tests agent_env_tests agent_orchestrator_tests)
+# --- Third-party (FetchContent) ---
+blackwell_set_folder("ThirdParty"    imgui gtest gtest_main gmock gmock_main)

@@ -6,101 +6,74 @@
 #   audio_realtime  Windows real-time visualiser: miniaudio capture + Direct2D
 #                   spectrogram + Dear ImGui controls + VAD .wav recorder.
 #
-# STANDALONE by design: its own project(), no CUDA, no BlackwellLLM engine deps.
-#     cmake -S audio_sandbox -B audio_sandbox/out -DCMAKE_BUILD_TYPE=Release
-#     cmake --build audio_sandbox/out --config Release
+# INTEGRATED into the root BlackwellLLM build via add_subdirectory(audio_sandbox).
+# The third-party deps (dr_wav, pocketfft, miniaudio, imgui) are the SHARED root
+# targets fetched ONCE in cmake/Dependencies.cmake -- this dir no longer declares
+# its own FetchContent. It stays CUDA-free with no engine deps.
 #
-# Third-party deps (dr_wav, pocketfft, miniaudio, imgui) are pulled via
-# FetchContent. NOTE: GIT_TAG uses upstream branches/tags for a first build. For
-# reproducibility, replace each with the exact commit hash you validated against
-# (the repo's convention is pinned FetchContent — see cmake/Dependencies.cmake).
+# STILL STANDALONE-CAPABLE: configuring this directory as the top-level source
+# re-uses the very same dependency module, so the old flow keeps working:
+#     cmake -S audio_sandbox -B audio_sandbox/out
+#     cmake --build audio_sandbox/out --config Release
 # =============================================================================
-cmake_minimum_required(VERSION 3.20)
-project(audio_sandbox LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# --- Standalone bootstrap: only when this dir is the top-level CMake source ----
+# When built from the root, project()/deps/warning-policy all come from the root
+# CMakeLists; this block runs ONLY for a direct `cmake -S audio_sandbox` build.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    cmake_minimum_required(VERSION 3.28)
+    project(audio_sandbox LANGUAGES CXX)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+
+    if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+        set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+    endif()
+
+    # Match the root's static-CRT deployment so a standalone build behaves the
+    # same as the integrated one.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+    # Pull the SHARED third-party targets (imgui, blackwell::sandbox_headers, ...)
+    # from the single source of truth so nothing is duplicated across build modes.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Dependencies.cmake)
+
+    # No root /W4 /WX directory property exists in a standalone build, so opt the
+    # first-party targets in explicitly (see the per-target flags at the bottom).
+    set(_sandbox_standalone TRUE)
 endif()
 
-include(FetchContent)
-
-# --- dr_wav: single-header WAV loader (mackron/dr_libs) -----------------------
-FetchContent_Declare(dr_libs
-    GIT_REPOSITORY https://github.com/mackron/dr_libs.git
-    GIT_TAG        master  # replace with a validated commit hash to pin
-    GIT_SHALLOW    TRUE)
-FetchContent_MakeAvailable(dr_libs)  # header-only: no CMake project, just populate
-
-# --- pocketfft: header-only C++ FFT (mreineck/pocketfft, 'cpp' branch) --------
-FetchContent_Declare(pocketfft
-    GIT_REPOSITORY https://github.com/mreineck/pocketfft.git
-    GIT_TAG        cpp
-    GIT_SHALLOW    TRUE)
-FetchContent_MakeAvailable(pocketfft)
-
-# --- miniaudio: single-header capture/playback (mackron/miniaudio) ------------
-# SOURCE_SUBDIR points at a non-existent dir so MakeAvailable only POPULATES the
-# header and never add_subdirectory()s miniaudio's own build (tests/examples).
-FetchContent_Declare(miniaudio
-    GIT_REPOSITORY https://github.com/mackron/miniaudio.git
-    GIT_TAG        master  # replace with a validated commit hash to pin
-    GIT_SHALLOW    TRUE
-    SOURCE_SUBDIR  cmake-noop-header-only)
-FetchContent_MakeAvailable(miniaudio)
-
-# --- Dear ImGui: immediate-mode GUI (ocornut/imgui) --------------------------
-# Ships no CMakeLists, so MakeAvailable just populates the sources; we build our
-# own static lib with the Win32 + DX11 backends.
-FetchContent_Declare(imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.91.0  # replace with a validated commit hash to pin
-    GIT_SHALLOW    TRUE)
-FetchContent_MakeAvailable(imgui)
-
-# Interface target bundling the single-header include dirs (marked SYSTEM so
-# their warnings are quarantined under /W4 — see the warnings block below).
-add_library(sandbox_thirdparty INTERFACE)
-target_include_directories(sandbox_thirdparty SYSTEM INTERFACE
-    ${dr_libs_SOURCE_DIR}
-    ${pocketfft_SOURCE_DIR}
-    ${miniaudio_SOURCE_DIR})
+# The shared deps must exist by now (root or standalone bootstrap provided them).
+if(NOT TARGET blackwell::sandbox_headers)
+    message(FATAL_ERROR
+        "audio_sandbox: shared third-party targets missing. Build from the repo "
+        "root (add_subdirectory) or configure audio_sandbox as the top-level "
+        "source so cmake/Dependencies.cmake runs.")
+endif()
 
 # --- DSP library (the VERIFIED core; shared by both products) -----------------
 add_library(whisper_dsp STATIC src/whisper_dsp.cpp)
 target_include_directories(whisper_dsp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(whisper_dsp PRIVATE sandbox_thirdparty)
+target_link_libraries(whisper_dsp PRIVATE blackwell::sandbox_headers)
 
 # --- parity_check: offline golden parity tester ------------------------------
 add_executable(parity_check src/parity_check.cpp)
-target_link_libraries(parity_check PRIVATE whisper_dsp sandbox_thirdparty)
+target_link_libraries(parity_check PRIVATE whisper_dsp blackwell::sandbox_headers)
 
 # --- audio_realtime: capture + Direct2D + ImGui + VAD recorder (Windows only) -
 if(WIN32)
-    # Dear ImGui static lib (core + Win32/DX11 backends). Its own headers are
-    # SYSTEM so ImGui/DirectX warnings never count against our /W4 budget.
-    add_library(imgui STATIC
-        ${imgui_SOURCE_DIR}/imgui.cpp
-        ${imgui_SOURCE_DIR}/imgui_draw.cpp
-        ${imgui_SOURCE_DIR}/imgui_tables.cpp
-        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
-    target_include_directories(imgui SYSTEM PUBLIC
-        ${imgui_SOURCE_DIR}
-        ${imgui_SOURCE_DIR}/backends)
-
     add_executable(audio_realtime
         src/main.cpp
         src/audio_capture.cpp
         src/audio_recorder.cpp
         src/realtime_dsp.cpp
         src/window_d2d.cpp)
+    # imgui is the SHARED root static lib (core + Win32/DX11 backends); its SYSTEM
+    # PUBLIC include dirs propagate here, quarantined from our /W4 budget.
     target_link_libraries(audio_realtime PRIVATE
-        whisper_dsp sandbox_thirdparty imgui
+        whisper_dsp blackwell::sandbox_headers imgui
         d3d11 dxgi d2d1 d3dcompiler user32 ole32)  # DX11 + DXGI + D2D + ImGui shaders + Win32 + COM
     # UNICODE aligns the generic Win32 macros (IDC_ARROW etc.) with the explicit
     # -W APIs we call. (NOMINMAX / WIN32_LEAN_AND_MEAN are set in the sources that
@@ -128,19 +101,23 @@ if(MSVC)
         VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
-# --- warnings: strict /W4 on ALL first-party code, quarantining third-party ---
-# /external:W0 + /external:anglebrackets silences <>-included SDK/STL headers;
-# the SYSTEM include dirs above (/external:I) cover the quote-included single-
-# header + ImGui deps. Result: only OUR .cpp/"".h files are held to /W4.
-if(MSVC)
-    set(FIRST_PARTY_WARN /W4 /external:W0 /external:anglebrackets)
-    target_compile_options(whisper_dsp  PRIVATE ${FIRST_PARTY_WARN})
-    target_compile_options(parity_check PRIVATE ${FIRST_PARTY_WARN})
-    if(TARGET audio_realtime)
-        target_compile_options(audio_realtime PRIVATE ${FIRST_PARTY_WARN})
+# --- warnings: strict /W4 /WX on ALL first-party code, quarantining third-party -
+# When integrated, the root CMakeLists already imposes /W4 /WX /external:W0 as a
+# directory property (audio_sandbox is added after that block), so we add nothing.
+# In a STANDALONE build there is no such property, so opt each first-party target
+# in explicitly. Third-party headers are quarantined either way: the SYSTEM
+# include dirs on blackwell::sandbox_headers + imgui map to /external:I -> W0.
+if(_sandbox_standalone)
+    if(MSVC)
+        set(FIRST_PARTY_WARN /W4 /WX /external:W0 /external:anglebrackets)
+        target_compile_options(whisper_dsp  PRIVATE ${FIRST_PARTY_WARN})
+        target_compile_options(parity_check PRIVATE ${FIRST_PARTY_WARN})
+        target_compile_definitions(parity_check PRIVATE _CRT_SECURE_NO_WARNINGS)
+        if(TARGET audio_realtime)
+            target_compile_options(audio_realtime PRIVATE ${FIRST_PARTY_WARN})
+        endif()
+    else()
+        target_compile_options(whisper_dsp  PRIVATE -Wall -Wextra)
+        target_compile_options(parity_check PRIVATE -Wall -Wextra)
     endif()
-    target_compile_definitions(parity_check PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(whisper_dsp  PRIVATE -Wall -Wextra)
-    target_compile_options(parity_check PRIVATE -Wall -Wextra)
 endif()
