@@ -1,5 +1,7 @@
 #pragma once
 #include <cstddef>
+
+#include <cuda_runtime.h>  // cudaStream_t
 // -----------------------------------------------------------------------------
 // Ultravox projector CUDA kernels (audio frontend, preprocessor-only).
 //
@@ -20,11 +22,14 @@
 // frames at or past num_frames are ZERO-padded (mirrors Ultravox's
 // F.pad(..)-then-reshape when num_frames is not a multiple of cf).
 // CONTRACT: hidden_dim % 4 == 0 (float4-vectorized copy).
+// stream: target stream (default 0). All launchers here take one so the whole
+// projector graph can run on a caller-owned audio stream (ping-pong pipeline).
 void launch_stack_audio_frames(const float* d_in,
                                float* d_out,
                                int num_frames,
                                int hidden_dim,
-                               int compression_factor);
+                               int compression_factor,
+                               cudaStream_t stream = 0);
 
 // SwiGLU: [num_tokens, input_dim] -> [num_tokens, input_dim/2].
 //
@@ -42,4 +47,5 @@ void launch_stack_audio_frames(const float* d_in,
 void launch_swiglu(const float* d_in,
                    float* d_out,
                    int num_tokens,
-                   int input_dim);
+                   int input_dim,
+                   cudaStream_t stream = 0);

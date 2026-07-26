@@ -70,8 +70,11 @@ public:
 
     // Runs the 6-stage graph for `num_frames` input frames (<= max_input_frames).
     // Returns a device pointer to [out_frames(num_frames), text_hidden]. Launches
-    // only; allocates nothing.
-    const float* forward(const float* d_whisper_out, int num_frames);
+    // only; allocates nothing. `stream` (default 0) lets the caller run the whole
+    // graph on an audio stream chained after the Whisper encoder (ping-pong
+    // pipeline); the returned buffer is ready once that stream reaches this point.
+    const float* forward(const float* d_whisper_out, int num_frames,
+                         cudaStream_t stream = 0);
 
     int out_frames(int num_frames) const {
         return (num_frames + cfg_.stack_factor - 1) / cfg_.stack_factor;

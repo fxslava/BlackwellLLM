@@ -77,12 +77,13 @@ void launch_stack_audio_frames(const float* d_in,
                                float* d_out,
                                int num_frames,
                                int hidden_dim,
-                               int compression_factor) {
+                               int compression_factor,
+                               cudaStream_t stream) {
     const int out_frames = (num_frames + compression_factor - 1) / compression_factor;
     const int vecH = hidden_dim / 4;
     const long long total_vec = (long long)out_frames * compression_factor * vecH;
 
-    stack_audio_frames_kernel<<<grid_for(total_vec), kBlock>>>(
+    stack_audio_frames_kernel<<<grid_for(total_vec), kBlock, 0, stream>>>(
         reinterpret_cast<const float4*>(d_in),
         reinterpret_cast<float4*>(d_out),
         num_frames, vecH, compression_factor, total_vec);
@@ -91,13 +92,14 @@ void launch_stack_audio_frames(const float* d_in,
 void launch_swiglu(const float* d_in,
                    float* d_out,
                    int num_tokens,
-                   int input_dim) {
+                   int input_dim,
+                   cudaStream_t stream) {
     const int mid = input_dim / 2;
     const int input_dim_vec = input_dim / 4;
     const int mid_vec = mid / 4;
     const long long total_vec = (long long)num_tokens * mid_vec;
 
-    swiglu_kernel<<<grid_for(total_vec), kBlock>>>(
+    swiglu_kernel<<<grid_for(total_vec), kBlock, 0, stream>>>(
         reinterpret_cast<const float4*>(d_in),
         reinterpret_cast<float4*>(d_out),
         input_dim_vec, mid_vec, total_vec);

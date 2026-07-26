@@ -62,14 +62,14 @@ __global__ void linear_wt_f32_kernel(const float* __restrict__ X,
 }
 
 void launch_rmsnorm_f32(const float* d_x, const float* d_w, float* d_y,
-                        int rows, int H, float eps) {
-    rmsnorm_f32_kernel<<<rows, kBlock>>>(d_x, d_w, d_y, rows, H, eps);
+                        int rows, int H, float eps, cudaStream_t stream) {
+    rmsnorm_f32_kernel<<<rows, kBlock, 0, stream>>>(d_x, d_w, d_y, rows, H, eps);
 }
 
 void launch_linear_wt_f32(const float* d_x, const float* d_w, float* d_y,
-                          int T, int K, int O) {
+                          int T, int K, int O, cudaStream_t stream) {
     dim3 grid((O + kBlock - 1) / kBlock, T);
-    linear_wt_f32_kernel<<<grid, kBlock>>>(d_x, d_w, d_y, T, K, O);
+    linear_wt_f32_kernel<<<grid, kBlock, 0, stream>>>(d_x, d_w, d_y, T, K, O);
 }
 
 }  // namespace
@@ -105,24 +105,25 @@ void UltravoxProjector::load_weights(const std::vector<float>& ln_pre,
     upload(w_linear_2_, linear_2);
 }
 
-const float* UltravoxProjector::forward(const float* d_whisper_out, int num_frames) {
+const float* UltravoxProjector::forward(const float* d_whisper_out, int num_frames,
+                                        cudaStream_t stream) {
     const int T = out_frames(num_frames);
     const int stacked = cfg_.stacked_dim();
     const int mid = cfg_.swiglu_out();
 
     // 1. StackAudioFrames  [num_frames,1280] -> [T,10240]
     launch_stack_audio_frames(d_whisper_out, ws_.stacked, num_frames,
-                              cfg_.hidden_dim, cfg_.stack_factor);
+                              cfg_.hidden_dim, cfg_.stack_factor, stream);
     // 2. RMSNorm(ln_pre)   -> [T,10240]
-    launch_rmsnorm_f32(ws_.stacked, w_ln_pre_, ws_.norm0, T, stacked, cfg_.eps);
+    launch_rmsnorm_f32(ws_.stacked, w_ln_pre_, ws_.norm0, T, stacked, cfg_.eps, stream);
     // 3. Linear_1          -> [T,4096]
-    launch_linear_wt_f32(ws_.norm0, w_linear_1_, ws_.linear1, T, stacked, cfg_.proj_hidden);
+    launch_linear_wt_f32(ws_.norm0, w_linear_1_, ws_.linear1, T, stacked, cfg_.proj_hidden, stream);
     // 4. SwiGLU            -> [T,2048]
-    launch_swiglu(ws_.linear1, ws_.swiglu, T, cfg_.proj_hidden);
+    launch_swiglu(ws_.linear1, ws_.swiglu, T, cfg_.proj_hidden, stream);
     // 5. RMSNorm(ln_mid)   -> [T,2048]
-    launch_rmsnorm_f32(ws_.swiglu, w_ln_mid_, ws_.norm1, T, mid, cfg_.eps);
+    launch_rmsnorm_f32(ws_.swiglu, w_ln_mid_, ws_.norm1, T, mid, cfg_.eps, stream);
     // 6. Linear_2          -> [T, text_hidden]  (4096 for the 8B default, 2048 for 1B)
-    launch_linear_wt_f32(ws_.norm1, w_linear_2_, ws_.out, T, mid, cfg_.text_hidden);
+    launch_linear_wt_f32(ws_.norm1, w_linear_2_, ws_.out, T, mid, cfg_.text_hidden, stream);
 
     return ws_.out.get();
 }
