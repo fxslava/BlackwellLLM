@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,6 +58,8 @@
 #include "engine_control_bridge.hpp"    // EngineControlBridge, Command
 #include "bridge/engine_api.h"          // BRIDGE_OK for the token sink
 
+#include "language_table.hpp"           // rt::kLanguages (forced-language prompt directives)
+
 namespace rt {
 
 class RealEngineControl : public blackwell::bridge::EngineControlBridge {
@@ -65,10 +68,63 @@ public:
 
     // engine + tok are non-owning; both outlive this object (single-thread
     // doctrine). max_context caps the persistent KV growth across utterances.
+    // The forced-language atomics seed from the engine's RESOLVED tier-3 plan
+    // (CLI/InferenceConfig defaults); the UI dropdowns override them at runtime.
     RealEngineControl(BlackwellEngine* engine, blackwell::ITokenizer* tok,
                       int max_context, const Config& cfg = {})
         : blackwell::bridge::EngineControlBridge(engine, cfg),
-          tok_(tok), max_context_(max_context) {}
+          tok_(tok), max_context_(max_context) {
+        if (engine != nullptr) {
+            const auto& plan = engine->get_impl()->m_runtime;
+            src_lang_.store(rt::language_index_or_auto(plan.source_language),
+                            std::memory_order_relaxed);
+            tgt_lang_.store(rt::language_index_or_auto(plan.target_language),
+                            std::memory_order_relaxed);
+        }
+    }
+
+    // ---- Text-context policy (Stateless vs Bounded dialogue history) ----------
+    // UI-thread -> engine-thread handoff is a set of plain atomics read only at
+    // TURN BOUNDARIES (finalize_turn / build_user_instruction) on the engine
+    // thread, so a mid-decode change simply applies from the next turn — no
+    // marshaling, no locks, doctrine intact.
+    enum class ContextMode : int {
+        Stateless      = 0,  // live translator: flush the whole turn after decode
+        BoundedHistory = 1,  // voice assistant: retain last turns as text, <= budget
+    };
+    void set_context_mode(ContextMode m) noexcept {
+        mode_.store(static_cast<int>(m), std::memory_order_release);
+    }
+    ContextMode context_mode() const noexcept {
+        return static_cast<ContextMode>(mode_.load(std::memory_order_acquire));
+    }
+    void set_history_budget_tokens(int n) noexcept {
+        history_budget_tokens_.store(n < 0 ? 0 : n, std::memory_order_release);
+    }
+    int history_budget_tokens() const noexcept {
+        return history_budget_tokens_.load(std::memory_order_acquire);
+    }
+
+    // Forced languages as rt::kLanguages indices (0 = Auto). Out-of-range stores
+    // clamp to Auto so a stale UI index can never read past the table.
+    void set_languages(int src_idx, int tgt_idx) noexcept {
+        auto clamp = [](int i) { return (i < 0 || i >= rt::kLanguageCount) ? 0 : i; };
+        src_lang_.store(clamp(src_idx), std::memory_order_release);
+        tgt_lang_.store(clamp(tgt_idx), std::memory_order_release);
+    }
+    int source_language_index() const noexcept {
+        return src_lang_.load(std::memory_order_acquire);
+    }
+    int target_language_index() const noexcept {
+        return tgt_lang_.load(std::memory_order_acquire);
+    }
+
+    // The retained-history base (system prefix + retained turns): the KV floor a
+    // barge-in rewind honours in bounded mode. Engine thread writes it at turn
+    // boundaries; any thread may read it (UI/tests invariant readout).
+    int history_base_pos() const noexcept {
+        return history_base_pos_.load(std::memory_order_acquire);
+    }
 
     // Engine-thread setup: prefill the frozen system prompt through the REAL
     // engine (BOS + system block via the checkpoint's chat template) and freeze
@@ -84,6 +140,7 @@ public:
         }
         const auto n = static_cast<uint32_t>(ids.size());
         set_system_prefix_tokens(n);   // KV rewind floor (barge-in never truncates it)
+        history_base_pos_.store(pos_, std::memory_order_relaxed);  // no history yet
         return n;
     }
 
@@ -208,23 +265,20 @@ public:
             }
             return true;
         };
-        // Strict Llama-3 template with an explicit instruction; the 188 audio
-        // soft-tokens occupy the <|audio|> placeholder slot (injected as embeddings,
-        // not as a literal token). Special-token strings are recognized by encode()
-        // (add_special=false: the BOS already lives in the frozen system prefix).
-        const std::string user_prefix =
-            "<|start_header_id|>user<|end_header_id|>\n\nTranscribe the following audio: ";
-        const std::string user_suffix = "<|eot_id|>";
-        const std::vector<int> user_hdr = tok_->encode(user_prefix, /*add_special=*/false);
-        const std::vector<int> user_eot = tok_->encode(user_suffix, false);
-        const std::vector<int> gen_cue  = tok_->encode_generation_prompt();
+        // Strict Llama-3 template with an explicit (language-directed) instruction;
+        // the 188 audio soft-tokens occupy the <|audio|> placeholder slot (injected
+        // as embeddings, not as a literal token). Special-token strings are
+        // recognized by encode() (add_special=false: the BOS already lives in the
+        // frozen system prefix).
+        const TurnFrame frame = make_turn_frame();
 
-        std::printf("[prompt] <sys:%d tok>%s<|audio x%d|>%s%s\n", pos_,
-                    user_prefix.c_str(), audio_pipeline_->out_frames(),
-                    user_suffix.c_str(), tok_->decode(gen_cue, /*render_special=*/true).c_str());
+        std::printf("[prompt] <sys:%d tok>%s<|audio x%d|><|eot_id|>%s\n", pos_,
+                    tok_->decode(frame.user_hdr, /*render_special=*/true).c_str(),
+                    audio_pipeline_->out_frames(),
+                    tok_->decode(frame.gen_cue, /*render_special=*/true).c_str());
         std::fflush(stdout);
 
-        if (!prefill_ids(user_hdr)) return blackwell::EngineStatus::StateMismatch;
+        if (!prefill_ids(frame.user_hdr)) return blackwell::EngineStatus::StateMismatch;
         prefill_audio(d_mel);  // the 188 audio embeddings occupy the placeholder slot
 
         // DEBUG (env-gated; does a device sync, so keep it off the live hot path):
@@ -242,8 +296,8 @@ public:
             std::fflush(stdout);
         }
 
-        if (!prefill_ids(user_eot)) return blackwell::EngineStatus::StateMismatch;
-        if (!prefill_ids(gen_cue))  return blackwell::EngineStatus::StateMismatch;
+        if (!prefill_ids(frame.user_eot)) return blackwell::EngineStatus::StateMismatch;
+        if (!prefill_ids(frame.gen_cue))  return blackwell::EngineStatus::StateMismatch;
 
         *first_token = next;
         return blackwell::EngineStatus::Success;
@@ -292,11 +346,8 @@ public:
             }
             return true;
         };
-        const std::vector<int> user_hdr = tok_->encode(
-            "<|start_header_id|>user<|end_header_id|>\n\nTranscribe the following audio: ", false);
-        const std::vector<int> user_eot = tok_->encode("<|eot_id|>", false);
-        const std::vector<int> gen_cue  = tok_->encode_generation_prompt();
-        if (!prefill_ids(user_hdr)) return std::string();
+        const TurnFrame frame = make_turn_frame();
+        if (!prefill_ids(frame.user_hdr)) return std::string();
 
         // Slide the window across [0, total_frames) in `hop`-frame steps; each hop
         // reconciles its overlap against the injected history and appends the delta.
@@ -318,8 +369,8 @@ public:
             if (end >= total_frames) break;
         }
 
-        if (!prefill_ids(user_eot)) return std::string();
-        if (!prefill_ids(gen_cue))  return std::string();
+        if (!prefill_ids(frame.user_eot)) return std::string();
+        if (!prefill_ids(frame.gen_cue))  return std::string();
 
         std::string out;
         for (int i = 0; i < max_new_tokens && pos_ < max_context_; ++i) {
@@ -332,7 +383,105 @@ public:
         return out;
     }
 
+    // Per-turn instruction carrying the FORCED language directives. It lives in
+    // the user turn (re-prefilled every utterance), NOT the frozen system prompt,
+    // so a dropdown change takes effect on the very next turn. The explicit
+    // native-script constraint is what kills the Latin-transliteration failure
+    // mode on short audio hops. Any thread (reads two atomics).
+    std::string build_user_instruction() const {
+        const int si = src_lang_.load(std::memory_order_acquire);
+        const int ti = tgt_lang_.load(std::memory_order_acquire);
+        std::string s;
+        if (si > 0) {
+            s += "The audio language is ";
+            s += rt::kLanguages[si];
+            s += ". Write the transcript in ";
+            s += rt::kLanguages[si];
+            s += " using its native script (never transliterate). ";
+        }
+        if (ti > 0) {
+            s += "Translate into ";
+            s += rt::kLanguages[ti];
+            s += ". ";
+        }
+        s += "Transcribe the following audio: ";
+        return s;
+    }
+
+    // End-of-turn context policy (engine thread, after the decode loop):
+    //   Stateless      -> roll the KV back to the base (== system floor): the turn
+    //                     leaves no trace, so long runs cannot accumulate
+    //                     transliteration/error feedback across utterances.
+    //   BoundedHistory -> close the assistant turn in place with <|eot_id|> (the
+    //                     KV keeps the richer audio-soft-token form) and record
+    //                     the turn as TEXT; the deque is pruned to the token
+    //                     budget every turn, but the KV rebuild (rollback to the
+    //                     floor + re-prefill of the retained turns) is AMORTIZED —
+    //                     it only runs when the context headroom demands it, since
+    //                     a rebuild costs one forward_status per retained token.
+    // An interrupted (barge-in) or empty turn is never recorded — the rollback
+    // here is idempotent with the barge-in's pending do_rewind.
+    void finalize_turn(const std::string& reply, bool completed) {
+        const bool bounded = context_mode() == ContextMode::BoundedHistory;
+        if (!bounded) {
+            // Also covers a live Bounded -> Stateless switch: drop the retained
+            // text history and re-anchor the base to the frozen system prefix.
+            turn_history_.clear();
+            history_text_tokens_ = 0;
+            history_base_pos_.store(static_cast<int>(system_prefix_tokens()),
+                                    std::memory_order_relaxed);
+        }
+        if (!bounded || !completed || reply.empty()) {
+            kv_cache_rollback({history_base_pos_.load(std::memory_order_relaxed),
+                               verified_prompt_tokens_});
+            if (audio_pipeline_) audio_pipeline_->reset_history();
+            return;
+        }
+
+        close_assistant_turn();  // <|eot_id|> keeps the in-place KV template-valid
+
+        TurnRecord rec{encode_history_turn(reply)};
+        history_text_tokens_ += rec.ids.size();
+        turn_history_.push_back(std::move(rec));
+        // Prune the RECORDS to the budget every turn (cheap bookkeeping)...
+        const auto budget = static_cast<size_t>(history_budget_tokens());
+        while (!turn_history_.empty() && history_text_tokens_ > budget) {
+            history_text_tokens_ -= turn_history_.front().ids.size();
+            turn_history_.pop_front();
+        }
+        // ...but rebuild the KV only when the next turn would not fit.
+        if (pos_ + kTurnHeadroomTokens > max_context_) {
+            rebuild_history_kv();
+        } else {
+            history_base_pos_.store(pos_, std::memory_order_relaxed);
+        }
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            std::printf("[context] bounded turn recorded: history=%zu turn(s)/%zu text tok, "
+                        "base=%d pos=%d\n", turn_history_.size(), history_text_tokens_,
+                        history_base_pos_.load(std::memory_order_relaxed), pos_);
+            std::fflush(stdout);
+        }
+    }
+
 protected:
+    struct TurnFrame {
+        std::vector<int> user_hdr;   // user header + forced-language instruction
+        std::vector<int> user_eot;   // "<|eot_id|>"
+        std::vector<int> gen_cue;    // assistant generation prompt
+    };
+    static constexpr const char* kUserHeader =
+        "<|start_header_id|>user<|end_header_id|>\n\n";
+
+    // One place frames EVERY audio user turn (whole-utterance and streaming paths
+    // both), so the language directives can never drift between them.
+    TurnFrame make_turn_frame() const {
+        return TurnFrame{
+            tok_->encode(std::string(kUserHeader) + build_user_instruction(),
+                         /*add_special=*/false),
+            tok_->encode("<|eot_id|>", false),
+            tok_->encode_generation_prompt()};
+    }
+
     // Barge-in micro-rewind. The 8B AWQ backbone runs Continuous KV: the resident
     // slabs are position-addressed and overwritten in place, so re-anchoring pos_ is
     // enough for the decode math. But when layers are offloaded, the host mirror /
@@ -344,7 +493,14 @@ protected:
     // prefix, and re-anchor pos_ to the resolved keep so the next utterance decodes
     // on top of the system prefix, not on top of the previous (superseded) answer.
     blackwell::EngineStatus do_rewind(const Command& cmd) override {
-        const uint32_t keep = effective_keep_tokens(cmd.keep_prompt_tokens);
+        uint32_t keep = effective_keep_tokens(cmd.keep_prompt_tokens);
+        // Bounded-history floor: retained dialogue turns sit directly above the
+        // system prefix and are committed context — a barge-in must not truncate
+        // them (they would silently vanish until the next rebuild). In stateless
+        // mode the base equals the system floor, so this clamp is a no-op there.
+        const auto hist_floor =
+            static_cast<uint32_t>(history_base_pos_.load(std::memory_order_relaxed));
+        if (keep < hist_floor) keep = hist_floor;
         last_rewind_keep_.store(keep, std::memory_order_release);
         pos_ = static_cast<int>(keep);
         // Full host-mirror reconciliation (Phase 0 truncate_kv), safe below the
@@ -400,9 +556,10 @@ protected:
 
         int next = -1;
         for (const int id : turn) {
-            if (pos_ >= max_context_) { clear_in_flight(); return finish(cmd, 0); }
-            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
-                blackwell::EngineStatus::Success) {
+            if (pos_ >= max_context_ ||
+                engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                    blackwell::EngineStatus::Success) {
+                finalize_turn(std::string(), /*completed=*/false);  // drop partial prefill
                 clear_in_flight();
                 return finish(cmd, 0);
             }
@@ -411,13 +568,17 @@ protected:
 
         // Decode the assistant turn, streaming real detokenized tokens.
         int emitted = 0;
+        std::string reply;
+        bool interrupted = false;
         blackwell::EngineStatus st = blackwell::EngineStatus::Success;
         while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) break;          // wait-free barge-in abort
+            if (cancelled(cmd.gen)) { interrupted = true; break; }  // wait-free barge-in
             if (tok_->is_stop(next)) break;
             const std::string piece = tok_->decode(next, /*render_special=*/false);
-            if (!piece.empty())
+            if (!piece.empty()) {
                 cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
+                reply += piece;
+            }
             ++emitted;
             st = engine_->forward_status(next, pos_, /*temperature=*/0.7f, /*top_p=*/0.9f,
                                          cfg_.seq_id, &next);
@@ -425,6 +586,8 @@ protected:
             ++pos_;
         }
 
+        finalize_turn(reply, /*completed=*/!interrupted &&
+                                st == blackwell::EngineStatus::Success);
         clear_in_flight();
         return finish(cmd, emitted);
     }
@@ -580,6 +743,84 @@ private:
         return blackwell::EngineStatus::Success;
     }
 
+    // ---- bounded-history internals (engine thread only) -----------------------
+
+    // Headroom the NEXT turn needs below max_context_: <=188 audio soft-tokens
+    // (30 s), the template framing, and a decode budget. Crossing it triggers the
+    // amortized history rebuild.
+    static constexpr int kTurnHeadroomTokens = 320;
+
+    // One completed dialogue turn re-encoded as TEXT for KV rebuilds: user turn =
+    // the transcript the model itself produced, assistant turn = the full
+    // formatted reply. The in-place KV keeps the richer audio form until a
+    // rebuild evicts it, so between rebuilds the model attends to full turns.
+    struct TurnRecord {
+        std::vector<int> ids;
+    };
+
+    // The decode loop breaks on is_stop BEFORE forwarding the stop token, so the
+    // assistant turn is still open in the KV; feed one <|eot_id|> to close it.
+    void close_assistant_turn() {
+        int next = -1;
+        for (const int id : tok_->encode("<|eot_id|>", /*add_special=*/false)) {
+            if (pos_ >= max_context_) break;
+            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                blackwell::EngineStatus::Success)
+                break;
+            ++pos_;
+        }
+    }
+
+    // "[Speech] X | [Translation] Y" -> user text = X; a reply that does not
+    // match the format contract degrades to an "(audio)" placeholder user turn.
+    std::vector<int> encode_history_turn(const std::string& reply) const {
+        auto trim = [](const std::string& s) {
+            const auto b = s.find_first_not_of(" \t\r\n");
+            const auto e = s.find_last_not_of(" \t\r\n");
+            return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+        };
+        std::string user_text = "(audio)";
+        constexpr const char* kSpeech = "[Speech]";
+        const auto sp  = reply.find(kSpeech);
+        const auto cut = reply.find(" | [Translation]");
+        if (sp != std::string::npos && cut != std::string::npos && cut > sp) {
+            const auto beg = sp + std::char_traits<char>::length(kSpeech);
+            const std::string t = trim(reply.substr(beg, cut - beg));
+            if (!t.empty()) user_text = t;
+        }
+        const std::string turn =
+            std::string(kUserHeader) + user_text + "<|eot_id|>" +
+            "<|start_header_id|>assistant<|end_header_id|>\n\n" + reply + "<|eot_id|>";
+        return tok_->encode(turn, /*add_special=*/false);
+    }
+
+    // The amortized rebuild: rollback to the frozen system floor, then re-prefill
+    // ONLY the retained text turns. Costs one forward_status per retained token
+    // (<= the budget), which is why finalize_turn defers it until the context
+    // headroom demands it.
+    void rebuild_history_kv() {
+        const bool dbg = std::getenv("BLACKWELL_AV_DEBUG") != nullptr;
+        const int floor = static_cast<int>(system_prefix_tokens());
+        kv_cache_rollback({floor, verified_prompt_tokens_});
+        if (audio_pipeline_) audio_pipeline_->reset_history();
+        int next = -1;
+        for (const TurnRecord& t : turn_history_) {
+            for (const int id : t.ids) {
+                if (pos_ >= max_context_) break;
+                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                    blackwell::EngineStatus::Success)
+                    break;
+                ++pos_;
+            }
+        }
+        history_base_pos_.store(pos_, std::memory_order_relaxed);
+        if (dbg) {
+            std::printf("[context] history rebuild: %zu turn(s), %zu text tok -> base=%d\n",
+                        turn_history_.size(), history_text_tokens_, pos_);
+            std::fflush(stdout);
+        }
+    }
+
     // Drain the buffered utterance PCM from the stream ring (engine-thread consumer),
     // run WhisperDSP -> [128,3000] log-mel -> prefill_ultravox_turn (audio soft-tokens)
     // -> stream the assistant reply through the sink, checking cancelled(gen) before
@@ -595,22 +836,32 @@ private:
         const float* d_mel = stage_logmel(pcm_stage_);
         int next = -1;
         if (prefill_ultravox_turn(d_mel, &next) != blackwell::EngineStatus::Success) {
+            finalize_turn(std::string(), /*completed=*/false);  // drop the partial prefill
             clear_in_flight();
             return finish(cmd, 0);
         }
 
         int emitted = 0;
+        std::string reply;
+        bool interrupted = false;
+        bool faulted = false;
         while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) break;              // wait-free barge-in abort
+            if (cancelled(cmd.gen)) { interrupted = true; break; }  // wait-free barge-in
             if (tok_->is_stop(next)) break;
             const std::string piece = tok_->decode(next, /*render_special=*/false);
-            if (!piece.empty()) cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
+            if (!piece.empty()) {
+                cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
+                reply += piece;
+            }
             ++emitted;
             if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
-                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
+                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success) {
+                faulted = true;
                 break;
+            }
             ++pos_;
         }
+        finalize_turn(reply, /*completed=*/!interrupted && !faulted);
         clear_in_flight();
         return finish(cmd, emitted);
     }
@@ -641,6 +892,20 @@ private:
     uint32_t verified_prompt_tokens_ = 0;     // committed-prefix boundary (checkpoint/rollback)
     std::atomic<uint32_t> last_rewind_keep_{0};
     std::atomic<std::size_t> turn_counter_{0};
+
+    // ---- text-context policy (UI thread writes, engine thread reads at turn
+    //      boundaries; see the ContextMode section) ----------------------------
+    std::atomic<int> mode_{static_cast<int>(ContextMode::Stateless)};
+    std::atomic<int> history_budget_tokens_{256};
+    std::atomic<int> src_lang_{0};            // rt::kLanguages index (0 = Auto)
+    std::atomic<int> tgt_lang_{0};            // rt::kLanguages index (0 = Auto)
+
+    // Bounded-history state. The deque/counter are engine-thread-only; the base
+    // position is atomic solely for the cross-thread invariant readout (the
+    // engine thread is its only writer).
+    std::deque<TurnRecord> turn_history_;
+    std::size_t history_text_tokens_ = 0;     // sum of turn_history_ id counts
+    std::atomic<int> history_base_pos_{0};    // system floor + retained turns
 
     // Audio frontend (owned; loaded lazily via load_audio_head). Both are driven
     // only from the engine-owning thread; the pipeline runs on its own stream.

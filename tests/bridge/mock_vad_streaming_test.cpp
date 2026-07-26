@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -51,6 +52,7 @@ public:
         set_system_prefix_tokens(n);
         kv_.assign(n, kSysToken);
         pos_ = static_cast<int>(n);
+        history_base_ = pos_;   // no retained history yet (== RealEngineControl)
     }
 
     // Append one sliding-window chunk's delta soft-tokens (the newly generated
@@ -74,12 +76,44 @@ public:
     int      pos() const { return pos_; }
     uint32_t verified_tokens() const { return verified_tokens_; }
 
+    // ---- Bounded-history additions: arithmetic-identical to RealEngineControl --
+
+    // The retained-history base (system prefix + retained turns) a barge-in
+    // rewind must honour; RealEngineControl advances it at turn boundaries.
+    void set_history_base(int base) { history_base_ = base; }
+    int  history_base() const { return history_base_; }
+
+    // Mirrors RealEngineControl::do_rewind's keep resolution: the requested keep
+    // is clamped up to the system-prefix floor AND the retained-history base.
+    uint32_t resolve_rewind_keep(uint32_t requested) const {
+        uint32_t keep = effective_keep_tokens(requested);
+        const auto base = static_cast<uint32_t>(history_base_);
+        return keep < base ? base : keep;
+    }
+
+    // Stateless end-of-turn flush: rollback to the base (== system floor when no
+    // history is retained). Mirrors finalize_turn's non-bounded branch.
+    void flush_turn() { rollback({history_base_, verified_tokens_}); }
+
 private:
     static constexpr int kSysToken = -1;   // sentinel for a frozen system-prefix slot
     std::vector<int> kv_;
     int      pos_ = 0;
+    int      history_base_ = 0;
     uint32_t verified_tokens_ = 0;
 };
+
+// Mirrors finalize_turn's deque pruning: drop OLDEST records until the total is
+// within the budget. Returns the retained total.
+std::size_t prune_to_budget(std::deque<std::vector<int>>& turns, std::size_t budget) {
+    std::size_t total = 0;
+    for (const auto& t : turns) total += t.size();
+    while (!turns.empty() && total > budget) {
+        total -= turns.front().size();
+        turns.pop_front();
+    }
+    return total;
+}
 
 // A scripted utterance fed as 320 ms sliding-window hops: each chunk contributes
 // two delta soft-tokens (the default hop_tokens of SlidingWindowConfig).
@@ -161,4 +195,62 @@ TEST(MockVadStreaming, RollbackRestoresVerifiedTokenBoundary) {
     b.rollback(cp);
     EXPECT_EQ(b.verified_tokens(), 2u);
     EXPECT_EQ(b.pos(), cp.pos);
+}
+
+// ---- Stateless text-context mode (Live Translator) --------------------------
+// Every turn (audio soft-tokens + generated reply) is flushed after decode: N
+// turns later the KV must be byte-identical to the freshly-prefilled prefix —
+// zero accumulation, which is the whole point of the mode (no transliteration
+// feedback loops, no silent dead-stop at max_context).
+TEST(MockVadStreaming, StatelessModeFlushesEveryTurnWithNoResidue) {
+    MockVadStreamingBridge b;
+    b.prefill_system_prompt(kSystemPrefix);
+    const std::vector<int> pristine = b.kv();
+
+    for (int turn = 0; turn < 50; ++turn) {
+        for (const auto& c : kChunks) b.feed_chunk(c);      // audio user turn
+        b.feed_chunk({500 + turn, 501 + turn, 502 + turn}); // generated reply
+        b.flush_turn();                                     // finalize_turn (stateless)
+        EXPECT_EQ(b.pos(), static_cast<int>(kSystemPrefix));
+        EXPECT_EQ(b.kv(), pristine);
+    }
+}
+
+// ---- Bounded-history mode (Voice Assistant) ---------------------------------
+// A barge-in rewind must clamp UP to the retained-history base, not just the
+// system prefix: retained turns are committed context and must survive the
+// micro-rewind (RealEngineControl::do_rewind's second clamp).
+TEST(MockVadStreaming, BargeInRewindHonoursHistoryBase) {
+    MockVadStreamingBridge b;
+    b.prefill_system_prompt(kSystemPrefix);
+    b.feed_chunk({70, 71, 72, 73});                         // a retained turn's tokens
+    b.set_history_base(b.pos());                            // turn boundary advanced the base
+
+    // A raw barge-in asks to keep only the verified prompt (often 0/the system
+    // prefix); both must resolve to the history base, never below it.
+    EXPECT_EQ(b.resolve_rewind_keep(0), static_cast<uint32_t>(kSystemPrefix) + 4u);
+    EXPECT_EQ(b.resolve_rewind_keep(kSystemPrefix), static_cast<uint32_t>(kSystemPrefix) + 4u);
+    // A keep ABOVE the base still wins (a rewind may keep more, never less).
+    EXPECT_EQ(b.resolve_rewind_keep(kSystemPrefix + 10u), static_cast<uint32_t>(kSystemPrefix) + 10u);
+}
+
+// The budget pruning drops the OLDEST turns first and retains the maximal
+// most-recent suffix that fits — exactly finalize_turn's deque arithmetic.
+TEST(MockVadStreaming, HistoryBudgetPrunesOldestTurnsFirst) {
+    std::deque<std::vector<int>> turns;
+    turns.push_back(std::vector<int>(100, 1));   // oldest
+    turns.push_back(std::vector<int>(90, 2));
+    turns.push_back(std::vector<int>(80, 3));    // newest
+
+    const std::size_t total = prune_to_budget(turns, /*budget=*/200);
+    ASSERT_EQ(turns.size(), 2u);                 // the 100-token turn was evicted
+    EXPECT_EQ(turns.front().front(), 2);         // retention is a most-recent suffix
+    EXPECT_EQ(turns.back().front(), 3);
+    EXPECT_EQ(total, 170u);
+
+    // A budget smaller than the newest turn empties the history entirely (the
+    // while loop has no "keep at least one" exemption — mirrors the impl).
+    const std::size_t total2 = prune_to_budget(turns, /*budget=*/50);
+    EXPECT_TRUE(turns.empty());
+    EXPECT_EQ(total2, 0u);
 }

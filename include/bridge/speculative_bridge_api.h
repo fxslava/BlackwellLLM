@@ -140,6 +140,14 @@ BRIDGE_API BridgeStatus speech_pipeline_on_speech_start(SpeechPipelineHandle han
  * decode loop, entering DECODE_TRANSLATING. No-op unless PREFILL_SPEAKING. */
 BRIDGE_API BridgeStatus speech_pipeline_on_silence_timeout(SpeechPipelineHandle handle);
 
+/* Retune the auto-commit silence hangover at RUNTIME (a UI slider seam).
+ * Lock-free (one atomic store; the VAD reads it per 10 ms block), callable from
+ * any thread, takes effect on the next VAD block. 0 disables the auto-commit
+ * entirely (manual/push-to-talk only). ADDITIVE ABI: existing callers that never
+ * call this keep the construction-time SpeechPipelineConfig value. */
+BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHandle handle,
+                                                                uint32_t silence_hangover_ms);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

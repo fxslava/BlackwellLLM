@@ -58,16 +58,20 @@
 #include "bridge_internal.hpp"       // bridge_wrap_engine / bridge_release_engine
 
 #include "cli_config.hpp"
+#include "control_panel.hpp"
 #include "real_engine_control.hpp"
 #include "transcript_view.hpp"
 
 namespace {
 
 // The frozen system instruction. Prefilled ONCE at startup; its KV prefix is never
-// truncated by a barge-in rewind (the prefix-cache floor).
+// truncated by a barge-in rewind (the prefix-cache floor). Deliberately
+// LANGUAGE-NEUTRAL (format contract only): the source/target languages are
+// runtime-selectable, so their directives live in the per-turn user prefix
+// (RealEngineControl::build_user_instruction), never in this frozen prefix.
 constexpr const char* kSystemPrompt =
     "You are a real-time speech translator. Transcribe the audio verbatim and "
-    "provide its translation into Russian in the format: "
+    "provide its translation in the format: "
     "[Speech] <transcript> | [Translation] <translation>";
 
 // The persistent KV budget (tokens). Utterances are short; a small context keeps
@@ -208,8 +212,14 @@ int main(int argc, char** argv) {
             req.audio_streaming.window_size_ms = args.stream_window_ms;
             req.audio_streaming.hop_size_ms    = args.stream_hop_ms;
             req.audio_streaming.max_reconciliation_rewind_tokens = args.stream_rewind_cap;
+            req.source_language = args.src_lang;
+            req.target_language = args.tgt_lang;
             BlackwellEngine engine(args.model_dir + "/model.safetensors.index.json", req);
             rt::RealEngineControl control(&engine, tokenizer.get(), static_cast<int>(kMaxContext));
+            control.set_context_mode(args.context_mode == "bounded"
+                                         ? rt::RealEngineControl::ContextMode::BoundedHistory
+                                         : rt::RealEngineControl::ContextMode::Stateless);
+            control.set_history_budget_tokens(args.history_budget_tokens);
             std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
             std::fflush(stdout);
             control.load_audio_head(args.audio_head);
@@ -265,13 +275,26 @@ int main(int argc, char** argv) {
         std::unique_ptr<blackwell::ITokenizer> tokenizer =
             blackwell::TokenizerFactory::create(args.model_dir);
         const std::string index_path = args.model_dir + "/model.safetensors.index.json";
-        BlackwellEngine engine(index_path, kMaxContext);   // INIT tier: throws on OOM/bad index
+        // Tier-2 request: context budget + the forced-language startup defaults
+        // (the ImGui dropdowns override them live). INIT tier: throws on OOM/bad index.
+        blackwell::InferenceConfig req;
+        req.max_context_length = kMaxContext;
+        req.source_language = args.src_lang;
+        req.target_language = args.tgt_lang;
+        BlackwellEngine engine(index_path, req);
         std::printf("[engine] loaded (hidden=%d vocab=%d, ~5.3 GB VRAM resident)\n",
                     backbone.hidden_size, backbone.vocab_size);
 
         // ---- speech pipeline over the REAL engine (real control plane) ---------
         rt::RealEngineControl control(&engine, tokenizer.get(),
                                       static_cast<int>(kMaxContext));
+        control.set_context_mode(args.context_mode == "bounded"
+                                     ? rt::RealEngineControl::ContextMode::BoundedHistory
+                                     : rt::RealEngineControl::ContextMode::Stateless);
+        control.set_history_budget_tokens(args.history_budget_tokens);
+        std::printf("[context] mode=%s history-budget=%d src=%s tgt=%s\n",
+                    args.context_mode.c_str(), args.history_budget_tokens,
+                    args.src_lang.c_str(), args.tgt_lang.c_str());
 
         // ---- STEP 3b: audio head (Whisper encoder + Ultravox projector) --------
         // Load the audio frontend weights from --audio-head so the double-buffered
@@ -345,8 +368,15 @@ int main(int argc, char** argv) {
         realtime.start();
 
         // ---- UI: spectrogram + control panel + live transcript window ----------
+        // The settings panel talks ONLY to RealEngineControl atomics and lock-free
+        // speech_pipeline_* calls (never the engine) — UI thread stays doctrine-clean.
+        rt::ControlPanel settings(&control, pipe,
+                                  static_cast<int>(scfg.silence_hangover_ms));
         rt::WindowD2D window(spectrogram, recorder, L"Real-time Speech Translator");
-        window.set_extra_panel([&transcript] { transcript.draw(); });
+        window.set_extra_panel([&transcript, &settings] {
+            transcript.draw();
+            settings.draw();
+        });
         if (!window.create(/*client_w=*/1000, /*client_h=*/640)) {
             throw std::runtime_error("failed to create Direct2D window");
         }

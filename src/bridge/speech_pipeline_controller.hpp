@@ -41,6 +41,9 @@ public:
     void push_pcm(const float* samples, size_t count) noexcept;
     void on_speech_start() noexcept;     // barge-in: bump gen, cancel, rewind, -> PREFILL
     void on_silence_timeout() noexcept;  // commit soft-tokens + decode -> DECODE_TRANSLATING
+    // Runtime retune of the auto-commit hangover (UI slider seam). Any thread;
+    // one atomic store, effective on the next VAD block. 0 = auto-commit off.
+    void set_silence_hangover_ms(uint32_t ms) noexcept;
 
     // ---- Engine-thread bookkeeping hooks (called by the IEngineControl impl) -
     // The engine owns the exact token accounting; it publishes it here so the
@@ -72,9 +75,11 @@ private:
     IEngineControl* control_ = nullptr;
     AudioStreamHandle stream_ = nullptr;
 
-    // Derived VAD geometry (sample counts).
+    // Derived VAD geometry (sample counts). hangover_samples_ is atomic: it is
+    // the ONE knob retunable at runtime (set_silence_hangover_ms from the UI
+    // thread) while the audio thread reads it per 10 ms block.
     uint32_t block_size_ = 160;          // 10 ms @ sample_rate
-    uint32_t hangover_samples_ = 0;      // silence_hangover_ms -> samples
+    std::atomic<uint32_t> hangover_samples_{0};  // silence_hangover_ms -> samples (0 = off)
     uint32_t warm_interval_samples_ = 0; // warm_prefill_interval_ms -> samples (0 = disabled)
     float release_db_ = 0.0f;            // resolved hysteresis release threshold
 

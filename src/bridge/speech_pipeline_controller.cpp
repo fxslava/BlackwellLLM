@@ -34,8 +34,9 @@ SpeechPipelineController::SpeechPipelineController(const SpeechPipelineConfig& c
     : cfg_(cfg), control_(control), stream_(stream) {
     const uint32_t sr = (cfg_.sample_rate != 0) ? cfg_.sample_rate : 16000u;
     block_size_ = kVadBlock;
-    hangover_samples_ = static_cast<uint32_t>(
-        static_cast<uint64_t>(cfg_.silence_hangover_ms) * sr / 1000u);
+    hangover_samples_.store(static_cast<uint32_t>(
+        static_cast<uint64_t>(cfg_.silence_hangover_ms) * sr / 1000u),
+        std::memory_order_relaxed);
     warm_interval_samples_ = static_cast<uint32_t>(
         static_cast<uint64_t>(cfg_.warm_prefill_interval_ms) * sr / 1000u);
     // Hysteresis: release <= onset. 0 (unset) => no hysteresis (release == onset).
@@ -140,13 +141,16 @@ void SpeechPipelineController::vad_on_block(float db) noexcept {
             break;
 
         case SPEECH_STATE_PREFILL_SPEAKING: {
+            // The hangover is runtime-retunable (UI slider): one relaxed load per
+            // 10 ms block. 0 = auto-commit disabled (manual/push-to-talk only).
+            const uint32_t hangover = hangover_samples_.load(std::memory_order_relaxed);
             if (db > release_db_) {
                 silence_samples_.store(0, std::memory_order_relaxed);  // still speaking
             } else {
                 const uint32_t sil = silence_samples_.fetch_add(block_size_,
                                                                 std::memory_order_relaxed) +
                                      block_size_;
-                if (sil >= hangover_samples_) {  // stable boundary reached
+                if (hangover != 0 && sil >= hangover) {  // stable boundary reached
                     on_silence_timeout();
                     break;
                 }
@@ -173,6 +177,14 @@ void SpeechPipelineController::vad_on_block(float db) noexcept {
             // Transient; the next block re-evaluates once PREFILL_SPEAKING is set.
             break;
     }
+}
+
+// ---- runtime VAD retune -----------------------------------------------------
+void SpeechPipelineController::set_silence_hangover_ms(uint32_t ms) noexcept {
+    const uint32_t sr = (cfg_.sample_rate != 0) ? cfg_.sample_rate : 16000u;
+    hangover_samples_.store(
+        static_cast<uint32_t>(static_cast<uint64_t>(ms) * sr / 1000u),
+        std::memory_order_relaxed);
 }
 
 // ---- token adaptation -------------------------------------------------------
@@ -285,6 +297,13 @@ BRIDGE_API BridgeStatus speech_pipeline_on_speech_start(SpeechPipelineHandle han
 BRIDGE_API BridgeStatus speech_pipeline_on_silence_timeout(SpeechPipelineHandle handle) {
     if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
     to_ctrl(handle)->on_silence_timeout();
+    return BRIDGE_OK;
+}
+
+BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHandle handle,
+                                                                uint32_t silence_hangover_ms) {
+    if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
+    to_ctrl(handle)->set_silence_hangover_ms(silence_hangover_ms);
     return BRIDGE_OK;
 }
 

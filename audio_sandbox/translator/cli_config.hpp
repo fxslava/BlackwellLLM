@@ -23,6 +23,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "language_table.hpp"  // rt::kLanguages / language_index (--src-lang/--tgt-lang)
+
 namespace rt {
 
 // Resolved launch configuration (from argv, with an app-config fallback).
@@ -43,6 +45,11 @@ struct TranslatorArgs {
     int         stream_hop_ms    = 320;   // --stream-hop-ms    : new audio committed per hop
     int         stream_rewind_cap = 8;    // --stream-rewind-cap : max overlap tokens rewritten
                                           //   per hop (0 = append-only, no reconciliation)
+    std::string src_lang = "Auto";        // --src-lang : forced audio language ("Auto" = LID)
+    std::string tgt_lang = "Russian";     // --tgt-lang : forced translation target (the
+                                          //   pre-dropdown shipping behaviour was Russian)
+    std::string context_mode = "stateless";  // --context-mode : stateless | bounded
+    int         history_budget_tokens = 256; // --history-budget : bounded-mode text budget
     bool        have_model_dir = false;   // whether model_dir was resolved at all
     bool        have_audio_head = false;  // whether audio_head was resolved at all
 };
@@ -123,6 +130,26 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
             a.stream_hop_ms = std::stoi(next("--stream-hop-ms"));
         } else if (arg == "--stream-rewind-cap") {
             a.stream_rewind_cap = std::stoi(next("--stream-rewind-cap"));
+        } else if (arg == "--src-lang" || arg == "--tgt-lang") {
+            // Strict: a typo must abort, not silently degrade to Auto.
+            const std::string v = next(arg.c_str());
+            if (language_index(v) < 0) {
+                std::string known;
+                for (int k = 0; k < kLanguageCount; ++k)
+                    known += std::string(k ? ", " : "") + kLanguages[k];
+                throw std::runtime_error("unknown language for " + arg + ": '" + v +
+                                         "' (known: " + known + ")");
+            }
+            (arg == "--src-lang" ? a.src_lang : a.tgt_lang) = v;
+        } else if (arg == "--context-mode") {
+            a.context_mode = next("--context-mode");
+            if (a.context_mode != "stateless" && a.context_mode != "bounded")
+                throw std::runtime_error("--context-mode must be 'stateless' or 'bounded', got '" +
+                                         a.context_mode + "'");
+        } else if (arg == "--history-budget") {
+            a.history_budget_tokens = std::stoi(next("--history-budget"));
+            if (a.history_budget_tokens < 0)
+                throw std::runtime_error("--history-budget must be >= 0");
         } else if (!arg.empty() && arg[0] != '-') {
             a.data_dir = arg;  // positional: data dir (mel_filters.bin)
         } else {

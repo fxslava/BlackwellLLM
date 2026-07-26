@@ -147,6 +147,15 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
             "RuntimeConfig: kv_disk_slots > 0 requires a non-empty kv_spill_path "
             "(the NVMe spill tier needs a backing file)");
 
+    // --- forced translation languages -------------------------------------------
+    // Free-form pass-through (the frontend owns the language list and prompt
+    // construction); an empty request normalizes to the "auto" sentinel so tier-3
+    // consumers never observe an unset value.
+    rt.source_language =
+        request.source_language.empty() ? std::string("auto") : request.source_language;
+    rt.target_language =
+        request.target_language.empty() ? std::string("auto") : request.target_language;
+
     // --- audio streaming plan (ms intent -> validated soft-token counts) --------
     // Resolved when the frontend opts in (.enable) OR any streaming override is
     // present. Requests are in ms; one soft-token == kAudioSoftTokenMs, so the ms

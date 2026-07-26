@@ -85,6 +85,14 @@ struct InferenceConfig {
     // unless .enable is set (or a streaming override is present); resolved into
     // RuntimeConfig::audio_streaming.
     AudioStreamingConfig audio_streaming;
+
+    // Forced translation languages for speech frontends (startup defaults the
+    // app's runtime language selectors may later override). Free-form English
+    // language names ("Russian", "German", ...); "auto" = no forcing. The core
+    // only carries the intent — prompt construction from it is the frontend's
+    // job, so no closed language list is validated here.
+    std::string source_language = "auto";
+    std::string target_language = "auto";
 };
 
 // Resolved streaming plan (tier 3): ms intent expanded to whole soft-token counts,
@@ -151,6 +159,11 @@ struct RuntimeConfig {
 
     // --- audio streaming plan (resolved from InferenceConfig::audio_streaming) ---
     AudioStreamingPlan audio_streaming;
+
+    // --- forced translation languages (from InferenceConfig; never empty here:
+    //     an unset request normalizes to the "auto" sentinel) ---
+    std::string source_language = "auto";
+    std::string target_language = "auto";
 };
 
 // Optional low-level overrides applied AFTER the automatic plan is derived but
