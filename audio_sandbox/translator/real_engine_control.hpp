@@ -13,32 +13,38 @@
 //   edge (cancel_generation / rewind_kv / warm_prefill / commit_and_decode) on
 //   the base class — it never reaches into here and never touches CUDA.
 //
-// THE AUDIO-ENCODER SEAM (the one remaining blocker, documented, not faked)
+// THE AUDIO PATH (encoder + double-buffered pipeline now real; feed is the seam)
 //   The full multimodal path is  live PCM -> Whisper log-mel (whisper_dsp) ->
-//   Whisper ENCODER (audio_tower) -> Ultravox projector -> inject_audio_
-//   embeddings at token 128256 -> prefill-from-embeddings -> decode. The Whisper
-//   *encoder* transformer that turns log-mel [128,N] into encoder hidden states
-//   [1500,1280] is NOT implemented (src/audio/kernels/ is empty; see
-//   ULTRAVOX_AUDIO_PLAN.md Phase 1). Until it lands there is no live audio->text
-//   content. do_commit_decode therefore runs a REAL text decode from the frozen
-//   system prefix (streaming genuine model output), and the projector splice is
-//   left as run_audio_prefill_seam() — wired to the real projector but never fed,
-//   with the exact drop-in point marked. This is the honest maximum: the whole
-//   GPU decode + streaming + barge-in path is real; only the audio CONTENT is the
-//   seam.
+//   Whisper ENCODER (audio_tower) -> Ultravox projector -> prefill-from-embeddings
+//   -> decode. The encoder (src/audio/whisper_encoder.*) and the async
+//   double-buffered pipeline (AudioEmbeddingPipeline + PingPongAudioBuffer) are
+//   now implemented and unit-tested (tests/integration/test_audio_pingpong_
+//   pipeline). prefill_audio_embeddings() below is the CONSUMER edge: it gates the
+//   engine's stream on the producer's ready event (cudaStreamWaitEvent, no host
+//   sync) and prefills the staged [num_audio, hidden] embeddings into the KV via
+//   the white-box step_* sweep. The engine's public API + decode loop stay
+//   untouched (hard rule). The ONE remaining seam is the live wiring in main.cpp:
+//   the DSP log-mel frames are not yet fed into the pipeline, so do_commit_decode
+//   still runs a REAL text decode from the frozen system prefix (genuine model
+//   output). Everything except that feed -- encode, project, double-buffer
+//   handoff, embedding prefill, decode, streaming, barge-in -- is real.
 // -----------------------------------------------------------------------------
 #include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "blackwell/engine.h"           // BlackwellEngine, blackwell::EngineStatus
 #include "blackwell/tokenizer.h"        // blackwell::ITokenizer, ChatMessage
 
+#include "common.h"                     // CUDA_CHECK_THROW
+#include "engine_impl.h"                // BlackwellEngine::Impl (white-box step_* + d_X_accum)
+#include "ping_pong_audio_buffer.h"     // blackwell::audio::PingPongAudioBuffer
+
 #include "engine_control_bridge.hpp"    // EngineControlBridge, Command
 #include "bridge/engine_api.h"          // BRIDGE_OK for the token sink
-
-namespace blackwell::audio { class UltravoxProjector; }
 
 namespace rt {
 
@@ -152,13 +158,58 @@ protected:
         return finish(cmd, emitted);
     }
 
-    // The drop-in seam for the real audio path. When the Whisper encoder lands,
-    // this runs: projector_->forward(encoder_hidden) -> audio_embeds ->
-    // inject_audio_embeddings at token 128256 -> prefill-from-embeddings (the
-    // granular step_* sweep, cf. tests/integration/test_ultravox8b_full_pipeline)
-    // -> return the position to decode from. It is intentionally never called
-    // today (no encoder feeds the projector); kept to pin the integration point.
-    int run_audio_prefill_seam() { return pos_; }
+    // Consume audio embeddings that the audio pipeline (Stream 1: WhisperEncoder
+    // -> UltravoxProjector, src/audio) has staged into pp.slot(frame) as
+    // [num_audio, hidden] soft-tokens. This is the CONSUMER edge of the
+    // double-buffered async handoff:
+    //
+    //   1. pp.consumer_acquire(frame, 0) makes the engine's own (default) stream
+    //      WAIT on the producer's ready event -- pure cudaStreamWaitEvent, no host
+    //      sync -- so Stream 1 can already be encoding the NEXT frame.
+    //   2. Each embedding row is injected into the residual stream (d_X_accum) and
+    //      prefilled into the KV via the white-box step_* sweep, exactly as the
+    //      injected-embedding path (tests/integration/test_llama8b_fp8_integration).
+    //      The engine's public API and decode loop are UNTOUCHED (hard rule).
+    //   3. pp.consumer_release(frame, 0) frees the slot for the producer (frame+2).
+    //
+    // Returns the decode position after the audio block; the caller then decodes
+    // the assistant turn from here with forward_status. NOTE: this is wired and
+    // unit-tested at the buffer/handoff level (tests/integration/
+    // test_audio_pingpong_pipeline), but not yet driven from the live UI loop --
+    // the remaining seam is the DSP log-mel -> pipeline feed in main.cpp.
+    int prefill_audio_embeddings(blackwell::audio::PingPongAudioBuffer& pp,
+                                 long long frame, int num_audio) {
+        auto* core = engine_->get_impl();
+        const int hidden = static_cast<int>(core->m_config.hidden_dim);
+        const int num_layers = static_cast<int>(core->m_config.num_layers);
+
+        pp.consumer_acquire(frame, /*engine default stream=*/nullptr);
+
+        for (int a = 0; a < num_audio && pos_ < max_context_; ++a, ++pos_) {
+            CUDA_CHECK_THROW(cudaMemcpyAsync(
+                core->d_X_accum, pp.slot(frame) + static_cast<size_t>(a) * hidden,
+                static_cast<size_t>(hidden) * sizeof(float),
+                cudaMemcpyDeviceToDevice, /*stream 0*/ nullptr));
+            core->kv_mgr->prepare_decode_step(cfg_.seq_id, pos_);
+
+            bool ok = true;
+            for (int l = 0; l < num_layers && ok; ++l) {
+                using S = blackwell::EngineStatus;
+                ok = core->step_attention_norm(l) == S::Success
+                  && core->step_attention_qkv_projections(l) == S::Success
+                  && core->step_attention_math(l, pos_) == S::Success
+                  && core->step_attention_out(l) == S::Success
+                  && core->step_mlp_norm(l) == S::Success
+                  && core->step_mlp_projections(l) == S::Success
+                  && core->step_mlp_out(l) == S::Success;
+            }
+            if (ok) ok = core->step_final_ops() == blackwell::EngineStatus::Success;
+            if (!ok) break;
+        }
+
+        pp.consumer_release(frame, /*stream 0*/ nullptr);
+        return pos_;
+    }
 
 private:
     // Emit the final callback (clean supersede or cap/fault both report OK to the

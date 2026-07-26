@@ -130,7 +130,8 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     target_include_directories(audio_translator PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/translator  # transcript_view.hpp, mock_engine_control.hpp
         ${CMAKE_SOURCE_DIR}/src                  # common.h
-        ${CMAKE_SOURCE_DIR}/src/core             # device_buffer.h (transitive)
+        ${CMAKE_SOURCE_DIR}/src/core             # device_buffer.h, engine_impl.h (white-box step_*)
+        ${CMAKE_SOURCE_DIR}/src/audio            # ping_pong_audio_buffer.h (audio prefill consumer)
         ${CMAKE_SOURCE_DIR}/src/bridge)          # engine_control_bridge.hpp, bridge_internal.hpp
 
     # whisper_dsp/sandbox_headers/imgui = the sandbox front-end (SYSTEM includes
