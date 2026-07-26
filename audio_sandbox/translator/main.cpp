@@ -50,6 +50,7 @@
 #include "window_d2d.h"
 
 #include "blackwell/engine.h"        // BlackwellEngine
+#include "blackwell/runtime_config.h" // blackwell::InferenceConfig (streaming opt-in)
 #include "blackwell/tokenizer.h"     // blackwell::TokenizerFactory / ITokenizer
 
 #include "bridge/engine_api.h"
@@ -134,6 +135,7 @@ int main(int argc, char** argv) {
             constexpr int kConvFrames = 3000;                 // Whisper large-v3-turbo 30 s
             const int nmb = projector.num_mel_bins;
             std::vector<float> mel_in(static_cast<size_t>(nmb) * kConvFrames, 0.0f);
+            int real_frames = kConvFrames;   // unpadded log-mel length (for --streaming)
 
             if (!args.features_path.empty()) {
                 std::ifstream f(args.features_path, std::ios::binary | std::ios::ate);
@@ -150,6 +152,7 @@ int main(int argc, char** argv) {
 
                 // WAV -> mono PCM, padded/trimmed to 30 s so the DSP emits 3000 frames.
                 std::vector<float> pcm = rt::load_wav_mono16k(args.wav_path);
+                const size_t orig_pcm_samples = pcm.size();   // pre-pad: real audio length
                 {   // PCM range check: normalized f32 audio must sit in [-1, 1].
                     float pmin = 0.f, pmax = 0.f; double psum = 0.0;
                     for (float s : pcm) { pmin = std::min(pmin, s); pmax = std::max(pmax, s); psum += std::abs(s); }
@@ -162,6 +165,9 @@ int main(int argc, char** argv) {
                 pcm.resize(k30s, 0.0f);
                 const whisper::LogMel mel = dsp.process(pcm);
                 const int nf = std::min(mel.n_frames, kConvFrames);
+                // The unpadded mel length --streaming slides over (Whisper hop = 160
+                // samples/frame). Clamp to nf so a >30 s clip still fits the buffer.
+                real_frames = std::min(nf, static_cast<int>(orig_pcm_samples / 160) + 1);
                 for (int m = 0; m < nmb; ++m)
                     std::copy(mel.data.begin() + static_cast<size_t>(m) * mel.n_frames,
                               mel.data.begin() + static_cast<size_t>(m) * mel.n_frames + nf,
@@ -194,7 +200,15 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             std::unique_ptr<blackwell::ITokenizer> tokenizer =
                 blackwell::TokenizerFactory::create(args.model_dir);
-            BlackwellEngine engine(args.model_dir + "/model.safetensors.index.json", kMaxContext);
+            // --streaming arms the sliding-window + dynamic overlap reconciliation
+            // plan in the engine's resolved RuntimeConfig; default stays whole-utterance.
+            blackwell::InferenceConfig req;
+            req.max_context_length = kMaxContext;
+            req.audio_streaming.enable = args.streaming;
+            req.audio_streaming.window_size_ms = args.stream_window_ms;
+            req.audio_streaming.hop_size_ms    = args.stream_hop_ms;
+            req.audio_streaming.max_reconciliation_rewind_tokens = args.stream_rewind_cap;
+            BlackwellEngine engine(args.model_dir + "/model.safetensors.index.json", req);
             rt::RealEngineControl control(&engine, tokenizer.get(), static_cast<int>(kMaxContext));
             std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
             std::fflush(stdout);
@@ -207,9 +221,12 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("cudaMemcpy log-mel H2D failed");
 
             const uint32_t nsys = control.prefill_system_prompt(kSystemPrompt);
-            std::printf("[system-prefix] %u tokens; running audio prefill + decode ...\n", nsys);
+            std::printf("[system-prefix] %u tokens; running audio prefill + decode (%s) ...\n",
+                        nsys, args.streaming ? "streaming/reconciled" : "whole-utterance");
             std::fflush(stdout);
-            const std::string text = control.transcribe(d_mel.get(), args.max_new_tokens);
+            const std::string text = args.streaming
+                ? control.transcribe_streaming(d_mel.get(), nmb, real_frames, args.max_new_tokens)
+                : control.transcribe(d_mel.get(), args.max_new_tokens);
             std::printf("\n===== AUDIO -> TEXT =====\n%s\n=========================\n", text.c_str());
             return text.empty() ? 3 : 0;
         } catch (const std::exception& e) {

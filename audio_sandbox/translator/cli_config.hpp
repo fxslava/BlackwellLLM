@@ -37,6 +37,12 @@ struct TranslatorArgs {
     std::string features_path;         // --features : headless inference on a precomputed
                                        //   log-mel .bin [n_mels,3000] (bypasses WhisperDSP)
     int         max_new_tokens = 64;   // --max-new-tokens : decode cap (headless/live)
+    bool        streaming = false;      // --streaming : sliding-window + dynamic overlap
+                                        //   reconciliation prefill (headless --wav path)
+    int         stream_window_ms = 2240;  // --stream-window-ms : sliding acoustic window
+    int         stream_hop_ms    = 320;   // --stream-hop-ms    : new audio committed per hop
+    int         stream_rewind_cap = 8;    // --stream-rewind-cap : max overlap tokens rewritten
+                                          //   per hop (0 = append-only, no reconciliation)
     bool        have_model_dir = false;   // whether model_dir was resolved at all
     bool        have_audio_head = false;  // whether audio_head was resolved at all
 };
@@ -109,6 +115,14 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
             a.features_path = next("--features");
         } else if (arg == "--max-new-tokens") {
             a.max_new_tokens = std::stoi(next("--max-new-tokens"));
+        } else if (arg == "--streaming") {
+            a.streaming = true;
+        } else if (arg == "--stream-window-ms") {
+            a.stream_window_ms = std::stoi(next("--stream-window-ms"));
+        } else if (arg == "--stream-hop-ms") {
+            a.stream_hop_ms = std::stoi(next("--stream-hop-ms"));
+        } else if (arg == "--stream-rewind-cap") {
+            a.stream_rewind_cap = std::stoi(next("--stream-rewind-cap"));
         } else if (!arg.empty() && arg[0] != '-') {
             a.data_dir = arg;  // positional: data dir (mel_filters.bin)
         } else {

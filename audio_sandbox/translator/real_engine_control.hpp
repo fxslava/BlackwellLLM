@@ -51,6 +51,7 @@
 #include "engine_impl.h"                // BlackwellEngine::Impl (white-box step_* + d_X_accum)
 #include "ping_pong_audio_buffer.h"     // blackwell::audio::PingPongAudioBuffer
 #include "audio_embedding_pipeline.h"   // blackwell::audio::AudioEmbeddingPipeline
+#include "sliding_audio_window.h"       // blackwell::audio::kMelFramesPerSoftToken
 #include "audio_head_loader.hpp"        // rt::load_audio_pipeline
 
 #include "engine_control_bridge.hpp"    // EngineControlBridge, Command
@@ -267,6 +268,70 @@ public:
         return out;
     }
 
+    // Streaming transcribe (dynamic overlap reconciliation). Frames the user turn,
+    // then slides a [history + hop] window across the utterance's log-mel
+    // [num_mel_bins, total_frames] (device, mel-major), feeding each window through
+    // prefill_audio_hop -- cold-start seeds the whole first window, later hops append
+    // only the (reconciled) delta -- then decodes the assistant reply. Requires the
+    // resolved streaming plan to be enabled (else returns empty; the caller falls
+    // back to transcribe()). Engine thread only.
+    std::string transcribe_streaming(const float* d_mel_full, int num_mel_bins,
+                                     int total_frames, int max_new_tokens) {
+        const auto& plan = engine_->get_impl()->m_runtime.audio_streaming;
+        if (!plan.enabled || !audio_head_loaded() || total_frames <= 0) return std::string();
+        const int W   = plan.window_tokens * blackwell::audio::kMelFramesPerSoftToken;
+        const int hop = plan.hop_tokens    * blackwell::audio::kMelFramesPerSoftToken;
+
+        int next = -1;
+        auto prefill_ids = [&](const std::vector<int>& ids) -> bool {
+            for (const int id : ids) {
+                if (pos_ >= max_context_) return false;
+                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                    blackwell::EngineStatus::Success) return false;
+                ++pos_;
+            }
+            return true;
+        };
+        const std::vector<int> user_hdr = tok_->encode(
+            "<|start_header_id|>user<|end_header_id|>\n\nTranscribe the following audio: ", false);
+        const std::vector<int> user_eot = tok_->encode("<|eot_id|>", false);
+        const std::vector<int> gen_cue  = tok_->encode_generation_prompt();
+        if (!prefill_ids(user_hdr)) return std::string();
+
+        // Slide the window across [0, total_frames) in `hop`-frame steps; each hop
+        // reconciles its overlap against the injected history and appends the delta.
+        const std::size_t stage_elems = static_cast<std::size_t>(num_mel_bins) * W;
+        if (d_window_stage_.count() != stage_elems) d_window_stage_.allocate(stage_elems);
+        audio_pipeline_->reset_history();
+        for (int e = std::min(W, total_frames); ; e += hop) {
+            const int end    = std::min(e, total_frames);
+            const int start  = std::max(0, end - W);
+            const int frames = end - start;
+            // Extract the contiguous [num_mel_bins, frames] window (mel-major slice).
+            CUDA_CHECK_THROW(cudaMemcpy2D(
+                d_window_stage_.get(), static_cast<std::size_t>(frames) * sizeof(float),
+                d_mel_full + start,    static_cast<std::size_t>(total_frames) * sizeof(float),
+                static_cast<std::size_t>(frames) * sizeof(float),
+                static_cast<std::size_t>(num_mel_bins), cudaMemcpyDeviceToDevice));
+            // `start` is the window's absolute mel-frame offset -> monotonic positions.
+            prefill_audio_hop(d_window_stage_.get(), frames, /*mel_frame_offset=*/start);
+            if (end >= total_frames) break;
+        }
+
+        if (!prefill_ids(user_eot)) return std::string();
+        if (!prefill_ids(gen_cue))  return std::string();
+
+        std::string out;
+        for (int i = 0; i < max_new_tokens && pos_ < max_context_; ++i) {
+            if (tok_->is_stop(next)) break;
+            out += tok_->decode(next, /*render_special=*/false);
+            if (engine_->forward_status(next, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                blackwell::EngineStatus::Success) break;
+            ++pos_;
+        }
+        return out;
+    }
+
 protected:
     // Barge-in micro-rewind. The 8B AWQ backbone runs Continuous KV: the resident
     // slabs are position-addressed and overwritten in place, so re-anchoring pos_ is
@@ -458,18 +523,27 @@ protected:
     //   * stable     -> inject only the tail delta (hop_tokens).
     // Then record what was committed. Returns pos_ after the hop. Engine thread only;
     // no-op reconcile (plan disabled) degenerates to Phase-1 tail-slicing.
-    int prefill_audio_hop(const float* d_mel, int mel_frames) {
-        const auto win = audio_pipeline_->encode_project_window(d_mel, mel_frames);
+    int prefill_audio_hop(const float* d_mel, int mel_frames, int mel_frame_offset = 0) {
+        const auto win = audio_pipeline_->encode_project_window(d_mel, mel_frames,
+                                                               mel_frame_offset);
         // The projector ran on the audio stream; make its output visible to the
         // host-side reconcile (D2H) and the stream-0 injection below.
         CUDA_CHECK_THROW(cudaStreamSynchronize(audio_pipeline_->audio_stream()));
 
         const auto& plan = engine_->get_impl()->m_runtime.audio_streaming;
+        // Cold start (no injected history yet): seed the ENTIRE window -- there is no
+        // overlap to reconcile, and injecting only the tail delta would drop the
+        // window's leading context. Subsequent hops append deltas / reconcile.
+        const bool cold = audio_pipeline_->history_size() == 0;
         const blackwell::audio::ReconciliationPlan rec =
-            audio_pipeline_->reconcile(win.embeds, win.num_tokens);
+            cold ? blackwell::audio::ReconciliationPlan{}
+                 : audio_pipeline_->reconcile(win.embeds, win.num_tokens);
 
         int start_row = 0, count = win.num_tokens;
-        if (rec.diverged) {
+        if (cold) {
+            start_row = 0;
+            count     = win.num_tokens;
+        } else if (rec.diverged) {
             kv_cache_rollback({rec.rewind_to_pos, verified_prompt_tokens_});
             start_row = rec.refill_from;
             count     = win.num_tokens - rec.refill_from;
@@ -579,6 +653,7 @@ private:
     std::vector<float>          pcm_stage_;
     std::vector<float>          mel_stage_;
     blackwell::DeviceBuffer<float> d_mel_;
+    blackwell::DeviceBuffer<float> d_window_stage_;   // contiguous sliding-window slice
 };
 
 }  // namespace rt
