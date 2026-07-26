@@ -29,13 +29,19 @@
 //   output). Everything except that feed -- encode, project, double-buffer
 //   handoff, embedding prefill, decode, streaming, barge-in -- is real.
 // -----------------------------------------------------------------------------
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
+
+#include "whisper_dsp.h"                // whisper::WhisperDSP (live mic log-mel)
 
 #include "blackwell/engine.h"           // BlackwellEngine, blackwell::EngineStatus
 #include "blackwell/tokenizer.h"        // blackwell::ITokenizer, ChatMessage
@@ -104,6 +110,14 @@ public:
         return audio_pipeline_ ? audio_pipeline_->out_frames() : 0;
     }
 
+    // Bind the CPU log-mel front-end (non-owning; outlives this object) used by the
+    // LIVE mic path to turn buffered utterance PCM into the encoder's [128,3000]
+    // input. Without it (or without an audio head) do_commit_decode falls back to a
+    // text-only decode. Engine-thread setup. NOTE: mel_filters.bin MUST be the
+    // freq-major [n_freqs,n_mels] layout WhisperDSP expects (the Ultravox dump's is
+    // the transpose — see the --wav diagnosis).
+    void set_dsp(whisper::WhisperDSP* dsp) noexcept { dsp_ = dsp; }
+
     // One live audio frame end-to-end (requires load_audio_head): PRODUCE the
     // embeddings on Stream 1 (encode + project + stage into the ping-pong) then
     // CONSUME on Stream 2 (event-gated step_* prefill into the KV). d_mel is a
@@ -115,6 +129,89 @@ public:
             prefill_audio_embeddings(*audio_pp_, audio_frame_, audio_pipeline_->out_frames());
         ++audio_frame_;
         return p;
+    }
+
+    // Prefill one Ultravox user turn whose content is the audio in d_mel: the
+    // audio soft-tokens ARE the placeholder, spliced between the user header and
+    // the turn close, followed by the assistant generation cue. The frozen system
+    // prompt (prefill_system_prompt) must already be prefilled. Advances pos_ and
+    // writes the first assistant token to decode into *first_token. Returns
+    // Success, or InvalidConfig if no audio head is loaded. Engine thread only.
+    //
+    //   [system prefix] <|start_header_id|>user<|end_header_id|>\n\n
+    //     {188 audio soft-tokens}  <|eot_id|>
+    //     <|start_header_id|>assistant<|end_header_id|>\n\n   -> decode
+    blackwell::EngineStatus prefill_ultravox_turn(const float* d_mel, int* first_token) {
+        if (!audio_head_loaded()) return blackwell::EngineStatus::InvalidConfig;
+        int next = -1;
+        auto prefill_ids = [&](const std::vector<int>& ids) -> bool {
+            for (const int id : ids) {
+                if (pos_ >= max_context_) return false;
+                if (engine_->forward_status(id, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
+                                            cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
+                    return false;
+                ++pos_;
+            }
+            return true;
+        };
+        // Strict Llama-3 template with an explicit instruction; the 188 audio
+        // soft-tokens occupy the <|audio|> placeholder slot (injected as embeddings,
+        // not as a literal token). Special-token strings are recognized by encode()
+        // (add_special=false: the BOS already lives in the frozen system prefix).
+        const std::string user_prefix =
+            "<|start_header_id|>user<|end_header_id|>\n\nTranscribe the following audio: ";
+        const std::string user_suffix = "<|eot_id|>";
+        const std::vector<int> user_hdr = tok_->encode(user_prefix, /*add_special=*/false);
+        const std::vector<int> user_eot = tok_->encode(user_suffix, false);
+        const std::vector<int> gen_cue  = tok_->encode_generation_prompt();
+
+        std::printf("[prompt] <sys:%d tok>%s<|audio x%d|>%s%s\n", pos_,
+                    user_prefix.c_str(), audio_pipeline_->out_frames(),
+                    user_suffix.c_str(), tok_->decode(gen_cue, /*render_special=*/true).c_str());
+        std::fflush(stdout);
+
+        if (!prefill_ids(user_hdr)) return blackwell::EngineStatus::StateMismatch;
+        prefill_audio(d_mel);  // the 188 audio embeddings occupy the placeholder slot
+
+        // DEBUG (env-gated; does a device sync, so keep it off the live hot path):
+        // confirm the injected audio embeddings are real (not zeros/noise).
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            const int H = static_cast<int>(engine_->get_impl()->m_config.hidden_dim);
+            std::vector<float> row(static_cast<size_t>(H));
+            cudaDeviceSynchronize();
+            cudaMemcpy(row.data(), audio_pp_->slot(audio_frame_ - 1),
+                       row.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            double n2 = 0.0, amax = 0.0;
+            for (float v : row) { n2 += static_cast<double>(v) * v; amax = std::max(amax, std::abs((double)v)); }
+            std::printf("[audio-embed] frame row0: L2=%.4f absmax=%.4f  [%.4f %.4f %.4f %.4f]\n",
+                        std::sqrt(n2), amax, row[0], row[1], row[2], row[3]);
+            std::fflush(stdout);
+        }
+
+        if (!prefill_ids(user_eot)) return blackwell::EngineStatus::StateMismatch;
+        if (!prefill_ids(gen_cue))  return blackwell::EngineStatus::StateMismatch;
+
+        *first_token = next;
+        return blackwell::EngineStatus::Success;
+    }
+
+    // Headless one-shot: prefill the audio turn (d_mel) and greedily decode up to
+    // max_new_tokens of the assistant reply, returning the detokenized text. Used
+    // by the --wav path; the live mic path streams the same decode via a sink.
+    std::string transcribe(const float* d_mel, int max_new_tokens) {
+        int next = -1;
+        if (prefill_ultravox_turn(d_mel, &next) != blackwell::EngineStatus::Success)
+            return std::string();
+        std::string out;
+        for (int i = 0; i < max_new_tokens && pos_ < max_context_; ++i) {
+            if (tok_->is_stop(next)) break;
+            out += tok_->decode(next, /*render_special=*/false);
+            if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
+                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
+                break;
+            ++pos_;
+        }
+        return out;
     }
 
 protected:
@@ -146,6 +243,12 @@ protected:
     // (the audio-derived transcript is the marked seam — see the header preamble);
     // everything downstream is the genuine GPU decode path.
     blackwell::EngineStatus do_commit_decode(const Command& cmd) override {
+        // LIVE AUDIO PATH: with an audio head + DSP bound, transcribe the buffered
+        // utterance (the SAME encode->project->prefill_audio->decode path the --wav
+        // mode proves) instead of the text placeholder below.
+        if (audio_head_loaded() && dsp_ != nullptr && cmd.stream != nullptr)
+            return commit_audio_decode(cmd);
+
         // Frame a user turn + assistant cue through the checkpoint's chat template,
         // then prefill it. Cycle a few prompts so the live GUI shows varied real
         // model output rather than one repeated answer.
@@ -254,6 +357,61 @@ private:
         return blackwell::EngineStatus::Success;
     }
 
+    // Drain the buffered utterance PCM from the stream ring (engine-thread consumer),
+    // run WhisperDSP -> [128,3000] log-mel -> prefill_ultravox_turn (audio soft-tokens)
+    // -> stream the assistant reply through the sink, checking cancelled(gen) before
+    // every token for wait-free barge-in. Mirrors the proven --wav transcribe path.
+    blackwell::EngineStatus commit_audio_decode(const Command& cmd) {
+        blackwell::bridge::AudioRingBuffer& ring = cmd.stream->ring;
+        const std::size_t avail = ring.available_samples();
+        if (avail == 0) { clear_in_flight(); return finish(cmd, 0); }
+        pcm_stage_.resize(avail);
+        const std::size_t got = ring.read_samples(pcm_stage_.data(), avail);
+        pcm_stage_.resize(got);
+
+        const float* d_mel = stage_logmel(pcm_stage_);
+        int next = -1;
+        if (prefill_ultravox_turn(d_mel, &next) != blackwell::EngineStatus::Success) {
+            clear_in_flight();
+            return finish(cmd, 0);
+        }
+
+        int emitted = 0;
+        while (pos_ < max_context_) {
+            if (cancelled(cmd.gen)) break;              // wait-free barge-in abort
+            if (tok_->is_stop(next)) break;
+            const std::string piece = tok_->decode(next, /*render_special=*/false);
+            if (!piece.empty()) cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
+            ++emitted;
+            if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
+                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
+                break;
+            ++pos_;
+        }
+        clear_in_flight();
+        return finish(cmd, emitted);
+    }
+
+    // PCM (any length) -> padded/trimmed 30 s -> WhisperDSP log-mel -> [n_mels,3000]
+    // (mel-major, zero-pad time) -> device buffer d_mel_. Returns the device pointer.
+    const float* stage_logmel(const std::vector<float>& pcm_in) {
+        constexpr int kConvFrames = 3000;              // Whisper large-v3-turbo 30 s
+        const int nmb = dsp_->config().n_mels;
+        std::vector<float> pcm = pcm_in;
+        pcm.resize(static_cast<std::size_t>(dsp_->config().sample_rate) * 30, 0.0f);
+        const whisper::LogMel mel = dsp_->process(pcm);
+        mel_stage_.assign(static_cast<std::size_t>(nmb) * kConvFrames, 0.0f);
+        const int nf = std::min(mel.n_frames, kConvFrames);
+        for (int m = 0; m < nmb; ++m)
+            std::copy(mel.data.begin() + static_cast<std::size_t>(m) * mel.n_frames,
+                      mel.data.begin() + static_cast<std::size_t>(m) * mel.n_frames + nf,
+                      mel_stage_.begin() + static_cast<std::size_t>(m) * kConvFrames);
+        if (d_mel_.count() != mel_stage_.size()) d_mel_.allocate(mel_stage_.size());
+        CUDA_CHECK_THROW(cudaMemcpy(d_mel_.get(), mel_stage_.data(),
+                                    mel_stage_.size() * sizeof(float), cudaMemcpyHostToDevice));
+        return d_mel_.get();
+    }
+
     blackwell::ITokenizer* tok_ = nullptr;   // non-owning
     int  max_context_ = 0;
     int  pos_ = 0;                            // logical decode position (engine thread only)
@@ -265,6 +423,12 @@ private:
     std::unique_ptr<blackwell::audio::AudioEmbeddingPipeline> audio_pipeline_;
     std::unique_ptr<blackwell::audio::PingPongAudioBuffer>    audio_pp_;
     long long audio_frame_ = 0;              // producer/consumer frame counter
+
+    // Live mic log-mel (non-owning DSP + reused staging buffers, engine thread only).
+    whisper::WhisperDSP*        dsp_ = nullptr;
+    std::vector<float>          pcm_stage_;
+    std::vector<float>          mel_stage_;
+    blackwell::DeviceBuffer<float> d_mel_;
 };
 
 }  // namespace rt

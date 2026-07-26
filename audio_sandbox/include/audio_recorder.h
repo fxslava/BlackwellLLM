@@ -19,6 +19,12 @@
 
 namespace rt {
 
+// Load a WAV file as mono float32 PCM (downmixes multi-channel by averaging).
+// The file is expected to already be 16 kHz (no resampling — a mismatch is warned,
+// not corrected). Throws std::runtime_error if the file cannot be read. Defined in
+// audio_recorder.cpp, the sole dr_wav implementation TU.
+std::vector<float> load_wav_mono16k(const std::string& path);
+
 class AudioRecorder {
 public:
     enum class State { Idle, Recording, Hangover };

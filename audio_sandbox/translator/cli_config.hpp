@@ -33,6 +33,10 @@ struct TranslatorArgs {
                                        //   checkpoint dir carrying audio_tower.* (Whisper
                                        //   encoder) + multi_modal_projector.* weights
     std::string data_dir = "data";     // positional : mel_filters.bin etc.
+    std::string wav_path;              // --wav : headless one-shot inference on a WAV
+    std::string features_path;         // --features : headless inference on a precomputed
+                                       //   log-mel .bin [n_mels,3000] (bypasses WhisperDSP)
+    int         max_new_tokens = 64;   // --max-new-tokens : decode cap (headless/live)
     bool        have_model_dir = false;   // whether model_dir was resolved at all
     bool        have_audio_head = false;  // whether audio_head was resolved at all
 };
@@ -99,6 +103,12 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
             a.projector_path = next("--projector-path");
         } else if (arg == "--audio-head" || arg == "--audio-tower-path") {
             a.audio_head = next(arg.c_str());
+        } else if (arg == "--wav") {
+            a.wav_path = next("--wav");
+        } else if (arg == "--features") {
+            a.features_path = next("--features");
+        } else if (arg == "--max-new-tokens") {
+            a.max_new_tokens = std::stoi(next("--max-new-tokens"));
         } else if (!arg.empty() && arg[0] != '-') {
             a.data_dir = arg;  // positional: data dir (mel_filters.bin)
         } else {

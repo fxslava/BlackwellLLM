@@ -16,11 +16,41 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <stdexcept>
 #include <utility>
 
 namespace rt {
+
+std::vector<float> load_wav_mono16k(const std::string& path) {
+    unsigned int channels = 0, sample_rate = 0;
+    drwav_uint64 frames = 0;
+    float* raw = drwav_open_file_and_read_pcm_frames_f32(
+        path.c_str(), &channels, &sample_rate, &frames, nullptr);
+    if (raw == nullptr)
+        throw std::runtime_error("cannot read WAV file: " + path);
+
+    std::vector<float> mono(static_cast<size_t>(frames), 0.0f);
+    if (channels <= 1) {
+        std::copy(raw, raw + frames, mono.begin());
+    } else {
+        for (drwav_uint64 i = 0; i < frames; ++i) {
+            double acc = 0.0;
+            for (unsigned int c = 0; c < channels; ++c)
+                acc += raw[i * channels + c];
+            mono[static_cast<size_t>(i)] = static_cast<float>(acc / channels);
+        }
+    }
+    drwav_free(raw, nullptr);
+
+    if (sample_rate != 16000)
+        std::fprintf(stderr, "[wav] WARN: %s is %u Hz, expected 16000 (no resample)\n",
+                     path.c_str(), sample_rate);
+    return mono;
+}
+
 namespace {
 
 constexpr size_t kBlockSize = 160;          // 10 ms VAD block @ 16 kHz

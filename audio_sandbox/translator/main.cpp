@@ -26,14 +26,22 @@
 // message instead of crashing inside a kernel. Only then is the ~5.3 GB engine
 // constructed. See real_engine_control.hpp for the audio-encoder seam.
 // -----------------------------------------------------------------------------
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+#include "device_buffer.h"           // blackwell::DeviceBuffer (--wav log-mel upload)
 
 #include "audio_capture.h"
 #include "audio_recorder.h"
@@ -117,6 +125,99 @@ int main(int argc, char** argv) {
     std::printf("  [validated] projector.output_dim == backbone.hidden_size (%d)\n\n",
                 backbone.hidden_size);
 
+    // ---- Headless one-shot: audio/log-mel -> text (no GUI / no mic) -------------
+    // --wav <file>       : WhisperDSP log-mel -> encoder -> projector -> decode.
+    // --features <bin>   : feed a precomputed log-mel [n_mels,3000] (isolates the
+    //                      encoder/projector/decode path from the DSP).
+    if (!args.wav_path.empty() || !args.features_path.empty()) {
+        try {
+            constexpr int kConvFrames = 3000;                 // Whisper large-v3-turbo 30 s
+            const int nmb = projector.num_mel_bins;
+            std::vector<float> mel_in(static_cast<size_t>(nmb) * kConvFrames, 0.0f);
+
+            if (!args.features_path.empty()) {
+                std::ifstream f(args.features_path, std::ios::binary | std::ios::ate);
+                if (!f) throw std::runtime_error("cannot read --features file: " + args.features_path);
+                const std::streamsize nb = f.tellg(); f.seekg(0);
+                if (static_cast<size_t>(nb) / sizeof(float) != mel_in.size())
+                    throw std::runtime_error("--features size mismatch (expected n_mels*3000 floats)");
+                f.read(reinterpret_cast<char*>(mel_in.data()), nb);
+                std::printf("[features] loaded %s [%d,%d]\n", args.features_path.c_str(), nmb, kConvFrames);
+            } else {
+                whisper::DspConfig dcfg;
+                dcfg.n_mels = nmb;
+                whisper::WhisperDSP dsp(dcfg, args.data_dir + "/mel_filters.bin");
+
+                // WAV -> mono PCM, padded/trimmed to 30 s so the DSP emits 3000 frames.
+                std::vector<float> pcm = rt::load_wav_mono16k(args.wav_path);
+                {   // PCM range check: normalized f32 audio must sit in [-1, 1].
+                    float pmin = 0.f, pmax = 0.f; double psum = 0.0;
+                    for (float s : pcm) { pmin = std::min(pmin, s); pmax = std::max(pmax, s); psum += std::abs(s); }
+                    std::printf("[wav] %s: %zu samples (%.2f s), pcm min=%.4f max=%.4f mean|.|=%.5f\n",
+                                args.wav_path.c_str(), pcm.size(),
+                                static_cast<double>(pcm.size()) / dcfg.sample_rate, pmin, pmax,
+                                pcm.empty() ? 0.0 : psum / pcm.size());
+                }
+                const size_t k30s = static_cast<size_t>(dcfg.sample_rate) * 30;
+                pcm.resize(k30s, 0.0f);
+                const whisper::LogMel mel = dsp.process(pcm);
+                const int nf = std::min(mel.n_frames, kConvFrames);
+                for (int m = 0; m < nmb; ++m)
+                    std::copy(mel.data.begin() + static_cast<size_t>(m) * mel.n_frames,
+                              mel.data.begin() + static_cast<size_t>(m) * mel.n_frames + nf,
+                              mel_in.begin() + static_cast<size_t>(m) * kConvFrames);
+                {   // log-mel sanity vs the golden input_features.bin.
+                    float lmin = mel_in[0], lmax = mel_in[0];
+                    for (float v : mel_in) { lmin = std::min(lmin, v); lmax = std::max(lmax, v); }
+                    std::printf("[log-mel] shape [%d,%d] (nf=%d) min=%.4f max=%.4f\n",
+                                nmb, kConvFrames, mel.n_frames, lmin, lmax);
+                    std::ifstream gf(args.data_dir + "/input_features.bin", std::ios::binary | std::ios::ate);
+                    if (gf) {
+                        const std::streamsize nb = gf.tellg(); gf.seekg(0);
+                        std::vector<float> golden(static_cast<size_t>(nb) / sizeof(float));
+                        gf.read(reinterpret_cast<char*>(golden.data()), nb);
+                        if (golden.size() == mel_in.size()) {
+                            double dot = 0, na = 0, nb2 = 0;
+                            for (size_t i = 0; i < mel_in.size(); ++i) {
+                                dot += (double)mel_in[i] * golden[i];
+                                na += (double)mel_in[i] * mel_in[i];
+                                nb2 += (double)golden[i] * golden[i];
+                            }
+                            std::printf("[log-mel] cosine vs golden input_features.bin = %.6f\n",
+                                        dot / (std::sqrt(na) * std::sqrt(nb2) + 1e-12));
+                        }
+                    }
+                }
+            }
+
+            std::printf("[engine] loading tokenizer + backbone from %s ...\n", args.model_dir.c_str());
+            std::fflush(stdout);
+            std::unique_ptr<blackwell::ITokenizer> tokenizer =
+                blackwell::TokenizerFactory::create(args.model_dir);
+            BlackwellEngine engine(args.model_dir + "/model.safetensors.index.json", kMaxContext);
+            rt::RealEngineControl control(&engine, tokenizer.get(), static_cast<int>(kMaxContext));
+            std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
+            std::fflush(stdout);
+            control.load_audio_head(args.audio_head);
+            std::printf("[audio] loaded (%d soft-tokens/frame)\n", control.audio_out_frames());
+
+            blackwell::DeviceBuffer<float> d_mel(mel_in.size());
+            if (cudaMemcpy(d_mel.get(), mel_in.data(), mel_in.size() * sizeof(float),
+                           cudaMemcpyHostToDevice) != cudaSuccess)
+                throw std::runtime_error("cudaMemcpy log-mel H2D failed");
+
+            const uint32_t nsys = control.prefill_system_prompt(kSystemPrompt);
+            std::printf("[system-prefix] %u tokens; running audio prefill + decode ...\n", nsys);
+            std::fflush(stdout);
+            const std::string text = control.transcribe(d_mel.get(), args.max_new_tokens);
+            std::printf("\n===== AUDIO -> TEXT =====\n%s\n=========================\n", text.c_str());
+            return text.empty() ? 3 : 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FATAL (--wav): %s\n", e.what());
+            return 1;
+        }
+    }
+
     std::printf("Capture source:\n  [M] Microphone\n  [L] System loopback (what you hear)\n> ");
     std::fflush(stdout);
     const int ch = std::getchar();
@@ -164,8 +265,9 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         try {
             control.load_audio_head(args.audio_head);
-            std::printf("[audio] encoder + projector loaded (%d audio soft-tokens/frame)\n",
-                        control.audio_out_frames());
+            control.set_dsp(&dsp);  // engine-thread log-mel for the live commit path
+            std::printf("[audio] encoder + projector loaded (%d audio soft-tokens/frame); "
+                        "live audio->text ARMED\n", control.audio_out_frames());
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[audio] WARN: audio head not loaded (%s) — text-only mode\n",
                          e.what());
