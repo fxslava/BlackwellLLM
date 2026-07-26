@@ -142,6 +142,9 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         whisper_dsp blackwell::sandbox_headers imgui
         d3d11 dxgi d2d1 d3dcompiler user32 ole32
         blackwell_bridge blackwell_kernels blackwell_core_obj
+        # audio frontend: WhisperEncoder + UltravoxProjector (the audio-head
+        # pipeline real_engine_control loads); pulls CUDA::cublas transitively.
+        blackwell_audio
         # config.json parsing (cli_config.hpp) -- header-only, angle-bracket
         # include keeps it outside the /W4 /WX budget (/external:W0).
         nlohmann_json::nlohmann_json)

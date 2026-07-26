@@ -31,6 +31,7 @@
 // -----------------------------------------------------------------------------
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,8 @@
 #include "common.h"                     // CUDA_CHECK_THROW
 #include "engine_impl.h"                // BlackwellEngine::Impl (white-box step_* + d_X_accum)
 #include "ping_pong_audio_buffer.h"     // blackwell::audio::PingPongAudioBuffer
+#include "audio_embedding_pipeline.h"   // blackwell::audio::AudioEmbeddingPipeline
+#include "audio_head_loader.hpp"        // rt::load_audio_pipeline
 
 #include "engine_control_bridge.hpp"    // EngineControlBridge, Command
 #include "bridge/engine_api.h"          // BRIDGE_OK for the token sink
@@ -80,6 +83,38 @@ public:
     // clamp), for the UI's prefix-cache invariant readout.
     uint32_t last_rewind_keep() const noexcept {
         return last_rewind_keep_.load(std::memory_order_acquire);
+    }
+
+    // Engine-thread setup: load the Whisper encoder + Ultravox projector weights
+    // from the audio-head checkpoint dir (<audio_head>/model.safetensors) into the
+    // async double-buffered pipeline, and size the ping-pong to one embeddings
+    // frame. The projector output width is taken from the engine's OWN hidden_size,
+    // so the audio soft-tokens always match the backbone they splice into. INIT
+    // tier: throws (blackwell::cuda_error / runtime_error) on a missing file or
+    // tensor. Idempotent per call (replaces any previous audio head).
+    void load_audio_head(const std::string& audio_head) {
+        const int hidden = static_cast<int>(engine_->get_impl()->m_config.hidden_dim);
+        audio_pipeline_ = rt::load_audio_pipeline(audio_head, hidden);
+        audio_pp_ = std::make_unique<blackwell::audio::PingPongAudioBuffer>(
+            audio_pipeline_->embed_elems());
+        audio_frame_ = 0;
+    }
+    bool audio_head_loaded() const noexcept { return audio_pipeline_ != nullptr; }
+    int  audio_out_frames() const {
+        return audio_pipeline_ ? audio_pipeline_->out_frames() : 0;
+    }
+
+    // One live audio frame end-to-end (requires load_audio_head): PRODUCE the
+    // embeddings on Stream 1 (encode + project + stage into the ping-pong) then
+    // CONSUME on Stream 2 (event-gated step_* prefill into the KV). d_mel is a
+    // device pointer to the log-mel [num_mel_bins, conv_frames]. Returns the decode
+    // position after the audio block. Engine-owning thread only.
+    int prefill_audio(const float* d_mel) {
+        audio_pipeline_->process_frame(d_mel, *audio_pp_, audio_frame_);
+        const int p =
+            prefill_audio_embeddings(*audio_pp_, audio_frame_, audio_pipeline_->out_frames());
+        ++audio_frame_;
+        return p;
     }
 
 protected:
@@ -224,6 +259,12 @@ private:
     int  pos_ = 0;                            // logical decode position (engine thread only)
     std::atomic<uint32_t> last_rewind_keep_{0};
     std::atomic<std::size_t> turn_counter_{0};
+
+    // Audio frontend (owned; loaded lazily via load_audio_head). Both are driven
+    // only from the engine-owning thread; the pipeline runs on its own stream.
+    std::unique_ptr<blackwell::audio::AudioEmbeddingPipeline> audio_pipeline_;
+    std::unique_ptr<blackwell::audio::PingPongAudioBuffer>    audio_pp_;
+    long long audio_frame_ = 0;              // producer/consumer frame counter
 };
 
 }  // namespace rt

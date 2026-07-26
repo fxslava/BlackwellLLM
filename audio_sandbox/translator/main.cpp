@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
 
     std::printf("=== Real-time speech translator ===\n");
     std::printf("  model-dir      : %s\n", args.model_dir.c_str());
+    std::printf("  audio-head     : %s\n", args.audio_head.c_str());
     std::printf("  backbone       : hidden_size=%d vocab_size=%d quant=%s rope=%s\n",
                 backbone.hidden_size, backbone.vocab_size, backbone.quant_method.c_str(),
                 backbone.has_rope_scaling ? backbone.rope_type.c_str() : "none");
@@ -153,6 +154,22 @@ int main(int argc, char** argv) {
         // ---- speech pipeline over the REAL engine (real control plane) ---------
         rt::RealEngineControl control(&engine, tokenizer.get(),
                                       static_cast<int>(kMaxContext));
+
+        // ---- STEP 3b: audio head (Whisper encoder + Ultravox projector) --------
+        // Load the audio frontend weights from --audio-head so the double-buffered
+        // encode->project->prefill path is armed. Non-fatal: a missing/failed audio
+        // head just leaves the app in text-only mode (the live mel feed is the one
+        // remaining seam, so nothing calls prefill_audio yet regardless).
+        std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
+        std::fflush(stdout);
+        try {
+            control.load_audio_head(args.audio_head);
+            std::printf("[audio] encoder + projector loaded (%d audio soft-tokens/frame)\n",
+                        control.audio_out_frames());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[audio] WARN: audio head not loaded (%s) — text-only mode\n",
+                         e.what());
+        }
         EngineHandle eng_handle = blackwell::bridge::bridge_wrap_engine(&control);
         if (eng_handle == nullptr) throw std::runtime_error("bridge_wrap_engine failed");
 

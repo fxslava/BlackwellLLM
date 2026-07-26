@@ -29,9 +29,18 @@ namespace rt {
 struct TranslatorArgs {
     std::string model_dir;             // --model-dir : HF checkpoint dir (backbone)
     std::string projector_path;        // --projector-path : Ultravox projector override (optional)
+    std::string audio_head;            // --audio-head / --audio-tower-path : Ultravox
+                                       //   checkpoint dir carrying audio_tower.* (Whisper
+                                       //   encoder) + multi_modal_projector.* weights
     std::string data_dir = "data";     // positional : mel_filters.bin etc.
-    bool        have_model_dir = false;  // whether model_dir was resolved at all
+    bool        have_model_dir = false;   // whether model_dir was resolved at all
+    bool        have_audio_head = false;  // whether audio_head was resolved at all
 };
+
+// Default checkpoint locations, used when neither a CLI flag nor a local
+// config.json provides them (so a bare `audio_translator.exe` just runs).
+inline constexpr const char* kDefaultModelDir  = "F:/AI/llama-3.1-8B-Instruct-AWQ-INT4";
+inline constexpr const char* kDefaultAudioHead = "F:/AI/ultravox-v0_5-llama-3_1-8b";
 
 // The backbone dimensions the validation and the projector configuration need,
 // parsed straight from the checkpoint's config.json (NOT from the engine, which
@@ -88,6 +97,8 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
             a.model_dir = next("--model-dir");
         } else if (arg == "--projector-path") {
             a.projector_path = next("--projector-path");
+        } else if (arg == "--audio-head" || arg == "--audio-tower-path") {
+            a.audio_head = next(arg.c_str());
         } else if (!arg.empty() && arg[0] != '-') {
             a.data_dir = arg;  // positional: data dir (mel_filters.bin)
         } else {
@@ -95,16 +106,23 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
         }
     }
 
-    // Fallback: only consult the app config.json when the flag was not given.
-    if (a.model_dir.empty()) {
+    // Fallback: consult a local app config.json for any value not given on argv.
+    if (a.model_dir.empty() || a.projector_path.empty() || a.audio_head.empty()) {
         nlohmann::json j;
         if (detail::read_json_file("config.json", j)) {
-            a.model_dir = j.value("model_dir", std::string{});
-            if (a.projector_path.empty())
-                a.projector_path = j.value("projector_path", std::string{});
+            if (a.model_dir.empty())      a.model_dir      = j.value("model_dir", std::string{});
+            if (a.projector_path.empty()) a.projector_path = j.value("projector_path", std::string{});
+            if (a.audio_head.empty())     a.audio_head     = j.value("audio_head", std::string{});
         }
     }
-    a.have_model_dir = !a.model_dir.empty();
+
+    // Last resort: the shipping default checkpoint locations, so a bare launch
+    // (no flags, no config.json) still resolves both the backbone and audio head.
+    if (a.model_dir.empty())  a.model_dir  = kDefaultModelDir;
+    if (a.audio_head.empty()) a.audio_head = kDefaultAudioHead;
+
+    a.have_model_dir  = !a.model_dir.empty();
+    a.have_audio_head = !a.audio_head.empty();
     return a;
 }
 
