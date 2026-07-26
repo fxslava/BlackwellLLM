@@ -130,6 +130,42 @@ TEST(WhisperEncoderBuckets, RejectsOutOfRangeFrames) {
     EXPECT_THROW((void)enc.forward(d_mel.get(), cfg.conv_frames + 1), std::runtime_error);
 }
 
+// The absolute position offset threads through the captured graph: encoding the same
+// window at a shifted offset applies a different embed_positions slice, so the output
+// changes (and stays finite). offset 0 is the default whole-clip encode.
+TEST(WhisperEncoderBuckets, PositionOffsetShiftsOutput) {
+    WhisperEncoderConfig cfg;
+    WhisperEncoder enc(cfg);
+    enc.load_weights(make_random_weights(cfg));
+
+    const int frames = 300;                                        // bucket 300 -> seq 150
+    DeviceBuffer<float> d_mel(static_cast<size_t>(cfg.num_mel_bins) * frames);
+    {   std::mt19937 rng(3);
+        auto h = rand_vec(d_mel.count(), 0.5f, rng);
+        CUDA_CHECK(cudaMemcpy(d_mel.get(), h.data(), h.size() * sizeof(float),
+                              cudaMemcpyHostToDevice)); }
+
+    const int seq = WhisperEncoderConfig::conv_out_frames_of(frames);   // 150
+    const size_t n = static_cast<size_t>(seq) * cfg.d_model;
+
+    const float* p0 = enc.forward(d_mel.get(), frames, /*enc_pos_offset=*/0);
+    CUDA_CHECK(cudaStreamSynchronize(enc.stream()));
+    std::vector<float> out0(n);
+    CUDA_CHECK(cudaMemcpy(out0.data(), p0, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    const float* pK = enc.forward(d_mel.get(), frames, /*enc_pos_offset=*/200);  // +200 <= 1500-150
+    CUDA_CHECK(cudaStreamSynchronize(enc.stream()));
+    std::vector<float> outK(n);
+    CUDA_CHECK(cudaMemcpy(outK.data(), pK, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    EXPECT_TRUE(all_finite(out0));
+    EXPECT_TRUE(all_finite(outK));
+    bool differs = false;
+    for (size_t i = 0; i < n && !differs; ++i)
+        if (std::abs(out0[i] - outK[i]) > 1e-4f) differs = true;
+    EXPECT_TRUE(differs) << "position offset did not change the encoder output";
+}
+
 // SlidingAudioWindow: a push shifts the window left and lands the newest chunk at
 // the tail; extract_delta returns exactly the tail hop_tokens rows.
 TEST(SlidingAudioWindow, ShiftLandsNewestAtTailAndDeltaIsTail) {

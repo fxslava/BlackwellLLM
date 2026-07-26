@@ -120,7 +120,13 @@ public:
     // stream() and returns without host sync. Returns a device pointer to the output
     // [output_frames(), d_model], owned by this object; output_frames() reflects the
     // SELECTED bucket after the call. Synchronize stream() before reading.
-    const float* forward(const float* d_mel, int mel_frames);
+    //
+    // enc_pos_offset shifts the absolute positional embeddings: the encoder adds
+    // embed_positions[enc_pos_offset + j] to output frame j instead of [j]. A
+    // STREAMING slice starting at absolute encoder frame `off` passes enc_pos_offset
+    // = off so its soft-tokens carry utterance-absolute positions and splice
+    // coherently after earlier windows (0 == the default whole-clip encode).
+    const float* forward(const float* d_mel, int mel_frames, int enc_pos_offset = 0);
 
     // The stream every forward() enqueues on (input copy + graph launch). Bracket
     // timing events on THIS stream and synchronize it before reading output().
@@ -186,7 +192,12 @@ private:
 
     // Weights (device).
     DeviceBuffer<float> conv1_w_, conv1_b_, conv2_w_, conv2_b_;
-    DeviceBuffer<float> embed_positions_;
+    DeviceBuffer<float> embed_positions_;   // [max_source_positions, d_model] (full table)
+    // Per-launch positional window the captured graph reads from: forward() copies
+    // embed_positions_[enc_pos_offset .. +seq) into this fixed buffer before the graph
+    // launch, so the absolute-position offset is runtime-selectable WITHOUT recapturing
+    // (the graph baked a fixed pointer, not a fixed offset).
+    DeviceBuffer<float> d_pos_window_;
     std::vector<DeviceLayer> dlayers_;
     DeviceBuffer<float> ln_post_w_, ln_post_b_;
 

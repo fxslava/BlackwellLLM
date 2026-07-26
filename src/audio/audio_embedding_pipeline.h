@@ -100,8 +100,13 @@ public:
     // must gate/sync before consuming. No ping-pong staging (the streaming consumer
     // reads the pointer directly).
     struct ProjectedWindow { const float* embeds; int num_tokens; };
-    ProjectedWindow encode_project_window(const float* d_mel, int mel_frames) {
-        const float* d_hidden = encoder_.forward(d_mel, mel_frames);
+    ProjectedWindow encode_project_window(const float* d_mel, int mel_frames,
+                                          int mel_frame_offset = 0) {
+        // conv2 (stride 2) halves the time axis, so a window starting at absolute mel
+        // frame `mel_frame_offset` begins at absolute encoder position offset/2. Passing
+        // it keeps the streamed soft-tokens' positional embeddings monotonic across
+        // windows (0 == whole-clip encode).
+        const float* d_hidden = encoder_.forward(d_mel, mel_frames, mel_frame_offset / 2);
         const int valid = encoder_.valid_output_frames(mel_frames);   // unpadded frames
         const float* d_embeds = projector_.forward(d_hidden, valid, audio_stream());
         return { d_embeds, projector_.out_frames(valid) };
@@ -120,42 +125,53 @@ public:
         return den > 1e-12 ? dot / den : 0.0;
     }
 
-    // Scan the NEW window's overlapping PREFIX (first overlap_tokens rows of
-    // d_new_proj) left-to-right against the historically INJECTED tokens for the same
-    // span. At the first row whose cosine < threshold, return a rewind/refill plan:
-    // rewind_to_pos is the KV position to roll back to, refill_from the NEW-window
-    // index to resume injection from — both honoring max_rewind_tokens (a deeper
-    // divergence is corrected only up to the cap; older tokens carry more right-
-    // context and drift least). Returns {diverged=false} when the overlap is stable
-    // (inject only the tail delta) or when streaming/history is not yet available.
-    // Does ONE small D2H of the overlap prefix (off the per-token hot path).
+    // Scan the TAIL of the overlap (the newest max_rewind_tokens rows, nearest the
+    // just-arrived audio) against the historically INJECTED tokens for the same span,
+    // and at the first row whose cosine < threshold return a rewind/refill plan
+    // (rewind_to_pos = KV position to roll back to; refill_from = NEW-window index to
+    // resume injection from). Returns {diverged=false} when the tail is stable (inject
+    // only the delta) or when streaming/history is not yet available.
+    //
+    // WHY ONLY THE TAIL: on a forward slide, the FRONT overlap tokens LOSE left-context
+    // in the bidirectional encoder (their window no longer reaches as far back), so
+    // they diverge — but they were originally encoded with MORE context, and rewriting
+    // them with the lower-context representation DEGRADES them. Only the tail tokens
+    // legitimately improve (they gain right-context from the new audio). Freezing the
+    // front (never scanning it) preserves the high-context tokens; scanning only the
+    // last max_rewind_tokens also makes the rewind depth intrinsically bounded.
+    // Does ONE small D2H of just the tail region (off the per-token hot path).
     ReconciliationPlan reconcile(const float* d_new_proj, int num_new_tokens) {
         if (!plan_.enabled) return {};
         const int H = text_hidden();
         const int overlap = std::min({plan_.overlap_tokens,
                                       static_cast<int>(injected_history_.size()),
                                       num_new_tokens});
-        if (overlap <= 0) return {};
+        const int scan_start = std::max(0, overlap - plan_.max_rewind_tokens);
+        const int scan_n = overlap - scan_start;   // == min(overlap, max_rewind_tokens)
+        if (scan_n <= 0) return {};                 // no overlap, or cap 0 (reconcile off)
 
-        recon_stage_.resize(static_cast<std::size_t>(overlap) * H);
-        CUDA_CHECK_THROW(cudaMemcpy(recon_stage_.data(), d_new_proj,
+        recon_stage_.resize(static_cast<std::size_t>(scan_n) * H);
+        CUDA_CHECK_THROW(cudaMemcpy(recon_stage_.data(),
+                                    d_new_proj + static_cast<std::size_t>(scan_start) * H,
                                     recon_stage_.size() * sizeof(float),
                                     cudaMemcpyDeviceToHost));
 
         const int base = static_cast<int>(injected_history_.size()) - overlap;
         const int cur_pos = injected_history_.back().kv_pos + 1;   // next free KV slot
-        for (int i = 0; i < overlap; ++i) {
+        for (int j = 0; j < scan_n; ++j) {
+            const int i = scan_start + j;   // overlap index (front frozen: i >= scan_start)
             const InjectedToken& hist = injected_history_[static_cast<std::size_t>(base + i)];
-            const double cos = cosine_similarity(&recon_stage_[static_cast<std::size_t>(i) * H],
+            const double cos = cosine_similarity(&recon_stage_[static_cast<std::size_t>(j) * H],
                                                  hist.embed.data(), H);
             if (cos < plan_.reconciliation_threshold) {
-                const int capped = std::min(overlap - i, plan_.max_rewind_tokens);
+                // Rewrite from the first diverging TAIL token to the end of the overlap;
+                // depth = overlap - i <= max_rewind_tokens by construction.
                 return { /*diverged=*/true,
-                         /*rewind_to_pos=*/cur_pos - capped,
-                         /*refill_from=*/ overlap - capped };
+                         /*rewind_to_pos=*/cur_pos - (overlap - i),
+                         /*refill_from=*/ i };
             }
         }
-        return {};   // overlap stable within threshold
+        return {};   // tail stable within threshold -> inject only the delta
     }
 
     // Record the soft-tokens actually injected into the KV this hop: `num_tokens`

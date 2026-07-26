@@ -278,6 +278,7 @@ WhisperEncoder::WhisperEncoder(const WhisperEncoderConfig& cfg) : cfg_(cfg) {
     CUBLAS_CHECK_THROW(cublasSetWorkspace(blas_, blas_ws_.get(), blas_ws_.size_bytes()));
 
     d_input_.allocate((size_t)mel * cf);
+    d_pos_window_.allocate(sD);              // [max_source_positions, D] positional window
     cols1_.allocate((size_t)mel * 3 * cf);
     cols2_.allocate((size_t)D * 3 * c2);
     conv1_out_.allocate((size_t)D * cf);
@@ -403,7 +404,10 @@ void WhisperEncoder::record(cudaStream_t s, int conv_frames) {
     gemm_ab(conv2_w_, cols2_, conv2_out_, D, c2, D * 3);          // [D, c2==seq]
     launch_row_bias_gelu(conv2_out_, conv2_b_, D, c2, s);
     launch_transpose(conv2_out_, conv_out_, D, c2, s);           // [D,seq] -> [seq,D]
-    launch_add_positional(conv_out_, embed_positions_, hidden_, seq, D, s);
+    // Add positions from the per-launch window (filled by forward() with the absolute
+    // offset slice), NOT directly from embed_positions_, so the offset is runtime-
+    // selectable without recapturing the graph.
+    launch_add_positional(conv_out_, d_pos_window_, hidden_, seq, D, s);
 
     // --- 32x encoder layers (pre-LN, bidirectional attention, GELU MLP) ---
     for (int l = 0; l < cfg_.num_layers; ++l) {
@@ -469,10 +473,10 @@ WhisperEncoder::GraphBucket& WhisperEncoder::select_bucket(int mel_frames) {
 }
 
 const float* WhisperEncoder::forward(const float* d_mel) {
-    return forward(d_mel, cfg_.conv_frames);  // full 30 s bucket (back-compat)
+    return forward(d_mel, cfg_.conv_frames, 0);  // full 30 s bucket, positions from 0
 }
 
-const float* WhisperEncoder::forward(const float* d_mel, int mel_frames) {
+const float* WhisperEncoder::forward(const float* d_mel, int mel_frames, int enc_pos_offset) {
     if (!weights_loaded_)
         throw std::runtime_error("WhisperEncoder::forward called before load_weights");
     if (mel_frames <= 0 || mel_frames > cfg_.conv_frames)
@@ -481,6 +485,19 @@ const float* WhisperEncoder::forward(const float* d_mel, int mel_frames) {
 
     GraphBucket& b = select_bucket(mel_frames);  // lazily captured
     const int mel = cfg_.num_mel_bins;
+    const int D = cfg_.d_model;
+
+    // Stage the absolute-position slice this launch needs: embed_positions_[off ..
+    // off+b.seq) -> d_pos_window_[0 .. b.seq). Clamp so the slice stays inside the
+    // trained positional range [0, max_source_positions); a window past 30 s of
+    // absolute position reuses the final positions (Whisper's hard limit).
+    const int max_pos = cfg_.max_source_positions;
+    int off = enc_pos_offset < 0 ? 0 : enc_pos_offset;
+    if (off + b.seq > max_pos) off = max_pos - b.seq;   // b.seq <= max_pos always
+    CUDA_CHECK_THROW(cudaMemcpyAsync(
+        d_pos_window_.get(), embed_positions_.get() + static_cast<size_t>(off) * D,
+        static_cast<size_t>(b.seq) * D * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream_));
 
     // Pack the [mel, mel_frames] input into d_input_ as [mel, b.conv_frames]: the
     // graph reads each mel row at stride b.conv_frames, so a shorter input is copied

@@ -175,27 +175,39 @@ TEST(AudioOverlapReconciliation, ExactDivergenceCoordinateAndCapEnforcement) {
     EXPECT_GE(cos_before, thr) << "token k-1 must match history (identical prefix)";
     EXPECT_LT(cos_at, thr)     << "token k must diverge (spliced twin); cos=" << cos_at;
 
-    auto run = [&](int cap) {
+    auto run = [&](int cap, const float* new_window) {
         pipe->configure_streaming(plan_for_cap(cap));
         pipe->reset_history();
         pipe->record_injected(dA.get(), kBasePos, overlap);   // history = dA[0..overlap)
-        return pipe->reconcile(dS.get(), N);
+        return pipe->reconcile(new_window, N);
     };
 
-    // === 1. UNCAPPED COORDINATE (cap 16 -> clamped to overlap 12; want_rewind 8 < 12) ===
-    const auto uncapped = run(16);
+    // === 1. UNCAPPED COORDINATE (cap 16 -> clamped to overlap 12; scans full overlap) ===
+    // Divergence at k (== 4) is inside the tail scan region, so it is detected exactly.
+    const auto uncapped = run(16, dS.get());
     EXPECT_TRUE(uncapped.diverged);
     EXPECT_EQ(uncapped.refill_from, k);                             // exact coordinate
     EXPECT_EQ(cur_pos - uncapped.rewind_to_pos, overlap - k);       // depth == overlap-k == 8
 
     // === 2. CAP ENFORCEMENT (same splice, cap 2) ===
-    const auto capped = run(2);
+    // Tail scan region is [overlap-2, overlap); the divergent suffix reaches it, so the
+    // first tail divergence is at overlap-2 -> depth 2.
+    const auto capped = run(2, dS.get());
     EXPECT_TRUE(capped.diverged);
     EXPECT_EQ(cur_pos - capped.rewind_to_pos, 2);                   // depth clamped to cap
     EXPECT_EQ(capped.refill_from, overlap - 2);                     // 10
 
+    // === 3. FRONT-ONLY DIVERGENCE IS IGNORED (freeze high-context front tokens) ===
+    // A window whose FRONT diverges [0,m) but whose TAIL matches history must NOT
+    // trigger a rewind (the front lost left-context and must be preserved, not rewritten).
+    const int m = 8;                                               // divergent front, stable tail
+    const DeviceBuffer<float> dFront = splice_at(dB, dA, m, N, H); // [dB[0,m), dA[m,N))
+    const auto front_only = run(2, dFront.get());                  // scan region [10,12) is dA
+    EXPECT_FALSE(front_only.diverged) << "front-only divergence (tail stable) must not rewind";
+
     std::printf("[reconcile-field] k=%d cos(k-1)=%.5f cos(k)=%.5f | "
-                "uncapped: refill=%d depth=%d | capped: refill=%d depth=%d\n",
+                "uncapped: refill=%d depth=%d | capped: refill=%d depth=%d | "
+                "front-only diverged=%d\n",
                 k, cos_before, cos_at, uncapped.refill_from, cur_pos - uncapped.rewind_to_pos,
-                capped.refill_from, cur_pos - capped.rewind_to_pos);
+                capped.refill_from, cur_pos - capped.rewind_to_pos, front_only.diverged);
 }
