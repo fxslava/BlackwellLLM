@@ -1,17 +1,19 @@
 // =============================================================================
 // The Ultimate Field Test — Dynamic Overlap Reconciliation on REAL audio.
 //
-// Splices two real-audio sources (a real-speech mel window and its time-reversed
-// twin), runs them through the REAL Whisper encoder + Ultravox projector, and
-// asserts that AudioEmbeddingPipeline::reconcile:
-//   * does NOT false-trigger when the overlap is unchanged (identical projection
-//     -> cosine 1.0 -> no divergence), and
-//   * DOES detect divergence when the overlapping audio changes, and caps the
-//     rewind depth at RuntimeConfig::AudioStreamingPlan::max_rewind_tokens.
+// Runs two real-audio sources (a real-speech mel window and its time-reversed
+// twin) through the REAL Whisper encoder + Ultravox projector, then SPLICES their
+// projected soft-tokens at a KNOWN token index k: rows [0,k) are byte-identical to
+// the injected history (cosine 1.0), rows [k,N) come from the divergent twin. This
+// pins the divergence coordinate to exactly k, so coordinate detection and the
+// rewind cap can be asserted INDEPENDENTLY:
+//
+//   1. Uncapped coordinate: cap large -> refill_from == k, rewind_depth == overlap-k.
+//   2. Cap enforcement (same splice): cap 2 -> rewind_depth == 2, refill_from == overlap-2.
 //
 // The streaming parameters come from the REAL config pipeline
-// (build_and_validate_runtime), not literals — this exercises the tier-2 -> tier-3
-// resolution and the capability gate end to end.
+// (build_and_validate_runtime), not literals — exercising tier-2 -> tier-3
+// resolution and the capability gate.
 //
 // SKIPs (does not fail) when the audio head or the golden log-mel are absent:
 //   BLACKWELL_AUDIO_HEAD      Ultravox head dir (default F:/AI/ultravox-v0_5-llama-3_1-8b)
@@ -35,6 +37,7 @@
 #include "audio_head_loader.hpp"       // rt::load_audio_pipeline (real encoder+projector)
 
 using blackwell::DeviceBuffer;
+using blackwell::audio::AudioEmbeddingPipeline;
 
 namespace {
 
@@ -79,71 +82,120 @@ DeviceBuffer<float> make_window(const std::vector<float>& mel, int win_frames, b
     return d;
 }
 
+// Encode+project a window and copy the projector output into a PERSISTENT device
+// buffer (the projector reuses its workspace across calls). Returns num soft-tokens.
+int project_persistent(AudioEmbeddingPipeline& pipe, const float* d_mel, int win_frames,
+                       DeviceBuffer<float>& out) {
+    const auto w = pipe.encode_project_window(d_mel, win_frames);
+    CUDA_CHECK(cudaStreamSynchronize(pipe.audio_stream()));
+    out.allocate(static_cast<size_t>(w.num_tokens) * kTextHidden);
+    CUDA_CHECK(cudaMemcpy(out.get(), w.embeds, out.count() * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    return w.num_tokens;
+}
+
+// Splice [num_tokens, H]: rows [0,k) from dA, rows [k,num_tokens) from dB.
+DeviceBuffer<float> splice_at(const DeviceBuffer<float>& dA, const DeviceBuffer<float>& dB,
+                              int k, int num_tokens, int H) {
+    DeviceBuffer<float> dS(static_cast<size_t>(num_tokens) * H);
+    const size_t head = static_cast<size_t>(k) * H;
+    const size_t tail = static_cast<size_t>(num_tokens - k) * H;
+    CUDA_CHECK(cudaMemcpy(dS.get(), dA.get(), head * sizeof(float), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(dS.get() + head, dB.get() + head, tail * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    return dS;
+}
+
+std::vector<float> download_row(const DeviceBuffer<float>& d, int row, int H) {
+    std::vector<float> h(H);
+    CUDA_CHECK(cudaMemcpy(h.data(), d.get() + static_cast<size_t>(row) * H,
+                          H * sizeof(float), cudaMemcpyDeviceToHost));
+    return h;
+}
+
+// Resolve the streaming plan through the REAL config pipeline for a given rewind cap
+// (dense model -> reconciliation enabled; window 2240 ms / hop 320 ms).
+blackwell::AudioStreamingPlan plan_for_cap(int cap) {
+    ModelConfig m{};
+    m.hidden_dim = kTextHidden;
+    m.num_layers = 32;
+    m.head_dim = 128;
+    m.max_position_embeddings = 4096;
+    blackwell::InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.max_reconciliation_rewind_tokens = cap;
+    return build_and_validate_runtime(m, blackwell::derive_capabilities(m), req).audio_streaming;
+}
+
 }  // namespace
 
-TEST(AudioOverlapReconciliation, DetectsDivergenceAndCapsRewindOnRealAudio) {
+TEST(AudioOverlapReconciliation, ExactDivergenceCoordinateAndCapEnforcement) {
     if (!file_exists(audio_head_dir() + "/model.safetensors"))
         GTEST_SKIP() << "audio head absent: " << audio_head_dir() << " (set BLACKWELL_AUDIO_HEAD)";
     if (!file_exists(dumps_dir() + "/input_features.bin"))
         GTEST_SKIP() << "golden log-mel absent in " << dumps_dir()
                      << " (set BLACKWELL_ULTRAVOX_DUMPS)";
 
-    // --- streaming plan from the REAL config pipeline (no literals) --------------
-    ModelConfig m{};
-    m.hidden_dim = kTextHidden;
-    m.num_layers = 32;
-    m.head_dim = 128;
-    m.max_position_embeddings = 4096;               // dense full-attention (no SSM gate)
-    blackwell::InferenceConfig req;
-    req.audio_streaming.enable = true;              // 2240 ms window / 320 ms hop
-    req.audio_streaming.max_reconciliation_rewind_tokens = 2;   // tight cap under test
-    const auto rt = build_and_validate_runtime(m, blackwell::derive_capabilities(m), req);
-    const blackwell::AudioStreamingPlan& plan = rt.audio_streaming;
-    ASSERT_TRUE(plan.enabled);
-    ASSERT_EQ(plan.window_tokens, 14);
-    ASSERT_EQ(plan.hop_tokens, 2);
-    ASSERT_EQ(plan.overlap_tokens, 12);
-    ASSERT_EQ(plan.max_rewind_tokens, 2);
+    const auto geom = plan_for_cap(8);   // geometry (cap irrelevant to window/hop/overlap)
+    ASSERT_TRUE(geom.enabled);
+    ASSERT_EQ(geom.window_tokens, 14);
+    ASSERT_EQ(geom.overlap_tokens, 12);
+    const int N = geom.window_tokens;        // 14
+    const int overlap = geom.overlap_tokens; // 12
+    const int H = kTextHidden;
+    const float thr = geom.reconciliation_threshold;
 
-    // --- real encoder + projector ------------------------------------------------
+    // --- real encoder + projector over two real-audio windows -------------------
     auto pipe = rt::load_audio_pipeline(audio_head_dir(), kTextHidden);
-    pipe->configure_streaming(plan);
-
     const std::vector<float> mel = load_input_features();
-    const int win_frames = plan.window_tokens * blackwell::audio::kMelFramesPerSoftToken;  // 224
-    DeviceBuffer<float> melA = make_window(mel, win_frames, /*reversed=*/false);
-    DeviceBuffer<float> melB = make_window(mel, win_frames, /*reversed=*/true);   // "second WAV"
+    const int win_frames = N * blackwell::audio::kMelFramesPerSoftToken;   // 224
+    const DeviceBuffer<float> melA = make_window(mel, win_frames, /*reversed=*/false);
+    const DeviceBuffer<float> melB = make_window(mel, win_frames, /*reversed=*/true);
 
-    // History = the first `overlap` projected soft-tokens of window A, injected at a
-    // known base position. (record_injected copies to host, so melA's projector
-    // output may be overwritten by the next encode.)
+    DeviceBuffer<float> dA, dB;   // persistent projected soft-tokens [N, H]
+    ASSERT_EQ(project_persistent(*pipe, melA.get(), win_frames, dA), N);
+    ASSERT_EQ(project_persistent(*pipe, melB.get(), win_frames, dB), N);
+
+    // Splice the NEW window at a KNOWN coordinate: [0,k) == history (audio A),
+    // [k,N) from the divergent twin (audio B).
+    const int k = 4;
+    const DeviceBuffer<float> dS = splice_at(dA, dB, k, N, H);
     const int kBasePos = 100;
-    auto wa = pipe->encode_project_window(melA.get(), win_frames);
-    CUDA_CHECK(cudaStreamSynchronize(pipe->audio_stream()));
-    ASSERT_EQ(wa.num_tokens, plan.window_tokens);
-    pipe->record_injected(wa.embeds, kBasePos, plan.overlap_tokens);   // [100, 112)
-    ASSERT_EQ(pipe->history_size(), plan.overlap_tokens);
+    const int cur_pos = kBasePos + overlap;   // 112 (next free KV slot after history)
 
-    // --- STABLE: re-encoding the SAME audio must NOT trigger a rewrite -----------
-    auto wa2 = pipe->encode_project_window(melA.get(), win_frames);
-    CUDA_CHECK(cudaStreamSynchronize(pipe->audio_stream()));
-    const auto stable = pipe->reconcile(wa2.embeds, wa2.num_tokens);
-    EXPECT_FALSE(stable.diverged) << "identical overlap must not diverge (false positive)";
+    // --- prove the divergence coordinate is EXACTLY k (independent of reconcile) --
+    // reconcile compares dS[i] against history[i] == dA[i] (base 0). By construction
+    // dS[k-1] == dA[k-1] (cosine 1.0) and dS[k] == dB[k] != dA[k].
+    const double cos_before =
+        AudioEmbeddingPipeline::cosine_similarity(download_row(dS, k - 1, H).data(),
+                                                  download_row(dA, k - 1, H).data(), H);
+    const double cos_at =
+        AudioEmbeddingPipeline::cosine_similarity(download_row(dS, k, H).data(),
+                                                  download_row(dA, k, H).data(), H);
+    EXPECT_GE(cos_before, thr) << "token k-1 must match history (identical prefix)";
+    EXPECT_LT(cos_at, thr)     << "token k must diverge (spliced twin); cos=" << cos_at;
 
-    // --- DIVERGENT + CAP: reversed audio must diverge, rewind capped -------------
-    auto wb = pipe->encode_project_window(melB.get(), win_frames);
-    CUDA_CHECK(cudaStreamSynchronize(pipe->audio_stream()));
-    const auto div = pipe->reconcile(wb.embeds, wb.num_tokens);
+    auto run = [&](int cap) {
+        pipe->configure_streaming(plan_for_cap(cap));
+        pipe->reset_history();
+        pipe->record_injected(dA.get(), kBasePos, overlap);   // history = dA[0..overlap)
+        return pipe->reconcile(dS.get(), N);
+    };
 
-    const int cur_pos = kBasePos + plan.overlap_tokens;   // 112 (next free KV slot)
-    EXPECT_TRUE(div.diverged) << "reversed-audio overlap must diverge below the 0.999 bar";
-    EXPECT_EQ(cur_pos - div.rewind_to_pos, plan.max_rewind_tokens)   // rewind depth == cap
-        << "rewind depth must be capped at max_reconciliation_rewind_tokens";
-    EXPECT_EQ(div.rewind_to_pos, cur_pos - plan.max_rewind_tokens);   // 110
-    EXPECT_EQ(div.refill_from, plan.overlap_tokens - plan.max_rewind_tokens);  // 10
+    // === 1. UNCAPPED COORDINATE (cap 16 -> clamped to overlap 12; want_rewind 8 < 12) ===
+    const auto uncapped = run(16);
+    EXPECT_TRUE(uncapped.diverged);
+    EXPECT_EQ(uncapped.refill_from, k);                             // exact coordinate
+    EXPECT_EQ(cur_pos - uncapped.rewind_to_pos, overlap - k);       // depth == overlap-k == 8
 
-    std::printf("[reconcile-field] stable.diverged=%d  div.diverged=%d "
-                "rewind_to=%d (depth %d, cap %d) refill_from=%d\n",
-                stable.diverged, div.diverged, div.rewind_to_pos,
-                cur_pos - div.rewind_to_pos, plan.max_rewind_tokens, div.refill_from);
+    // === 2. CAP ENFORCEMENT (same splice, cap 2) ===
+    const auto capped = run(2);
+    EXPECT_TRUE(capped.diverged);
+    EXPECT_EQ(cur_pos - capped.rewind_to_pos, 2);                   // depth clamped to cap
+    EXPECT_EQ(capped.refill_from, overlap - 2);                     // 10
+
+    std::printf("[reconcile-field] k=%d cos(k-1)=%.5f cos(k)=%.5f | "
+                "uncapped: refill=%d depth=%d | capped: refill=%d depth=%d\n",
+                k, cos_before, cos_at, uncapped.refill_from, cur_pos - uncapped.rewind_to_pos,
+                capped.refill_from, cur_pos - capped.rewind_to_pos);
 }
