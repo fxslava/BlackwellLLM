@@ -103,10 +103,10 @@ if(TARGET blackwell_audio)
         test_prompt_injector.cpp)
     blackwell_wire_audio_test(kernel_unit_tests)
 
-    # The full end-to-end chain (projector -> injector -> Llama seam) stays its own
-    # standalone target -- it is an integration-shaped parity harness, not a unit.
-    add_executable(ultravox_model_integration_test test_ultravox_model_integration.cpp)
-    blackwell_wire_audio_test(ultravox_model_integration_test)
+    # NOTE: the full end-to-end chain (projector -> injector -> Llama seam) is a
+    # gtest now living in integration/test_ultravox_model_integration.cpp -- it is
+    # picked up by the integration_tests suite via CONFIGURE_DEPENDS (which already
+    # links blackwell_audio + its includes above), so it needs no target here.
 endif()
 
 # Bridge suite: CPU-only control-plane test for EngineControlBridge (SPSC command
