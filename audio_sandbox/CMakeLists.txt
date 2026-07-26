@@ -107,8 +107,11 @@ endif()
 # (blackwell_core_obj, which pulls CUDA), so it is built ONLY in the integrated
 # (root) build where those targets already exist. A standalone `cmake -S
 # audio_sandbox` skips it and stays CUDA-free. A GPU-free MockEngineControl drives
-# the REAL EngineControlBridge (SPSC command ring + barge-in epoch + wait/pump), so
-# the full streaming + interruption path runs with no FP8 Llama weights present.
+# the REAL EngineControlBridge (SPSC command ring + barge-in epoch + wait/pump).
+# It now drives a REAL BlackwellEngine (8B AWQ) via RealEngineControl: --model-dir
+# selects the checkpoint, config.json is validated against the projector width
+# before any CUDA alloc, and each commit streams a genuine GPU decode. The live
+# audio->embeddings splice (Whisper encoder -> projector) is the one marked seam.
 if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     add_executable(audio_translator
         translator/main.cpp
@@ -137,7 +140,10 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     target_link_libraries(audio_translator PRIVATE
         whisper_dsp blackwell::sandbox_headers imgui
         d3d11 dxgi d2d1 d3dcompiler user32 ole32
-        blackwell_bridge blackwell_kernels blackwell_core_obj)
+        blackwell_bridge blackwell_kernels blackwell_core_obj
+        # config.json parsing (cli_config.hpp) -- header-only, angle-bracket
+        # include keeps it outside the /W4 /WX budget (/external:W0).
+        nlohmann_json::nlohmann_json)
 
     target_compile_definitions(audio_translator PRIVATE UNICODE _UNICODE)
     if(MSVC)
