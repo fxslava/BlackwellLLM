@@ -17,6 +17,7 @@
 
 # --- Audio-frontend CUDA sources (explicit; add each new .cu here) ------------
 add_library(blackwell_audio STATIC
+    whisper_encoder.cu                  # audio_tower: 32-layer bidirectional encoder
     ultravox_projector.cu               # StackAudioFrames + SwiGLU launchers
     ultravox_projector_pipeline.cu      # UltravoxProjector: 6-stage FP32 graph
     prompt_injector.cu)                 # inject_audio_embeddings splice kernel
@@ -27,6 +28,12 @@ target_include_directories(blackwell_audio PRIVATE
     ${CMAKE_SOURCE_DIR}/src             # common.h
     ${CMAKE_SOURCE_DIR}/src/core        # device_buffer.h
     ${CMAKE_CURRENT_SOURCE_DIR})        # *.cuh
+
+# cuBLAS (TF32 tensor cores) powers WhisperEncoder's GEMMs + batched attention.
+# CUDAToolkit gives the CUDA::cublas imported target (include dir + link). PRIVATE
+# on a STATIC lib still propagates as a link requirement to the final executable.
+find_package(CUDAToolkit REQUIRED)
+target_link_libraries(blackwell_audio PRIVATE CUDA::cublas)
 
 # Mirror src/kernels/ CUDA flags (fast-math + O3 in Release, -G in Debug).
 target_compile_options(blackwell_audio PRIVATE
