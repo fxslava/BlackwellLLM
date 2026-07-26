@@ -9,8 +9,10 @@ namespace blackwell {
 // offloading. attention_decode reproduces the original step_attention_math
 // kernel sequence byte-for-byte, so routing BlackwellEngine through
 // IKVCacheManager is a no-behavior-change refactor and stays the FP32 parity
-// reference. Branching (fork/rewind) and chunked prefill are unsupported on the
-// contiguous cache and throw std::runtime_error.
+// reference. CoW branching (fork) and chunked prefill are unsupported on the
+// contiguous cache and throw std::runtime_error; rewind() IS supported as a
+// single-sequence linear rollback (delegates to VRAMArena::truncate_kv to
+// reconcile the offload high-water marks with the rewound position).
 class ContinuousKVManager : public IKVCacheManager {
 public:
     ContinuousKVManager(VRAMArena& arena, const ModelConfig& config)

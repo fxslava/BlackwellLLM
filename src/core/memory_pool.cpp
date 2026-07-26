@@ -642,3 +642,24 @@ void VRAMArena::commit_layer_kv(int layer, int pos) {
     slot.valid_upto = std::max(slot.valid_upto, pos + 1);
     m_kv_host_filled[oi] = std::max(m_kv_host_filled[oi], pos + 1);
 }
+
+void VRAMArena::truncate_kv(int target_pos) {
+    if (target_pos < 0) target_pos = 0;
+
+    // Pull every offloaded layer's host-mirror high-water mark back to target_pos.
+    // A later commit_layer_kv re-extends it with std::max, so any speculative
+    // column above target_pos is overwritten rather than read as valid.
+    for (int& filled : m_kv_host_filled)
+        filled = std::min(filled, target_pos);
+
+    // Invalidate any staging slot content above target_pos. Clearing
+    // compute_synced forces prepare_layer_kv to re-wait on a fresh stage before the
+    // next attention read, so a rewound-then-refilled prefix is never served stale.
+    for (int s = 0; s < kNumSlots; ++s) {
+        KVSlot& slot = m_kvslots[s];
+        if (slot.valid_upto > target_pos) {
+            slot.valid_upto = target_pos;
+            slot.compute_synced = false;
+        }
+    }
+}

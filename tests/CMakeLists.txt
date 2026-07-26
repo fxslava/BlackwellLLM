@@ -116,7 +116,9 @@ endif()
 # overrides those hooks, so they are never called, but must resolve at link. Runs
 # under the fast `validation` label (no GPU needed).
 if(TARGET blackwell_bridge)
-    add_executable(bridge_tests "${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_control_bridge_test.cpp")
+    add_executable(bridge_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_control_bridge_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/mock_vad_streaming_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h

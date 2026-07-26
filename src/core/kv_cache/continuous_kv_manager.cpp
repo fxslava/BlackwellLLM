@@ -52,9 +52,13 @@ void ContinuousKVManager::fork(SeqId, SeqId) {
         "construct the engine with the paged KV manager for branching");
 }
 
-void ContinuousKVManager::rewind(SeqId, int) {
-    throw std::runtime_error(
-        "ContinuousKVManager::rewind: unsupported by the FP32 contiguous cache; use the paged KV manager");
+void ContinuousKVManager::rewind(SeqId, int target_pos) {
+    // Single-sequence KV rewind: the resident FP32 slabs are position-addressed
+    // and overwritten in place, so rolling back is purely a bookkeeping step --
+    // reconcile the arena's offload high-water marks (host mirror + staging slots)
+    // with target_pos so no speculative column above it leaks across the rewind.
+    // (CoW branch-rewind still needs the paged manager; this is the linear rewind.)
+    m_arena.truncate_kv(target_pos);
 }
 
 } // namespace blackwell

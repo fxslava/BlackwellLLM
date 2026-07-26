@@ -5,8 +5,10 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>  // CUDART_INF_F
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "common.h"  // CUDA_CHECK_THROW
 
@@ -292,11 +294,29 @@ WhisperEncoder::WhisperEncoder(const WhisperEncoderConfig& cfg) : cfg_(cfg) {
     mlp_hidden_.allocate((size_t)seq * cfg_.ffn_dim);
     mlp_out_.allocate(sD);
     output_.allocate(sD);
+
+    // Resolve the graph-bucket set: sort ascending, drop duplicates and anything
+    // larger than conv_frames (the workspace-sizing bound), and guarantee conv_frames
+    // itself is present (the parity reference + the largest / fallback bucket). Each
+    // bucket is captured lazily on its first covering forward().
+    std::vector<int> want = cfg_.graph_buckets;
+    want.push_back(cfg_.conv_frames);
+    std::sort(want.begin(), want.end());
+    want.erase(std::unique(want.begin(), want.end()), want.end());
+    for (const int f : want) {
+        if (f <= 0 || f > cfg_.conv_frames) continue;
+        GraphBucket b;
+        b.conv_frames = f;
+        b.seq = WhisperEncoderConfig::conv_out_frames_of(f);
+        buckets_.push_back(b);
+    }
 }
 
 WhisperEncoder::~WhisperEncoder() {
-    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
-    if (graph_) cudaGraphDestroy(graph_);
+    for (GraphBucket& b : buckets_) {
+        if (b.exec) cudaGraphExecDestroy(b.exec);
+        if (b.graph) cudaGraphDestroy(b.graph);
+    }
     if (blas_) cublasDestroy(blas_);
     if (stream_) cudaStreamDestroy(stream_);
 }
@@ -363,15 +383,15 @@ void WhisperEncoder::gemm_ab(const float* A, const float* B, float* C, int M, in
         kComputeType, CUBLAS_GEMM_DEFAULT));
 }
 
-void WhisperEncoder::record(cudaStream_t s) {
-    const int seq = cfg_.max_source_positions;
+void WhisperEncoder::record(cudaStream_t s, int conv_frames) {
     const int D = cfg_.d_model;
     const int mel = cfg_.num_mel_bins;
-    const int cf = cfg_.conv_frames;
+    const int cf = conv_frames;                              // this bucket's input width
     const int ffn = cfg_.ffn_dim;
     const int H = cfg_.num_heads;
     const int hd = cfg_.head_dim();
-    const int c2 = cfg_.conv_out_frames();
+    const int c2 = WhisperEncoderConfig::conv_out_frames_of(cf);
+    const int seq = c2;                                      // encoder rows for this bucket
     const float scale = 1.0f / sqrtf((float)hd);
     const float one = 1.0f, zero = 0.0f;
 
@@ -421,31 +441,67 @@ void WhisperEncoder::record(cudaStream_t s) {
     launch_layernorm(hidden_, ln_post_w_, ln_post_b_, output_, seq, D, cfg_.ln_eps, s);
 }
 
-void WhisperEncoder::build_graph(const float* d_mel) {
-    const size_t in_bytes = d_input_.size_bytes();
-    // Warm-up (eager): fills d_input_, lets cuBLAS resolve its algorithms + touch
-    // its workspace BEFORE capture (capture forbids new allocations).
-    CUDA_CHECK_THROW(cudaMemcpyAsync(d_input_.get(), d_mel, in_bytes,
-                                     cudaMemcpyDeviceToDevice, stream_));
-    record(stream_);
+void WhisperEncoder::build_graph(GraphBucket& b) {
+    const size_t used = (size_t)cfg_.num_mel_bins * b.conv_frames;
+    // Warm-up (eager): zero-fill the used input region (values are irrelevant for
+    // algorithm resolution) and let cuBLAS resolve its algorithms + touch its
+    // workspace at THIS bucket's shapes BEFORE capture (capture forbids new allocs).
+    CUDA_CHECK_THROW(cudaMemsetAsync(d_input_.get(), 0, used * sizeof(float), stream_));
+    record(stream_, b.conv_frames);
     CUDA_CHECK_THROW(cudaStreamSynchronize(stream_));
 
     CUDA_CHECK_THROW(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
-    record(stream_);
-    CUDA_CHECK_THROW(cudaStreamEndCapture(stream_, &graph_));
-    CUDA_CHECK_THROW(cudaGraphInstantiate(&graph_exec_, graph_, 0));
-    graph_ready_ = true;
+    record(stream_, b.conv_frames);
+    CUDA_CHECK_THROW(cudaStreamEndCapture(stream_, &b.graph));
+    CUDA_CHECK_THROW(cudaGraphInstantiate(&b.exec, b.graph, 0));
+    b.ready = true;
+}
+
+WhisperEncoder::GraphBucket& WhisperEncoder::select_bucket(int mel_frames) {
+    // buckets_ is sorted ascending; pick the smallest that covers mel_frames, else
+    // the largest (== conv_frames, always present).
+    GraphBucket* chosen = &buckets_.back();
+    for (GraphBucket& b : buckets_) {
+        if (b.conv_frames >= mel_frames) { chosen = &b; break; }
+    }
+    if (!chosen->ready) build_graph(*chosen);
+    return *chosen;
 }
 
 const float* WhisperEncoder::forward(const float* d_mel) {
+    return forward(d_mel, cfg_.conv_frames);  // full 30 s bucket (back-compat)
+}
+
+const float* WhisperEncoder::forward(const float* d_mel, int mel_frames) {
     if (!weights_loaded_)
         throw std::runtime_error("WhisperEncoder::forward called before load_weights");
+    if (mel_frames <= 0 || mel_frames > cfg_.conv_frames)
+        throw std::runtime_error("WhisperEncoder::forward: mel_frames out of range "
+                                 "(1.." + std::to_string(cfg_.conv_frames) + ")");
 
-    if (!graph_ready_) build_graph(d_mel);  // first call: warm-up + capture
+    GraphBucket& b = select_bucket(mel_frames);  // lazily captured
+    const int mel = cfg_.num_mel_bins;
 
-    CUDA_CHECK_THROW(cudaMemcpyAsync(d_input_.get(), d_mel, d_input_.size_bytes(),
-                                     cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK_THROW(cudaGraphLaunch(graph_exec_, stream_));
+    // Pack the [mel, mel_frames] input into d_input_ as [mel, b.conv_frames]: the
+    // graph reads each mel row at stride b.conv_frames, so a shorter input is copied
+    // column-wise and the tail is zero-padded. When it exactly fills the bucket
+    // (e.g. the 30 s back-compat path) this is a single contiguous copy.
+    if (mel_frames == b.conv_frames) {
+        CUDA_CHECK_THROW(cudaMemcpyAsync(d_input_.get(), d_mel,
+                                         (size_t)mel * b.conv_frames * sizeof(float),
+                                         cudaMemcpyDeviceToDevice, stream_));
+    } else {
+        CUDA_CHECK_THROW(cudaMemsetAsync(d_input_.get(), 0,
+                                         (size_t)mel * b.conv_frames * sizeof(float), stream_));
+        CUDA_CHECK_THROW(cudaMemcpy2DAsync(
+            d_input_.get(), (size_t)b.conv_frames * sizeof(float),   // dst row pitch
+            d_mel,          (size_t)mel_frames * sizeof(float),      // src row pitch
+            (size_t)mel_frames * sizeof(float),                      // copied width (bytes)
+            (size_t)mel,                                             // rows (mel bins)
+            cudaMemcpyDeviceToDevice, stream_));
+    }
+    CUDA_CHECK_THROW(cudaGraphLaunch(b.exec, stream_));
+    last_seq_ = b.seq;
     return output_.get();
 }
 

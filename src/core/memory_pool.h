@@ -158,6 +158,16 @@ public:
     // the attention kernels of this step have finished (event-ordered, async).
     void commit_layer_kv(int layer, int pos);
 
+    // Roll every offload high-water mark back to `target_pos` tokens (KV rewind).
+    // Clamps each offloaded layer's host-mirror fill count AND every device
+    // staging slot's valid_upto down to target_pos, so positions >= target_pos are
+    // treated as stale and re-spilled/re-staged by the next decode step. The
+    // resident (VRAM) KV slabs are position-addressed and overwritten in place, so
+    // they need no truncation. No-op when nothing is offloaded. Idempotent; does
+    // not touch the device (no kernels, no sync) -- the single engine-owning thread
+    // calls it between decode steps.
+    void truncate_kv(int target_pos);
+
 private:
     void allocate_weights_pool(const std::string& safetensors_path, const SafetensorsLoader& metadata_loader);
     void allocate_dynamic_pool(size_t max_seq_len);

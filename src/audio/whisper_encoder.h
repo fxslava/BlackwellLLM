@@ -52,12 +52,23 @@ struct WhisperEncoderConfig {
     int num_heads = 20;               // encoder_attention_heads
     int ffn_dim = 5120;               // encoder_ffn_dim (fc1 out / fc2 in)
     int max_source_positions = 1500;  // encoder output frames (== seq len)
-    int conv_frames = 3000;           // mel time frames fed to conv1 (30 s)
+    int conv_frames = 3000;           // mel time frames fed to conv1 (30 s); the
+                                      // LARGEST bucket + the workspace-sizing bound
     float ln_eps = 1e-5f;             // nn.LayerNorm default eps
+
+    // CUDA-graph buckets (conv-frame counts) the encoder may capture, ascending. A
+    // forward(d_mel, mel_frames) rounds its input UP to the smallest covering bucket
+    // and captures that graph lazily, so a short chunk is NOT padded to 30 s. Any
+    // value > conv_frames is dropped and conv_frames is always included (it is the
+    // parity reference + the buffer-sizing bound). Default: 1.5 s / 3 s / 5 s / 30 s.
+    std::vector<int> graph_buckets = {150, 300, 500, 3000};
 
     int head_dim() const { return d_model / num_heads; }
     // conv2 halves the time axis (stride 2, k=3, pad=1): out == max_source_positions.
-    int conv_out_frames() const { return (conv_frames + 2 * 1 - 3) / 2 + 1; }
+    int conv_out_frames() const { return conv_out_frames_of(conv_frames); }
+    // Encoder frames produced for `cf` mel frames (shared by the buckets + the valid-
+    // prefix accounting the sliding window uses inside a padded bucket).
+    static int conv_out_frames_of(int cf) { return (cf + 2 * 1 - 3) / 2 + 1; }
 };
 
 // Host-side fp32 weights for ONE encoder layer. Linear weights keep the PyTorch
@@ -94,14 +105,22 @@ public:
     // mismatch). Must be called once before forward().
     void load_weights(const WhisperWeights& w);
 
-    // Runs the full encoder. d_mel is a device pointer to the log-mel
-    // spectrogram [num_mel_bins, conv_frames] (row-major, mel-major). On the
-    // FIRST call the CUDA graph is built (warm-up + capture); every call issues
-    // an async input copy + cudaGraphLaunch on stream() and returns immediately
-    // (no host sync). Returns a device pointer to the output [max_source_positions,
-    // d_model], owned by this object. The caller must synchronize stream() before
-    // reading it.
+    // Runs the full encoder over the FULL 30 s bucket. d_mel is a device pointer to
+    // the log-mel spectrogram [num_mel_bins, conv_frames] (row-major, mel-major).
+    // Back-compat overload of the bucketed forward below (mel_frames == conv_frames):
+    // returns [max_source_positions, d_model]. Kept bit-identical for the --wav path
+    // and the golden-parity tests.
     const float* forward(const float* d_mel);
+
+    // Bucketed forward. d_mel is [num_mel_bins, mel_frames] (mel-major); the encode
+    // is sized to the smallest captured bucket whose frame count covers mel_frames
+    // (padded with zeros to the bucket width), so a short chunk pays a short encode
+    // instead of the full 30 s. On the first use of a bucket its graph is built
+    // (warm-up + capture); every call issues an async input pack + cudaGraphLaunch on
+    // stream() and returns without host sync. Returns a device pointer to the output
+    // [output_frames(), d_model], owned by this object; output_frames() reflects the
+    // SELECTED bucket after the call. Synchronize stream() before reading.
+    const float* forward(const float* d_mel, int mel_frames);
 
     // The stream every forward() enqueues on (input copy + graph launch). Bracket
     // timing events on THIS stream and synchronize it before reading output().
@@ -112,9 +131,26 @@ public:
     const float* conv_out() const { return conv_out_.get(); }
 
     const WhisperEncoderConfig& config() const { return cfg_; }
-    int output_frames() const { return cfg_.max_source_positions; }
+    // Valid output frames of the LAST forward() (the selected bucket's seq); falls
+    // back to the full 30 s length before the first call.
+    int output_frames() const { return last_seq_ ? last_seq_ : cfg_.max_source_positions; }
+    // Real (unpadded) encoder frames for `mel_frames` of input — the valid prefix the
+    // projector / sliding-window delta-slicer should trust inside a padded bucket.
+    int valid_output_frames(int mel_frames) const {
+        return WhisperEncoderConfig::conv_out_frames_of(mel_frames);
+    }
 
 private:
+    // One captured graph for a given input length. The workspace buffers are sized
+    // for the largest bucket, so a smaller bucket is a prefix of the same allocations.
+    struct GraphBucket {
+        int             conv_frames = 0;   // input mel frames this graph is captured for
+        int             seq = 0;           // conv_out_frames_of(conv_frames) == output rows
+        cudaGraph_t     graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        bool            ready = false;      // captured yet? (lazy on first covering call)
+    };
+
     struct DeviceLayer {
         DeviceBuffer<float> attn_ln_w, attn_ln_b;
         DeviceBuffer<float> q_w, q_b, k_w, v_w, v_b, out_w, out_b;
@@ -122,25 +158,31 @@ private:
         DeviceBuffer<float> fc1_w, fc1_b, fc2_w, fc2_b;
     };
 
-    // Issues the full forward op sequence on `stream_` (no input copy, no sync).
-    // Shared by the eager warm-up and the graph capture so they are bit-identical.
-    void record(cudaStream_t s);
+    // Issues the full forward op sequence on `stream_` for a `conv_frames`-frame
+    // input (no input copy, no sync). Every extent derives from conv_frames, so the
+    // eager warm-up and the graph capture are bit-identical for a given bucket.
+    void record(cudaStream_t s, int conv_frames);
     // Y[T,O] = X[T,K] @ W[O,K]^T on cuBLAS (row-major via a transposed col-major
     // formulation); no bias (added by a fused epilogue).
     void gemm_linear(const float* X, const float* W, float* Y, int T, int K, int O,
                      cudaStream_t s);
     // C[M,N] = A[M,K] @ B[K,N] on cuBLAS (both row-major); the im2col conv GEMM.
     void gemm_ab(const float* A, const float* B, float* C, int M, int N, int K);
-    void build_graph(const float* d_mel);
+    // Eager warm-up (resolve cuBLAS algorithms/workspace) at b.conv_frames, then
+    // capture the graph into b.exec. Capture forbids new allocations, so the warm-up
+    // must run first. Populates b.{graph,exec,ready}.
+    void build_graph(GraphBucket& b);
+    // Smallest captured bucket whose conv_frames covers mel_frames (clamped to the
+    // largest); builds it lazily. buckets_ is sorted ascending.
+    GraphBucket& select_bucket(int mel_frames);
 
     WhisperEncoderConfig cfg_;
 
     // GPU control objects (raw handles; freed in the dtor).
     cudaStream_t stream_ = nullptr;
     cublasHandle_t blas_ = nullptr;
-    cudaGraph_t graph_ = nullptr;
-    cudaGraphExec_t graph_exec_ = nullptr;
-    bool graph_ready_ = false;
+    std::vector<GraphBucket> buckets_;  // sorted ascending by conv_frames; captured lazily
+    int last_seq_ = 0;                  // valid output length of the last forward()
 
     // Weights (device).
     DeviceBuffer<float> conv1_w_, conv1_b_, conv2_w_, conv2_b_;

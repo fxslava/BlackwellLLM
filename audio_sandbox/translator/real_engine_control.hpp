@@ -31,6 +31,7 @@
 // -----------------------------------------------------------------------------
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -89,6 +90,55 @@ public:
     // clamp), for the UI's prefix-cache invariant readout.
     uint32_t last_rewind_keep() const noexcept {
         return last_rewind_keep_.load(std::memory_order_acquire);
+    }
+
+    // ---- Explicit KV checkpoint / rollback (Phase 0, speculative prefill) -----
+    // A lightweight snapshot of the sequence pointer + verified-prefix boundary.
+    // Captured before speculatively prefilling audio/text soft-tokens, restored to
+    // discard those tokens without leaving stale KV above the rewound position.
+    struct KVCheckpoint {
+        int      pos = 0;               // logical decode position at capture time
+        uint32_t verified_tokens = 0;   // prompt tokens confirmed committed
+    };
+
+    // Snapshot the current sequence pointer + verified-prefix boundary. Engine
+    // thread only (reads pos_ / verified_prompt_tokens_ without a lock).
+    KVCheckpoint kv_cache_checkpoint() {
+        const KVCheckpoint cp{pos_, verified_prompt_tokens_};
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            std::printf("[kv-ckpt] checkpoint pos=%d verified_tokens=%u\n",
+                        cp.pos, cp.verified_tokens);
+            std::fflush(stdout);
+        }
+        return cp;
+    }
+
+    // Roll the sequence back to a checkpoint, discarding every KV column above it.
+    // Enforces the frozen system-prefix floor (a rollback may keep MORE than the
+    // checkpoint but never truncate the system prompt), restores the sequence
+    // pointer + verified boundary, then reconciles the arena's offload high-water
+    // marks through the Continuous KV rewind (VRAMArena::truncate_kv). Engine
+    // thread only.
+    void kv_cache_rollback(const KVCheckpoint& cp) {
+        const int floor    = static_cast<int>(effective_keep_tokens(0));
+        const int safe_pos = std::max(cp.pos, floor);
+        const bool dbg     = std::getenv("BLACKWELL_AV_DEBUG") != nullptr;
+        const auto t0      = std::chrono::steady_clock::now();
+
+        pos_ = safe_pos;
+        verified_prompt_tokens_ = cp.verified_tokens;
+        // Continuous KV rewind() delegates to VRAMArena::truncate_kv; safe below the
+        // engine's public API (single-thread doctrine) and a no-op for a fully
+        // resident model (nothing offloaded), so regular decode is unaffected.
+        engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, safe_pos);
+
+        if (dbg) {
+            const double us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::printf("[kv-ckpt] rollback pos %d -> %d (floor=%d) verified_tokens=%u  %.1f us\n",
+                        cp.pos, safe_pos, floor, cp.verified_tokens, us);
+            std::fflush(stdout);
+        }
     }
 
     // Engine-thread setup: load the Whisper encoder + Ultravox projector weights
@@ -215,17 +265,29 @@ public:
     }
 
 protected:
-    // Barge-in micro-rewind. The 8B AWQ backbone runs Continuous KV, which is
-    // position-addressed and has no CoW rewind (BlackwellEngine::rewind is gated
-    // to Paged), so we do NOT call the engine here — re-decoding from an earlier
-    // position simply overwrites stale KV slots. We still honour the frozen-
-    // prefix floor (effective_keep_tokens) and re-anchor pos_ to the resolved
-    // keep so the next utterance decodes on top of the system prefix, not on top
-    // of the previous (superseded) answer.
+    // Barge-in micro-rewind. The 8B AWQ backbone runs Continuous KV: the resident
+    // slabs are position-addressed and overwritten in place, so re-anchoring pos_ is
+    // enough for the decode math. But when layers are offloaded, the host mirror /
+    // staging slots keep a high-water mark that would otherwise leak stale KV above
+    // the rewound position across the barge-in; ContinuousKVManager::rewind() now
+    // reconciles those via VRAMArena::truncate_kv (a no-op when nothing is
+    // offloaded, so the resident-only path is unaffected). We honour the frozen-
+    // prefix floor (effective_keep_tokens) so the rewind never drops the system
+    // prefix, and re-anchor pos_ to the resolved keep so the next utterance decodes
+    // on top of the system prefix, not on top of the previous (superseded) answer.
     blackwell::EngineStatus do_rewind(const Command& cmd) override {
         const uint32_t keep = effective_keep_tokens(cmd.keep_prompt_tokens);
         last_rewind_keep_.store(keep, std::memory_order_release);
         pos_ = static_cast<int>(keep);
+        // Full host-mirror reconciliation (Phase 0 truncate_kv), safe below the
+        // engine's public API on the single engine-owning thread.
+        engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, static_cast<int>(keep));
+
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            std::printf("[kv-ckpt] barge-in rewind -> keep=%u (floor=%u)\n",
+                        keep, system_prefix_tokens());
+            std::fflush(stdout);
+        }
         return blackwell::EngineStatus::Success;
     }
 
@@ -415,6 +477,7 @@ private:
     blackwell::ITokenizer* tok_ = nullptr;   // non-owning
     int  max_context_ = 0;
     int  pos_ = 0;                            // logical decode position (engine thread only)
+    uint32_t verified_prompt_tokens_ = 0;     // committed-prefix boundary (checkpoint/rollback)
     std::atomic<uint32_t> last_rewind_keep_{0};
     std::atomic<std::size_t> turn_counter_{0};
 
