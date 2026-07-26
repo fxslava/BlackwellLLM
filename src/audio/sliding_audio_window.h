@@ -46,6 +46,11 @@ inline constexpr int kStackFactor           = 8;
 inline constexpr int kMelFramesPerSoftToken = kConvStride * kStackFactor;  // 16 == 160 ms
 inline constexpr int kMelFramesPerSecond    = 100;                          // 10 ms hop
 
+// Sliding-window geometry in soft-tokens. In the LIVE path these are NOT hardcoded:
+// they are derived from the validated tier-3 AudioStreamingPlan via
+// sliding_window_from_plan() below (window_tokens / hop_tokens resolved from the
+// InferenceConfig ms request). The defaults here are an illustrative 2.24 s / 320 ms
+// preset for standalone tests only.
 struct SlidingWindowConfig {
     int num_mel_bins   = 128;   // Whisper log-mel channels (encoder conv1 in-channels)
     int history_tokens = 12;    // acoustic history kept per hop (12 * 160 ms = 1.92 s)
@@ -54,6 +59,18 @@ struct SlidingWindowConfig {
     int window_tokens()     const { return history_tokens + hop_tokens; }
     int window_mel_frames() const { return window_tokens() * kMelFramesPerSoftToken; }
 };
+
+// Build the window geometry from the resolved plan's soft-token counts (retires the
+// magic numbers: the live path passes plan.window_tokens / plan.hop_tokens). Kept as
+// scalars so this header stays free of the core config dependency.
+inline SlidingWindowConfig sliding_window_from_plan(int window_tokens, int hop_tokens,
+                                                    int num_mel_bins) {
+    SlidingWindowConfig c;
+    c.num_mel_bins   = num_mel_bins;
+    c.hop_tokens     = hop_tokens;
+    c.history_tokens = window_tokens - hop_tokens;
+    return c;
+}
 
 // The extracted delta: a view into the projector output plus how many soft-token
 // rows (each text_hidden wide) belong to the new chunk. These — and only these —

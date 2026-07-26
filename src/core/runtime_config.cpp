@@ -1,4 +1,5 @@
 #include "blackwell/runtime_config.h"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -145,6 +146,67 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
         throw std::invalid_argument(
             "RuntimeConfig: kv_disk_slots > 0 requires a non-empty kv_spill_path "
             "(the NVMe spill tier needs a backing file)");
+
+    // --- audio streaming plan (ms intent -> validated soft-token counts) --------
+    // Resolved when the frontend opts in (.enable) OR any streaming override is
+    // present. Requests are in ms; one soft-token == kAudioSoftTokenMs, so the ms
+    // values must land on whole soft-token boundaries (else the sliding window's
+    // overlap would not align to injected tokens and reconciliation would compare
+    // misaligned spans). Left all-zero / disabled otherwise.
+    {
+        const auto& a = request.audio_streaming;
+        const bool any_override =
+            overrides.audio_window_size_ms || overrides.audio_hop_size_ms ||
+            overrides.audio_overlap_reconciliation || overrides.audio_reconciliation_threshold ||
+            overrides.audio_max_reconciliation_rewind_tokens;
+
+        if (a.enable || any_override) {
+            const int win_ms = overrides.audio_window_size_ms.value_or(a.window_size_ms);
+            const int hop_ms = overrides.audio_hop_size_ms.value_or(a.hop_size_ms);
+            const float thr =
+                overrides.audio_reconciliation_threshold.value_or(a.overlap_reconciliation_threshold);
+            const int cap =
+                overrides.audio_max_reconciliation_rewind_tokens.value_or(a.max_reconciliation_rewind_tokens);
+            const bool want_recon =
+                overrides.audio_overlap_reconciliation.value_or(a.overlap_reconciliation);
+
+            if (win_ms <= 0 || hop_ms <= 0)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming window/hop ms must be > 0");
+            if (win_ms % kAudioSoftTokenMs != 0 || hop_ms % kAudioSoftTokenMs != 0)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming window_size_ms (" + std::to_string(win_ms) +
+                    ") and hop_size_ms (" + std::to_string(hop_ms) +
+                    ") must each be a whole multiple of one soft-token (" +
+                    std::to_string(kAudioSoftTokenMs) + " ms) so the sliding-window overlap "
+                    "aligns to injected tokens");
+            const int wt = win_ms / kAudioSoftTokenMs;
+            const int ht = hop_ms / kAudioSoftTokenMs;
+            if (ht < 1 || wt < ht)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming requires window_tokens (" + std::to_string(wt) +
+                    ") >= hop_tokens (" + std::to_string(ht) + ") >= 1");
+            if (thr <= 0.0f || thr > 1.0f)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming overlap_reconciliation_threshold must be "
+                    "in (0, 1]");
+            if (cap < 0)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming max_reconciliation_rewind_tokens must be >= 0");
+
+            rt.audio_streaming.window_tokens          = wt;
+            rt.audio_streaming.hop_tokens             = ht;
+            rt.audio_streaming.overlap_tokens         = wt - ht;
+            rt.audio_streaming.reconciliation_threshold = thr;
+            rt.audio_streaming.max_rewind_tokens      = std::min(cap, wt - ht);
+
+            // Capability gate: rewind+re-inject reconciles the (position-addressed)
+            // KV, but NOT a hybrid model's recurrent linear-attention (SSM) state, so
+            // it is disabled there -- the frontend falls back to Phase-1 tail-slicing
+            // (still correct, just no dynamic tail rewrite). Mirrors the branching gate.
+            rt.audio_streaming.enabled = want_recon && !caps.requires_ssm_subsystem;
+        }
+    }
 
     return rt;
 }

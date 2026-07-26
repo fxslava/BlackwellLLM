@@ -33,6 +33,26 @@
 
 namespace blackwell {
 
+// One Ultravox audio soft-token spans conv_stride(2) * stack_factor(8) mel frames
+// at the Whisper 100-frame/s log-mel rate = 160 ms. Streaming requests are given in
+// hardware/stack-agnostic MILLISECONDS and resolved to whole soft-token counts here.
+// MUST match audio::kMelFramesPerSoftToken (src/audio/sliding_audio_window.h): 16
+// mel frames * 10 ms = 160 ms.
+inline constexpr int kAudioSoftTokenMs = 160;
+
+// ── Tier 2: high-level streaming request (audio sliding-window + reconciliation) ─
+// All fields are USER INTENT in ms / ratios; build_and_validate_runtime resolves
+// them into a validated AudioStreamingPlan (tier 3). Nothing here is consumed
+// directly — the pipeline reads only the resolved plan.
+struct AudioStreamingConfig {
+    bool  enable                           = false;   // audio frontends opt in
+    int   window_size_ms                   = 2240;    // acoustic context window (14 tokens)
+    int   hop_size_ms                      = 320;     // new audio committed per hop (2 tokens)
+    bool  overlap_reconciliation           = true;    // rewrite tail when history diverges
+    float overlap_reconciliation_threshold = 0.999f;  // cosine below this ⇒ divergence
+    int   max_reconciliation_rewind_tokens = 8;       // safety cap on re-prefill depth
+};
+
 // ── Tier 2: high-level request ──────────────────────────────────────────────
 struct InferenceConfig {
     // Max tokens (prompt + generated) for a single sequence. Drives KV-cache and
@@ -60,6 +80,22 @@ struct InferenceConfig {
     // Default sampling knobs. Per-call forward() arguments still override these.
     float temperature = 0.6f;
     float top_p       = 0.9f;
+
+    // Audio streaming (sliding-window + dynamic overlap reconciliation). Inert
+    // unless .enable is set (or a streaming override is present); resolved into
+    // RuntimeConfig::audio_streaming.
+    AudioStreamingConfig audio_streaming;
+};
+
+// Resolved streaming plan (tier 3): ms intent expanded to whole soft-token counts,
+// validated, and gated on model capability. The audio pipeline consumes ONLY this.
+struct AudioStreamingPlan {
+    bool  enabled                  = false;   // reconciliation active AFTER the capability gate
+    int   window_tokens            = 0;       // window_size_ms / kAudioSoftTokenMs
+    int   hop_tokens               = 0;       // hop_size_ms    / kAudioSoftTokenMs
+    int   overlap_tokens           = 0;       // window_tokens - hop_tokens (the compare span)
+    float reconciliation_threshold = 0.999f;  // cosine below ⇒ divergence
+    int   max_rewind_tokens        = 0;       // clamped to [0, overlap_tokens]
 };
 
 // ── Tier 3: resolved execution plan ─────────────────────────────────────────
@@ -112,6 +148,9 @@ struct RuntimeConfig {
     int kv_disk_slots = 0;
     // Backing file for the spill tier. Must be non-empty iff kv_disk_slots > 0.
     std::string kv_spill_path;
+
+    // --- audio streaming plan (resolved from InferenceConfig::audio_streaming) ---
+    AudioStreamingPlan audio_streaming;
 };
 
 // Optional low-level overrides applied AFTER the automatic plan is derived but
@@ -128,6 +167,14 @@ struct RuntimeOverrides {
     std::optional<int>         kv_ram_slots;       // kMirrorDevicePool = mirror device pool
     std::optional<int>         kv_disk_slots;      // 0 = disk tier off
     std::optional<std::string> kv_spill_path;
+
+    // Audio streaming (see AudioStreamingConfig for semantics). Any of these being
+    // present also activates the streaming-plan resolution even if .enable is false.
+    std::optional<int>   audio_window_size_ms;
+    std::optional<int>   audio_hop_size_ms;
+    std::optional<bool>  audio_overlap_reconciliation;
+    std::optional<float> audio_reconciliation_threshold;
+    std::optional<int>   audio_max_reconciliation_rewind_tokens;
 
     // Observability seam, not an execution-plan knob (deliberately absent from
     // RuntimeConfig): invoked from the engine-constructing thread while model

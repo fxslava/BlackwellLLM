@@ -63,7 +63,9 @@ blackwell_add_test_suite(integration_tests "${CMAKE_CURRENT_SOURCE_DIR}/integrat
 # launch_fused_swiglu_kernel/launch_*_embedding_kernel.
 if(TARGET blackwell_audio)
     target_link_libraries(integration_tests PRIVATE blackwell_audio)
-    target_include_directories(integration_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/audio)
+    target_include_directories(integration_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/audio
+        ${CMAKE_SOURCE_DIR}/audio_sandbox/translator)  # audio_head_loader.hpp (reconciliation field test)
 endif()
 
 # Ultravox audio-frontend parity tests. Unlike the gtest suites above these are

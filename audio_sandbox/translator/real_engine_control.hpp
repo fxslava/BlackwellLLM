@@ -154,6 +154,9 @@ public:
         audio_pp_ = std::make_unique<blackwell::audio::PingPongAudioBuffer>(
             audio_pipeline_->embed_elems());
         audio_frame_ = 0;
+        // Bind the resolved tier-3 streaming plan so the sliding-window hop path can
+        // reconcile overlap (inert when the plan is disabled / capability-gated off).
+        audio_pipeline_->configure_streaming(engine_->get_impl()->m_runtime.audio_streaming);
     }
     bool audio_head_loaded() const noexcept { return audio_pipeline_ != nullptr; }
     int  audio_out_frames() const {
@@ -282,6 +285,9 @@ protected:
         // Full host-mirror reconciliation (Phase 0 truncate_kv), safe below the
         // engine's public API on the single engine-owning thread.
         engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, static_cast<int>(keep));
+        // The KV is rewound to (at most) the frozen system prefix, so no audio soft-
+        // tokens survive: drop the overlap-reconciliation history too.
+        if (audio_pipeline_) audio_pipeline_->reset_history();
 
         if (std::getenv("BLACKWELL_AV_DEBUG")) {
             std::printf("[kv-ckpt] barge-in rewind -> keep=%u (floor=%u)\n",
@@ -408,6 +414,87 @@ protected:
         }
 
         pp.consumer_release(frame, /*stream 0*/ nullptr);
+        return pos_;
+    }
+
+    // Inject `count` projector soft-token rows starting at d_embeds[start_row] into
+    // the KV via the white-box step_* sweep, advancing pos_. d_embeds is the audio-
+    // stream projector output; the caller must have synchronized that stream first.
+    // Returns Success, or the first failing step's status.
+    blackwell::EngineStatus inject_embedding_rows(const float* d_embeds, int start_row,
+                                                  int count) {
+        auto* core = engine_->get_impl();
+        const int hidden = static_cast<int>(core->m_config.hidden_dim);
+        const int num_layers = static_cast<int>(core->m_config.num_layers);
+        for (int a = 0; a < count && pos_ < max_context_; ++a, ++pos_) {
+            CUDA_CHECK_THROW(cudaMemcpyAsync(
+                core->d_X_accum,
+                d_embeds + static_cast<size_t>(start_row + a) * hidden,
+                static_cast<size_t>(hidden) * sizeof(float),
+                cudaMemcpyDeviceToDevice, /*stream 0*/ nullptr));
+            core->kv_mgr->prepare_decode_step(cfg_.seq_id, pos_);
+            using S = blackwell::EngineStatus;
+            bool ok = true;
+            for (int l = 0; l < num_layers && ok; ++l) {
+                ok = core->step_attention_norm(l) == S::Success
+                  && core->step_attention_qkv_projections(l) == S::Success
+                  && core->step_attention_math(l, pos_) == S::Success
+                  && core->step_attention_out(l) == S::Success
+                  && core->step_mlp_norm(l) == S::Success
+                  && core->step_mlp_projections(l) == S::Success
+                  && core->step_mlp_out(l) == S::Success;
+            }
+            if (ok) ok = core->step_final_ops() == S::Success;
+            if (!ok) return S::CudaRuntimeError;
+        }
+        return blackwell::EngineStatus::Success;
+    }
+
+    // One streaming hop with DYNAMIC OVERLAP RECONCILIATION. d_mel is [num_mel_bins,
+    // mel_frames] for the CURRENT sliding window. Encode+project the window, compare
+    // its overlapping prefix against the injected history, and either:
+    //   * divergence -> kv_cache_rollback(rewind_to_pos) then re-inject the corrected
+    //     overlap tail + the new hop (from refill_from), or
+    //   * stable     -> inject only the tail delta (hop_tokens).
+    // Then record what was committed. Returns pos_ after the hop. Engine thread only;
+    // no-op reconcile (plan disabled) degenerates to Phase-1 tail-slicing.
+    int prefill_audio_hop(const float* d_mel, int mel_frames) {
+        const auto win = audio_pipeline_->encode_project_window(d_mel, mel_frames);
+        // The projector ran on the audio stream; make its output visible to the
+        // host-side reconcile (D2H) and the stream-0 injection below.
+        CUDA_CHECK_THROW(cudaStreamSynchronize(audio_pipeline_->audio_stream()));
+
+        const auto& plan = engine_->get_impl()->m_runtime.audio_streaming;
+        const blackwell::audio::ReconciliationPlan rec =
+            audio_pipeline_->reconcile(win.embeds, win.num_tokens);
+
+        int start_row = 0, count = win.num_tokens;
+        if (rec.diverged) {
+            kv_cache_rollback({rec.rewind_to_pos, verified_prompt_tokens_});
+            start_row = rec.refill_from;
+            count     = win.num_tokens - rec.refill_from;
+        } else {
+            const int hop = plan.hop_tokens > 0 ? plan.hop_tokens : win.num_tokens;
+            start_row = std::max(0, win.num_tokens - hop);
+            count     = win.num_tokens - start_row;
+        }
+
+        const int hidden = static_cast<int>(engine_->get_impl()->m_config.hidden_dim);
+        const int inject_pos = pos_;
+        inject_embedding_rows(win.embeds, start_row, count);
+        audio_pipeline_->record_injected(
+            win.embeds + static_cast<size_t>(start_row) * hidden, inject_pos, count);
+
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            if (rec.diverged)
+                std::printf("[reconcile] divergence: rollback pos=%d, refill %d row(s) "
+                            "(window %d tok) -> pos=%d\n",
+                            rec.rewind_to_pos, count, win.num_tokens, pos_);
+            else
+                std::printf("[reconcile] stable: appended delta %d row(s) (window %d tok) "
+                            "-> pos=%d\n", count, win.num_tokens, pos_);
+            std::fflush(stdout);
+        }
         return pos_;
     }
 

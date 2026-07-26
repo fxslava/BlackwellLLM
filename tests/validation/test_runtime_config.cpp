@@ -188,3 +188,117 @@ TEST(RuntimeConfig, BatchedGemmThresholdBelowOneRejected) {
     EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), InferenceConfig{}, ov),
                  std::invalid_argument);
 }
+
+// ── audio streaming plan (dynamic overlap reconciliation) ───────────────────
+
+// Default request leaves the streaming plan inert (frontend has not opted in).
+TEST(RuntimeConfig, AudioStreamingInertByDefault) {
+    const auto m = dense_model();
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), InferenceConfig{});
+    EXPECT_FALSE(rt.audio_streaming.enabled);
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 0);
+    EXPECT_EQ(rt.audio_streaming.hop_tokens, 0);
+}
+
+// Opt-in resolves ms intent to whole soft-token counts (160 ms/token) and derives
+// the overlap span; on a dense model reconciliation is enabled.
+TEST(RuntimeConfig, AudioStreamingResolvesMsToTokens) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;            // defaults: 2240 ms / 320 ms
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_TRUE(rt.audio_streaming.enabled);
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 14);   // 2240 / 160
+    EXPECT_EQ(rt.audio_streaming.hop_tokens, 2);        // 320 / 160
+    EXPECT_EQ(rt.audio_streaming.overlap_tokens, 12);   // 14 - 2
+    EXPECT_FLOAT_EQ(rt.audio_streaming.reconciliation_threshold, 0.999f);
+    EXPECT_EQ(rt.audio_streaming.max_rewind_tokens, 8);  // min(8, overlap 12)
+}
+
+// A window/hop not on a whole soft-token boundary is rejected (would misalign the
+// overlap against the injected tokens).
+TEST(RuntimeConfig, AudioStreamingRejectsUnalignedMs) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.hop_size_ms = 300;        // not a multiple of 160
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::invalid_argument);
+}
+
+// window_tokens must be >= hop_tokens.
+TEST(RuntimeConfig, AudioStreamingRejectsHopExceedingWindow) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.window_size_ms = 320;     // 2 tokens
+    req.audio_streaming.hop_size_ms    = 640;     // 4 tokens > window
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::invalid_argument);
+}
+
+// Threshold must be in (0, 1]; cap must be >= 0.
+TEST(RuntimeConfig, AudioStreamingRejectsBadThresholdAndCap) {
+    const auto m = dense_model();
+    const auto caps = derive_capabilities(m);
+    {   InferenceConfig req; req.audio_streaming.enable = true;
+        req.audio_streaming.overlap_reconciliation_threshold = 1.5f;
+        EXPECT_THROW(build_and_validate_runtime(m, caps, req), std::invalid_argument); }
+    {   InferenceConfig req; req.audio_streaming.enable = true;
+        req.audio_streaming.overlap_reconciliation_threshold = 0.0f;
+        EXPECT_THROW(build_and_validate_runtime(m, caps, req), std::invalid_argument); }
+    {   InferenceConfig req; req.audio_streaming.enable = true;
+        req.audio_streaming.max_reconciliation_rewind_tokens = -1;
+        EXPECT_THROW(build_and_validate_runtime(m, caps, req), std::invalid_argument); }
+}
+
+// The rewind cap is clamped to the overlap span (can never rewind past it).
+TEST(RuntimeConfig, AudioStreamingClampsRewindCapToOverlap) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.max_reconciliation_rewind_tokens = 99;   // > overlap 12
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_EQ(rt.audio_streaming.max_rewind_tokens, rt.audio_streaming.overlap_tokens);  // 12
+}
+
+// SSM/hybrid capability gate: the plan still resolves the token geometry, but
+// reconciliation is DISABLED (recurrent state can't be rewound+re-injected).
+TEST(RuntimeConfig, AudioStreamingReconciliationGatedOffForHybrid) {
+    const auto m = hybrid_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_FALSE(rt.audio_streaming.enabled);        // gated off
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 14); // geometry still resolved
+    EXPECT_EQ(rt.audio_streaming.hop_tokens, 2);
+}
+
+// A streaming OVERRIDE activates plan resolution even when .enable is false, and
+// wins over the request defaults.
+TEST(RuntimeConfig, AudioStreamingOverrideActivatesAndWins) {
+    const auto m = dense_model();
+    InferenceConfig req;                              // enable stays false
+    RuntimeOverrides ov;
+    ov.audio_window_size_ms = 1600;                  // 10 tokens
+    ov.audio_hop_size_ms    = 160;                   // 1 token
+    ov.audio_reconciliation_threshold = 0.995f;
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req, ov);
+    EXPECT_TRUE(rt.audio_streaming.enabled);
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 10);
+    EXPECT_EQ(rt.audio_streaming.hop_tokens, 1);
+    EXPECT_EQ(rt.audio_streaming.overlap_tokens, 9);
+    EXPECT_FLOAT_EQ(rt.audio_streaming.reconciliation_threshold, 0.995f);
+}
+
+// The reconciliation on/off override is honored (off => plan disabled, geometry kept).
+TEST(RuntimeConfig, AudioStreamingReconciliationOverrideOff) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    RuntimeOverrides ov;
+    ov.audio_overlap_reconciliation = false;
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req, ov);
+    EXPECT_FALSE(rt.audio_streaming.enabled);
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 14);
+}

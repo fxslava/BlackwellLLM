@@ -16,17 +16,33 @@
 // DOCTRINE: single owning thread; INIT-tier ctor/load throw; forward path
 // allocates nothing and never calls cudaDeviceSynchronize.
 // -----------------------------------------------------------------------------
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <deque>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "common.h"                        // CUDA_CHECK_THROW
+#include "blackwell/runtime_config.h"      // blackwell::AudioStreamingPlan (resolved tier-3)
 #include "whisper_encoder.h"               // WhisperEncoder{,Config}, WhisperWeights
 #include "ultravox_projector_pipeline.cuh" // UltravoxProjector, ProjectorConfig
 #include "ping_pong_audio_buffer.h"        // PingPongAudioBuffer
 
 namespace blackwell::audio {
+
+// What a streaming hop should do with the KV after re-encoding its window. When
+// `diverged`, the caller rolls the KV back to `rewind_to_pos` (Phase-0
+// kv_cache_rollback) and re-injects the NEW window's soft-tokens from index
+// `refill_from` (the corrected overlap tail + the new hop); otherwise it injects
+// only the tail delta (hop_tokens). See AudioEmbeddingPipeline::reconcile.
+struct ReconciliationPlan {
+    bool diverged      = false;
+    int  rewind_to_pos = 0;   // KV position to roll back to before re-injecting
+    int  refill_from   = 0;   // start index into the NEW window's soft-tokens
+};
 
 class AudioEmbeddingPipeline {
 public:
@@ -70,10 +86,121 @@ public:
         pp.producer_publish(frame, audio_stream());       // slot ready for consumer
     }
 
+    // ---- Streaming path: dynamic overlap reconciliation --------------------------
+
+    // Bind the resolved tier-3 streaming plan (engine-thread setup). When
+    // plan.enabled, reconcile()/record_injected() maintain the injected-token history
+    // and dynamic tail rewrite; otherwise they are inert (Phase-1 tail-slicing).
+    void configure_streaming(const blackwell::AudioStreamingPlan& plan) { plan_ = plan; }
+    const blackwell::AudioStreamingPlan& streaming_plan() const { return plan_; }
+
+    // Bucketed encode + project of a `mel_frames`-long window (mel-major d_mel):
+    // returns the projector output [num_tokens, text_hidden] device pointer (owned by
+    // the projector) and the VALID soft-token count. All on audio_stream(); the caller
+    // must gate/sync before consuming. No ping-pong staging (the streaming consumer
+    // reads the pointer directly).
+    struct ProjectedWindow { const float* embeds; int num_tokens; };
+    ProjectedWindow encode_project_window(const float* d_mel, int mel_frames) {
+        const float* d_hidden = encoder_.forward(d_mel, mel_frames);
+        const int valid = encoder_.valid_output_frames(mel_frames);   // unpadded frames
+        const float* d_embeds = projector_.forward(d_hidden, valid, audio_stream());
+        return { d_embeds, projector_.out_frames(valid) };
+    }
+
+    // Cosine similarity over one text_hidden-dim embedding pair, double-accumulated.
+    // In 4096-d, similar embeddings sit at cos ~ 1.0; a drop below the (strict) tier-3
+    // threshold marks a genuine acoustic-meaning shift, not float noise.
+    static double cosine_similarity(const float* a, const float* b, int n) {
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double x = a[i], y = b[i];
+            dot += x * y; na += x * x; nb += y * y;
+        }
+        const double den = std::sqrt(na) * std::sqrt(nb);
+        return den > 1e-12 ? dot / den : 0.0;
+    }
+
+    // Scan the NEW window's overlapping PREFIX (first overlap_tokens rows of
+    // d_new_proj) left-to-right against the historically INJECTED tokens for the same
+    // span. At the first row whose cosine < threshold, return a rewind/refill plan:
+    // rewind_to_pos is the KV position to roll back to, refill_from the NEW-window
+    // index to resume injection from — both honoring max_rewind_tokens (a deeper
+    // divergence is corrected only up to the cap; older tokens carry more right-
+    // context and drift least). Returns {diverged=false} when the overlap is stable
+    // (inject only the tail delta) or when streaming/history is not yet available.
+    // Does ONE small D2H of the overlap prefix (off the per-token hot path).
+    ReconciliationPlan reconcile(const float* d_new_proj, int num_new_tokens) {
+        if (!plan_.enabled) return {};
+        const int H = text_hidden();
+        const int overlap = std::min({plan_.overlap_tokens,
+                                      static_cast<int>(injected_history_.size()),
+                                      num_new_tokens});
+        if (overlap <= 0) return {};
+
+        recon_stage_.resize(static_cast<std::size_t>(overlap) * H);
+        CUDA_CHECK_THROW(cudaMemcpy(recon_stage_.data(), d_new_proj,
+                                    recon_stage_.size() * sizeof(float),
+                                    cudaMemcpyDeviceToHost));
+
+        const int base = static_cast<int>(injected_history_.size()) - overlap;
+        const int cur_pos = injected_history_.back().kv_pos + 1;   // next free KV slot
+        for (int i = 0; i < overlap; ++i) {
+            const InjectedToken& hist = injected_history_[static_cast<std::size_t>(base + i)];
+            const double cos = cosine_similarity(&recon_stage_[static_cast<std::size_t>(i) * H],
+                                                 hist.embed.data(), H);
+            if (cos < plan_.reconciliation_threshold) {
+                const int capped = std::min(overlap - i, plan_.max_rewind_tokens);
+                return { /*diverged=*/true,
+                         /*rewind_to_pos=*/cur_pos - capped,
+                         /*refill_from=*/ overlap - capped };
+            }
+        }
+        return {};   // overlap stable within threshold
+    }
+
+    // Record the soft-tokens actually injected into the KV this hop: `num_tokens`
+    // rows of d_embeds committed at KV positions [start_pos, start_pos+num_tokens).
+    // First evicts any history at/after start_pos (mirrors a preceding rollback), so
+    // the mirror stays consistent with the KV; then appends, capped to window_tokens
+    // (only the overlap can ever be rewound). Inert unless streaming is enabled.
+    void record_injected(const float* d_embeds, int start_pos, int num_tokens) {
+        if (!plan_.enabled || num_tokens <= 0) return;
+        while (!injected_history_.empty() && injected_history_.back().kv_pos >= start_pos)
+            injected_history_.pop_back();
+
+        const int H = text_hidden();
+        recon_stage_.resize(static_cast<std::size_t>(num_tokens) * H);
+        CUDA_CHECK_THROW(cudaMemcpy(recon_stage_.data(), d_embeds,
+                                    recon_stage_.size() * sizeof(float),
+                                    cudaMemcpyDeviceToHost));
+        for (int i = 0; i < num_tokens; ++i) {
+            InjectedToken t;
+            t.kv_pos = start_pos + i;
+            t.embed.assign(recon_stage_.begin() + static_cast<std::size_t>(i) * H,
+                           recon_stage_.begin() + static_cast<std::size_t>(i + 1) * H);
+            injected_history_.push_back(std::move(t));
+            if (static_cast<int>(injected_history_.size()) > plan_.window_tokens)
+                injected_history_.pop_front();
+        }
+    }
+
+    // Drop the whole injected-token history (barge-in: the KV is rewound to the
+    // frozen system prefix, so no audio history survives).
+    void reset_history() noexcept { injected_history_.clear(); }
+    int  history_size() const noexcept { return static_cast<int>(injected_history_.size()); }
+
 private:
     WhisperEncoder encoder_;
     UltravoxProjector projector_;
     int num_input_frames_;
+
+    // Injected-token history (host mirror) for overlap reconciliation: the soft-token
+    // embeddings already committed to the KV, newest last, each tagged with its KV
+    // position. Bounded to plan_.window_tokens rows.
+    blackwell::AudioStreamingPlan plan_{};
+    struct InjectedToken { int kv_pos; std::vector<float> embed; };  // embed: [text_hidden]
+    std::deque<InjectedToken> injected_history_;
+    std::vector<float> recon_stage_;   // reused D2H staging (overlap prefix / injected rows)
 };
 
 }  // namespace blackwell::audio
