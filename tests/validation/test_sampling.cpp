@@ -79,6 +79,138 @@ TEST_F(SamplingValidation, KnownLogitsLlamaDecodeStep) {
     EXPECT_NE(gpu_token[0], 128000) << "argmax echoed the BOS/input token";
 }
 
+// ---------------------------------------------------------------------------
+// Repetition penalty (the degenerate-loop brake the live translator's decode
+// loop applies before sampling). Contract: sampling.cuh.
+// ---------------------------------------------------------------------------
+
+// Sign-aware shaping: a POSITIVE logit is divided by the penalty, a NEGATIVE one
+// multiplied (dividing a negative would make it LARGER, i.e. reward the repeat).
+// Untouched ids must be bit-identical.
+TEST_F(SamplingValidation, RepetitionPenaltyIsSignAware) {
+    const size_t vocab = 1024;
+    const float  penalty = 1.15f;
+    std::vector<float> h_logits =
+        test_utils::random_uniform(vocab, /*seed=*/131, -5.0f, 5.0f);
+    h_logits[10] = 4.0f;    // positive -> divided
+    h_logits[20] = -4.0f;   // negative -> multiplied
+    h_logits[30] = 0.0f;    // the v > 0 boundary: takes the multiply branch
+
+    const std::vector<int> h_ids{10, 20, 30};
+    CudaVector<float> d_logits(vocab); d_logits.upload(h_logits);
+    CudaVector<int>   d_ids(h_ids.size()); d_ids.upload(h_ids);
+
+    launch_repetition_penalty_kernel(d_logits, vocab, d_ids,
+                                     static_cast<int>(h_ids.size()), penalty);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> out(vocab);
+    d_logits.download(out);
+    EXPECT_FLOAT_EQ(out[10], 4.0f / penalty);
+    EXPECT_FLOAT_EQ(out[20], -4.0f * penalty);
+    EXPECT_FLOAT_EQ(out[30], 0.0f);
+    for (size_t i = 0; i < vocab; ++i) {
+        if (i == 10 || i == 20 || i == 30) continue;
+        ASSERT_FLOAT_EQ(out[i], h_logits[i]) << "untouched logit " << i << " moved";
+    }
+}
+
+// A rolling window legitimately holds the SAME id many times (that is what a
+// degenerate loop looks like). The penalty must still be applied exactly ONCE
+// per distinct id — compounding it would be both non-deterministic (a
+// read-modify-write race) and far too aggressive.
+TEST_F(SamplingValidation, RepetitionPenaltyAppliedOncePerDistinctId) {
+    const size_t vocab = 1024;
+    const float  penalty = 1.15f;
+    std::vector<float> h_logits(vocab, 1.0f);
+    h_logits[7] = 8.0f;
+
+    // id 7 repeated 40 times, as an exact phrase loop would produce.
+    const std::vector<int> h_ids(40, 7);
+    CudaVector<float> d_logits(vocab); d_logits.upload(h_logits);
+    CudaVector<int>   d_ids(h_ids.size()); d_ids.upload(h_ids);
+
+    launch_repetition_penalty_kernel(d_logits, vocab, d_ids,
+                                     static_cast<int>(h_ids.size()), penalty);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> out(vocab);
+    d_logits.download(out);
+    EXPECT_FLOAT_EQ(out[7], 8.0f / penalty)
+        << "penalty compounded across duplicate window entries";
+}
+
+// The documented no-ops (penalty <= 1, empty window) and the out-of-range-id
+// guard must all leave the logits untouched rather than corrupt memory.
+TEST_F(SamplingValidation, RepetitionPenaltyNoOpsAndRangeGuard) {
+    const size_t vocab = 256;
+    std::vector<float> h_logits =
+        test_utils::random_uniform(vocab, /*seed=*/132, -5.0f, 5.0f);
+    // -1 is the window's "unwritten slot" fill; the large id is out of vocab.
+    const std::vector<int> h_ids{-1, 5, 999999};
+
+    CudaVector<float> d_logits(vocab); d_logits.upload(h_logits);
+    CudaVector<int>   d_ids(h_ids.size()); d_ids.upload(h_ids);
+
+    // penalty == 1.0 -> disabled.
+    launch_repetition_penalty_kernel(d_logits, vocab, d_ids, 3, 1.0f);
+    // empty window -> nothing to penalize.
+    launch_repetition_penalty_kernel(d_logits, vocab, d_ids, 0, 1.15f);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> out(vocab);
+    d_logits.download(out);
+    for (size_t i = 0; i < vocab; ++i)
+        ASSERT_FLOAT_EQ(out[i], h_logits[i]) << "no-op call modified logit " << i;
+
+    // Now a live call: only the in-range id 5 may move; -1 and 999999 are skipped
+    // (an unguarded kernel would write outside the 256-element buffer here).
+    launch_repetition_penalty_kernel(d_logits, vocab, d_ids, 3, 1.15f);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    d_logits.download(out);
+    const float expect5 =
+        h_logits[5] > 0.0f ? h_logits[5] / 1.15f : h_logits[5] * 1.15f;
+    EXPECT_FLOAT_EQ(out[5], expect5);
+    for (size_t i = 0; i < vocab; ++i) {
+        if (i == 5) continue;
+        ASSERT_FLOAT_EQ(out[i], h_logits[i]) << "out-of-range id touched logit " << i;
+    }
+}
+
+// Realistic geometry: the live window (64 ids) against the Llama vocab, mixed
+// with untouched neighbours, so the multi-block launch path is exercised.
+TEST_F(SamplingValidation, RepetitionPenaltyLlamaVocabFullWindow) {
+    const size_t vocab = 128256;
+    const float  penalty = 1.15f;
+    std::vector<float> h_logits =
+        test_utils::random_uniform(vocab, /*seed=*/133, -5.0f, 5.0f);
+
+    std::vector<int> h_ids(64);
+    for (int i = 0; i < 64; ++i) h_ids[i] = 1000 + i * 977;   // spread across blocks
+
+    CudaVector<float> d_logits(vocab); d_logits.upload(h_logits);
+    CudaVector<int>   d_ids(h_ids.size()); d_ids.upload(h_ids);
+
+    launch_repetition_penalty_kernel(d_logits, vocab, d_ids, 64, penalty);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> out(vocab);
+    d_logits.download(out);
+    std::vector<char> penalized(vocab, 0);
+    for (const int id : h_ids) penalized[static_cast<size_t>(id)] = 1;
+    for (size_t i = 0; i < vocab; ++i) {
+        const float want = penalized[i]
+            ? (h_logits[i] > 0.0f ? h_logits[i] / penalty : h_logits[i] * penalty)
+            : h_logits[i];
+        ASSERT_FLOAT_EQ(out[i], want) << "logit " << i << " wrong after penalty";
+    }
+}
+
 // The last block stride covers only indices [128000, 128256), so half the
 // 512-thread block has no element there. Sweeping the peak across the final
 // two strides makes every thread, lane and warp the winner at least once,

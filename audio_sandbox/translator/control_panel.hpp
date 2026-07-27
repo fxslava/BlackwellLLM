@@ -38,6 +38,8 @@ public:
         history_budget_ = control_->history_budget_tokens();
         src_idx_ = control_->source_language_index();
         tgt_idx_ = control_->target_language_index();
+        task_transcribe_ = control_->task_transcribe();
+        task_translate_ = control_->task_translate();
     }
 
     // UI thread, once per ImGui frame.
@@ -49,6 +51,8 @@ public:
         draw_mode_section();
         ImGui::Separator();
         draw_streaming_section();
+        ImGui::Separator();
+        draw_task_section();
         ImGui::Separator();
         draw_language_section();
         ImGui::Separator();
@@ -116,6 +120,27 @@ private:
         } else {
             ImGui::TextDisabled("last TTFT: n/a (no utterance yet)");
         }
+    }
+
+    // Narrowing the task is the cheapest cognitive-load cut available for the 8B
+    // backbone: one output instead of two. The toggles only flip atomics the
+    // engine thread reads when it builds the NEXT user turn's prefix — nothing
+    // cached is invalidated (the task directive never enters the frozen system
+    // prefix), so a flip costs nothing.
+    void draw_task_section() {
+        ImGui::TextUnformatted("Task (applies from the next utterance)");
+        bool changed = ImGui::Checkbox("Transcribe", &task_transcribe_);
+        ImGui::SameLine();
+        changed = ImGui::Checkbox("Translate", &task_translate_) || changed;
+        if (changed) {
+            // The control coerces "neither" to transcribe-only; mirror that back
+            // into the widgets so the panel never displays an impossible state.
+            if (!task_transcribe_ && !task_translate_) task_transcribe_ = true;
+            control_->set_tasks(task_transcribe_, task_translate_);
+        }
+        // The exact tags the model is being held to — the live answer to "do the
+        // expected output tags match the selected mode?".
+        ImGui::TextDisabled("expects: %s", control_->expected_output_format().c_str());
     }
 
     void draw_language_section() {
@@ -191,6 +216,8 @@ private:
     int  history_budget_ = 256;
     int  src_idx_ = 0;
     int  tgt_idx_ = 0;
+    bool task_transcribe_ = true;
+    bool task_translate_ = true;
     int  silence_ms_ = 800;
     bool manual_only_ = false;
     int  hotkey_idx_ = 0;

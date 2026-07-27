@@ -26,8 +26,21 @@
 //     monotone) — so the encoder work is off the TTFT critical path. The VAD
 //     pause (commit_center_decode) flushes the tail, commits the withheld
 //     right-edge tokens (zero encoder work — persisted by the last hop), closes
-//     the turn frame and decodes; a barge-in resumes the SAME utterance via a
-//     pointer-only rollback to the pause checkpoint (see do_rewind).
+//     the turn frame and decodes; a SHORT-pause barge-in resumes the SAME
+//     utterance via a pointer-only rollback to the pause checkpoint (see
+//     do_rewind + is_continuation).
+//
+// TWO SAFETY RAILS (both learned from live testing)
+//   * BARGE-IN ROUTING IS TIME-BASED. A decode can hold the pipeline in
+//     DECODE_TRANSLATING for a minute, so "speech arrived while decoding" says
+//     nothing about intent. is_continuation() measures the SILENCE since the
+//     user stopped speaking: a breath (<= kContinuationTimeoutS) continues the
+//     utterance; a longer gap is a new thought and takes the full rewind to
+//     history_base_pos_, flushing the stale audio even mid-generation.
+//   * DEGENERATE-LOOP GUARDS. Every live decode runs through ONE loop
+//     (decode_assistant_turn) carrying a repetition penalty (kRepetitionPenalty,
+//     applied in the sampler over this turn's rolling window) and a hard
+//     per-turn ceiling (kMaxGeneratedTokens) that force-closes the turn cleanly.
 // -----------------------------------------------------------------------------
 #include <algorithm>
 #include <atomic>
@@ -50,6 +63,7 @@
 
 #include "common.h"                     // CUDA_CHECK_THROW
 #include "engine_impl.h"                // BlackwellEngine::Impl (white-box step_* + d_X_accum)
+#include "kernels/sampling.cuh"         // sample_top_p + launch_repetition_penalty_kernel
 #include "ping_pong_audio_buffer.h"     // blackwell::audio::PingPongAudioBuffer
 #include "audio_embedding_pipeline.h"   // blackwell::audio::AudioEmbeddingPipeline
 #include "sliding_audio_window.h"       // blackwell::audio::kMelFramesPerSoftToken
@@ -148,6 +162,30 @@ public:
     }
     int target_language_index() const noexcept {
         return tgt_lang_.load(std::memory_order_acquire);
+    }
+
+    // ---- Task selection (Transcribe / Translate) ------------------------------
+    // Narrowing the task is the cheapest way to cut the 8B backbone's cognitive
+    // load: asking for one output instead of two roughly halves the tokens a turn
+    // must generate and removes the format the model most often drifts out of.
+    // Same UI-thread -> engine-thread handoff as the languages: plain atomics read
+    // only at TURN BOUNDARIES (build_user_instruction), so a mid-decode change
+    // applies from the next utterance. Both false is coerced to transcribe-only —
+    // an empty task would leave the model with no instruction at all.
+    //
+    // Nothing cached is invalidated by a flip: the task directive lives in the
+    // per-turn user prefix, never in the frozen system prefix that
+    // history_base_pos_ measures. (Even if it did, a ~40-token text re-prefill is
+    // sub-millisecond.)
+    void set_tasks(bool transcribe, bool translate) noexcept {
+        task_transcribe_.store(transcribe, std::memory_order_release);
+        task_translate_.store(translate, std::memory_order_release);
+    }
+    bool task_transcribe() const noexcept {
+        return task_transcribe_.load(std::memory_order_acquire);
+    }
+    bool task_translate() const noexcept {
+        return task_translate_.load(std::memory_order_acquire);
     }
 
     // The retained-history base (system prefix + retained turns): the KV floor a
@@ -429,14 +467,39 @@ public:
         return out;
     }
 
-    // Per-turn instruction carrying the FORCED language directives. It lives in
-    // the user turn (re-prefilled every utterance), NOT the frozen system prompt,
-    // so a dropdown change takes effect on the very next turn. The explicit
-    // native-script constraint is what kills the Latin-transliteration failure
-    // mode on short audio hops. Any thread (reads two atomics).
+    // The output tags the CURRENT task selection expects. The frozen system prompt
+    // can only describe ONE format, so the per-turn instruction restates the
+    // contract that matches the live toggles — asking for a [Translation] tag the
+    // user turned off is exactly how the model learns to emit junk. Also drives
+    // the panel's readout and encode_history_turn's parser. Any thread.
+    std::string expected_output_format() const {
+        const bool tr = task_transcribe_.load(std::memory_order_acquire);
+        const bool tl = task_translate_.load(std::memory_order_acquire);
+        if (tr && tl) return "[Speech] <transcript> | [Translation] <translation>";
+        if (tl)       return "[Translation] <translation>";
+        return "[Speech] <transcript>";
+    }
+
+    // Per-turn instruction carrying the TASK selection and the FORCED language
+    // directives. It lives in the user turn (re-prefilled every utterance), NOT
+    // the frozen system prompt, so a dropdown/checkbox change takes effect on the
+    // very next turn. The explicit native-script constraint is what kills the
+    // Latin-transliteration failure mode on short audio hops. Any thread (reads
+    // four atomics).
+    //
+    // ORDER IS LOAD-BEARING: language constraints, then the output-tag contract,
+    // then the task phrase LAST — it ends in ": " and must abut the audio
+    // soft-tokens that occupy the placeholder slot immediately after this text.
     std::string build_user_instruction() const {
         const int si = src_lang_.load(std::memory_order_acquire);
         const int ti = tgt_lang_.load(std::memory_order_acquire);
+        bool transcribe = task_transcribe_.load(std::memory_order_acquire);
+        const bool translate = task_translate_.load(std::memory_order_acquire);
+        // Both tasks off would produce an instruction with no verb; fall back to
+        // transcription — the one task that needs no target language. Matches
+        // expected_output_format(), which resolves the same case to [Speech].
+        if (!transcribe && !translate) transcribe = true;
+
         std::string s;
         if (si > 0) {
             s += "The audio language is ";
@@ -445,12 +508,24 @@ public:
             s += rt::kLanguages[si];
             s += " using its native script (never transliterate). ";
         }
+        s += "Reply using exactly this format: ";
+        s += expected_output_format();
+        s += ". ";
+
+        // " into <Target>" — empty when the target is Auto, so every phrasing
+        // below stays grammatical without a second set of branches.
+        std::string into;
         if (ti > 0) {
-            s += "Translate into ";
-            s += rt::kLanguages[ti];
-            s += ". ";
+            into = " into ";
+            into += rt::kLanguages[ti];
         }
-        s += "Transcribe the following audio: ";
+        if (transcribe && translate) {
+            s += "Translate" + into + ". Transcribe the following audio: ";
+        } else if (translate) {
+            s += "Translate the following audio" + into + ": ";
+        } else {
+            s += "Transcribe the following audio: ";
+        }
         return s;
     }
 
@@ -532,6 +607,45 @@ protected:
             tok_->encode_generation_prompt()};
     }
 
+    // ---- Barge-in routing: TIME decides, not the decode state ------------------
+    // The pipeline can sit in DECODE_TRANSLATING for a minute — a long reply, or a
+    // degenerate repetition loop the guards below now cut short. So "speech
+    // arrived while we were decoding" is NOT evidence that the user is continuing
+    // the same sentence. What distinguishes the two cases is how long they were
+    // SILENT:
+    //   <= kContinuationTimeoutS : they took a breath -> continuation; keep the
+    //                              utterance's committed center tokens and resume
+    //                              with a pointer-only rollback;
+    //   >  kContinuationTimeoutS : a new thought      -> FULL rewind down to
+    //                              history_base_pos_, flushing the stale (and
+    //                              possibly hallucination-poisoned) audio, even
+    //                              though a generation is still in flight.
+    static constexpr float kContinuationTimeoutS = 2.0f;
+
+    // Engine thread. *out_silence_s (optional) receives the measured gap. A turn
+    // with no recorded speech end — the very first utterance of the session — is
+    // never a continuation: there is nothing to continue.
+    bool is_continuation(float* out_silence_s = nullptr) const {
+        if (!have_speech_end_) {
+            if (out_silence_s != nullptr) *out_silence_s = 0.0f;
+            return false;
+        }
+        const float s = static_cast<float>(
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          last_speech_end_).count());
+        if (out_silence_s != nullptr) *out_silence_s = s;
+        return s <= kContinuationTimeoutS;
+    }
+
+    // The user stopped speaking: the VAD's stable boundary handed us the
+    // utterance. Stamped at the START of the commit, BEFORE any encoder / prefill
+    // / decode work — deliberately not at the end of the decode, so a long or
+    // runaway generation counts as silence instead of masking it.
+    void mark_speech_end() noexcept {
+        last_speech_end_ = std::chrono::steady_clock::now();
+        have_speech_end_ = true;
+    }
+
     // Barge-in micro-rewind. The 8B AWQ backbone runs Continuous KV: the resident
     // slabs are position-addressed and overwritten in place, so re-anchoring pos_ is
     // enough for the decode math. But when layers are offloaded, the host mirror /
@@ -543,14 +657,29 @@ protected:
     // prefix, and re-anchor pos_ to the resolved keep so the next utterance decodes
     // on top of the system prefix, not on top of the previous (superseded) answer.
     blackwell::EngineStatus do_rewind(const Command& cmd) override {
-        // CenterSlice mid-utterance resume: the barge-in continues the SAME user
-        // turn, so the committed center tokens are real audio context and must
-        // survive. Any tentative state above the pause checkpoint (edge tokens,
-        // turn-close template, generated text) was already discarded by the
-        // interrupted decode's resume_after_pause(); this call is its idempotent
-        // twin for the decode-not-yet-started case. A full rewind to the floor
-        // here would throw the utterance's audio away mid-sentence.
-        if (utterance_open_ && center_slice_available()) {   // latch, not the live toggle
+        // ROUTING: continuation vs fresh utterance is decided by the SILENCE
+        // DURATION, never by "were we decoding?" — see is_continuation(). A
+        // degenerate decode can hold the engine for a minute, and the speech that
+        // finally arrives is then a new sentence, not a barge-in.
+        float silence_s = 0.0f;
+        const bool cont = is_continuation(&silence_s);
+        if (utterance_open_ && center_slice_available()) {
+            std::printf("[Barge-in Route] %s (silence %.2f s vs %.2f s continuation "
+                        "window)\n",
+                        cont ? "CONTINUATION — keep the utterance's center tokens"
+                             : "FRESH UTTERANCE — full rewind, flush the stale audio",
+                        silence_s, kContinuationTimeoutS);
+            std::fflush(stdout);
+        }
+
+        // CenterSlice mid-utterance resume: a short-pause barge-in continues the
+        // SAME user turn, so the committed center tokens are real audio context
+        // and must survive. Any tentative state above the pause checkpoint (edge
+        // tokens, turn-close template, generated text) was already discarded by
+        // the interrupted decode's resume_after_pause(); this call is its
+        // idempotent twin for the decode-not-yet-started case. A full rewind to
+        // the floor here would throw the utterance's audio away mid-sentence.
+        if (utterance_open_ && center_slice_available() && cont) {  // latch, not the live toggle
             resume_after_pause();
             last_rewind_keep_.store(static_cast<uint32_t>(pos_), std::memory_order_release);
             if (std::getenv("BLACKWELL_AV_DEBUG")) {
@@ -570,10 +699,10 @@ protected:
         if (keep < hist_floor) keep = hist_floor;
         last_rewind_keep_.store(keep, std::memory_order_release);
         std::printf("[KV CACHE INVALIDATION] Reason: speech-start full rewind (fresh "
-                    "utterance). pos %d -> %u (dropping %d KV tokens; system floor=%u, "
-                    "history base=%u)\n",
-                    pos_, keep, pos_ - static_cast<int>(keep), system_prefix_tokens(),
-                    hist_floor);
+                    "utterance after %.2f s of silence). pos %d -> %u (dropping %d KV "
+                    "tokens; system floor=%u, history base=%u)\n",
+                    silence_s, pos_, keep, pos_ - static_cast<int>(keep),
+                    system_prefix_tokens(), hist_floor);
         std::fflush(stdout);
         pos_ = static_cast<int>(keep);
         // Full host-mirror reconciliation (Phase 0 truncate_kv), safe below the
@@ -646,6 +775,11 @@ protected:
     // (the audio-derived transcript is the marked seam — see the header preamble);
     // everything downstream is the genuine GPU decode path.
     blackwell::EngineStatus do_commit_decode(const Command& cmd) override {
+        // The VAD's stable boundary IS the moment the user stopped speaking: start
+        // the silence clock here, before the (possibly multi-second) commit work,
+        // so a barge-in arriving later measures the true gap (see is_continuation).
+        mark_speech_end();
+
         // CENTER-SLICE LIVE PATH: the audio was already streamed into the KV by
         // the warm hops; this commit only flushes the tail, completes the phrase
         // (right-edge commit), closes the turn frame, and decodes. An OPEN
@@ -698,48 +832,14 @@ protected:
             ++pos_;
         }
 
-        // Decode the assistant turn, streaming real detokenized tokens.
-        int emitted = 0;
-        std::string reply;
-        bool interrupted = false;
-        blackwell::EngineStatus st = blackwell::EngineStatus::Success;
-        const char* stop_reason = "max length hit (context budget)";
-        // Seeded at the turn-prefill start: the first [Decode] line reports the
+        // Decode the assistant turn, streaming real detokenized tokens. t_turn0
+        // seeds the per-token clock, so the first [Decode] line reports the
         // prefill-to-first-token wall time (no VAD trigger on this text path).
-        auto t_tok = t_turn0;
-        while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) {                              // wait-free barge-in
-                interrupted = true;
-                stop_reason = "barge-in detected (gen superseded)";
-                break;
-            }
-            {   // telemetry: EVERY produced token, stop/special tokens included
-                const auto now = std::chrono::steady_clock::now();
-                log_decode_token(next,
-                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
-                t_tok = now;
-            }
-            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
-            const std::string piece = tok_->decode(next, /*render_special=*/false);
-            if (!piece.empty()) {
-                cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
-                reply += piece;
-            }
-            ++emitted;
-            st = engine_->forward_status(next, pos_, /*temperature=*/0.7f, /*top_p=*/0.9f,
-                                         cfg_.seq_id, &next);
-            if (st != blackwell::EngineStatus::Success) {
-                stop_reason = "engine fault (forward_status != Success)";
-                break;
-            }
-            ++pos_;
-        }
-        log_decode_stop(stop_reason, pos_, emitted);
-
-        finalize_turn(reply, /*completed=*/!interrupted &&
-                                st == blackwell::EngineStatus::Success);
+        const TurnDecode d = decode_assistant_turn(cmd, next, t_turn0,
+                                                   /*temperature=*/0.7f, /*top_p=*/0.9f);
+        finalize_turn(d.reply, d.completed());
         clear_in_flight();
-        return finish(cmd, emitted);
+        return finish(cmd, d.emitted);
     }
 
     // Consume audio embeddings that the audio pipeline (Stream 1: WhisperEncoder
@@ -958,6 +1058,148 @@ private:
         return blackwell::EngineStatus::Success;
     }
 
+    // ---- degenerate-loop guards (the GPU's seatbelt) --------------------------
+    // Live testing found the 8B backbone falling into exact phrase loops in a
+    // quiet room, cooking the GPU for 2000+ tokens and pinning the pipeline in
+    // DECODE_TRANSLATING for over a minute. Two INDEPENDENT brakes, because
+    // either one alone can be defeated:
+    //   * kRepetitionPenalty shapes the logits (in the sampler, before argmax /
+    //     top-p) so an exact repeat becomes strictly less likely — this breaks
+    //     the loop mathematically rather than just truncating it;
+    //   * kMaxGeneratedTokens is the hard ceiling for when it does not. Hitting
+    //     it force-closes the turn CLEANLY (counts as completed -> finalize_turn
+    //     emits the EOT / stateless flush), so the pipeline returns to IDLE and
+    //     the next utterance is a normal fresh start, not a wedged state.
+    // The penalty window is per TURN and rolling: a penalty that leaked across
+    // utterances would suppress legitimately repeated words forever, and an
+    // unbounded window would suppress common words within one long reply.
+    static constexpr float kRepetitionPenalty  = 1.15f;
+    static constexpr int   kMaxGeneratedTokens = 256;
+    static constexpr int   kRepetitionWindow   = 64;
+
+    // What a decode loop produced. `completed` deliberately treats a max-token or
+    // context-cap stop as CLEAN: only a barge-in or an engine fault leaves the
+    // turn unusable.
+    struct TurnDecode {
+        std::string reply;
+        int  emitted = 0;
+        bool interrupted = false;   // barge-in superseded this generation
+        bool faulted = false;       // run_token / sampling reported != Success
+        bool completed() const noexcept { return !interrupted && !faulted; }
+    };
+
+    // THE decode loop — one implementation behind every live commit path
+    // (center-slice, whole-utterance, text placeholder), so the guards above can
+    // never drift between them. `first_token` is the token the prefill's last
+    // forward_status already sampled; t_start seeds the per-token clock (the VAD
+    // trigger on the audio paths), so the first [Decode] line reports true TTFT.
+    // Engine thread only; advances pos_.
+    TurnDecode decode_assistant_turn(const Command& cmd, int first_token,
+                                     std::chrono::steady_clock::time_point t_start,
+                                     float temperature, float top_p) {
+        TurnDecode out;
+        int next = first_token;
+        const char* stop_reason = "max length hit (context budget)";
+        reset_repetition_window();
+        auto t_tok = t_start;
+        while (pos_ < max_context_) {
+            if (cancelled(cmd.gen)) {                              // wait-free barge-in
+                out.interrupted = true;
+                stop_reason = "barge-in detected (gen superseded)";
+                break;
+            }
+            {   // telemetry: EVERY produced token, stop/special tokens included
+                const auto now = std::chrono::steady_clock::now();
+                log_decode_token(next,
+                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
+                t_tok = now;
+            }
+            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
+            // Checked AFTER the stop test so a natural EOT landing exactly on the
+            // cap is still reported as an EOT, and BEFORE emitting so the turn
+            // ends at exactly kMaxGeneratedTokens streamed tokens.
+            if (out.emitted >= kMaxGeneratedTokens) {
+                stop_reason = "Max turn tokens reached";
+                break;
+            }
+            const std::string piece = tok_->decode(next, /*render_special=*/false);
+            if (!piece.empty()) {
+                cmd.sink.emit(piece.c_str(), out.emitted, /*is_final=*/0, BRIDGE_OK);
+                out.reply += piece;
+            }
+            ++out.emitted;
+            push_repetition_token(next);   // this turn's rolling penalty window
+            if (decode_step(next, pos_, temperature, top_p, &next) !=
+                blackwell::EngineStatus::Success) {
+                out.faulted = true;
+                stop_reason = "engine fault (run_token/sample != Success)";
+                break;
+            }
+            ++pos_;
+        }
+        log_decode_stop(stop_reason, pos_, out.emitted);
+        return out;
+    }
+
+    // One PENALIZED decode step. Mirrors BlackwellEngine::forward_status — the
+    // same run_token then sample_top_p pair — but shapes the logits with this
+    // turn's repetition window in between. The engine's public API and its own
+    // decode path stay UNTOUCHED (hard rule): the extra stage sits between two
+    // calls the white-box tier already owns, exactly like the step_* audio
+    // injection sweep above. RUNTIME error tier: noexcept, reports by status.
+    blackwell::EngineStatus decode_step(int token_id, int pos, float temperature,
+                                        float top_p, int* out_token) noexcept {
+        auto* core = engine_->get_impl();
+        try {
+            const blackwell::EngineStatus st =
+                core->run_token(token_id, pos, cfg_.seq_id);
+            if (st != blackwell::EngineStatus::Success) return st;
+            launch_repetition_penalty_kernel(
+                core->d_logits, core->m_config.vocab_size, d_penalty_ids_,
+                std::min(penalty_count_, kRepetitionWindow), kRepetitionPenalty);
+            *out_token = sample_top_p(core->d_logits, core->m_config.vocab_size,
+                                      temperature, top_p);
+            return blackwell::EngineStatus::Success;
+        } catch (...) {
+            // The decode hot loop never unwinds (hybrid error doctrine): the only
+            // throwing callee is sample_top_p's scratch alloc / copy-back.
+            return blackwell::EngineStatus::CudaRuntimeError;
+        }
+    }
+
+    // Arm an empty penalty window for a new turn (lazily allocating the device
+    // ring on first use). NOTHING here may throw: an exception escaping the
+    // decode path skips finish()/clear_in_flight() and wedges the pipeline in
+    // DECODE_TRANSLATING — the exact failure these guards exist to prevent. On a
+    // failed allocation the penalty is simply off for the session (count()==0
+    // makes push/launch no-ops); the hard token cap still holds the line.
+    void reset_repetition_window() noexcept {
+        penalty_count_ = 0;
+        try {
+            if (d_penalty_ids_.count() != static_cast<std::size_t>(kRepetitionWindow))
+                d_penalty_ids_.allocate(static_cast<std::size_t>(kRepetitionWindow));
+            penalty_ids_host_.assign(static_cast<std::size_t>(kRepetitionWindow), -1);
+        } catch (...) {
+            // allocate() reset the buffer before failing, so count() == 0 holds.
+        }
+    }
+
+    // Record one generated id into the rolling window: a 4-byte H2D copy per
+    // token (~microseconds against a ~30 ms decode step). Synchronous on purpose
+    // — the source is a host member, and an async copy would race the next write.
+    // A failed copy only weakens the penalty for one token; see above for why it
+    // must not throw.
+    void push_repetition_token(int token_id) noexcept {
+        if (d_penalty_ids_.count() == 0) return;
+        const std::size_t slot =
+            static_cast<std::size_t>(penalty_count_ % kRepetitionWindow);
+        penalty_ids_host_[slot] = token_id;
+        if (cudaMemcpy(d_penalty_ids_.get() + slot, &penalty_ids_host_[slot],
+                       sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)
+            return;
+        ++penalty_count_;
+    }
+
     // ---- raw decode telemetry (stdout diagnostics for the TRANSLATION stall) --
     // One line per generated token. The text is SPECIAL-rendered so invisible
     // tokens (<|eot_id|>, headers, hallucinated specials) are identifiable —
@@ -1002,8 +1244,12 @@ private:
         }
     }
 
-    // "[Speech] X | [Translation] Y" -> user text = X; a reply that does not
-    // match the format contract degrades to an "(audio)" placeholder user turn.
+    // Recover the user-side text from the model's reply. Tolerates EVERY task
+    // mode's tag set (see expected_output_format): "[Speech] X | [Translation] Y",
+    // a bare "[Speech] X", or a translation-only reply with no transcript to
+    // recover. Anything that does not match degrades to an "(audio)" placeholder
+    // user turn rather than poisoning the retained history with the model's
+    // formatting noise.
     std::vector<int> encode_history_turn(const std::string& reply) const {
         auto trim = [](const std::string& s) {
             const auto b = s.find_first_not_of(" \t\r\n");
@@ -1012,11 +1258,15 @@ private:
         };
         std::string user_text = "(audio)";
         constexpr const char* kSpeech = "[Speech]";
-        const auto sp  = reply.find(kSpeech);
-        const auto cut = reply.find(" | [Translation]");
-        if (sp != std::string::npos && cut != std::string::npos && cut > sp) {
+        const auto sp = reply.find(kSpeech);
+        if (sp != std::string::npos) {
             const auto beg = sp + std::char_traits<char>::length(kSpeech);
-            const std::string t = trim(reply.substr(beg, cut - beg));
+            // The transcript runs to the translation separator, or to the end of
+            // the reply in transcribe-only mode.
+            const auto cut = reply.find(" | [Translation]", beg);
+            const std::string t =
+                trim(cut == std::string::npos ? reply.substr(beg)
+                                              : reply.substr(beg, cut - beg));
             if (!t.empty()) user_text = t;
         }
         const std::string turn =
@@ -1194,56 +1444,37 @@ private:
                     resident_kv, pos_ - resident_kv);
         std::fflush(stdout);
 
-        int emitted = 0;
-        std::string reply;
-        bool interrupted = false;
-        bool faulted = false;
-        const char* stop_reason = "max length hit (context budget)";
         // Seed the per-token clock at the VAD trigger: the FIRST [Decode] line
         // then reports the true wall-clock TTFT, not ~0.
-        auto t_tok = t_vad;
-        while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) {                              // wait-free barge-in
-                interrupted = true;
-                stop_reason = "barge-in detected (gen superseded)";
-                break;
-            }
-            {   // telemetry: EVERY produced token, stop/special tokens included
-                const auto now = std::chrono::steady_clock::now();
-                log_decode_token(next,
-                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
-                t_tok = now;
-            }
-            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
-            const std::string piece = tok_->decode(next, /*render_special=*/false);
-            if (!piece.empty()) {
-                cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
-                reply += piece;
-            }
-            ++emitted;
-            if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
-                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success) {
-                faulted = true;
-                stop_reason = "engine fault (forward_status != Success)";
-                break;
-            }
-            ++pos_;
-        }
-        log_decode_stop(stop_reason, pos_, emitted);
+        const TurnDecode d = decode_assistant_turn(cmd, next, t_vad,
+                                                   /*temperature=*/0.0f, /*top_p=*/1.0f);
 
-        if (interrupted && pause_pending_) {
-            // Micro-pause resume: speech returned before the turn finalized.
-            // Pointer-rollback the tentative edge + template + generated tokens
-            // and keep the utterance open — the next warm hop overwrites the edge
-            // region with fresh, context-complete center tokens.
-            resume_after_pause();
-            clear_in_flight();
-            return finish(cmd, emitted);
+        if (d.interrupted && pause_pending_) {
+            // Speech returned before the turn finalized. WHICH kind of return it
+            // is comes down to TIME, not to the fact that we were decoding: a
+            // breath continues this utterance, a long gap means the user gave up
+            // on whatever we were saying and started a new thought.
+            float silence_s = 0.0f;
+            if (is_continuation(&silence_s)) {
+                // Micro-pause resume: pointer-rollback the tentative edge +
+                // template + generated tokens and keep the utterance open — the
+                // next warm hop overwrites the edge region with fresh,
+                // context-complete center tokens.
+                resume_after_pause();
+                clear_in_flight();
+                return finish(cmd, d.emitted);
+            }
+            // Fresh utterance: drop this one outright. finalize_turn's rollback to
+            // history_base_pos_ resolves pause_pending_, so the do_rewind the
+            // barge-in queued finds a clean slate and only has to flush the ring.
+            std::printf("[Barge-in Route] FRESH UTTERANCE after %.2f s of silence — "
+                        "discarding the interrupted turn (no resume)\n", silence_s);
+            std::fflush(stdout);
         }
-        finalize_turn(reply, /*completed=*/!interrupted && !faulted);
+        finalize_turn(d.reply, d.completed());
         reset_utterance();
         clear_in_flight();
-        return finish(cmd, emitted);
+        return finish(cmd, d.emitted);
     }
 
     // Drain the buffered utterance PCM from the stream ring (engine-thread consumer),
@@ -1279,45 +1510,13 @@ private:
                                 std::chrono::steady_clock::now() - t_vad).count()),
                             std::memory_order_release);
 
-        int emitted = 0;
-        std::string reply;
-        bool interrupted = false;
-        bool faulted = false;
-        const char* stop_reason = "max length hit (context budget)";
         // Seed the per-token clock at the VAD trigger: the FIRST [Decode] line
         // then reports the true wall-clock TTFT, not ~0.
-        auto t_tok = t_vad;
-        while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) {                              // wait-free barge-in
-                interrupted = true;
-                stop_reason = "barge-in detected (gen superseded)";
-                break;
-            }
-            {   // telemetry: EVERY produced token, stop/special tokens included
-                const auto now = std::chrono::steady_clock::now();
-                log_decode_token(next,
-                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
-                t_tok = now;
-            }
-            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
-            const std::string piece = tok_->decode(next, /*render_special=*/false);
-            if (!piece.empty()) {
-                cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
-                reply += piece;
-            }
-            ++emitted;
-            if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
-                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success) {
-                faulted = true;
-                stop_reason = "engine fault (forward_status != Success)";
-                break;
-            }
-            ++pos_;
-        }
-        log_decode_stop(stop_reason, pos_, emitted);
-        finalize_turn(reply, /*completed=*/!interrupted && !faulted);
+        const TurnDecode d = decode_assistant_turn(cmd, next, t_vad,
+                                                   /*temperature=*/0.0f, /*top_p=*/1.0f);
+        finalize_turn(d.reply, d.completed());
         clear_in_flight();
-        return finish(cmd, emitted);
+        return finish(cmd, d.emitted);
     }
 
     // PCM (any length) -> padded/trimmed 30 s -> WhisperDSP log-mel -> [n_mels,3000]
@@ -1359,6 +1558,8 @@ protected:
     std::atomic<int> history_budget_tokens_{256};
     std::atomic<int> src_lang_{0};            // rt::kLanguages index (0 = Auto)
     std::atomic<int> tgt_lang_{0};            // rt::kLanguages index (0 = Auto)
+    std::atomic<bool> task_transcribe_{true}; // emit [Speech]      (see set_tasks)
+    std::atomic<bool> task_translate_{true};  // emit [Translation] (see set_tasks)
     std::atomic<bool> live_center_{false};    // UI streaming toggle (utterance-latched)
     std::atomic<float> last_ttft_ms_{0.0f};   // VAD->first-token, panel readout (0 = none)
 
@@ -1388,6 +1589,18 @@ protected:
     std::vector<float> utterance_pcm_;
     int  streamed_mel_end_ = 0;
     bool utterance_open_ = false;
+
+    // Barge-in routing clock (engine thread only): when the user last stopped
+    // speaking, stamped at the VAD commit. See is_continuation().
+    std::chrono::steady_clock::time_point last_speech_end_{};
+    bool have_speech_end_ = false;
+
+    // Rolling repetition-penalty window for the CURRENT turn (engine thread
+    // only): the device ring the sampler reads, its host mirror, and the total
+    // pushed this turn (the live length is min(count, kRepetitionWindow)).
+    blackwell::DeviceBuffer<int> d_penalty_ids_;
+    std::vector<int> penalty_ids_host_;
+    int penalty_count_ = 0;
 };
 
 }  // namespace rt

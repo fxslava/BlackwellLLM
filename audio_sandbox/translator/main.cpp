@@ -66,13 +66,16 @@ namespace {
 
 // The frozen system instruction. Prefilled ONCE at startup; its KV prefix is never
 // truncated by a barge-in rewind (the prefix-cache floor). Deliberately
-// LANGUAGE-NEUTRAL (format contract only): the source/target languages are
-// runtime-selectable, so their directives live in the per-turn user prefix
-// (RealEngineControl::build_user_instruction), never in this frozen prefix.
+// LANGUAGE- AND TASK-NEUTRAL: the source/target languages, the task selection
+// (transcribe / translate) and the exact output tags are all runtime-selectable,
+// so their directives live in the per-turn user prefix
+// (RealEngineControl::build_user_instruction), never in this frozen prefix. A
+// format hardcoded here would contradict the panel the moment a task is switched
+// off — and it cannot be re-prefilled without invalidating the frozen floor.
 constexpr const char* kSystemPrompt =
-    "You are a real-time speech translator. Transcribe the audio verbatim and "
-    "provide its translation in the format: "
-    "[Speech] <transcript> | [Translation] <translation>";
+    "You are a real-time speech transcriber and translator. Each user turn states "
+    "its task and its exact output format: follow them literally, transcribe "
+    "verbatim, and output nothing else.";
 
 // The persistent KV budget (tokens). Utterances are short; a small context keeps
 // VRAM near the ~5.3 GB AWQ weight footprint and decode latency low.

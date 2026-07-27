@@ -72,6 +72,51 @@ void launch_argmax_kernel(const float* d_logits, int* d_out_token_id, size_t voc
 }
 
 // ============================================================================
+// 1b. REPETITION PENALTY (in-place logit shaping, applied BEFORE sampling)
+// ============================================================================
+// Contract + rationale: sampling.cuh. One thread per entry of `ids`; only the
+// FIRST occurrence of a given id acts, which makes the pass exactly-once per
+// DISTINCT id and removes any read-modify-write race on a shared logit slot
+// (two threads holding the same id would otherwise compound the penalty
+// non-deterministically). `ids` is a small rolling window (tens of entries), so
+// the O(n^2) first-occurrence scan is a few thousand comparisons -- far cheaper
+// than a device-side dedup pass or an atomic protocol.
+__global__ void repetition_penalty_kernel(float* __restrict__ logits,
+                                          size_t vocab_size,
+                                          const int* __restrict__ ids,
+                                          int num_tokens,
+                                          float penalty)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_tokens) return;
+
+    const int id = ids[i];
+    if (id < 0 || static_cast<size_t>(id) >= vocab_size) return;
+    for (int j = 0; j < i; ++j) {
+        if (ids[j] == id) return;   // an earlier thread owns this id
+    }
+
+    const float v = logits[id];
+    // Sign-aware: dividing a NEGATIVE logit would make it larger (less penalized),
+    // so the negative branch multiplies instead. This is the CTRL formulation.
+    logits[id] = (v > 0.0f) ? (v / penalty) : (v * penalty);
+}
+
+void launch_repetition_penalty_kernel(float* d_logits, size_t vocab_size,
+                                      const int* d_token_ids, int num_tokens,
+                                      float penalty)
+{
+    if (d_logits == nullptr || d_token_ids == nullptr || num_tokens <= 0 ||
+        penalty <= 1.0f) {
+        return;   // documented no-op (penalty disabled / empty history)
+    }
+    constexpr int kBlock = 128;
+    const int blocks = (num_tokens + kBlock - 1) / kBlock;
+    repetition_penalty_kernel<<<blocks, kBlock>>>(d_logits, vocab_size, d_token_ids,
+                                                  num_tokens, penalty);
+}
+
+// ============================================================================
 // 2. НОВОЕ CPU СЭМПЛИРОВАНИЕ (Temperature + Top-P)
 // ============================================================================
 struct ProbIndex {
