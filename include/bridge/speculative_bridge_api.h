@@ -148,6 +148,17 @@ BRIDGE_API BridgeStatus speech_pipeline_on_silence_timeout(SpeechPipelineHandle 
 BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHandle handle,
                                                                 uint32_t silence_hangover_ms);
 
+/* MANUAL (push-to-talk) mode switch. While enabled, the internal threshold VAD
+ * is muted for ALL state transitions — no auto speech onset, no auto barge-in,
+ * no silence auto-commit — so boundaries are driven EXCLUSIVELY by the explicit
+ * speech_pipeline_on_speech_start / speech_pipeline_on_silence_timeout calls
+ * (hotkey press / release). PCM keeps streaming to the ring and speculative
+ * warming stays active. Lock-free (one atomic store), callable from any thread,
+ * takes effect on the next VAD block. ADDITIVE ABI: existing callers that never
+ * call this keep the automatic VAD behaviour. */
+BRIDGE_API BridgeStatus speech_pipeline_set_manual_mode(SpeechPipelineHandle handle,
+                                                        bool enabled);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

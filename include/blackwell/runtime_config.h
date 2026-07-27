@@ -40,17 +40,36 @@ namespace blackwell {
 // mel frames * 10 ms = 160 ms.
 inline constexpr int kAudioSoftTokenMs = 160;
 
+// How the streaming frontend maintains the LLM KV across sliding-window hops.
+//   Reconcile   — cosine-compare the window's overlap tail against the injected
+//                 history; on divergence, rollback + re-inject the corrected tail
+//                 (dynamic overlap reconciliation).
+//   CenterSlice — append-only during active speech: the Whisper CNN's receptive
+//                 field distorts a window's edge tokens, so both edges are
+//                 discarded and only the stable CENTER tokens are committed (no
+//                 cosine checks, no mid-speech rollbacks; pos only moves forward).
+//                 The right-edge tokens are committed only at a VAD pause to
+//                 complete the phrase, and un-committed by a pointer-only rollback
+//                 if speech resumes.
+enum class AudioStreamingMode { Reconcile, CenterSlice };
+
 // ── Tier 2: high-level streaming request (audio sliding-window + reconciliation) ─
 // All fields are USER INTENT in ms / ratios; build_and_validate_runtime resolves
 // them into a validated AudioStreamingPlan (tier 3). Nothing here is consumed
 // directly — the pipeline reads only the resolved plan.
 struct AudioStreamingConfig {
     bool  enable                           = false;   // audio frontends opt in
+    AudioStreamingMode mode                = AudioStreamingMode::Reconcile;
     int   window_size_ms                   = 2240;    // acoustic context window (14 tokens)
     int   hop_size_ms                      = 320;     // new audio committed per hop (2 tokens)
-    bool  overlap_reconciliation           = true;    // rewrite tail when history diverges
-    float overlap_reconciliation_threshold = 0.999f;  // cosine below this ⇒ divergence
-    int   max_reconciliation_rewind_tokens = 8;       // safety cap on re-prefill depth
+    bool  overlap_reconciliation           = true;    // (Reconcile) rewrite tail when history diverges
+    float overlap_reconciliation_threshold = 0.999f;  // (Reconcile) cosine below this ⇒ divergence
+    int   max_reconciliation_rewind_tokens = 8;       // (Reconcile) safety cap on re-prefill depth
+    // (CenterSlice) edge margins discarded from every window. The left (past) edge
+    // is dropped outright; the right (unstable future) edge K is withheld during
+    // speech and committed only at a VAD pause.
+    int   left_edge_ms                     = 320;     // 2 tokens of distorted past edge
+    int   right_edge_ms                    = 480;     // K = 3 tokens of tentative future edge
 };
 
 // ── Tier 2: high-level request ──────────────────────────────────────────────
@@ -98,12 +117,18 @@ struct InferenceConfig {
 // Resolved streaming plan (tier 3): ms intent expanded to whole soft-token counts,
 // validated, and gated on model capability. The audio pipeline consumes ONLY this.
 struct AudioStreamingPlan {
-    bool  enabled                  = false;   // reconciliation active AFTER the capability gate
+    bool  enabled                  = false;   // streaming active AFTER the capability gate
+    AudioStreamingMode mode        = AudioStreamingMode::Reconcile;
     int   window_tokens            = 0;       // window_size_ms / kAudioSoftTokenMs
     int   hop_tokens               = 0;       // hop_size_ms    / kAudioSoftTokenMs
     int   overlap_tokens           = 0;       // window_tokens - hop_tokens (the compare span)
-    float reconciliation_threshold = 0.999f;  // cosine below ⇒ divergence
-    int   max_rewind_tokens        = 0;       // clamped to [0, overlap_tokens]
+    float reconciliation_threshold = 0.999f;  // (Reconcile) cosine below ⇒ divergence
+    int   max_rewind_tokens        = 0;       // (Reconcile) clamped to [0, overlap_tokens]
+    // (CenterSlice) validated edge margins, in soft-tokens. Invariant:
+    // left + right + hop <= window (consecutive centers stay contiguous — no
+    // uncovered gap between one window's center span and the next's).
+    int   left_edge_tokens         = 0;       // dropped past edge per window
+    int   right_edge_tokens        = 0;       // K: pause-commit margin (>= 1 in CenterSlice)
 };
 
 // ── Tier 3: resolved execution plan ─────────────────────────────────────────
@@ -183,11 +208,14 @@ struct RuntimeOverrides {
 
     // Audio streaming (see AudioStreamingConfig for semantics). Any of these being
     // present also activates the streaming-plan resolution even if .enable is false.
+    std::optional<AudioStreamingMode> audio_streaming_mode;
     std::optional<int>   audio_window_size_ms;
     std::optional<int>   audio_hop_size_ms;
     std::optional<bool>  audio_overlap_reconciliation;
     std::optional<float> audio_reconciliation_threshold;
     std::optional<int>   audio_max_reconciliation_rewind_tokens;
+    std::optional<int>   audio_left_edge_ms;    // (CenterSlice) past-edge margin
+    std::optional<int>   audio_right_edge_ms;   // (CenterSlice) pause-commit margin K
 
     // Observability seam, not an execution-plan knob (deliberately absent from
     // RuntimeConfig): invoked from the engine-constructing thread while model

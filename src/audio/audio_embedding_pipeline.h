@@ -27,9 +27,11 @@
 
 #include "common.h"                        // CUDA_CHECK_THROW
 #include "blackwell/runtime_config.h"      // blackwell::AudioStreamingPlan (resolved tier-3)
+#include "device_buffer.h"                 // blackwell::DeviceBuffer (persisted last window)
 #include "whisper_encoder.h"               // WhisperEncoder{,Config}, WhisperWeights
 #include "ultravox_projector_pipeline.cuh" // UltravoxProjector, ProjectorConfig
 #include "ping_pong_audio_buffer.h"        // PingPongAudioBuffer
+#include "sliding_audio_window.h"          // kMelFramesPerSoftToken, center_slice_plan
 
 namespace blackwell::audio {
 
@@ -91,7 +93,16 @@ public:
     // Bind the resolved tier-3 streaming plan (engine-thread setup). When
     // plan.enabled, reconcile()/record_injected() maintain the injected-token history
     // and dynamic tail rewrite; otherwise they are inert (Phase-1 tail-slicing).
-    void configure_streaming(const blackwell::AudioStreamingPlan& plan) { plan_ = plan; }
+    // INIT tier: CenterSlice pre-allocates the persisted-window buffer here so the
+    // per-hop path stays allocation-free (throws on OOM).
+    void configure_streaming(const blackwell::AudioStreamingPlan& plan) {
+        plan_ = plan;
+        if (plan_.enabled && plan_.mode == blackwell::AudioStreamingMode::CenterSlice) {
+            const std::size_t elems =
+                static_cast<std::size_t>(plan_.window_tokens) * text_hidden();
+            if (last_window_.count() < elems) last_window_.allocate(elems);
+        }
+    }
     const blackwell::AudioStreamingPlan& streaming_plan() const { return plan_; }
 
     // Bucketed encode + project of a `mel_frames`-long window (mel-major d_mel):
@@ -200,9 +211,77 @@ public:
         }
     }
 
-    // Drop the whole injected-token history (barge-in: the KV is rewound to the
-    // frozen system prefix, so no audio history survives).
-    void reset_history() noexcept { injected_history_.clear(); }
+    // ---- CenterSlice streaming path (append-only, no mid-speech rollbacks) ------
+    // A slice of the PERSISTED last window's soft-tokens to inject: embeds is the
+    // [last_n, text_hidden] device buffer owned by this pipeline (stable across
+    // hops, unlike the projector workspace), rows [start_row, start_row+count).
+    struct CenterSlice {
+        const float* embeds    = nullptr;
+        int          start_row = 0;
+        int          count     = 0;
+    };
+
+    // One append-only hop: encode+project the window (absolute mel offset keeps the
+    // positional embeddings monotonic), persist the FULL projector output into
+    // last_window_ (the pause-commit reads its tail later without re-encoding), and
+    // slice out the NEW stable center rows per center_slice_plan. Advances the
+    // committed counter past the stable span. All GPU work is enqueued on
+    // audio_stream(); the caller must sync it before injecting on the engine stream.
+    // Engine thread only; allocation-free (buffer sized at configure_streaming).
+    CenterSlice center_hop(const float* d_mel, int mel_frames, int mel_frame_offset) {
+        const auto win = encode_project_window(d_mel, mel_frames, mel_frame_offset);
+        if (win.num_tokens <= 0) return {};
+        const int H = text_hidden();
+        CUDA_CHECK_THROW(cudaMemcpyAsync(
+            last_window_.get(), win.embeds,
+            static_cast<std::size_t>(win.num_tokens) * H * sizeof(float),
+            cudaMemcpyDeviceToDevice, audio_stream()));
+        last_w0_ = mel_frame_offset / kMelFramesPerSoftToken;
+        last_n_  = win.num_tokens;
+
+        const CenterSlicePlan p = center_slice_plan(center_committed_, last_w0_,
+                                                    last_n_, plan_.right_edge_tokens);
+        center_committed_ = std::max(center_committed_,
+                                     last_w0_ + std::max(0, last_n_ - plan_.right_edge_tokens));
+        pre_commit_committed_ = -1;   // a new hop supersedes any uncommitted pause edge
+        if (p.count <= 0) return {};
+        return { last_window_.get(), p.start_row, p.count };
+    }
+
+    // VAD pause: the K right-edge rows of the persisted last window (everything not
+    // yet committed, so a short cold utterance commits its whole tail) — inject them
+    // to complete the phrase before decoding. Remembers the pre-commit counter so a
+    // speech resume can un-commit without GPU work. No encode, no stream work: the
+    // rows were persisted (and synced) by the hop that produced them.
+    CenterSlice commit_pending_edge() {
+        const int start_row = std::max(0, center_committed_ - last_w0_);
+        const int count     = last_n_ - start_row;
+        if (count <= 0) return {};
+        pre_commit_committed_ = center_committed_;
+        center_committed_     = last_w0_ + last_n_;
+        return { last_window_.get(), start_row, count };
+    }
+
+    // Speech resumed after a pause-commit: restore the committed counter to the
+    // pre-commit value (the caller performs the matching pointer-only KV rollback).
+    // Idempotent; a no-op when no pause-commit is outstanding.
+    void uncommit_pending_edge() noexcept {
+        if (pre_commit_committed_ >= 0) {
+            center_committed_     = pre_commit_committed_;
+            pre_commit_committed_ = -1;
+        }
+    }
+    int center_committed() const noexcept { return center_committed_; }
+
+    // Drop the whole injected-token history — reconcile mirror AND center-slice
+    // bookkeeping (barge-in / turn flush: the KV is rewound to the frozen system
+    // prefix, so no audio history survives in either mode).
+    void reset_history() noexcept {
+        injected_history_.clear();
+        center_committed_     = 0;
+        pre_commit_committed_ = -1;
+        last_w0_ = last_n_ = 0;
+    }
     int  history_size() const noexcept { return static_cast<int>(injected_history_.size()); }
 
 private:
@@ -217,6 +296,16 @@ private:
     struct InjectedToken { int kv_pos; std::vector<float> embed; };  // embed: [text_hidden]
     std::deque<InjectedToken> injected_history_;
     std::vector<float> recon_stage_;   // reused D2H staging (overlap prefix / injected rows)
+
+    // CenterSlice state: the persisted last projector window (sized to the plan at
+    // configure_streaming) + absolute soft-token bookkeeping. committed counts the
+    // tokens already injected into the KV; pre_commit remembers the counter across
+    // a pause-commit so a resume can restore it (-1 = none outstanding).
+    blackwell::DeviceBuffer<float> last_window_;
+    int center_committed_     = 0;
+    int pre_commit_committed_ = -1;
+    int last_w0_ = 0;                  // persisted window's first absolute soft-token
+    int last_n_  = 0;                  // persisted window's valid soft-token count
 };
 
 }  // namespace blackwell::audio

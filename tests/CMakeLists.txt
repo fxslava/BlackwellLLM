@@ -68,6 +68,12 @@ if(TARGET blackwell_audio)
         ${CMAKE_SOURCE_DIR}/audio_sandbox/translator)  # audio_head_loader.hpp (reconciliation field test)
 endif()
 
+# NOTE: the streaming TTFT profiler (integration/test_streaming_ttft_profiler.cpp)
+# subclasses the translator's RealEngineControl and needs blackwell_bridge +
+# whisper_dsp — targets defined AFTER tests/ (audio_sandbox is added later), so
+# its wiring lives in the ROOT CMakeLists (the post-subdirectory if(TARGET ...)
+# block), and the test compiles to nothing without BLACKWELL_HAVE_SPEECH_STACK.
+
 # Ultravox audio-frontend parity tests. Unlike the gtest suites above these are
 # STANDALONE mains (NOT gtest) that drive the blackwell_audio kernels against the
 # FP32 PyTorch golden dumps (cosine > 0.999) -- kept standalone to preserve their
@@ -120,12 +126,14 @@ endif()
 if(TARGET blackwell_bridge)
     add_executable(bridge_tests
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_control_bridge_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/mock_vad_streaming_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/mock_vad_streaming_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_manual_mode_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
         ${CMAKE_SOURCE_DIR}/src/core     # device_buffer.h (transitive)
-        ${CMAKE_SOURCE_DIR}/src/bridge)  # engine_control_bridge.hpp, bridge_internal.hpp
+        ${CMAKE_SOURCE_DIR}/src/bridge   # engine_control_bridge.hpp, bridge_internal.hpp
+        ${CMAKE_SOURCE_DIR}/src/audio)   # sliding_audio_window.h (center_slice_plan)
     target_link_libraries(bridge_tests PRIVATE
         GTest::gtest
         GTest::gtest_main

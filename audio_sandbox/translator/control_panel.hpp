@@ -48,6 +48,8 @@ public:
 
         draw_mode_section();
         ImGui::Separator();
+        draw_streaming_section();
+        ImGui::Separator();
         draw_language_section();
         ImGui::Separator();
         draw_timing_section();
@@ -90,6 +92,32 @@ private:
                             control_->history_base_pos());
     }
 
+    void draw_streaming_section() {
+        ImGui::TextUnformatted("Audio streaming (applies from the next utterance)");
+        if (!control_->center_slice_available()) {
+            // The CenterSlice geometry is resolved at launch (tier-3 plan); without
+            // it the toggle would be a lie, so say how to arm it instead.
+            ImGui::TextDisabled("center-slice plan not armed — launch with"
+                                " --streaming --stream-mode center");
+        } else {
+            bool center = control_->live_center_slice();
+            if (ImGui::RadioButton("Whole utterance (encode at pause)", !center)) {
+                control_->set_live_center_slice(false);
+            }
+            if (ImGui::RadioButton("Center-slice streaming (append-only)", center)) {
+                control_->set_live_center_slice(true);
+            }
+        }
+        // Live latency readout: both commit paths record it, so flipping the mode
+        // above gives a direct A/B on the very next utterance.
+        const float ttft = control_->last_ttft_ms();
+        if (ttft > 0.0f) {
+            ImGui::TextDisabled("last TTFT (VAD -> first token): %.0f ms", ttft);
+        } else {
+            ImGui::TextDisabled("last TTFT: n/a (no utterance yet)");
+        }
+    }
+
     void draw_language_section() {
         ImGui::TextUnformatted("Languages (apply from the next utterance)");
         ImGui::SetNextItemWidth(160.0f);
@@ -106,9 +134,13 @@ private:
             (void)speech_pipeline_set_silence_hangover_ms(
                 pipe_, static_cast<uint32_t>(silence_ms_));
         }
-        if (ImGui::Checkbox("Manual only (disable auto-commit)", &manual_only_)) {
-            (void)speech_pipeline_set_silence_hangover_ms(
-                pipe_, manual_only_ ? 0u : static_cast<uint32_t>(silence_ms_));
+        // Manual mode mutes the WHOLE auto-VAD (onset + barge-in + auto-commit)
+        // in the pipeline, not just the hangover: state transitions then come
+        // exclusively from the push-to-talk press/release events, so a
+        // threshold trigger can never race a hotkey mid-utterance. The slider
+        // value is preserved for when auto mode is re-enabled.
+        if (ImGui::Checkbox("Manual only (push-to-talk, auto-VAD muted)", &manual_only_)) {
+            (void)speech_pipeline_set_manual_mode(pipe_, manual_only_);
         }
     }
 
@@ -128,12 +160,19 @@ private:
         const ImGuiKey key = kHotkeys[hotkey_idx_];
         const bool down = ImGui::IsKeyDown(key);
         if (down && !ptt_down_) {
-            // Press: open (or barge into) an utterance boundary NOW.
+            // Press: mute the auto-VAD FIRST, then open (or barge into) an
+            // utterance boundary. Ordering matters — while the key is held the
+            // hold is exclusively key-driven, so a threshold onset/auto-commit
+            // can never fire in parallel and race this press (even in auto mode).
+            (void)speech_pipeline_set_manual_mode(pipe_, true);
             (void)speech_pipeline_on_speech_start(pipe_);
         } else if (!down && ptt_down_) {
-            // Release: flush the buffered audio and decode immediately. A no-op
-            // unless the pipeline is PREFILL_SPEAKING, so a stray tap is safe.
+            // Release: flush the buffered audio and decode immediately (a no-op
+            // unless the pipeline is PREFILL_SPEAKING, so a stray tap is safe),
+            // THEN restore the checkbox's mode — the release event itself must
+            // still be the one that commits, never a revived auto-trigger.
             (void)speech_pipeline_on_silence_timeout(pipe_);
+            (void)speech_pipeline_set_manual_mode(pipe_, manual_only_);
         }
         ptt_down_ = down;
     }

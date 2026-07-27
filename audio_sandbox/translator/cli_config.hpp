@@ -23,6 +23,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "blackwell/runtime_config.h"  // blackwell::InferenceConfig (apply_streaming_flags)
 #include "language_table.hpp"  // rt::kLanguages / language_index (--src-lang/--tgt-lang)
 
 namespace rt {
@@ -45,6 +46,12 @@ struct TranslatorArgs {
     int         stream_hop_ms    = 320;   // --stream-hop-ms    : new audio committed per hop
     int         stream_rewind_cap = 8;    // --stream-rewind-cap : max overlap tokens rewritten
                                           //   per hop (0 = append-only, no reconciliation)
+    std::string stream_mode = "center";   // --stream-mode : center | reconcile. Center-slice
+                                          //   is the SHIPPING streaming mode (append-only,
+                                          //   ~150 ms TTFT); reconcile stays as the explicit
+                                          //   opt-in for the cosine-overlap A/B.
+    int         stream_left_edge_ms  = 320;  // --stream-left-edge-ms  : (center) dropped past edge
+    int         stream_right_edge_ms = 480;  // --stream-right-edge-ms : (center) pause-commit K
     std::string src_lang = "Auto";        // --src-lang : forced audio language ("Auto" = LID)
     std::string tgt_lang = "Russian";     // --tgt-lang : forced translation target (the
                                           //   pre-dropdown shipping behaviour was Russian)
@@ -130,6 +137,15 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
             a.stream_hop_ms = std::stoi(next("--stream-hop-ms"));
         } else if (arg == "--stream-rewind-cap") {
             a.stream_rewind_cap = std::stoi(next("--stream-rewind-cap"));
+        } else if (arg == "--stream-mode") {
+            a.stream_mode = next("--stream-mode");
+            if (a.stream_mode != "reconcile" && a.stream_mode != "center")
+                throw std::runtime_error("--stream-mode must be 'reconcile' or 'center', got '" +
+                                         a.stream_mode + "'");
+        } else if (arg == "--stream-left-edge-ms") {
+            a.stream_left_edge_ms = std::stoi(next("--stream-left-edge-ms"));
+        } else if (arg == "--stream-right-edge-ms") {
+            a.stream_right_edge_ms = std::stoi(next("--stream-right-edge-ms"));
         } else if (arg == "--src-lang" || arg == "--tgt-lang") {
             // Strict: a typo must abort, not silently degrade to Auto.
             const std::string v = next(arg.c_str());
@@ -175,6 +191,21 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
     a.have_model_dir  = !a.model_dir.empty();
     a.have_audio_head = !a.audio_head.empty();
     return a;
+}
+
+// Map the parsed --stream-* flags onto the tier-2 request in ONE place, so the
+// headless (--wav) and live GUI engine constructions can never drift. The ms/token
+// validation itself stays in build_and_validate_runtime (tier-3 resolution).
+inline void apply_streaming_flags(const TranslatorArgs& a, blackwell::InferenceConfig& req) {
+    req.audio_streaming.enable         = a.streaming;
+    req.audio_streaming.mode           = (a.stream_mode == "center")
+                                             ? blackwell::AudioStreamingMode::CenterSlice
+                                             : blackwell::AudioStreamingMode::Reconcile;
+    req.audio_streaming.window_size_ms = a.stream_window_ms;
+    req.audio_streaming.hop_size_ms    = a.stream_hop_ms;
+    req.audio_streaming.max_reconciliation_rewind_tokens = a.stream_rewind_cap;
+    req.audio_streaming.left_edge_ms   = a.stream_left_edge_ms;
+    req.audio_streaming.right_edge_ms  = a.stream_right_edge_ms;
 }
 
 // Parse <model_dir>/config.json for the backbone geometry. Throws with a clear

@@ -72,6 +72,35 @@ inline SlidingWindowConfig sliding_window_from_plan(int window_tokens, int hop_t
     return c;
 }
 
+// ---- CenterSlice geometry (pure arithmetic, Tier-1 testable) -----------------
+// Which rows of a projected window are NEW stable center tokens. All coordinates
+// are ABSOLUTE soft-token indices from the utterance start except the returned
+// row range, which is window-relative.
+//
+//   committed_abs     tokens already injected into the KV ([0, committed_abs))
+//   window_start_abs  the window's first token (mel_frame_offset / 16)
+//   num_tokens        valid soft-tokens the projector produced for this window
+//   right_edge_tokens K — the unstable future edge withheld during speech
+//
+// The stable span is [start_row, num_tokens - K): everything not yet committed,
+// stopping K short of the window's right edge. The LEFT edge needs no explicit
+// term here: the plan validator enforces left + right + hop <= window, which
+// guarantees committed_abs >= window_start_abs + left_edge on every warm hop —
+// so the returned rows always sit >= left_edge tokens from the window's left
+// boundary (full acoustic left context). On the COLD first window committed_abs
+// is 0 and the slice starts at row 0: the utterance opening has no earlier audio
+// to lose context from, and no later window will ever re-cover it.
+struct CenterSlicePlan {
+    int start_row = 0;   // first NEW row (window-relative)
+    int count     = 0;   // rows to inject (0 = nothing new stable yet)
+};
+inline CenterSlicePlan center_slice_plan(int committed_abs, int window_start_abs,
+                                         int num_tokens, int right_edge_tokens) {
+    const int stable_end = num_tokens - right_edge_tokens;              // window-relative
+    const int start_row  = std::max(0, committed_abs - window_start_abs);
+    return { start_row, std::max(0, stable_end - start_row) };
+}
+
 // The extracted delta: a view into the projector output plus how many soft-token
 // rows (each text_hidden wide) belong to the new chunk. These — and only these —
 // are prefilled into Llama's KV.

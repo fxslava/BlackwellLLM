@@ -165,11 +165,14 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
     {
         const auto& a = request.audio_streaming;
         const bool any_override =
+            overrides.audio_streaming_mode ||
             overrides.audio_window_size_ms || overrides.audio_hop_size_ms ||
             overrides.audio_overlap_reconciliation || overrides.audio_reconciliation_threshold ||
-            overrides.audio_max_reconciliation_rewind_tokens;
+            overrides.audio_max_reconciliation_rewind_tokens ||
+            overrides.audio_left_edge_ms || overrides.audio_right_edge_ms;
 
         if (a.enable || any_override) {
+            const AudioStreamingMode mode = overrides.audio_streaming_mode.value_or(a.mode);
             const int win_ms = overrides.audio_window_size_ms.value_or(a.window_size_ms);
             const int hop_ms = overrides.audio_hop_size_ms.value_or(a.hop_size_ms);
             const float thr =
@@ -178,6 +181,8 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
                 overrides.audio_max_reconciliation_rewind_tokens.value_or(a.max_reconciliation_rewind_tokens);
             const bool want_recon =
                 overrides.audio_overlap_reconciliation.value_or(a.overlap_reconciliation);
+            const int left_ms  = overrides.audio_left_edge_ms.value_or(a.left_edge_ms);
+            const int right_ms = overrides.audio_right_edge_ms.value_or(a.right_edge_ms);
 
             if (win_ms <= 0 || hop_ms <= 0)
                 throw std::invalid_argument(
@@ -203,17 +208,58 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
                 throw std::invalid_argument(
                     "InferenceConfig: audio_streaming max_reconciliation_rewind_tokens must be >= 0");
 
+            // CenterSlice edge margins: same whole-soft-token alignment rule as
+            // window/hop (a fractional edge would split a soft-token).
+            if (left_ms < 0 || right_ms < 0)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming left/right edge ms must be >= 0");
+            if (left_ms % kAudioSoftTokenMs != 0 || right_ms % kAudioSoftTokenMs != 0)
+                throw std::invalid_argument(
+                    "InferenceConfig: audio_streaming left_edge_ms (" + std::to_string(left_ms) +
+                    ") and right_edge_ms (" + std::to_string(right_ms) +
+                    ") must each be a whole multiple of one soft-token (" +
+                    std::to_string(kAudioSoftTokenMs) + " ms)");
+            const int lt = left_ms / kAudioSoftTokenMs;
+            const int kt = right_ms / kAudioSoftTokenMs;
+            if (mode == AudioStreamingMode::CenterSlice) {
+                // K >= 1: the pause-commit needs at least one tentative edge token
+                // to complete the phrase (and the resume rollback to un-commit).
+                if (kt < 1)
+                    throw std::invalid_argument(
+                        "InferenceConfig: CenterSlice requires right_edge_ms >= one soft-token (" +
+                        std::to_string(kAudioSoftTokenMs) + " ms): the VAD-pause commit margin K "
+                        "must be at least 1 token");
+                // Center-span continuity: window W sliding by hop h keeps consecutive
+                // center spans [w0+L, w0+W-K) contiguous iff L + K + h <= W; a larger
+                // hop would leave audio no window's center ever covers.
+                if (lt + kt + ht > wt)
+                    throw std::invalid_argument(
+                        "InferenceConfig: CenterSlice requires left_edge + right_edge + hop <= "
+                        "window (" + std::to_string(lt) + " + " + std::to_string(kt) + " + " +
+                        std::to_string(ht) + " > " + std::to_string(wt) + " tokens): consecutive "
+                        "windows' center spans would leave an uncovered gap — widen the window or "
+                        "shrink the edges/hop");
+            }
+
+            rt.audio_streaming.mode                   = mode;
             rt.audio_streaming.window_tokens          = wt;
             rt.audio_streaming.hop_tokens             = ht;
             rt.audio_streaming.overlap_tokens         = wt - ht;
             rt.audio_streaming.reconciliation_threshold = thr;
             rt.audio_streaming.max_rewind_tokens      = std::min(cap, wt - ht);
+            rt.audio_streaming.left_edge_tokens       = lt;
+            rt.audio_streaming.right_edge_tokens      = kt;
 
-            // Capability gate: rewind+re-inject reconciles the (position-addressed)
-            // KV, but NOT a hybrid model's recurrent linear-attention (SSM) state, so
-            // it is disabled there -- the frontend falls back to Phase-1 tail-slicing
-            // (still correct, just no dynamic tail rewrite). Mirrors the branching gate.
-            rt.audio_streaming.enabled = want_recon && !caps.requires_ssm_subsystem;
+            // Capability gate: BOTH modes rewind the (position-addressed) KV --
+            // Reconcile on tail divergence, CenterSlice on pause/resume -- but a
+            // hybrid model's recurrent linear-attention (SSM) state cannot be
+            // rewound, so streaming is disabled there and the frontend falls back
+            // to Phase-1 tail-slicing. In Reconcile mode the explicit
+            // overlap_reconciliation opt-out also disables the plan; CenterSlice
+            // ignores that knob (it never runs the cosine reconcile).
+            const bool mode_active =
+                (mode == AudioStreamingMode::CenterSlice) || want_recon;
+            rt.audio_streaming.enabled = mode_active && !caps.requires_ssm_subsystem;
         }
     }
 

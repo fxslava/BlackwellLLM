@@ -31,8 +31,8 @@
         }
     ],
     "buildPresets": [
-        { "name": "x64-debug",   "configurePreset": "x64-debug" },
-        { "name": "x64-release", "configurePreset": "x64-release" }
+        { "name": "x64-debug",   "configurePreset": "x64-debug",   "configuration": "Debug" },
+        { "name": "x64-release", "configurePreset": "x64-release", "configuration": "Release" }
     ],
     "testPresets": [
         {

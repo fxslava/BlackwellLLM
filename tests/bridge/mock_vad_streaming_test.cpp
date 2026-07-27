@@ -26,6 +26,8 @@
 
 #include <gtest/gtest.h>
 
+#include "sliding_audio_window.h"  // blackwell::audio::center_slice_plan (pure geometry)
+
 using blackwell::EngineStatus;
 using blackwell::bridge::EngineControlBridge;
 
@@ -232,6 +234,119 @@ TEST(MockVadStreaming, BargeInRewindHonoursHistoryBase) {
     EXPECT_EQ(b.resolve_rewind_keep(kSystemPrefix), static_cast<uint32_t>(kSystemPrefix) + 4u);
     // A keep ABOVE the base still wins (a rewind may keep more, never less).
     EXPECT_EQ(b.resolve_rewind_keep(kSystemPrefix + 10u), static_cast<uint32_t>(kSystemPrefix) + 10u);
+}
+
+// ---- CenterSlice geometry (append-only speculative center-slicing) ----------
+// Pure-arithmetic pins for blackwell::audio::center_slice_plan and the
+// pause-commit / resume bookkeeping AudioEmbeddingPipeline::center_hop /
+// commit_pending_edge implement on top of it. Geometry: the validated defaults
+// W=14, hop=2, L=2, K=3 (L+K+hop <= W holds).
+
+namespace {
+
+constexpr int kCsW   = 14;  // window_tokens
+constexpr int kCsHop = 2;   // hop_tokens
+constexpr int kCsK   = 3;   // right_edge_tokens (the pause-commit margin)
+
+// The soft-tokens a window starting at absolute token w0 "projects": token i's
+// identity IS its absolute index, so KV byte-identity across scenarios is exact.
+std::vector<int> cs_window(int w0) {
+    std::vector<int> v(kCsW);
+    for (int i = 0; i < kCsW; ++i) v[static_cast<std::size_t>(i)] = w0 + i;
+    return v;
+}
+
+// Apply one center hop to a mock stream: slice per center_slice_plan, feed the
+// new rows, advance the committed counter exactly as center_hop does.
+int cs_hop(MockVadStreamingBridge& b, int committed, int w0) {
+    const auto p = blackwell::audio::center_slice_plan(committed, w0, kCsW, kCsK);
+    const std::vector<int> win = cs_window(w0);
+    b.feed_chunk(std::vector<int>(win.begin() + p.start_row,
+                                  win.begin() + p.start_row + p.count));
+    return std::max(committed, w0 + std::max(0, kCsW - kCsK));
+}
+
+}  // namespace
+
+// Cold start: the first window commits its ENTIRE stable span [0, W-K) — the
+// utterance opening has full left context by definition (no earlier audio), so
+// no left-edge drop applies at row 0.
+TEST(MockVadStreaming, CenterSliceColdStartCommitsWholeStableSpan) {
+    const auto p = blackwell::audio::center_slice_plan(/*committed=*/0, /*w0=*/0,
+                                                       kCsW, kCsK);
+    EXPECT_EQ(p.start_row, 0);
+    EXPECT_EQ(p.count, kCsW - kCsK);   // 11
+}
+
+// Warm hops: each slide by `hop` appends exactly hop new rows, contiguous with
+// the committed history, and every appended row sits >= L rows from the window's
+// left edge (the continuity invariant L+K+hop <= W at work).
+TEST(MockVadStreaming, CenterSliceWarmHopsAppendExactlyHopTokens) {
+    constexpr int kL = 2;              // left_edge_tokens of the validated defaults
+    int committed = kCsW - kCsK;       // after the cold window
+    for (int w0 = kCsHop; w0 <= 8; w0 += kCsHop) {
+        const auto p = blackwell::audio::center_slice_plan(committed, w0, kCsW, kCsK);
+        EXPECT_EQ(p.count, kCsHop);                    // exactly the hop, no more
+        EXPECT_EQ(w0 + p.start_row, committed);        // contiguous, no gap/overlap
+        EXPECT_GE(p.start_row, kL);                    // full left context in-window
+        committed = std::max(committed, w0 + kCsW - kCsK);
+    }
+}
+
+// A window too short to clear the right edge yields nothing (no negative counts).
+TEST(MockVadStreaming, CenterSliceShortWindowYieldsNothing) {
+    EXPECT_EQ(blackwell::audio::center_slice_plan(0, 0, kCsK, kCsK).count, 0);
+    EXPECT_EQ(blackwell::audio::center_slice_plan(0, 0, kCsK - 1, kCsK).count, 0);
+    // And a window already fully covered by the committed history yields nothing.
+    EXPECT_EQ(blackwell::audio::center_slice_plan(/*committed=*/20, /*w0=*/2,
+                                                  kCsW, kCsK).count, 0);
+}
+
+// The definitive CenterSlice guard: a VAD pause commits the K edge tokens, speech
+// resumes (pointer-only rollback + counter un-commit), and streaming continues —
+// the final KV must be byte-identical to the never-paused baseline: zero
+// tentative-edge residue, and pos_ monotone during speech in both scenarios.
+TEST(MockVadStreaming, CenterSlicePauseResumeLeavesNoEdgeResidue) {
+    // Baseline: continuous speech across windows w0 = 0, 2, 4, 6 — append-only.
+    MockVadStreamingBridge base;
+    base.prefill_system_prompt(kSystemPrefix);
+    int base_committed = 0;
+    for (int w0 = 0; w0 <= 6; w0 += kCsHop) base_committed = cs_hop(base, base_committed, w0);
+
+    // Paused stream: same speech, but a pause after w0 = 4 commits the K edge
+    // tokens (checkpoint first), then speech resumes and w0 = 6 continues.
+    MockVadStreamingBridge stream;
+    stream.prefill_system_prompt(kSystemPrefix);
+    int committed = 0;
+    int prev_pos = stream.pos();
+    for (int w0 = 0; w0 <= 4; w0 += kCsHop) {
+        committed = cs_hop(stream, committed, w0);
+        EXPECT_GE(stream.pos(), prev_pos);             // append-only during speech
+        prev_pos = stream.pos();
+    }
+
+    // VAD pause: commit everything the last window (w0=4) still withholds —
+    // exactly commit_pending_edge's slice [committed - w0, W).
+    const auto cp = stream.checkpoint();               // pause_cp_ analogue
+    const int pre_commit = committed;                  // pre_commit_committed_ analogue
+    {
+        const std::vector<int> win = cs_window(4);
+        const int start_row = committed - 4;
+        stream.feed_chunk(std::vector<int>(win.begin() + start_row, win.end()));
+        committed = 4 + kCsW;
+        EXPECT_EQ(stream.pos(), cp.pos + kCsK);        // exactly K tentative tokens
+    }
+
+    // Speech resumes: pointer-only rollback (resume_after_pause analogue).
+    stream.rollback(cp);
+    committed = pre_commit;                            // uncommit_pending_edge analogue
+    EXPECT_EQ(stream.pos(), cp.pos);
+
+    committed = cs_hop(stream, committed, 6);          // streaming continues
+
+    EXPECT_EQ(committed, base_committed);
+    EXPECT_EQ(stream.pos(), base.pos());
+    EXPECT_EQ(stream.kv(), base.kv());                 // zero edge residue
 }
 
 // The budget pruning drops the OLDEST turns first and retains the maximal

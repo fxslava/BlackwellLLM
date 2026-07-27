@@ -204,14 +204,12 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             std::unique_ptr<blackwell::ITokenizer> tokenizer =
                 blackwell::TokenizerFactory::create(args.model_dir);
-            // --streaming arms the sliding-window + dynamic overlap reconciliation
-            // plan in the engine's resolved RuntimeConfig; default stays whole-utterance.
+            // --streaming arms the sliding-window plan (reconcile or center-slice
+            // per --stream-mode) in the engine's resolved RuntimeConfig; default
+            // stays whole-utterance.
             blackwell::InferenceConfig req;
             req.max_context_length = kMaxContext;
-            req.audio_streaming.enable = args.streaming;
-            req.audio_streaming.window_size_ms = args.stream_window_ms;
-            req.audio_streaming.hop_size_ms    = args.stream_hop_ms;
-            req.audio_streaming.max_reconciliation_rewind_tokens = args.stream_rewind_cap;
+            rt::apply_streaming_flags(args, req);
             req.source_language = args.src_lang;
             req.target_language = args.tgt_lang;
             BlackwellEngine engine(args.model_dir + "/model.safetensors.index.json", req);
@@ -275,10 +273,23 @@ int main(int argc, char** argv) {
         std::unique_ptr<blackwell::ITokenizer> tokenizer =
             blackwell::TokenizerFactory::create(args.model_dir);
         const std::string index_path = args.model_dir + "/model.safetensors.index.json";
-        // Tier-2 request: context budget + the forced-language startup defaults
-        // (the ImGui dropdowns override them live). INIT tier: throws on OOM/bad index.
+        // Tier-2 request: context budget + streaming plan + the forced-language
+        // startup defaults (the ImGui dropdowns override them live). INIT tier:
+        // throws on OOM/bad index.
         blackwell::InferenceConfig req;
         req.max_context_length = kMaxContext;
+        rt::apply_streaming_flags(args, req);
+        // The LIVE translator is the streaming product: the plan is ALWAYS armed
+        // here (unlike headless --wav, where --streaming stays an opt-in) so the
+        // panel's mode toggle is functional and the commit can never silently
+        // fall back to the multi-second whole-utterance re-prefill just because
+        // a launch flag was missing. --stream-mode still picks the initial mode
+        // (center by default); the whole-utterance radio remains the live opt-out.
+        req.audio_streaming.enable = true;
+        std::printf("[stream] plan armed: mode=%s window=%d ms hop=%d ms edges L=%d/K=%d ms "
+                    "(toggle live in Translator Settings)\n",
+                    args.stream_mode.c_str(), args.stream_window_ms, args.stream_hop_ms,
+                    args.stream_left_edge_ms, args.stream_right_edge_ms);
         req.source_language = args.src_lang;
         req.target_language = args.tgt_lang;
         BlackwellEngine engine(index_path, req);

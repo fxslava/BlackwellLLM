@@ -13,21 +13,21 @@
 //   edge (cancel_generation / rewind_kv / warm_prefill / commit_and_decode) on
 //   the base class — it never reaches into here and never touches CUDA.
 //
-// THE AUDIO PATH (encoder + double-buffered pipeline now real; feed is the seam)
+// THE AUDIO PATH (fully wired, two live modes)
 //   The full multimodal path is  live PCM -> Whisper log-mel (whisper_dsp) ->
 //   Whisper ENCODER (audio_tower) -> Ultravox projector -> prefill-from-embeddings
-//   -> decode. The encoder (src/audio/whisper_encoder.*) and the async
-//   double-buffered pipeline (AudioEmbeddingPipeline + PingPongAudioBuffer) are
-//   now implemented and unit-tested (tests/integration/test_audio_pingpong_
-//   pipeline). prefill_audio_embeddings() below is the CONSUMER edge: it gates the
-//   engine's stream on the producer's ready event (cudaStreamWaitEvent, no host
-//   sync) and prefills the staged [num_audio, hidden] embeddings into the KV via
-//   the white-box step_* sweep. The engine's public API + decode loop stay
-//   untouched (hard rule). The ONE remaining seam is the live wiring in main.cpp:
-//   the DSP log-mel frames are not yet fed into the pipeline, so do_commit_decode
-//   still runs a REAL text decode from the frozen system prefix (genuine model
-//   output). Everything except that feed -- encode, project, double-buffer
-//   handoff, embedding prefill, decode, streaming, barge-in -- is real.
+//   -> decode. The engine's public API + decode loop stay untouched (hard rule);
+//   all embedding injection goes through the white-box step_* sweep.
+//   * WHOLE-UTTERANCE: do_commit_decode drains the ring at the VAD boundary and
+//     runs the proven --wav transcribe path (commit_audio_decode).
+//   * CENTER-SLICE STREAMING (plan.mode == CenterSlice): do_warm_prefill drains
+//     the ring DURING speech, recomputes the utterance log-mel, and appends only
+//     the stable center soft-tokens per sliding-window hop (append-only, pos
+//     monotone) — so the encoder work is off the TTFT critical path. The VAD
+//     pause (commit_center_decode) flushes the tail, commits the withheld
+//     right-edge tokens (zero encoder work — persisted by the last hop), closes
+//     the turn frame and decodes; a barge-in resumes the SAME utterance via a
+//     pointer-only rollback to the pause checkpoint (see do_rewind).
 // -----------------------------------------------------------------------------
 #include <algorithm>
 #include <atomic>
@@ -80,7 +80,38 @@ public:
                             std::memory_order_relaxed);
             tgt_lang_.store(rt::language_index_or_auto(plan.target_language),
                             std::memory_order_relaxed);
+            // Live streaming toggle seeds from the resolved plan: ON iff the
+            // CenterSlice geometry was armed at launch (the UI can flip it).
+            live_center_.store(plan.audio_streaming.enabled &&
+                               plan.audio_streaming.mode ==
+                                   blackwell::AudioStreamingMode::CenterSlice,
+                               std::memory_order_relaxed);
         }
+    }
+
+    // ---- Live streaming-mode toggle (UI thread writes, engine thread reads at
+    //      UTTERANCE boundaries — an open utterance latches its mode, so a
+    //      mid-speech flip applies from the next utterance) --------------------
+    // Whether the CenterSlice plan geometry + audio frontend are armed at all
+    // (static capability: resolved at launch; without it the toggle is inert).
+    bool center_slice_available() const {
+        if (engine_ == nullptr || !audio_head_loaded() || dsp_ == nullptr) return false;
+        const auto& plan = engine_->get_impl()->m_runtime.audio_streaming;
+        return plan.enabled && plan.mode == blackwell::AudioStreamingMode::CenterSlice;
+    }
+    void set_live_center_slice(bool on) noexcept {
+        live_center_.store(on, std::memory_order_release);
+    }
+    bool live_center_slice() const noexcept {
+        return live_center_.load(std::memory_order_acquire);
+    }
+
+    // Last utterance's TTFT — VAD trigger (commit command execution) to the first
+    // decode token being available — in ms; 0 until the first utterance. Written
+    // by the engine thread's commit paths, read by the UI readout. Both live
+    // paths report it, so the toggle gives a direct A/B in the panel.
+    float last_ttft_ms() const noexcept {
+        return last_ttft_ms_.load(std::memory_order_acquire);
     }
 
     // ---- Text-context policy (Stateless vs Bounded dialogue history) ----------
@@ -177,10 +208,16 @@ public:
     // pointer + verified boundary, then reconciles the arena's offload high-water
     // marks through the Continuous KV rewind (VRAMArena::truncate_kv). Engine
     // thread only.
-    void kv_cache_rollback(const KVCheckpoint& cp) {
+    //
+    // EVERY KV drop in this app flows through here or do_rewind — the two choke
+    // points — so each prints an UNCONDITIONAL, highly visible invalidation line
+    // with its reason: any multi-second re-prefill must be traceable to a named
+    // cause in the log, never a silent cache flush.
+    void kv_cache_rollback(const KVCheckpoint& cp,
+                           const char* reason = "explicit checkpoint rollback") {
         const int floor    = static_cast<int>(effective_keep_tokens(0));
         const int safe_pos = std::max(cp.pos, floor);
-        const bool dbg     = std::getenv("BLACKWELL_AV_DEBUG") != nullptr;
+        const int from_pos = pos_;
         const auto t0      = std::chrono::steady_clock::now();
 
         pos_ = safe_pos;
@@ -190,13 +227,13 @@ public:
         // resident model (nothing offloaded), so regular decode is unaffected.
         engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, safe_pos);
 
-        if (dbg) {
-            const double us = std::chrono::duration<double, std::micro>(
-                std::chrono::steady_clock::now() - t0).count();
-            std::printf("[kv-ckpt] rollback pos %d -> %d (floor=%d) verified_tokens=%u  %.1f us\n",
-                        cp.pos, safe_pos, floor, cp.verified_tokens, us);
-            std::fflush(stdout);
-        }
+        const double us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::printf("[KV CACHE INVALIDATION] Reason: %s. pos %d -> %d "
+                    "(dropping %d KV tokens; floor=%d, verified=%u)  %.1f us\n",
+                    reason, from_pos, safe_pos, from_pos - safe_pos, floor,
+                    cp.verified_tokens, us);
+        std::fflush(stdout);
     }
 
     // Engine-thread setup: load the Whisper encoder + Ultravox projector weights
@@ -349,8 +386,13 @@ public:
         const TurnFrame frame = make_turn_frame();
         if (!prefill_ids(frame.user_hdr)) return std::string();
 
-        // Slide the window across [0, total_frames) in `hop`-frame steps; each hop
-        // reconciles its overlap against the injected history and appends the delta.
+        // Slide the window across [0, total_frames) in `hop`-frame steps. Per hop:
+        //   Reconcile   — compare the overlap against the injected history and
+        //                 append the delta (rollback+re-inject on divergence);
+        //   CenterSlice — append only the NEW stable center rows (no cosine work,
+        //                 no mid-speech rollbacks; pos only moves forward).
+        const bool center =
+            plan.mode == blackwell::AudioStreamingMode::CenterSlice;
         const std::size_t stage_elems = static_cast<std::size_t>(num_mel_bins) * W;
         if (d_window_stage_.count() != stage_elems) d_window_stage_.allocate(stage_elems);
         audio_pipeline_->reset_history();
@@ -365,9 +407,13 @@ public:
                 static_cast<std::size_t>(frames) * sizeof(float),
                 static_cast<std::size_t>(num_mel_bins), cudaMemcpyDeviceToDevice));
             // `start` is the window's absolute mel-frame offset -> monotonic positions.
-            prefill_audio_hop(d_window_stage_.get(), frames, /*mel_frame_offset=*/start);
+            if (center) prefill_audio_center_hop(d_window_stage_.get(), frames, start);
+            else        prefill_audio_hop(d_window_stage_.get(), frames, start);
             if (end >= total_frames) break;
         }
+        // End of utterance == the VAD pause: complete the phrase by committing the
+        // withheld right-edge tokens before closing the turn frame.
+        if (center) commit_audio_right_edge();
 
         if (!prefill_ids(frame.user_eot)) return std::string();
         if (!prefill_ids(frame.gen_cue))  return std::string();
@@ -422,6 +468,7 @@ public:
     // An interrupted (barge-in) or empty turn is never recorded — the rollback
     // here is idempotent with the barge-in's pending do_rewind.
     void finalize_turn(const std::string& reply, bool completed) {
+        pause_pending_ = false;   // the turn is over: the edge commit is resolved
         const bool bounded = context_mode() == ContextMode::BoundedHistory;
         if (!bounded) {
             // Also covers a live Bounded -> Stateless switch: drop the retained
@@ -433,7 +480,10 @@ public:
         }
         if (!bounded || !completed || reply.empty()) {
             kv_cache_rollback({history_base_pos_.load(std::memory_order_relaxed),
-                               verified_prompt_tokens_});
+                               verified_prompt_tokens_},
+                              !bounded ? "end-of-turn stateless flush (by design: audio + "
+                                         "generated text leave no trace)"
+                                       : "incomplete/empty turn discarded");
             if (audio_pipeline_) audio_pipeline_->reset_history();
             return;
         }
@@ -493,6 +543,23 @@ protected:
     // prefix, and re-anchor pos_ to the resolved keep so the next utterance decodes
     // on top of the system prefix, not on top of the previous (superseded) answer.
     blackwell::EngineStatus do_rewind(const Command& cmd) override {
+        // CenterSlice mid-utterance resume: the barge-in continues the SAME user
+        // turn, so the committed center tokens are real audio context and must
+        // survive. Any tentative state above the pause checkpoint (edge tokens,
+        // turn-close template, generated text) was already discarded by the
+        // interrupted decode's resume_after_pause(); this call is its idempotent
+        // twin for the decode-not-yet-started case. A full rewind to the floor
+        // here would throw the utterance's audio away mid-sentence.
+        if (utterance_open_ && center_slice_available()) {   // latch, not the live toggle
+            resume_after_pause();
+            last_rewind_keep_.store(static_cast<uint32_t>(pos_), std::memory_order_release);
+            if (std::getenv("BLACKWELL_AV_DEBUG")) {
+                std::printf("[center] barge-in resume: utterance continues at pos=%d\n", pos_);
+                std::fflush(stdout);
+            }
+            return blackwell::EngineStatus::Success;
+        }
+
         uint32_t keep = effective_keep_tokens(cmd.keep_prompt_tokens);
         // Bounded-history floor: retained dialogue turns sit directly above the
         // system prefix and are committed context — a barge-in must not truncate
@@ -502,13 +569,50 @@ protected:
             static_cast<uint32_t>(history_base_pos_.load(std::memory_order_relaxed));
         if (keep < hist_floor) keep = hist_floor;
         last_rewind_keep_.store(keep, std::memory_order_release);
+        std::printf("[KV CACHE INVALIDATION] Reason: speech-start full rewind (fresh "
+                    "utterance). pos %d -> %u (dropping %d KV tokens; system floor=%u, "
+                    "history base=%u)\n",
+                    pos_, keep, pos_ - static_cast<int>(keep), system_prefix_tokens(),
+                    hist_floor);
+        std::fflush(stdout);
         pos_ = static_cast<int>(keep);
         // Full host-mirror reconciliation (Phase 0 truncate_kv), safe below the
         // engine's public API on the single engine-owning thread.
         engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, static_cast<int>(keep));
         // The KV is rewound to (at most) the frozen system prefix, so no audio soft-
-        // tokens survive: drop the overlap-reconciliation history too.
+        // tokens survive: drop the overlap-reconciliation / center-slice history too
+        // (reset_history covers both), any outstanding pause-edge commit, and the
+        // live utterance accumulators (a fresh utterance starts here).
         if (audio_pipeline_) audio_pipeline_->reset_history();
+        pause_pending_ = false;
+        reset_utterance();
+
+        // HARD AUDIO FLUSH: a fresh utterance starts from THIS moment's audio.
+        // Everything still buffered in the ring is pre-speech-start material —
+        // in auto mode the background noise accumulated since the last commit
+        // (unbounded between utterances), in manual mode anything that leaked in
+        // before the press — and encoding it makes the LLM hallucinate over
+        // noise. Discarded HERE because this runs on the engine thread, the only
+        // consumer allowed to move the ring's read cursor (SPSC contract). The
+        // few ms of samples pushed between the trigger and this command
+        // executing are dropped with the noise (the engine is idle at speech
+        // start, so that window is command-latency-small). The mid-utterance
+        // resume branch above deliberately does NOT flush: there the ring holds
+        // the freshly resumed speech.
+        if (cmd.stream != nullptr) {
+            blackwell::bridge::AudioRingBuffer& ring = cmd.stream->ring;
+            const std::size_t stale = ring.available_samples();
+            if (stale != 0) {
+                pcm_stage_.resize(stale);
+                const std::size_t got = ring.read_samples(pcm_stage_.data(), stale);
+                if (std::getenv("BLACKWELL_AV_DEBUG")) {
+                    std::printf("[flush] speech start: discarded %zu stale PCM samples"
+                                " (%.0f ms of pre-press audio)\n",
+                                got, static_cast<double>(got) / 16.0);
+                    std::fflush(stdout);
+                }
+            }
+        }
 
         if (std::getenv("BLACKWELL_AV_DEBUG")) {
             std::printf("[kv-ckpt] barge-in rewind -> keep=%u (floor=%u)\n",
@@ -518,11 +622,21 @@ protected:
         return blackwell::EngineStatus::Success;
     }
 
-    // Speculative warm-prefill: the real path grows the KV over buffered audio via
-    // the projector splice. That needs the (unimplemented) Whisper encoder, so it
-    // is a documented no-op here — report Success so the state machine keeps
-    // warming without faulting the stream.
-    blackwell::EngineStatus do_warm_prefill(const Command& /*cmd*/) override {
+    // Speculative warm-prefill — the CenterSlice LIVE feed. While the user is
+    // still speaking (throttled by warm_prefill_interval_ms), drain the buffered
+    // PCM, recompute the utterance log-mel, and advance the sliding window by
+    // whole hops, appending only the stable center tokens. This grows the KV
+    // DURING speech, which is what keeps the encoder off the TTFT critical path.
+    // Falls back to the documented no-op (Success, state machine keeps warming)
+    // when the center-slice live path is not armed.
+    blackwell::EngineStatus do_warm_prefill(const Command& cmd) override {
+        // utterance_open_ = the mode latch: an utterance the center path opened
+        // keeps hopping even if the UI toggled mid-speech (flip applies next turn).
+        if (cmd.stream == nullptr || (!center_streaming_live() && !utterance_open_))
+            return blackwell::EngineStatus::Success;
+        drain_stream_pcm(cmd.stream->ring);
+        open_utterance_if_needed();
+        run_pending_center_hops(/*flush_tail=*/false);
         return blackwell::EngineStatus::Success;
     }
 
@@ -532,11 +646,28 @@ protected:
     // (the audio-derived transcript is the marked seam — see the header preamble);
     // everything downstream is the genuine GPU decode path.
     blackwell::EngineStatus do_commit_decode(const Command& cmd) override {
-        // LIVE AUDIO PATH: with an audio head + DSP bound, transcribe the buffered
-        // utterance (the SAME encode->project->prefill_audio->decode path the --wav
-        // mode proves) instead of the text placeholder below.
-        if (audio_head_loaded() && dsp_ != nullptr && cmd.stream != nullptr)
+        // CENTER-SLICE LIVE PATH: the audio was already streamed into the KV by
+        // the warm hops; this commit only flushes the tail, completes the phrase
+        // (right-edge commit), closes the turn frame, and decodes. An OPEN
+        // utterance always commits here regardless of the live toggle (the mode
+        // latch — only the center path ever opens one).
+        if (cmd.stream != nullptr && (center_streaming_live() || utterance_open_))
+            return commit_center_decode(cmd);
+
+        // WHOLE-UTTERANCE LIVE PATH: with an audio head + DSP bound, transcribe
+        // the buffered utterance (the SAME encode->project->prefill_audio->decode
+        // path the --wav mode proves) instead of the text placeholder below.
+        // ROUTING TELEMETRY: taking this path means a FULL utterance re-encode +
+        // batch prefill (the multi-second <|audio x188|> event) — say WHY the
+        // fast path was not taken, so a misrouted commit can never hide.
+        if (audio_head_loaded() && dsp_ != nullptr && cmd.stream != nullptr) {
+            std::printf("[Prefill Route] whole-utterance FALLBACK: %s\n",
+                        center_slice_available()
+                            ? "center-slice armed but live toggle = Whole utterance"
+                            : "center-slice plan NOT armed (launch --stream-mode center)");
+            std::fflush(stdout);
             return commit_audio_decode(cmd);
+        }
 
         // Frame a user turn + assistant cue through the checkpoint's chat template,
         // then prefill it. Cycle a few prompts so the live GUI shows varied real
@@ -555,6 +686,7 @@ protected:
         turn.insert(turn.end(), gen.begin(), gen.end());
 
         int next = -1;
+        const auto t_turn0 = std::chrono::steady_clock::now();  // placeholder TTFT clock
         for (const int id : turn) {
             if (pos_ >= max_context_ ||
                 engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
@@ -571,9 +703,23 @@ protected:
         std::string reply;
         bool interrupted = false;
         blackwell::EngineStatus st = blackwell::EngineStatus::Success;
+        const char* stop_reason = "max length hit (context budget)";
+        // Seeded at the turn-prefill start: the first [Decode] line reports the
+        // prefill-to-first-token wall time (no VAD trigger on this text path).
+        auto t_tok = t_turn0;
         while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) { interrupted = true; break; }  // wait-free barge-in
-            if (tok_->is_stop(next)) break;
+            if (cancelled(cmd.gen)) {                              // wait-free barge-in
+                interrupted = true;
+                stop_reason = "barge-in detected (gen superseded)";
+                break;
+            }
+            {   // telemetry: EVERY produced token, stop/special tokens included
+                const auto now = std::chrono::steady_clock::now();
+                log_decode_token(next,
+                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
+                t_tok = now;
+            }
+            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
             const std::string piece = tok_->decode(next, /*render_special=*/false);
             if (!piece.empty()) {
                 cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
@@ -582,9 +728,13 @@ protected:
             ++emitted;
             st = engine_->forward_status(next, pos_, /*temperature=*/0.7f, /*top_p=*/0.9f,
                                          cfg_.seq_id, &next);
-            if (st != blackwell::EngineStatus::Success) break;
+            if (st != blackwell::EngineStatus::Success) {
+                stop_reason = "engine fault (forward_status != Success)";
+                break;
+            }
             ++pos_;
         }
+        log_decode_stop(stop_reason, pos_, emitted);
 
         finalize_turn(reply, /*completed=*/!interrupted &&
                                 st == blackwell::EngineStatus::Success);
@@ -707,7 +857,8 @@ protected:
             start_row = 0;
             count     = win.num_tokens;
         } else if (rec.diverged) {
-            kv_cache_rollback({rec.rewind_to_pos, verified_prompt_tokens_});
+            kv_cache_rollback({rec.rewind_to_pos, verified_prompt_tokens_},
+                              "reconcile divergence (overlap cosine below threshold)");
             start_row = rec.refill_from;
             count     = win.num_tokens - rec.refill_from;
         } else {
@@ -735,12 +886,92 @@ protected:
         return pos_;
     }
 
+    // ---- CenterSlice streaming (append-only during speech) -----------------------
+    // One hop: encode+project the window, then inject ONLY the new stable center
+    // rows (the pipeline drops both CNN-distorted edges and tracks the absolute
+    // committed count). No cosine checks, no rollbacks — pos_ only moves forward
+    // while speech is active. Engine thread only.
+    int prefill_audio_center_hop(const float* d_mel, int mel_frames, int mel_frame_offset) {
+        const auto slice = audio_pipeline_->center_hop(d_mel, mel_frames, mel_frame_offset);
+        // The hop ran on the audio stream; the injection below runs on stream 0.
+        CUDA_CHECK_THROW(cudaStreamSynchronize(audio_pipeline_->audio_stream()));
+        if (slice.count > 0) {
+            inject_embedding_rows(slice.embeds, slice.start_row, slice.count);
+            // Visible proof the incremental path is alive DURING speech: if these
+            // lines are absent before a commit, the commit will be a full re-prefill.
+            std::printf("[Warm Hop] +%d center token(s) (utterance committed: %d) -> pos=%d\n",
+                        slice.count, audio_pipeline_->center_committed(), pos_);
+            std::fflush(stdout);
+        } else if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            std::printf("[center] hop: window not grown yet (committed=%d, pos=%d)\n",
+                        audio_pipeline_->center_committed(), pos_);
+            std::fflush(stdout);
+        }
+        return pos_;
+    }
+
+    // VAD pause: capture the KV checkpoint, then commit the withheld right-edge
+    // tokens to complete the phrase (they were persisted by the last hop — zero
+    // encoder work here). If speech resumes before the turn finalizes,
+    // resume_after_pause() undoes exactly this commit. pause_pending_ arms even
+    // when the edge slice is empty: everything the caller prefills ABOVE the
+    // checkpoint (turn-close template + generated tokens) is tentative until the
+    // turn finalizes, and a resume must discard it either way. Engine thread only.
+    int commit_audio_right_edge() {
+        pause_cp_ = kv_cache_checkpoint();
+        pause_pending_ = true;
+        const auto slice = audio_pipeline_->commit_pending_edge();
+        if (slice.count > 0)
+            inject_embedding_rows(slice.embeds, slice.start_row, slice.count);
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            std::printf("[center] pause: committed %d edge row(s) -> pos=%d\n",
+                        slice.count, pos_);
+            std::fflush(stdout);
+        }
+        return pos_;
+    }
+
+    // Speech resumed after a pause-commit (barge-in / micro-pause): pointer-only
+    // rollback of the tentative edge tokens (pos -= K; truncate_kv is a no-op for
+    // the resident model — 0 ms of GPU compute) and un-commit the pipeline's
+    // counter, so the next hop overwrites the edge region with fresh,
+    // context-complete center tokens. Idempotent. Engine thread only.
+    void resume_after_pause() {
+        if (!pause_pending_) return;
+        pause_pending_ = false;
+        kv_cache_rollback(pause_cp_,
+                          "barge-in resume (pointer-only: tentative edge/template/"
+                          "generated tokens dropped, center tokens KEPT)");
+        audio_pipeline_->uncommit_pending_edge();
+        if (std::getenv("BLACKWELL_AV_DEBUG")) {
+            std::printf("[center] resume: edge un-committed -> pos=%d (committed=%d)\n",
+                        pos_, audio_pipeline_->center_committed());
+            std::fflush(stdout);
+        }
+    }
+
 private:
     // Emit the final callback (clean supersede or cap/fault both report OK to the
     // stream) and return Success — a barge-in is not an error.
     blackwell::EngineStatus finish(const Command& cmd, int emitted) {
         cmd.sink.emit("", emitted, /*is_final=*/1, BRIDGE_OK);
         return blackwell::EngineStatus::Success;
+    }
+
+    // ---- raw decode telemetry (stdout diagnostics for the TRANSLATION stall) --
+    // One line per generated token. The text is SPECIAL-rendered so invisible
+    // tokens (<|eot_id|>, headers, hallucinated specials) are identifiable —
+    // the piece the sink streams stays render_special=false as before. dt_ms is
+    // the time this token took to produce; the FIRST token's clock is seeded at
+    // the VAD trigger, so its line reports the true wall-clock TTFT.
+    void log_decode_token(int token_id, double dt_ms) const {
+        std::printf("[Decode] TokenID: %d | String: '%s' | Time: %.1f ms\n", token_id,
+                    tok_->decode(token_id, /*render_special=*/true).c_str(), dt_ms);
+        std::fflush(stdout);
+    }
+    static void log_decode_stop(const char* reason, int pos, int emitted) {
+        std::printf("[Decode Stop] Reason: %s (pos=%d, emitted=%d)\n", reason, pos, emitted);
+        std::fflush(stdout);
     }
 
     // ---- bounded-history internals (engine thread only) -----------------------
@@ -801,7 +1032,8 @@ private:
     void rebuild_history_kv() {
         const bool dbg = std::getenv("BLACKWELL_AV_DEBUG") != nullptr;
         const int floor = static_cast<int>(system_prefix_tokens());
-        kv_cache_rollback({floor, verified_prompt_tokens_});
+        kv_cache_rollback({floor, verified_prompt_tokens_},
+                          "bounded-history KV rebuild (context headroom exhausted)");
         if (audio_pipeline_) audio_pipeline_->reset_history();
         int next = -1;
         for (const TurnRecord& t : turn_history_) {
@@ -821,33 +1053,168 @@ private:
         }
     }
 
-    // Drain the buffered utterance PCM from the stream ring (engine-thread consumer),
-    // run WhisperDSP -> [128,3000] log-mel -> prefill_ultravox_turn (audio soft-tokens)
-    // -> stream the assistant reply through the sink, checking cancelled(gen) before
-    // every token for wait-free barge-in. Mirrors the proven --wav transcribe path.
-    blackwell::EngineStatus commit_audio_decode(const Command& cmd) {
-        blackwell::bridge::AudioRingBuffer& ring = cmd.stream->ring;
-        const std::size_t avail = ring.available_samples();
-        if (avail == 0) { clear_in_flight(); return finish(cmd, 0); }
-        pcm_stage_.resize(avail);
-        const std::size_t got = ring.read_samples(pcm_stage_.data(), avail);
-        pcm_stage_.resize(got);
+    // ---- CenterSlice LIVE internals (engine thread only) -----------------------
 
-        const float* d_mel = stage_logmel(pcm_stage_);
+    // The encoder's positional-embedding ceiling: mel frames beyond 30 s cannot be
+    // encoded at their true absolute offset, so the hop driver stops there (the
+    // whole-utterance path has the same 30 s cap).
+    static constexpr int kMaxUtteranceMelFrames = 3000;
+
+    // Is the append-only live path selected RIGHT NOW? Static capability
+    // (center_slice_available) AND the UI's live toggle. Callers that may run
+    // mid-utterance must OR this with utterance_open_ (the mode latch): an open
+    // utterance always finishes on the center path that started it, so a live
+    // flip applies from the next utterance and can never corrupt an open turn.
+    bool center_streaming_live() const {
+        return center_slice_available() &&
+               live_center_.load(std::memory_order_acquire);
+    }
+
+    // Move every sample buffered in the ring into the utterance accumulator.
+    void drain_stream_pcm(blackwell::bridge::AudioRingBuffer& ring) {
+        const std::size_t avail = ring.available_samples();
+        if (avail == 0) return;
+        const std::size_t old = utterance_pcm_.size();
+        utterance_pcm_.resize(old + avail);
+        const std::size_t got = ring.read_samples(utterance_pcm_.data() + old, avail);
+        utterance_pcm_.resize(old + got);
+    }
+
+    // First audio of an utterance: prefill the user header (with the CURRENT
+    // forced-language instruction) so the streamed soft-tokens land inside a
+    // template-valid user turn. Idempotent per utterance.
+    void open_utterance_if_needed() {
+        if (utterance_open_) return;
+        utterance_open_ = true;
         int next = -1;
-        if (prefill_ultravox_turn(d_mel, &next) != blackwell::EngineStatus::Success) {
-            finalize_turn(std::string(), /*completed=*/false);  // drop the partial prefill
+        for (const int id : make_turn_frame().user_hdr) {
+            if (pos_ >= max_context_) break;
+            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                blackwell::EngineStatus::Success)
+                break;
+            ++pos_;
+        }
+    }
+
+    // Recompute the utterance log-mel (whole-buffer WhisperDSP; incremental STFT
+    // is a future optimization — CPU cost is ms-scale for seconds of audio) and
+    // advance the sliding window by whole hops through prefill_audio_center_hop.
+    // streamed_mel_end_ tracks the mel frames already covered; flush_tail also
+    // commits a final short window at the commit boundary.
+    void run_pending_center_hops(bool flush_tail) {
+        if (utterance_pcm_.empty()) return;
+        const auto& plan = engine_->get_impl()->m_runtime.audio_streaming;
+        const int W   = plan.window_tokens * blackwell::audio::kMelFramesPerSoftToken;
+        const int hop = plan.hop_tokens    * blackwell::audio::kMelFramesPerSoftToken;
+        const int nmb = dsp_->config().n_mels;
+
+        const whisper::LogMel mel = dsp_->process(utterance_pcm_);
+        int total = std::min(mel.n_frames, kMaxUtteranceMelFrames);
+        total -= total % blackwell::audio::kMelFramesPerSoftToken;   // whole soft-tokens
+
+        const std::size_t cap = static_cast<std::size_t>(nmb) * W;
+        if (d_window_stage_.count() < cap) d_window_stage_.allocate(cap);
+
+        while (true) {
+            int end;
+            if (streamed_mel_end_ == 0)                     end = std::min(W, total);
+            else if (streamed_mel_end_ + hop <= total)      end = streamed_mel_end_ + hop;
+            else if (flush_tail && streamed_mel_end_ < total) end = total;
+            else break;
+            if (end <= streamed_mel_end_) break;
+
+            const int start  = std::max(0, end - W);
+            const int frames = end - start;
+            // Host-side mel window slice (mel-major) -> contiguous [nmb, frames].
+            mel_stage_.resize(static_cast<std::size_t>(nmb) * frames);
+            for (int m = 0; m < nmb; ++m)
+                std::copy(mel.data.begin() + static_cast<std::size_t>(m) * mel.n_frames + start,
+                          mel.data.begin() + static_cast<std::size_t>(m) * mel.n_frames + end,
+                          mel_stage_.begin() + static_cast<std::size_t>(m) * frames);
+            CUDA_CHECK_THROW(cudaMemcpy(d_window_stage_.get(), mel_stage_.data(),
+                                        mel_stage_.size() * sizeof(float),
+                                        cudaMemcpyHostToDevice));
+            prefill_audio_center_hop(d_window_stage_.get(), frames, /*mel_frame_offset=*/start);
+            streamed_mel_end_ = end;
+        }
+    }
+
+    // Per-utterance live state reset (turn finalized, or a fresh utterance began).
+    void reset_utterance() {
+        utterance_pcm_.clear();
+        streamed_mel_end_ = 0;
+        utterance_open_ = false;
+    }
+
+    // The CenterSlice commit: flush the mel tail, complete the phrase with the
+    // right-edge commit, close the turn frame, decode. On a barge-in with the
+    // pause checkpoint armed, the utterance CONTINUES: only the tentative state
+    // above the checkpoint is discarded (pointer rollback) and the queued
+    // do_rewind sees the open utterance and preserves the audio context.
+    blackwell::EngineStatus commit_center_decode(const Command& cmd) {
+        const auto t_vad = std::chrono::steady_clock::now();   // VAD trigger -> TTFT clock
+        const int resident_kv = pos_;            // tokens ALREADY in the KV at the trigger
+        drain_stream_pcm(cmd.stream->ring);
+        if (!utterance_open_ && utterance_pcm_.empty()) {
             clear_in_flight();
             return finish(cmd, 0);
         }
+        open_utterance_if_needed();
+        run_pending_center_hops(/*flush_tail=*/true);
+        commit_audio_right_edge();               // pause checkpoint + K edge rows
+
+        const TurnFrame frame = make_turn_frame();
+        int next = -1;
+        auto prefill_ids = [&](const std::vector<int>& ids) -> bool {
+            for (const int id : ids) {
+                if (pos_ >= max_context_) return false;
+                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                    blackwell::EngineStatus::Success)
+                    return false;
+                ++pos_;
+            }
+            return true;
+        };
+        if (!prefill_ids(frame.user_eot) || !prefill_ids(frame.gen_cue)) {
+            finalize_turn(std::string(), /*completed=*/false);
+            reset_utterance();
+            clear_in_flight();
+            return finish(cmd, 0);
+        }
+        // First decode token is sampled by the last gen-cue forward: TTFT closes.
+        last_ttft_ms_.store(static_cast<float>(std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_vad).count()),
+                            std::memory_order_release);
+
+        // What actually hit the GPU on the critical path: the resident streamed
+        // tokens were accepted as-is; only the delta was prefilled. If the delta
+        // ever balloons toward the full utterance, the fast path is broken.
+        std::printf("[Prefill Start] Mode: Center-Slice | Resident KV: %d tokens | "
+                    "Prefill Batch (Delta): %d tokens (tail hops + K edge + turn close)\n",
+                    resident_kv, pos_ - resident_kv);
+        std::fflush(stdout);
 
         int emitted = 0;
         std::string reply;
         bool interrupted = false;
         bool faulted = false;
+        const char* stop_reason = "max length hit (context budget)";
+        // Seed the per-token clock at the VAD trigger: the FIRST [Decode] line
+        // then reports the true wall-clock TTFT, not ~0.
+        auto t_tok = t_vad;
         while (pos_ < max_context_) {
-            if (cancelled(cmd.gen)) { interrupted = true; break; }  // wait-free barge-in
-            if (tok_->is_stop(next)) break;
+            if (cancelled(cmd.gen)) {                              // wait-free barge-in
+                interrupted = true;
+                stop_reason = "barge-in detected (gen superseded)";
+                break;
+            }
+            {   // telemetry: EVERY produced token, stop/special tokens included
+                const auto now = std::chrono::steady_clock::now();
+                log_decode_token(next,
+                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
+                t_tok = now;
+            }
+            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
             const std::string piece = tok_->decode(next, /*render_special=*/false);
             if (!piece.empty()) {
                 cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
@@ -857,10 +1224,97 @@ private:
             if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
                                         cfg_.seq_id, &next) != blackwell::EngineStatus::Success) {
                 faulted = true;
+                stop_reason = "engine fault (forward_status != Success)";
                 break;
             }
             ++pos_;
         }
+        log_decode_stop(stop_reason, pos_, emitted);
+
+        if (interrupted && pause_pending_) {
+            // Micro-pause resume: speech returned before the turn finalized.
+            // Pointer-rollback the tentative edge + template + generated tokens
+            // and keep the utterance open — the next warm hop overwrites the edge
+            // region with fresh, context-complete center tokens.
+            resume_after_pause();
+            clear_in_flight();
+            return finish(cmd, emitted);
+        }
+        finalize_turn(reply, /*completed=*/!interrupted && !faulted);
+        reset_utterance();
+        clear_in_flight();
+        return finish(cmd, emitted);
+    }
+
+    // Drain the buffered utterance PCM from the stream ring (engine-thread consumer),
+    // run WhisperDSP -> [128,3000] log-mel -> prefill_ultravox_turn (audio soft-tokens)
+    // -> stream the assistant reply through the sink, checking cancelled(gen) before
+    // every token for wait-free barge-in. Mirrors the proven --wav transcribe path.
+    blackwell::EngineStatus commit_audio_decode(const Command& cmd) {
+        const auto t_vad = std::chrono::steady_clock::now();   // VAD trigger -> TTFT clock
+        blackwell::bridge::AudioRingBuffer& ring = cmd.stream->ring;
+        const std::size_t avail = ring.available_samples();
+        if (avail == 0) { clear_in_flight(); return finish(cmd, 0); }
+        pcm_stage_.resize(avail);
+        const std::size_t got = ring.read_samples(pcm_stage_.data(), avail);
+        pcm_stage_.resize(got);
+
+        // Announce the batch BEFORE the multi-second work so the log shows what
+        // is about to hit the GPU (header + ALL audio soft-tokens + turn close).
+        std::printf("[Prefill Start] Mode: Whole-Utterance | Resident KV: %d tokens | "
+                    "Prefill Batch: FULL utterance (~%d audio soft-tokens + turn framing)\n",
+                    pos_, audio_out_frames());
+        std::fflush(stdout);
+
+        const float* d_mel = stage_logmel(pcm_stage_);
+        int next = -1;
+        if (prefill_ultravox_turn(d_mel, &next) != blackwell::EngineStatus::Success) {
+            finalize_turn(std::string(), /*completed=*/false);  // drop the partial prefill
+            clear_in_flight();
+            return finish(cmd, 0);
+        }
+        // The whole utterance (DSP + encoder + 188-token prefill) sat on this
+        // path — recording it makes the panel readout a direct A/B vs CenterSlice.
+        last_ttft_ms_.store(static_cast<float>(std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_vad).count()),
+                            std::memory_order_release);
+
+        int emitted = 0;
+        std::string reply;
+        bool interrupted = false;
+        bool faulted = false;
+        const char* stop_reason = "max length hit (context budget)";
+        // Seed the per-token clock at the VAD trigger: the FIRST [Decode] line
+        // then reports the true wall-clock TTFT, not ~0.
+        auto t_tok = t_vad;
+        while (pos_ < max_context_) {
+            if (cancelled(cmd.gen)) {                              // wait-free barge-in
+                interrupted = true;
+                stop_reason = "barge-in detected (gen superseded)";
+                break;
+            }
+            {   // telemetry: EVERY produced token, stop/special tokens included
+                const auto now = std::chrono::steady_clock::now();
+                log_decode_token(next,
+                                 std::chrono::duration<double, std::milli>(now - t_tok).count());
+                t_tok = now;
+            }
+            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
+            const std::string piece = tok_->decode(next, /*render_special=*/false);
+            if (!piece.empty()) {
+                cmd.sink.emit(piece.c_str(), emitted, /*is_final=*/0, BRIDGE_OK);
+                reply += piece;
+            }
+            ++emitted;
+            if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
+                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success) {
+                faulted = true;
+                stop_reason = "engine fault (forward_status != Success)";
+                break;
+            }
+            ++pos_;
+        }
+        log_decode_stop(stop_reason, pos_, emitted);
         finalize_turn(reply, /*completed=*/!interrupted && !faulted);
         clear_in_flight();
         return finish(cmd, emitted);
@@ -886,10 +1340,16 @@ private:
         return d_mel_.get();
     }
 
+protected:
+    // ---- state (protected, not private: the Tier-2 profiler/latency tests
+    //      subclass this control and drive the SAME single-threaded flow the
+    //      do_* overrides use — white-box tier, engine thread only) -----------
     blackwell::ITokenizer* tok_ = nullptr;   // non-owning
     int  max_context_ = 0;
     int  pos_ = 0;                            // logical decode position (engine thread only)
     uint32_t verified_prompt_tokens_ = 0;     // committed-prefix boundary (checkpoint/rollback)
+    KVCheckpoint pause_cp_{};                 // pre-edge-commit snapshot (CenterSlice pause)
+    bool pause_pending_ = false;              // an edge commit awaits finalize-or-resume
     std::atomic<uint32_t> last_rewind_keep_{0};
     std::atomic<std::size_t> turn_counter_{0};
 
@@ -899,6 +1359,8 @@ private:
     std::atomic<int> history_budget_tokens_{256};
     std::atomic<int> src_lang_{0};            // rt::kLanguages index (0 = Auto)
     std::atomic<int> tgt_lang_{0};            // rt::kLanguages index (0 = Auto)
+    std::atomic<bool> live_center_{false};    // UI streaming toggle (utterance-latched)
+    std::atomic<float> last_ttft_ms_{0.0f};   // VAD->first-token, panel readout (0 = none)
 
     // Bounded-history state. The deque/counter are engine-thread-only; the base
     // position is atomic solely for the cross-thread invariant readout (the
@@ -919,6 +1381,13 @@ private:
     std::vector<float>          mel_stage_;
     blackwell::DeviceBuffer<float> d_mel_;
     blackwell::DeviceBuffer<float> d_window_stage_;   // contiguous sliding-window slice
+
+    // CenterSlice live-utterance state (engine thread only): the utterance's
+    // accumulated PCM, the mel frames already covered by hops, and whether the
+    // user turn's header is prefilled (utterance open until finalize/rewind).
+    std::vector<float> utterance_pcm_;
+    int  streamed_mel_end_ = 0;
+    bool utterance_open_ = false;
 };
 
 }  // namespace rt

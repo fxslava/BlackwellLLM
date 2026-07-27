@@ -44,6 +44,14 @@ public:
     // Runtime retune of the auto-commit hangover (UI slider seam). Any thread;
     // one atomic store, effective on the next VAD block. 0 = auto-commit off.
     void set_silence_hangover_ms(uint32_t ms) noexcept;
+    // MANUAL (push-to-talk) mode: while enabled, the internal threshold VAD may
+    // never drive a state transition — no auto onset, no auto barge-in, no
+    // silence auto-commit. Boundaries come EXCLUSIVELY from the explicit
+    // on_speech_start()/on_silence_timeout() calls (hotkey press/release), so a
+    // background VAD trigger can never race a key event mid-utterance. PCM keeps
+    // flowing to the ring and speculative warming stays active. Any thread.
+    void set_manual_mode(bool enabled) noexcept;
+    bool manual_mode() const noexcept { return manual_mode_.load(std::memory_order_acquire); }
 
     // ---- Engine-thread bookkeeping hooks (called by the IEngineControl impl) -
     // The engine owns the exact token accounting; it publishes it here so the
@@ -80,6 +88,7 @@ private:
     // thread) while the audio thread reads it per 10 ms block.
     uint32_t block_size_ = 160;          // 10 ms @ sample_rate
     std::atomic<uint32_t> hangover_samples_{0};  // silence_hangover_ms -> samples (0 = off)
+    std::atomic<bool> manual_mode_{false};       // true = auto-VAD transitions muted (PTT)
     uint32_t warm_interval_samples_ = 0; // warm_prefill_interval_ms -> samples (0 = disabled)
     float release_db_ = 0.0f;            // resolved hysteresis release threshold
 

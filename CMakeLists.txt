@@ -153,6 +153,20 @@ if(BUILD_AUDIO_SANDBOX)
     add_subdirectory(audio_sandbox)
 endif()
 
+# Streaming TTFT profiler wiring (tests/integration/test_streaming_ttft_profiler.cpp):
+# it subclasses the translator's RealEngineControl, whose base lives in
+# blackwell_bridge and whose virtuals reach WhisperDSP. Those targets are defined
+# AFTER tests/, so the extra deps are attached HERE (same post-subdirectory
+# pattern as the folder assignments below). Without the sandbox the test's TU
+# compiles to nothing (it is gated on BLACKWELL_HAVE_SPEECH_STACK).
+if(TARGET integration_tests AND TARGET blackwell_bridge AND TARGET whisper_dsp)
+    target_link_libraries(integration_tests PRIVATE blackwell_bridge whisper_dsp)
+    target_include_directories(integration_tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/bridge"              # engine_control_bridge.hpp, bridge_internal.hpp
+        "${CMAKE_SOURCE_DIR}/audio_sandbox/include")  # whisper_dsp.h
+    target_compile_definitions(integration_tests PRIVATE BLACKWELL_HAVE_SPEECH_STACK)
+endif()
+
 # ============================================================================
 # Solution-folder assignments (USE_FOLDERS is ON above). Centralised here --
 # after every add_subdirectory -- so all targets exist and the taxonomy lives in

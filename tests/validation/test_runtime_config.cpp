@@ -302,3 +302,115 @@ TEST(RuntimeConfig, AudioStreamingReconciliationOverrideOff) {
     EXPECT_FALSE(rt.audio_streaming.enabled);
     EXPECT_EQ(rt.audio_streaming.window_tokens, 14);
 }
+
+// ── CenterSlice mode (append-only center-token streaming) ────────────────────
+
+// The default mode stays Reconcile, but the edge margins resolve to tokens either
+// way (they are inert outside CenterSlice).
+TEST(RuntimeConfig, AudioStreamingDefaultModeIsReconcileWithResolvedEdges) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_EQ(rt.audio_streaming.mode, blackwell::AudioStreamingMode::Reconcile);
+    EXPECT_EQ(rt.audio_streaming.left_edge_tokens, 2);    // 320 / 160
+    EXPECT_EQ(rt.audio_streaming.right_edge_tokens, 3);   // 480 / 160
+}
+
+// CenterSlice resolves edge ms -> tokens and is enabled on a dense model even
+// with overlap_reconciliation opted out (the cosine knob belongs to the other mode).
+TEST(RuntimeConfig, CenterSliceResolvesEdgesAndIgnoresReconcileOptOut) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.mode = blackwell::AudioStreamingMode::CenterSlice;
+    req.audio_streaming.overlap_reconciliation = false;   // must not matter
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_TRUE(rt.audio_streaming.enabled);
+    EXPECT_EQ(rt.audio_streaming.mode, blackwell::AudioStreamingMode::CenterSlice);
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 14);
+    EXPECT_EQ(rt.audio_streaming.hop_tokens, 2);
+    EXPECT_EQ(rt.audio_streaming.left_edge_tokens, 2);
+    EXPECT_EQ(rt.audio_streaming.right_edge_tokens, 3);
+}
+
+// Edge margins must land on whole soft-token boundaries, like window/hop.
+TEST(RuntimeConfig, CenterSliceRejectsUnalignedEdgeMs) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.mode = blackwell::AudioStreamingMode::CenterSlice;
+    req.audio_streaming.left_edge_ms = 300;               // not a multiple of 160
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::invalid_argument);
+}
+
+// Negative edges are rejected in every mode.
+TEST(RuntimeConfig, AudioStreamingRejectsNegativeEdgeMs) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.right_edge_ms = -160;
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::invalid_argument);
+}
+
+// K >= 1: a zero pause-commit margin leaves nothing to complete the phrase with.
+TEST(RuntimeConfig, CenterSliceRejectsZeroRightEdge) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.mode = blackwell::AudioStreamingMode::CenterSlice;
+    req.audio_streaming.right_edge_ms = 0;
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::invalid_argument);
+    // ...but right_edge_ms = 0 is fine in Reconcile mode (the knob is inert there).
+    req.audio_streaming.mode = blackwell::AudioStreamingMode::Reconcile;
+    EXPECT_NO_THROW(build_and_validate_runtime(m, derive_capabilities(m), req));
+}
+
+// Center-span continuity: left + right + hop must fit in the window, else audio
+// between consecutive center spans would never be committed.
+TEST(RuntimeConfig, CenterSliceRejectsGapGeometry) {
+    const auto m = dense_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.mode = blackwell::AudioStreamingMode::CenterSlice;
+    req.audio_streaming.window_size_ms = 640;   // 4 tokens
+    req.audio_streaming.hop_size_ms    = 320;   // 2 tokens; defaults L=2, K=3 -> 2+3+2 > 4
+    EXPECT_THROW(build_and_validate_runtime(m, derive_capabilities(m), req),
+                 std::invalid_argument);
+    // The boundary case (L + K + h == W) is legal: centers tile exactly.
+    req.audio_streaming.window_size_ms = 1120;  // 7 tokens == 2 + 3 + 2
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_EQ(rt.audio_streaming.window_tokens, 7);
+}
+
+// Mode + edge overrides activate resolution (even with .enable false) and win
+// over the request values.
+TEST(RuntimeConfig, CenterSliceModeAndEdgeOverridesWin) {
+    const auto m = dense_model();
+    InferenceConfig req;                                  // enable stays false
+    RuntimeOverrides ov;
+    ov.audio_streaming_mode = blackwell::AudioStreamingMode::CenterSlice;
+    ov.audio_left_edge_ms  = 160;                        // 1 token
+    ov.audio_right_edge_ms = 160;                        // K = 1 token
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req, ov);
+    EXPECT_TRUE(rt.audio_streaming.enabled);
+    EXPECT_EQ(rt.audio_streaming.mode, blackwell::AudioStreamingMode::CenterSlice);
+    EXPECT_EQ(rt.audio_streaming.left_edge_tokens, 1);
+    EXPECT_EQ(rt.audio_streaming.right_edge_tokens, 1);
+}
+
+// The SSM capability gate applies to CenterSlice too: the pause/resume pointer
+// rollback rewinds the KV, which a recurrent state cannot follow.
+TEST(RuntimeConfig, CenterSliceGatedOffForHybrid) {
+    const auto m = hybrid_model();
+    InferenceConfig req;
+    req.audio_streaming.enable = true;
+    req.audio_streaming.mode = blackwell::AudioStreamingMode::CenterSlice;
+    const auto rt = build_and_validate_runtime(m, derive_capabilities(m), req);
+    EXPECT_FALSE(rt.audio_streaming.enabled);             // gated off
+    EXPECT_EQ(rt.audio_streaming.mode, blackwell::AudioStreamingMode::CenterSlice);
+    EXPECT_EQ(rt.audio_streaming.left_edge_tokens, 2);    // geometry still resolved
+}

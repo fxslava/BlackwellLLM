@@ -118,7 +118,17 @@ void SpeechPipelineController::push_pcm(const float* samples, size_t count) noex
     // Backpressure (ring full) is intentionally swallowed here — the VAD/decode
     // logic must not stall the producer; dropped samples degrade quality, not
     // correctness.
-    (void)stream_->ring.push_samples(samples, count);
+    //
+    // TRUE PUSH-TO-TALK: in manual mode the ring receives audio ONLY while an
+    // utterance is being captured (between the explicit press and release, i.e.
+    // PREFILL_SPEAKING). Idle/decoding background noise is discarded at the
+    // door, so a press can never feed pre-press audio into the encoder. The VAD
+    // block accounting below keeps running either way (it feeds the level meter
+    // and re-arms instantly when manual mode is turned off).
+    const bool capture =
+        !manual_mode_.load(std::memory_order_acquire) ||
+        state_.load(std::memory_order_acquire) == SPEECH_STATE_PREFILL_SPEAKING;
+    if (capture) (void)stream_->ring.push_samples(samples, count);
 
     // Internal VAD in fixed 10 ms blocks (sample-accurate, no wall clock).
     for (size_t i = 0; i < count; ++i) {
@@ -134,25 +144,35 @@ void SpeechPipelineController::push_pcm(const float* samples, size_t count) noex
 
 void SpeechPipelineController::vad_on_block(float db) noexcept {
     const SpeechPipelineState s = state_.load(std::memory_order_acquire);
+    // MANUAL/PTT gate: while set, the threshold VAD may not drive ANY state
+    // transition (onset, auto-commit, barge-in) — those come exclusively from
+    // the explicit on_speech_start/on_silence_timeout key events, so a
+    // background VAD trigger can never race a hotkey mid-utterance. Speculative
+    // warming below is NOT a transition and stays active during a PTT hold.
+    const bool manual = manual_mode_.load(std::memory_order_acquire);
 
     switch (s) {
         case SPEECH_STATE_IDLE:
-            if (db > cfg_.vad_threshold_db) on_speech_start();  // onset
+            if (!manual && db > cfg_.vad_threshold_db) on_speech_start();  // onset
             break;
 
         case SPEECH_STATE_PREFILL_SPEAKING: {
             // The hangover is runtime-retunable (UI slider): one relaxed load per
-            // 10 ms block. 0 = auto-commit disabled (manual/push-to-talk only).
+            // 10 ms block. 0 = auto-commit disabled. In manual mode the silence
+            // clock does not even accumulate (a later mode flip must not fire an
+            // instant commit off stale silence).
             const uint32_t hangover = hangover_samples_.load(std::memory_order_relaxed);
-            if (db > release_db_) {
-                silence_samples_.store(0, std::memory_order_relaxed);  // still speaking
-            } else {
-                const uint32_t sil = silence_samples_.fetch_add(block_size_,
-                                                                std::memory_order_relaxed) +
-                                     block_size_;
-                if (hangover != 0 && sil >= hangover) {  // stable boundary reached
-                    on_silence_timeout();
-                    break;
+            if (!manual) {
+                if (db > release_db_) {
+                    silence_samples_.store(0, std::memory_order_relaxed);  // still speaking
+                } else {
+                    const uint32_t sil = silence_samples_.fetch_add(block_size_,
+                                                                    std::memory_order_relaxed) +
+                                         block_size_;
+                    if (hangover != 0 && sil >= hangover) {  // stable boundary reached
+                        on_silence_timeout();
+                        break;
+                    }
                 }
             }
             // TrackUpdate analogue: throttle speculative warming prefills.
@@ -170,7 +190,7 @@ void SpeechPipelineController::vad_on_block(float db) noexcept {
         }
 
         case SPEECH_STATE_DECODE_TRANSLATING:
-            if (db > cfg_.vad_threshold_db) on_speech_start();  // barge-in mid-translation
+            if (!manual && db > cfg_.vad_threshold_db) on_speech_start();  // barge-in mid-translation
             break;
 
         case SPEECH_STATE_INTERRUPTION_REWIND:
@@ -185,6 +205,14 @@ void SpeechPipelineController::set_silence_hangover_ms(uint32_t ms) noexcept {
     hangover_samples_.store(
         static_cast<uint32_t>(static_cast<uint64_t>(ms) * sr / 1000u),
         std::memory_order_relaxed);
+}
+
+void SpeechPipelineController::set_manual_mode(bool enabled) noexcept {
+    manual_mode_.store(enabled, std::memory_order_release);
+    // A mode flip mid-utterance must not inherit the other mode's silence
+    // accounting: the auto-commit clock restarts from the flip (belt-and-braces
+    // with the !manual accumulation gate in vad_on_block).
+    silence_samples_.store(0, std::memory_order_relaxed);
 }
 
 // ---- token adaptation -------------------------------------------------------
@@ -304,6 +332,13 @@ BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHa
                                                                 uint32_t silence_hangover_ms) {
     if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
     to_ctrl(handle)->set_silence_hangover_ms(silence_hangover_ms);
+    return BRIDGE_OK;
+}
+
+BRIDGE_API BridgeStatus speech_pipeline_set_manual_mode(SpeechPipelineHandle handle,
+                                                        bool enabled) {
+    if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
+    to_ctrl(handle)->set_manual_mode(enabled);
     return BRIDGE_OK;
 }
 
