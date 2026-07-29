@@ -148,6 +148,32 @@ resident), compacting two-thirds is ~700 MB of traffic — sub-millisecond, amor
 **Cut semantically.** `KvLedger` (§6) only ever cuts on a turn boundary, so eviction can
 never strand a dangling `<|start_header_id|>` or half an utterance.
 
+### What eviction actually promises (measured, not assumed)
+
+Eviction is **positionally exact and content-lossy**, and the difference matters when
+reasoning about how the session degrades.
+
+The tempting specification — "an evicted cache equals a from-scratch prefill of the
+survivors" — is **false, and not because of a bug**. When `[P][A][B]` was prefilled, every
+token of B attended to A, so B's K and V at layers 1..N-1 already encode A's content.
+Sliding those rows down and re-phasing them fixes *where* they are; nothing can
+un-condition *what* they are. This is the defining lossiness of every sliding-window
+scheme, StreamingLLM included.
+
+Measured on the 8B AWQ checkpoint (`tests/integration/test_kv_evict_logit_equivalence.cpp`):
+
+| Observable | Result | Why |
+|---|---|---|
+| Layer 0 K vs fresh prefill | **cosine 1.00000000**, max abs 1.3e-5 | layer-0 K is a pure function of (token, position) — the one place the positional transform is visible in isolation |
+| Layer 0 V vs fresh prefill | max abs 1e-7 | V is moved, never rotated |
+| Layer 31 K vs fresh prefill | cosine 0.9924 | survivors retain the evicted context, as above |
+| Answer after eviction | identical top-1 to a fresh prefill | the surviving context is still read correctly |
+
+The practical consequence for Phase 8: evicting does not corrupt the session, and it does
+not fully erase what was evicted either. Committed history fades rather than vanishing,
+which is the desirable behaviour — but it means eviction must never be relied on as a
+*privacy* or *reset* mechanism. A genuine reset is `KvLedger::reset()` plus a re-prefill.
+
 Later, if a profile ever demands it: the paged manager (`KVCacheMode::Paged`) makes step 1 a
 block-table edit. It does not remove step 2, so it buys the memmove and not the rotation.
 Do not start there.
@@ -160,7 +186,8 @@ Do not start there.
 |---|---|---|---|
 | `SpeechSegmenter` | `src/vad/speech_segmenter.hpp` | CPU, header-only, STL-only | **done (T1)** |
 | `KvLedger` | `src/bridge/kv_ledger.hpp` | CPU, header-only, STL-only | **done (T2)** |
-| `evict_head` kernel | `src/kernels/` | CUDA | T3 |
+| `evict_head` kernel | `src/kernels/kv_evict.cu` | CUDA | **done (T3)** |
+| `ContinuousStreamingConfig` | `src/bridge/continuous_streaming_config.hpp` | CPU, header-only | **done** |
 | Encoder worker + descriptor queue | `src/audio/` | CUDA | T4 |
 | Engine-thread redraft loop | `src/bridge/` | CUDA | T4 |
 
@@ -173,10 +200,16 @@ cut and *where* the cache is cut, and both are now decidable at desk speed.
 - **T1** `tests/vad/speech_segmenter_test.cpp` — segmentation policy. Green.
 - **T2** `tests/bridge/kv_ledger_test.cpp` — zone invariants, the draft cycle, eviction
   planning. Green.
-- **T3** the decisive kernel test: prefill sequence X and snapshot logits; separately
-  prefill the *same content with the head already absent* at shifted positions; run
-  `evict_head` on the first and assert the logits match the second within tolerance. That
-  makes "eviction is transparent" an assertion rather than a hope.
+- **T3** `tests/validation/test_kv_evict.cpp` (8) — the kernel in isolation: an evicted
+  cache must equal one built from scratch with the dropped rows absent at shifted
+  positions. The reference is produced by REPLAYING the append kernel rather than by a CPU
+  reimplementation, so the test cannot agree with a shared misunderstanding of the
+  frequency ladder. Covers the overlap split, llama3 scaling, 8B geometry, repeated
+  evictions and the argument guards. **Verified to have teeth by mutation:** zeroing the
+  angle fails 6/8, flipping its sign fails 6/8. Green.
+- **T3b** `tests/integration/test_kv_evict_logit_equivalence.cpp` (3) — the same property
+  inside the real engine at real geometry, plus the lossiness boundary above asserted in
+  executable form. Green.
 - **T4** 10-minute synthetic stream at 2048 context → several evictions; assert the session
   never resets and the transcript stays coherent across each boundary.
 

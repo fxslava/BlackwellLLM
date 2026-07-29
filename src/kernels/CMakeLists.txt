@@ -12,6 +12,7 @@ set(SOURCES
     embedding.cu
     fp8_linear.cu
     full_attention.cu
+    kv_evict.cu
     paged_flash_attention.cu
     rmsnorm.cu
     rope.cu
