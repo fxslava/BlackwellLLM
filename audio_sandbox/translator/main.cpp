@@ -78,9 +78,17 @@ constexpr const char* kSystemPrompt =
     "its task and its exact output format: follow them literally, transcribe "
     "verbatim, and output nothing else.";
 
-// The persistent KV budget (tokens). Utterances are short; a small context keeps
-// VRAM near the ~5.3 GB AWQ weight footprint and decode latency low.
-constexpr size_t kMaxContext = 2048;
+// The persistent KV budget (tokens). Sized for CONTINUOUS STREAMING: the default
+// eviction high water mark is 3000 tokens and a maximal draft adds ~222 (one
+// 15 s utterance's soft tokens plus the decode cap), so 2048 could not hold the
+// steady state — a redraft would run off the end of the cache between two
+// evictions. See ContinuousStreamingConfig::fits_context, which the control
+// panel evaluates live and warns about.
+//
+// Cost: the FP32 KV pool is ~256 KB/token at 8B geometry (32 layers x 8 kv heads
+// x 128 head_dim x 4 B x K+V), so 4096 tokens is ~1.05 GB on top of the ~5.3 GB
+// AWQ weight footprint.
+constexpr size_t kMaxContext = 4096;
 
 // ---- speech-pipeline callbacks (fire on the engine / VAD threads) -------------
 // They only hand results off to the thread-safe TranscriptView (never touch ImGui,

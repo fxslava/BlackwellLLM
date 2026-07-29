@@ -130,7 +130,10 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_manual_mode_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_vad_scorer_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/kv_ledger_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/continuous_streaming_config_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/continuous_streaming_config_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/retranslation_session_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/segment_job_queue_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/absolute_audio_ring_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
