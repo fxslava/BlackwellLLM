@@ -128,7 +128,8 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_control_bridge_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/mock_vad_streaming_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_manual_mode_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_vad_scorer_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_vad_scorer_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/kv_ledger_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
@@ -208,7 +209,12 @@ endif()
 # The model path is baked in rather than passed as argv/CWD-relative, so the
 # suite runs identically under CTest, under F5, and from any directory.
 if(TARGET blackwell_vad)
-    add_executable(vad_tests "${CMAKE_CURRENT_SOURCE_DIR}/vad/silero_vad_test.cpp")
+    # speech_segmenter_test is CPU/STL-only and needs neither ORT nor the model,
+    # but it rides in this target because SpeechSegmenter ships from src/vad as
+    # the policy layer over whatever produced the probabilities.
+    add_executable(vad_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/vad/silero_vad_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vad/speech_segmenter_test.cpp")
     # audio_test_wav.hpp: the reference speech clip's path + WAV reader + the
     # documented silence-valley geometry (header-only, STL-only, no CUDA).
     target_include_directories(vad_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/integration")

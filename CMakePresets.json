@@ -38,7 +38,8 @@
         {
             "name": "test-base",
             "hidden": true,
-            "configurePreset": "x64-release",
+            "configurePreset": "x64-debug",
+            "configuration": "Debug",
             "output": { "outputOnFailure": true }
         },
         { "name": "validation",         "inherits": "test-base", "filter": { "include": { "label": "^validation$" } } },

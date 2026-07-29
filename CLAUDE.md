@@ -117,6 +117,8 @@ reference dumps the integration suite compares against: skill `golden-dumps`.
 - `docs/TIERED_KV_AND_AOT.md` — Phase 2: VRAM⇄RAM⇄NVMe paging, AOT context compiler; has a component→file→status table.
 - `docs/TRANSLATION_AGENT.md` — the translation agent product design.
 - `docs/REACT_1STEP_ASSESSMENT.md` — strict 1-step ReAct assessment (dense checkpoints only).
+- `docs/CONTINUOUS_STREAMING.md` — Phase 8: SimulMT re-translation (draft-and-commit), the
+  commit pointer, and RoPE-aware KV head eviction.
 
 **Architectural Atlas** (`docs/README.md` + numbered guides) — the cross-cutting
 architecture the subsystem docs above assume: [`docs/README.md`](docs/README.md) (repo map),
