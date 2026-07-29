@@ -1,9 +1,13 @@
 #pragma once
 // -----------------------------------------------------------------------------
 // translator/control_panel.hpp — the "Translator Settings" ImGui panel for
-// audio_translator: context-mode toggle (Live Translator / Voice Assistant),
-// forced source/target language dropdowns, the auto-commit silence-timeout
-// slider, and the push-to-talk hotkey.
+// audio_translator. Grouped into collapsing sections, each one a subsystem:
+// VAD & audio gating, streaming & eviction, context & task, languages, hotkey.
+//
+// NO MAGIC NUMBERS HERE. Every streaming/eviction widget reads its default AND
+// its slider bounds from ContinuousStreamingConfig's own constants, so a value
+// the UI can produce is by construction a value the pipeline accepts. Adding a
+// knob means adding it there, not here.
 //
 // THREADING (single-thread engine doctrine, CLAUDE.md)
 //   draw() runs ONLY on the UI thread inside the ImGui frame. It never touches
@@ -20,6 +24,7 @@
 #include "imgui.h"
 
 #include "bridge/speculative_bridge_api.h"  // speech_pipeline_* boundary events
+#include "continuous_streaming_config.hpp"  // ContinuousStreamingConfig + Live publisher
 #include "language_table.hpp"               // rt::kLanguages
 #include "real_engine_control.hpp"          // RealEngineControl atomics (setters)
 #include "silero_vad.hpp"                   // blackwell::vad::SileroVAD (live readout)
@@ -37,11 +42,18 @@ public:
     // the built-in RMS threshold detector is running and disables the controls.
     // The panel only READS the SileroVAD's published atomics — it never calls
     // feed() or reset_state(), which belong to the DSP worker thread.
+    // `streaming` is the re-translation config publisher and may be null (the
+    // pipeline is not wired yet): the section then says so instead of offering
+    // sliders that go nowhere. `context_length` / `max_new_tokens` are only used
+    // for the headroom readout; pass 0 to skip that check.
     ControlPanel(RealEngineControl* control, SpeechPipelineHandle pipe,
                  int initial_silence_ms, blackwell::vad::SileroVAD* vad = nullptr,
-                 SpeechVadScoreFn vad_fn = nullptr) noexcept
-        : control_(control), pipe_(pipe), silence_ms_(initial_silence_ms), vad_(vad),
-          vad_fn_(vad_fn) {
+                 SpeechVadScoreFn vad_fn = nullptr,
+                 blackwell::bridge::LiveStreamingConfig* streaming = nullptr,
+                 int context_length = 0, int max_new_tokens = 0) noexcept
+        : control_(control), pipe_(pipe), vad_(vad), vad_fn_(vad_fn),
+          streaming_(streaming), context_length_(context_length),
+          max_new_tokens_(max_new_tokens) {
         neural_vad_on_ = (vad_ != nullptr && vad_fn_ != nullptr);
         if (vad_ != nullptr) vad_threshold_ = vad_->threshold();
         mode_bounded_ = control_->context_mode() ==
@@ -51,27 +63,44 @@ public:
         tgt_idx_ = control_->target_language_index();
         task_transcribe_ = control_->task_transcribe();
         task_translate_ = control_->task_translate();
+        // Seed the widget mirror from the publisher, so CLI-supplied values show
+        // up pre-selected exactly like the language/mode dropdowns do.
+        if (streaming_ != nullptr) cfg_ = streaming_->load();
+        // The hangover is ONE knob: the segmenter's release window and the
+        // pipeline's silence timeout are the same boundary. The CLI still owns the
+        // initial value, so adopt it rather than overwriting it from the default.
+        if (initial_silence_ms > 0) cfg_.hangover_ms = initial_silence_ms;
+        cfg_.clamp();
+        publish_streaming();
     }
 
     // UI thread, once per ImGui frame.
     void draw() {
         ImGui::SetNextWindowPos(ImVec2(444.0f, 12.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(400.0f, 300.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(430.0f, 560.0f), ImGuiCond_FirstUseEver);
         ImGui::Begin("Translator Settings");
 
-        draw_mode_section();
-        ImGui::Separator();
-        draw_streaming_section();
-        ImGui::Separator();
-        draw_vad_section();
-        ImGui::Separator();
-        draw_task_section();
-        ImGui::Separator();
-        draw_language_section();
-        ImGui::Separator();
-        draw_timing_section();
-        ImGui::Separator();
-        draw_hotkey_section();
+        if (ImGui::CollapsingHeader("VAD & Audio Gating", ImGuiTreeNodeFlags_DefaultOpen)) {
+            draw_vad_section();
+            ImGui::Spacing();
+            draw_gating_section();
+        }
+        if (ImGui::CollapsingHeader("Streaming & Eviction", ImGuiTreeNodeFlags_DefaultOpen)) {
+            draw_retranslation_section();
+            ImGui::Spacing();
+            draw_encoder_streaming_section();
+        }
+        if (ImGui::CollapsingHeader("Context & Task")) {
+            draw_mode_section();
+            ImGui::Spacing();
+            draw_task_section();
+        }
+        if (ImGui::CollapsingHeader("Languages")) {
+            draw_language_section();
+        }
+        if (ImGui::CollapsingHeader("Push-to-talk", ImGuiTreeNodeFlags_DefaultOpen)) {
+            draw_hotkey_section();
+        }
 
         ImGui::End();
 
@@ -81,8 +110,16 @@ public:
     }
 
 private:
+    // Single publish path. clamp() runs FIRST, so the widget mirror the next frame
+    // draws from is already legal — the UI cannot display a configuration the
+    // pipeline would reject, and the target <= high_water invariant is repaired in
+    // the mirror rather than only in the publisher.
+    void publish_streaming() {
+        cfg_.clamp();
+        if (streaming_ != nullptr) streaming_->store(cfg_);
+    }
     void draw_mode_section() {
-        ImGui::TextUnformatted("Context mode");
+        ImGui::SeparatorText("Context mode");
         bool changed = false;
         if (ImGui::RadioButton("Live Translator (stateless)", !mode_bounded_)) {
             mode_bounded_ = false;
@@ -109,8 +146,8 @@ private:
                             control_->history_base_pos());
     }
 
-    void draw_streaming_section() {
-        ImGui::TextUnformatted("Audio streaming (applies from the next utterance)");
+    void draw_encoder_streaming_section() {
+        ImGui::SeparatorText("Encoder mode (applies from the next utterance)");
         if (!control_->center_slice_available()) {
             // The CenterSlice geometry is resolved at launch (tier-3 plan); without
             // it the toggle would be a lie, so say how to arm it instead.
@@ -144,7 +181,7 @@ private:
     // in the pipeline, effective on the next 10 ms block, so the two detectors
     // can be A/B'd mid-conversation.
     void draw_vad_section() {
-        ImGui::TextUnformatted("Voice activity detection");
+        ImGui::SeparatorText("Detector");
         if (vad_ == nullptr || vad_fn_ == nullptr) {
             ImGui::TextDisabled("neural VAD unavailable — RMS threshold detector active");
             ImGui::TextDisabled("(launch without --no-neural-vad, and check "
@@ -195,7 +232,7 @@ private:
     // cached is invalidated (the task directive never enters the frozen system
     // prefix), so a flip costs nothing.
     void draw_task_section() {
-        ImGui::TextUnformatted("Task (applies from the next utterance)");
+        ImGui::SeparatorText("Task (applies from the next utterance)");
         bool changed = ImGui::Checkbox("Transcribe", &task_transcribe_);
         ImGui::SameLine();
         changed = ImGui::Checkbox("Translate", &task_translate_) || changed;
@@ -211,7 +248,7 @@ private:
     }
 
     void draw_language_section() {
-        ImGui::TextUnformatted("Languages (apply from the next utterance)");
+        ImGui::SeparatorText("Languages (apply from the next utterance)");
         ImGui::SetNextItemWidth(160.0f);
         const bool s = ImGui::Combo("Source", &src_idx_, kLanguages, kLanguageCount);
         ImGui::SetNextItemWidth(160.0f);
@@ -219,25 +256,112 @@ private:
         if (s || t) control_->set_languages(src_idx_, tgt_idx_);
     }
 
-    void draw_timing_section() {
-        ImGui::TextUnformatted("Auto-generation");
+    // WHERE an utterance's edges fall. The pre-roll and the hangover are the two
+    // halves of that question, and both are segmenter policy — nothing here can
+    // change WHETHER a block is speech, only how much audio surrounds the verdict.
+    void draw_gating_section() {
+        ImGui::SeparatorText("Utterance boundaries");
+        using Cfg = blackwell::bridge::ContinuousStreamingConfig;
+
         ImGui::SetNextItemWidth(200.0f);
-        if (ImGui::SliderInt("Silence timeout (ms)", &silence_ms_, 200, 2000)) {
-            (void)speech_pipeline_set_silence_hangover_ms(
-                pipe_, static_cast<uint32_t>(silence_ms_));
+        if (ImGui::SliderInt("Pre-roll (ms)", &cfg_.pre_roll_ms,
+                             Cfg::kMinPreRollMs, Cfg::kMaxPreRollMs)) {
+            publish_streaming();
         }
+        ImGui::TextDisabled("audio kept BEFORE the onset: the encoder is weakest at a");
+        ImGui::TextDisabled("window's left edge, so never start it on the first phoneme");
+
+        // ONE knob for the release window. The segmenter's hangover and the
+        // pipeline's silence timeout are the same boundary, so the slider drives
+        // both rather than leaving two controls to disagree.
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::SliderInt("Hangover / silence (ms)", &cfg_.hangover_ms,
+                             Cfg::kMinHangoverMs, Cfg::kMaxHangoverMs)) {
+            publish_streaming();
+            (void)speech_pipeline_set_silence_hangover_ms(
+                pipe_, static_cast<uint32_t>(cfg_.hangover_ms));
+        }
+        ImGui::TextDisabled("silence that ends an utterance and triggers the commit");
+
         // Manual mode mutes the WHOLE auto-VAD (onset + barge-in + auto-commit)
         // in the pipeline, not just the hangover: state transitions then come
-        // exclusively from the push-to-talk press/release events, so a
-        // threshold trigger can never race a hotkey mid-utterance. The slider
-        // value is preserved for when auto mode is re-enabled.
+        // exclusively from the push-to-talk press/release events, so a threshold
+        // trigger can never race a hotkey mid-utterance.
         if (ImGui::Checkbox("Manual only (push-to-talk, auto-VAD muted)", &manual_only_)) {
             (void)speech_pipeline_set_manual_mode(pipe_, manual_only_);
         }
     }
 
+    // The re-translation loop's budget (docs/CONTINUOUS_STREAMING.md). These do
+    // not change WHAT is translated, only how often the draft is rebuilt and how
+    // much committed history survives behind the commit pointer.
+    void draw_retranslation_section() {
+        ImGui::SeparatorText("Re-translation (draft & commit)");
+        if (streaming_ == nullptr) {
+            ImGui::TextDisabled("continuous streaming not wired — these knobs are inert");
+            return;
+        }
+        using Cfg = blackwell::bridge::ContinuousStreamingConfig;
+
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::SliderInt("Redraft cadence (ms)", &cfg_.partial_cadence_ms,
+                             Cfg::kMinPartialCadenceMs, Cfg::kMaxPartialCadenceMs)) {
+            publish_streaming();
+        }
+        ImGui::TextDisabled("every redraft re-prefills the utterance and re-decodes it:");
+        ImGui::TextDisabled("lower = fresher partial text, higher = more GPU headroom");
+
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::SliderInt("Max utterance (ms)", &cfg_.max_utterance_ms,
+                             Cfg::kMinMaxUtteranceMs, Cfg::kMaxMaxUtteranceMs)) {
+            publish_streaming();
+        }
+        ImGui::TextDisabled("forced commit for a speaker who never pauses");
+
+        ImGui::SeparatorText("KV eviction watermarks");
+        // GC-style watermarks: evict AT high water, reclaim down TO target. The
+        // gap between them is the hysteresis, so a wide gap means rare, large
+        // compactions instead of a compaction on every commit.
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::DragInt("High water (tokens)", &cfg_.eviction_high_water_mark, 8.0f,
+                           Cfg::kMinHighWaterTokens, Cfg::kMaxHighWaterTokens)) {
+            publish_streaming();   // clamp() pulls target down if it dragged under
+        }
+        ImGui::SetNextItemWidth(200.0f);
+        // Bounded by the CURRENT high water, so the invariant is enforced at the
+        // widget as well as in clamp() — the slider cannot even express the
+        // illegal state, rather than silently snapping back a frame later.
+        if (ImGui::DragInt("Target / low water (tokens)", &cfg_.eviction_target_tokens, 8.0f,
+                           Cfg::kMinTargetTokens, cfg_.eviction_high_water_mark)) {
+            publish_streaming();
+        }
+        ImGui::TextDisabled("evict at high water, reclaim down to target (frees %d tokens)",
+                            cfg_.eviction_high_water_mark - cfg_.eviction_target_tokens);
+
+        draw_headroom_readout();
+    }
+
+    // The draft zone lives ABOVE the high water mark and eviction never touches
+    // it, so its worst case is headroom the context length has to cover. Getting
+    // this wrong does not misbehave gracefully: a redraft runs off the end of the
+    // cache between two evictions. Show the arithmetic rather than assume it.
+    void draw_headroom_readout() {
+        if (context_length_ <= 0) return;
+        const std::uint32_t draft = cfg_.draft_headroom_tokens(max_new_tokens_);
+        const long long need =
+            static_cast<long long>(cfg_.eviction_high_water_mark) + static_cast<long long>(draft);
+        ImGui::TextDisabled("headroom: %d high water + %u draft = %lld of %d context",
+                            cfg_.eviction_high_water_mark, draft, need, context_length_);
+        if (!cfg_.fits_context(context_length_, max_new_tokens_)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                               "WARNING: exceeds context by %lld tokens — lower the high",
+                               need - static_cast<long long>(context_length_));
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                               "water mark or the max utterance, or raise --max-context");
+        }
+    }
+
     void draw_hotkey_section() {
-        ImGui::TextUnformatted("Push-to-talk");
         ImGui::SetNextItemWidth(120.0f);
         ImGui::Combo("Hotkey", &hotkey_idx_, kHotkeyNames, kHotkeyCount);
         ImGui::TextDisabled(ptt_down_ ? "[%s] HELD — release to translate"
@@ -281,15 +405,21 @@ private:
     // detector's atomics and installs/clears it; the DSP worker owns feeding it.
     blackwell::vad::SileroVAD* vad_ = nullptr;  // non-owning
     SpeechVadScoreFn vad_fn_ = nullptr;
+    // Re-translation config publisher (null until the pipeline is wired). The
+    // panel owns the widget MIRROR below and publishes into this; it never reads
+    // back mid-session, so a drag cannot fight the engine thread for the value.
+    blackwell::bridge::LiveStreamingConfig* streaming_ = nullptr;  // non-owning
+    int context_length_ = 0;    // readout only (headroom check)
+    int max_new_tokens_ = 0;    // readout only (draft worst case)
 
     // UI-thread-only widget state.
+    blackwell::bridge::ContinuousStreamingConfig cfg_{};
     bool mode_bounded_ = false;
     int  history_budget_ = 256;
     int  src_idx_ = 0;
     int  tgt_idx_ = 0;
     bool task_transcribe_ = true;
     bool task_translate_ = true;
-    int  silence_ms_ = 800;
     bool manual_only_ = false;
     int  hotkey_idx_ = 0;
     bool ptt_down_ = false;

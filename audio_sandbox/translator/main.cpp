@@ -435,9 +435,18 @@ int main(int argc, char** argv) {
         // ---- UI: spectrogram + control panel + live transcript window ----------
         // The settings panel talks ONLY to RealEngineControl atomics and lock-free
         // speech_pipeline_* calls (never the engine) — UI thread stays doctrine-clean.
+        // Re-translation tunables (docs/CONTINUOUS_STREAMING.md). The publisher is
+        // the UI->workers seam: the panel stores, and the DSP/engine threads will
+        // load it once the continuous pipeline is wired (T4). It is live from the
+        // first frame so the eviction headroom check is visible now — with
+        // kMaxContext at 2048 the default 3000-token high water does NOT fit, and
+        // the panel says so rather than letting a redraft run off the cache.
+        blackwell::bridge::LiveStreamingConfig streaming_cfg;
         rt::ControlPanel settings(&control, pipe,
                                   static_cast<int>(scfg.silence_hangover_ms),
-                                  neural_vad.get(), neural_vad ? &vad_score : nullptr);
+                                  neural_vad.get(), neural_vad ? &vad_score : nullptr,
+                                  &streaming_cfg, static_cast<int>(kMaxContext),
+                                  args.max_new_tokens);
         rt::WindowD2D window(spectrogram, recorder, L"Real-time Speech Translator");
         window.set_extra_panel([&transcript, &settings] {
             transcript.draw();
