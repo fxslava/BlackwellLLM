@@ -112,6 +112,11 @@ void SpeechPipelineController::on_silence_timeout() noexcept {
 
 // ---- streaming edge + internal VAD ------------------------------------------
 void SpeechPipelineController::push_pcm(const float* samples, size_t count) noexcept {
+    // The buffer an external scorer is handed must hold a whole block. Both are
+    // compile-time constants, which is what makes the clamp below an identity
+    // rather than a silent truncation.
+    static_assert(kVadBlock == kVadBlockCapacity,
+                  "vad_block_ must be sized to exactly one VAD block");
     if (samples == nullptr || count == 0) return;
 
     // Forward to the SPSC ring so the engine thread can (speculatively) prefill.
@@ -130,19 +135,53 @@ void SpeechPipelineController::push_pcm(const float* samples, size_t count) noex
         state_.load(std::memory_order_acquire) == SPEECH_STATE_PREFILL_SPEAKING;
     if (capture) (void)stream_->ring.push_samples(samples, count);
 
-    // Internal VAD in fixed 10 ms blocks (sample-accurate, no wall clock).
+    // Internal VAD in fixed 10 ms blocks (sample-accurate, no wall clock). The
+    // block's samples are retained alongside the running sum of squares so an
+    // installed scorer can be handed the audio; the RMS path ignores them.
     for (size_t i = 0; i < count; ++i) {
         const double s = static_cast<double>(samples[i]);
         vad_sumsq_ += s * s;
+        if (vad_count_ < kVadBlockCapacity) vad_block_[vad_count_] = samples[i];
         if (++vad_count_ >= block_size_) {
-            vad_on_block(rms_db(vad_sumsq_, vad_count_));
+            // The scorer is third-party code: hand it only what was actually
+            // written. Today block_size_ == kVadBlockCapacity (static_assert at
+            // the top of this function), so this clamp is an identity — it
+            // exists so a future config-driven block size cannot become an
+            // overread inside someone else's callback.
+            const uint32_t scored = (vad_count_ < kVadBlockCapacity) ? vad_count_
+                                                                     : kVadBlockCapacity;
+            vad_on_block(evaluate_block(vad_block_, scored, rms_db(vad_sumsq_, vad_count_)));
             vad_sumsq_ = 0.0;
             vad_count_ = 0;
         }
     }
 }
 
-void SpeechPipelineController::vad_on_block(float db) noexcept {
+// The ONE place the two detectors diverge. Everything downstream consumes the
+// VadDecision and cannot tell which produced it.
+SpeechPipelineController::VadDecision SpeechPipelineController::evaluate_block(
+    const float* block, uint32_t count, float db) noexcept {
+    const SpeechVadScoreFn fn = vad_scorer_.load(std::memory_order_acquire);
+    if (fn != nullptr) {
+        void* user = vad_scorer_user_.load(std::memory_order_acquire);
+        const float p = fn(user, block, static_cast<size_t>(count));
+        if (p >= 0.0f) {
+            const float onset   = vad_threshold_.load(std::memory_order_relaxed);
+            const float release = (onset - kProbReleaseDrop > kProbReleaseFloor)
+                                      ? onset - kProbReleaseDrop
+                                      : kProbReleaseFloor;
+            last_decision_ = VadDecision{p > onset, p > release};
+        }
+        // A negative score is "no opinion": hold the previous verdict rather
+        // than silently falling back to RMS, which would interleave two
+        // detectors' hysteresis and could flap the state machine.
+        return last_decision_;
+    }
+    // Built-in RMS threshold — the default, byte-for-byte the original policy.
+    return VadDecision{db > cfg_.vad_threshold_db, db > release_db_};
+}
+
+void SpeechPipelineController::vad_on_block(VadDecision decision) noexcept {
     const SpeechPipelineState s = state_.load(std::memory_order_acquire);
     // MANUAL/PTT gate: while set, the threshold VAD may not drive ANY state
     // transition (onset, auto-commit, barge-in) — those come exclusively from
@@ -153,7 +192,7 @@ void SpeechPipelineController::vad_on_block(float db) noexcept {
 
     switch (s) {
         case SPEECH_STATE_IDLE:
-            if (!manual && db > cfg_.vad_threshold_db) on_speech_start();  // onset
+            if (!manual && decision.onset) on_speech_start();  // onset
             break;
 
         case SPEECH_STATE_PREFILL_SPEAKING: {
@@ -163,7 +202,7 @@ void SpeechPipelineController::vad_on_block(float db) noexcept {
             // instant commit off stale silence).
             const uint32_t hangover = hangover_samples_.load(std::memory_order_relaxed);
             if (!manual) {
-                if (db > release_db_) {
+                if (decision.sustain) {
                     silence_samples_.store(0, std::memory_order_relaxed);  // still speaking
                 } else {
                     const uint32_t sil = silence_samples_.fetch_add(block_size_,
@@ -190,7 +229,7 @@ void SpeechPipelineController::vad_on_block(float db) noexcept {
         }
 
         case SPEECH_STATE_DECODE_TRANSLATING:
-            if (!manual && db > cfg_.vad_threshold_db) on_speech_start();  // barge-in mid-translation
+            if (!manual && decision.onset) on_speech_start();  // barge-in mid-translation
             break;
 
         case SPEECH_STATE_INTERRUPTION_REWIND:
@@ -213,6 +252,28 @@ void SpeechPipelineController::set_manual_mode(bool enabled) noexcept {
     // accounting: the auto-commit clock restarts from the flip (belt-and-braces
     // with the !manual accumulation gate in vad_on_block).
     silence_samples_.store(0, std::memory_order_relaxed);
+}
+
+void SpeechPipelineController::set_vad_scorer(SpeechVadScoreFn fn, void* user) noexcept {
+    // User pointer first, so the audio thread can never observe a live scorer
+    // paired with a stale user pointer. (Clearing goes the other way: drop the
+    // function first, then the pointer it would have been called with.)
+    if (fn != nullptr) {
+        vad_scorer_user_.store(user, std::memory_order_release);
+        vad_scorer_.store(fn, std::memory_order_release);
+    } else {
+        vad_scorer_.store(nullptr, std::memory_order_release);
+        vad_scorer_user_.store(nullptr, std::memory_order_release);
+    }
+    // A detector swap must not inherit the other one's verdict or its silence
+    // accounting — the next block starts the decision fresh.
+    last_decision_ = VadDecision{};
+    silence_samples_.store(0, std::memory_order_relaxed);
+}
+
+void SpeechPipelineController::set_vad_threshold(float threshold) noexcept {
+    const float clamped = (threshold < 0.0f) ? 0.0f : (threshold > 1.0f ? 1.0f : threshold);
+    vad_threshold_.store(clamped, std::memory_order_relaxed);
 }
 
 // ---- token adaptation -------------------------------------------------------
@@ -339,6 +400,20 @@ BRIDGE_API BridgeStatus speech_pipeline_set_manual_mode(SpeechPipelineHandle han
                                                         bool enabled) {
     if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
     to_ctrl(handle)->set_manual_mode(enabled);
+    return BRIDGE_OK;
+}
+
+BRIDGE_API BridgeStatus speech_pipeline_set_vad_scorer(SpeechPipelineHandle handle,
+                                                       SpeechVadScoreFn fn, void* user) {
+    if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
+    to_ctrl(handle)->set_vad_scorer(fn, user);
+    return BRIDGE_OK;
+}
+
+BRIDGE_API BridgeStatus speech_pipeline_set_vad_threshold(SpeechPipelineHandle handle,
+                                                          float threshold) {
+    if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
+    to_ctrl(handle)->set_vad_threshold(threshold);
     return BRIDGE_OK;
 }
 

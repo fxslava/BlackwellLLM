@@ -72,12 +72,22 @@ enable_testing()
 # включения модуля, который на неё смотрит.
 option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading on Windows" OFF)
 
+# Silero neural VAD (ONNXRuntime CPU + the pinned silero_vad.onnx). ON by
+# default: it is what the live speech pipeline's boundary detection runs on.
+# OFF drops the ~75 MB ONNXRuntime fetch and builds the pipeline with only its
+# built-in RMS-threshold VAD -- which stays the compiled-in default either way,
+# so nothing downstream breaks. Declared before the module that reads it.
+option(USE_SILERO_VAD "Enable the Silero neural VAD (fetches ONNXRuntime CPU + silero_vad.onnx)" ON)
+
 # 3. Зависимости: pinned FetchContent + опциональный DirectStorage SDK
 # (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls())
+# + ONNXRuntime CPU для нейросетевого VAD (blackwell::onnxruntime +
+# blackwell_copy_onnxruntime_dlls() + blackwell_copy_vad_model())
 # + общие хелперы (blackwell_copy_runtime_dlls).
 include(cmake/BlackwellHelpers.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/DirectStorage.cmake)
+include(cmake/OnnxRuntime.cmake)
 
 # ============================================================================
 # Compiler hygiene: zero-warning policy on our first-party CXX code.
@@ -182,7 +192,7 @@ function(blackwell_set_folder folder)
 endfunction()
 
 # --- Engine (CUDA inference stack) ---
-blackwell_set_folder("Engine/Core"   blackwell_kernels blackwell_core_obj blackwell_core blackwell_audio)
+blackwell_set_folder("Engine/Core"   blackwell_kernels blackwell_core_obj blackwell_core blackwell_audio blackwell_vad)
 blackwell_set_folder("Engine/Bridge" blackwell_bridge)
 # --- Agent stack (CUDA-free) ---
 blackwell_set_folder("Engine/Agent"  treesitter agent_core agent_env agent_orchestrator)
@@ -194,7 +204,7 @@ blackwell_set_folder("Audio"         whisper_dsp parity_check audio_realtime aud
 # --- Tests ---
 blackwell_set_folder("Tests"
     validation_tests benchmark_tests integration_tests
-    bridge_tests kernel_unit_tests ultravox_model_integration_test
+    bridge_tests kernel_unit_tests ultravox_model_integration_test vad_tests
     agent_tests agent_env_tests agent_orchestrator_tests)
 # --- Third-party (FetchContent) ---
 blackwell_set_folder("ThirdParty"    imgui gtest gtest_main gmock gmock_main)

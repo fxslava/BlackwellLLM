@@ -22,17 +22,28 @@
 #include "bridge/speculative_bridge_api.h"  // speech_pipeline_* boundary events
 #include "language_table.hpp"               // rt::kLanguages
 #include "real_engine_control.hpp"          // RealEngineControl atomics (setters)
+#include "silero_vad.hpp"                   // blackwell::vad::SileroVAD (live readout)
 
 namespace rt {
 
 class ControlPanel {
 public:
-    // Both non-owning; the app guarantees they outlive the UI loop. The initial
+    // All non-owning; the app guarantees they outlive the UI loop. The initial
     // widget values are read back from the control's atomics so CLI defaults
     // (--context-mode/--src-lang/...) show up pre-selected.
+    //
+    // `vad` + `vad_fn` are the neural-VAD seam and may be null/null (the app
+    // failed to load the model, or --no-neural-vad): the panel then reports that
+    // the built-in RMS threshold detector is running and disables the controls.
+    // The panel only READS the SileroVAD's published atomics — it never calls
+    // feed() or reset_state(), which belong to the DSP worker thread.
     ControlPanel(RealEngineControl* control, SpeechPipelineHandle pipe,
-                 int initial_silence_ms) noexcept
-        : control_(control), pipe_(pipe), silence_ms_(initial_silence_ms) {
+                 int initial_silence_ms, blackwell::vad::SileroVAD* vad = nullptr,
+                 SpeechVadScoreFn vad_fn = nullptr) noexcept
+        : control_(control), pipe_(pipe), silence_ms_(initial_silence_ms), vad_(vad),
+          vad_fn_(vad_fn) {
+        neural_vad_on_ = (vad_ != nullptr && vad_fn_ != nullptr);
+        if (vad_ != nullptr) vad_threshold_ = vad_->threshold();
         mode_bounded_ = control_->context_mode() ==
                         RealEngineControl::ContextMode::BoundedHistory;
         history_budget_ = control_->history_budget_tokens();
@@ -51,6 +62,8 @@ public:
         draw_mode_section();
         ImGui::Separator();
         draw_streaming_section();
+        ImGui::Separator();
+        draw_vad_section();
         ImGui::Separator();
         draw_task_section();
         ImGui::Separator();
@@ -119,6 +132,60 @@ private:
             ImGui::TextDisabled("last TTFT (VAD -> first token): %.0f ms", ttft);
         } else {
             ImGui::TextDisabled("last TTFT: n/a (no utterance yet)");
+        }
+    }
+
+    // Voice activity detection: which detector decides "is this speech?", and how
+    // readily it says yes. Everything downstream of that verdict — the silence
+    // timeout below, push-to-talk, background listening, the ping-pong swap
+    // policy — is unchanged by this choice and keeps running either way.
+    //
+    // The toggle is live: installing or clearing the scorer is one atomic store
+    // in the pipeline, effective on the next 10 ms block, so the two detectors
+    // can be A/B'd mid-conversation.
+    void draw_vad_section() {
+        ImGui::TextUnformatted("Voice activity detection");
+        if (vad_ == nullptr || vad_fn_ == nullptr) {
+            ImGui::TextDisabled("neural VAD unavailable — RMS threshold detector active");
+            ImGui::TextDisabled("(launch without --no-neural-vad, and check "
+                                "--vad-model points at silero_vad.onnx)");
+            return;
+        }
+
+        if (ImGui::Checkbox("Neural VAD (Silero)", &neural_vad_on_)) {
+            (void)speech_pipeline_set_vad_scorer(pipe_, neural_vad_on_ ? vad_fn_ : nullptr,
+                                                 neural_vad_on_ ? vad_ : nullptr);
+        }
+
+        // SENSITIVITY. The slider is the probability a block must exceed to count
+        // as a speech onset. The pipeline derives the release threshold 0.15
+        // below it, so utterances in progress survive a dip without chattering.
+        if (!neural_vad_on_) ImGui::BeginDisabled();
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::SliderFloat("VAD sensitivity", &vad_threshold_, 0.1f, 0.9f, "%.2f")) {
+            vad_->set_threshold(vad_threshold_);
+            (void)speech_pipeline_set_vad_threshold(pipe_, vad_threshold_);
+        }
+        ImGui::TextDisabled("lower = triggers on quieter/less certain speech; "
+                            "higher = rejects more non-speech");
+
+        // Live readout. A sensitivity slider is untunable without seeing what it
+        // is being compared against, so show the probability and where the
+        // threshold sits on the same bar.
+        const float p = vad_->last_probability();
+        ImGui::ProgressBar(p, ImVec2(200.0f, 0.0f));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(p > vad_threshold_ ? "SPEECH" : "silence");
+        if (!neural_vad_on_) ImGui::EndDisabled();
+
+        const uint64_t errors = vad_->inference_errors();
+        if (errors != 0) {
+            // Non-zero means inferences are failing and the last-good probability
+            // is being reported instead — the detector is degraded, not dead.
+            ImGui::TextDisabled("WARNING: %llu failed inference(s); running degraded",
+                                static_cast<unsigned long long>(errors));
+        } else if (!neural_vad_on_) {
+            ImGui::TextDisabled("off: the built-in RMS threshold detector decides boundaries");
         }
     }
 
@@ -210,6 +277,10 @@ private:
 
     RealEngineControl*  control_ = nullptr;  // non-owning
     SpeechPipelineHandle pipe_ = nullptr;    // non-owning
+    // Neural VAD seam (both null when it is unavailable). The panel reads the
+    // detector's atomics and installs/clears it; the DSP worker owns feeding it.
+    blackwell::vad::SileroVAD* vad_ = nullptr;  // non-owning
+    SpeechVadScoreFn vad_fn_ = nullptr;
 
     // UI-thread-only widget state.
     bool mode_bounded_ = false;
@@ -222,6 +293,8 @@ private:
     bool manual_only_ = false;
     int  hotkey_idx_ = 0;
     bool ptt_down_ = false;
+    bool  neural_vad_on_ = false;    // seeded in the ctor from whether the seam exists
+    float vad_threshold_ = 0.5f;     // seeded from the detector's own threshold
 };
 
 }  // namespace rt

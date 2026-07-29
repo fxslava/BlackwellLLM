@@ -28,6 +28,7 @@ endif()
 # ==============================================================================
 add_subdirectory(core)   # blackwell_core (см. src/core/CMakeLists.txt)
 add_subdirectory(audio)  # blackwell_audio (Ultravox projector + prompt-injector kernels)
+add_subdirectory(vad)    # blackwell_vad (Silero neural VAD, ONNXRuntime CPU, CUDA-free)
 add_subdirectory(bridge) # blackwell_bridge (app<->engine SPSC audio + prompt splice + C-ABI)
 add_subdirectory(apps)   # blackwell_llm, blackwell_bench
 

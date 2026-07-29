@@ -60,6 +60,7 @@
 #include "cli_config.hpp"
 #include "control_panel.hpp"
 #include "real_engine_control.hpp"
+#include "silero_vad.hpp"            // blackwell::vad::SileroVAD (neural VAD scorer)
 #include "transcript_view.hpp"
 
 namespace {
@@ -95,6 +96,26 @@ void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next
     if (view == nullptr) return;
     view->set_state(next);
     if (next == SPEECH_STATE_IDLE) view->on_final(gen_id);
+}
+
+// ---- neural-VAD scorer trampoline (SpeechVadScoreFn) -------------------------
+// Runs on the DSP worker thread, inside push_pcm, once per 10 ms block. feed()
+// accumulates to Silero's 512-sample chunk and runs an inference every 32 ms,
+// returning the latest probability in between — measured at ~0.1 ms per
+// inference in a Debug build, a ~0.3% duty cycle on this thread.
+//
+// The DSP worker is the SINGLE owner of the SileroVAD (the class's threading
+// contract): it is the only thread that ever calls feed(). The UI thread only
+// reads the published atomics (last_probability / inference_errors).
+//
+// NO reset_state() in this path, deliberately. The mic feed is continuous — even
+// in push-to-talk, where the ring is gated but VAD blocks keep flowing — so the
+// recurrent state never sees a discontinuity to recover from. A reset issued
+// from the UI thread would be a data race on the ORT session; if a future path
+// does introduce a gap, it must marshal the reset onto this thread.
+float vad_score(void* user, const float* block, size_t count) {
+    auto* vad = static_cast<blackwell::vad::SileroVAD*>(user);
+    return vad->feed(block, count);
 }
 
 }  // namespace
@@ -356,6 +377,36 @@ int main(int argc, char** argv) {
         rt::TranscriptView transcript;
         speech_pipeline_register_callbacks(pipe, &on_token, &on_state, &transcript);
 
+        // ---- STEP 3c: Silero neural VAD (the boundary detector) ---------------
+        // Installed as the pipeline's VAD scorer, replacing the RMS threshold as
+        // the answer to "is this block speech?" — and ONLY that. The hangover,
+        // the warm-prefill throttle, push-to-talk muting, background listening
+        // and the ping-pong swap policy all keep running on top of its verdict.
+        //
+        // Non-fatal, like the audio head: a missing or unloadable model leaves
+        // the built-in threshold detector in place (the panel then says so)
+        // rather than taking the app down over a 2.3 MB file.
+        std::unique_ptr<blackwell::vad::SileroVAD> neural_vad;
+        if (args.neural_vad && !args.vad_model.empty()) {
+            try {
+                neural_vad = std::make_unique<blackwell::vad::SileroVAD>(args.vad_model);
+                neural_vad->set_threshold(args.vad_threshold);
+                (void)speech_pipeline_set_vad_threshold(pipe, args.vad_threshold);
+                (void)speech_pipeline_set_vad_scorer(pipe, &vad_score, neural_vad.get());
+                std::printf("[vad] Silero neural VAD armed (threshold %.2f) from %s\n",
+                            args.vad_threshold, args.vad_model.c_str());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                             "[vad] WARN: neural VAD not loaded (%s) — falling back to the "
+                             "RMS threshold detector (%.0f dBFS)\n",
+                             e.what(), static_cast<double>(scfg.vad_threshold_db));
+                neural_vad.reset();
+            }
+        } else {
+            std::printf("[vad] neural VAD disabled — RMS threshold detector (%.0f dBFS)\n",
+                        static_cast<double>(scfg.vad_threshold_db));
+        }
+
         // ---- engine thread: prefill the frozen prefix, then drain the ring -----
         std::atomic<bool> running{true};
         std::atomic<bool> prefilled{false};
@@ -385,7 +436,8 @@ int main(int argc, char** argv) {
         // The settings panel talks ONLY to RealEngineControl atomics and lock-free
         // speech_pipeline_* calls (never the engine) — UI thread stays doctrine-clean.
         rt::ControlPanel settings(&control, pipe,
-                                  static_cast<int>(scfg.silence_hangover_ms));
+                                  static_cast<int>(scfg.silence_hangover_ms),
+                                  neural_vad.get(), neural_vad ? &vad_score : nullptr);
         rt::WindowD2D window(spectrogram, recorder, L"Real-time Speech Translator");
         window.set_extra_panel([&transcript, &settings] {
             transcript.draw();

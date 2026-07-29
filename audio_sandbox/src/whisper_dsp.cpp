@@ -59,6 +59,7 @@ WhisperDSP::WhisperDSP(const DspConfig& cfg, const std::string& mel_filters_path
     const size_t n_mels = static_cast<size_t>(cfg_.n_mels);
     // [n_freqs, n_mels], row-major (freq-major) — matches the Python dump.
     mel_filters_ = load_binary_f32(mel_filters_path, n_freqs * n_mels);
+    validate_mel_layout(mel_filters_path);
 
     // Periodic Hann: w[n] = 0.5 - 0.5*cos(2*pi*n / N), n in [0, N). Matches
     // torch.hann_window(N) default (periodic=True), NOT the symmetric /(N-1) form.
@@ -66,6 +67,57 @@ WhisperDSP::WhisperDSP(const DspConfig& cfg, const std::string& mel_filters_path
     for (int n = 0; n < cfg_.n_fft; ++n) {
         hann_[static_cast<size_t>(n)] = static_cast<float>(
             0.5 - 0.5 * std::cos(2.0 * kPi * n / static_cast<double>(cfg_.n_fft)));
+    }
+}
+
+// THE TRANSPOSE GUARD (INIT tier: throws).
+//
+// A mel filterbank is square-ish — [201 freqs, 128 mels] here — so a mel-major
+// dump has EXACTLY the same byte count as the freq-major layout this class
+// indexes, and load_binary_f32's size check waves it straight through. What
+// comes out the other end is not an error, it is silently wrong log-mel: the
+// encoder still runs, the model still decodes, and it hallucinates fluent text
+// about audio it never heard. That failure costs hours to attribute, and both
+// layouts of this file exist in this repo (audio_sandbox/data/ is freq-major;
+// the Ultravox golden dump is its transpose), so the mistake is one wrong path
+// away at every call site.
+//
+// The layouts are distinguishable by an invariant of what a mel filterbank IS:
+// the triangular filters overlap only with their immediate neighbours, so a
+// FREQUENCY row touches at most a couple of mel bins, while a MEL row spans a
+// whole triangle — dozens of frequency bins at this resolution. Comparing the
+// mean nonzeros per row against a threshold no correct filterbank can reach
+// separates them with an enormous margin (~1.6 vs ~2.5 nonzeros... see below).
+void WhisperDSP::validate_mel_layout(const std::string& path) const {
+    const size_t n_freqs = static_cast<size_t>(cfg_.n_freqs());
+    const size_t n_mels = static_cast<size_t>(cfg_.n_mels);
+    // Widest triangle in the CORRECT layout is one mel filter's worth of freq
+    // bins; in the WRONG one, a row is a whole triangle. Measure the max row
+    // occupancy under the assumed (freq-major) interpretation: correct layouts
+    // stay tiny (a frequency feeds <= 2 adjacent filters, plus slack for the
+    // dense high-frequency end), transposed ones blow far past it.
+    size_t max_row_nnz = 0;
+    for (size_t f = 0; f < n_freqs; ++f) {
+        size_t nnz = 0;
+        for (size_t m = 0; m < n_mels; ++m)
+            if (mel_filters_[f * n_mels + m] != 0.0f) ++nnz;
+        max_row_nnz = std::max(max_row_nnz, nnz);
+    }
+    // A frequency bin can only fall inside adjacent triangles; 8 is already an
+    // order of magnitude of slack over the true maximum of 2.
+    constexpr size_t kMaxFreqRowNnz = 8;
+    if (max_row_nnz > kMaxFreqRowNnz) {
+        throw std::runtime_error(
+            "mel_filters.bin at '" + path + "' looks TRANSPOSED: interpreted as "
+            "freq-major [" + std::to_string(n_freqs) + "," + std::to_string(n_mels) +
+            "] its densest row has " + std::to_string(max_row_nnz) + " nonzeros, but a "
+            "frequency bin can only belong to adjacent mel filters (<= " +
+            std::to_string(kMaxFreqRowNnz) + "). This file is almost certainly the "
+            "mel-major [n_mels,n_freqs] dump (scripts/generate_ultravox_audio_dumps.py "
+            "writes that layout for the golden comparisons). Both layouts have the "
+            "SAME byte count, so the size check cannot catch it — and the symptom is "
+            "not a crash but a fluent, confident, completely wrong transcript. Use the "
+            "freq-major file (audio_sandbox/data/mel_filters.bin) or transpose it.");
     }
 }
 

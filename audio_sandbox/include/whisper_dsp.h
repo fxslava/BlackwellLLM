@@ -65,6 +65,12 @@ public:
     const DspConfig& config() const { return cfg_; }
 
 private:
+    // Reject a TRANSPOSED filterbank at load time. The two layouts have identical
+    // byte counts, so only the filters' own structure can tell them apart — and
+    // the symptom of getting it wrong is a confident, fluent, wrong transcript
+    // rather than any kind of error. Throws (INIT tier). See the definition.
+    void validate_mel_layout(const std::string& path) const;
+
     // The one copy of the per-frame core math (raw log10-mel, [n_mels] doubles).
     void log_mel_frame_(const float* samples, double* mel_out) const;
 

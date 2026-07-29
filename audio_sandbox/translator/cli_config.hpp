@@ -57,6 +57,19 @@ struct TranslatorArgs {
                                           //   pre-dropdown shipping behaviour was Russian)
     std::string context_mode = "stateless";  // --context-mode : stateless | bounded
     int         history_budget_tokens = 256; // --history-budget : bounded-mode text budget
+    // ---- Silero neural VAD (Phase 7) ----------------------------------------
+    // Defaults to the model CMake fetched at configure time; --vad-model points
+    // at another copy. --no-neural-vad falls back to the pipeline's built-in RMS
+    // threshold detector (also the automatic fallback if the model fails to load).
+    std::string vad_model =
+#ifdef BLACKWELL_VAD_MODEL_PATH
+        BLACKWELL_VAD_MODEL_PATH;            // --vad-model : silero_vad.onnx
+#else
+        "";                                  // built without USE_SILERO_VAD
+#endif
+    bool        neural_vad = true;           // --no-neural-vad : force the RMS detector
+    float       vad_threshold = 0.5f;        // --vad-threshold : speech probability in
+                                             //   [0.1, 0.9]; higher = less sensitive
     bool        have_model_dir = false;   // whether model_dir was resolved at all
     bool        have_audio_head = false;  // whether audio_head was resolved at all
 };
@@ -166,6 +179,16 @@ inline TranslatorArgs parse_cli(int argc, char** argv) {
             a.history_budget_tokens = std::stoi(next("--history-budget"));
             if (a.history_budget_tokens < 0)
                 throw std::runtime_error("--history-budget must be >= 0");
+        } else if (arg == "--vad-model") {
+            a.vad_model = next("--vad-model");
+        } else if (arg == "--no-neural-vad") {
+            a.neural_vad = false;
+        } else if (arg == "--vad-threshold") {
+            a.vad_threshold = std::stof(next("--vad-threshold"));
+            // Matches the panel slider's range: outside it the detector is
+            // effectively always-on or always-off, which is never what is meant.
+            if (a.vad_threshold < 0.1f || a.vad_threshold > 0.9f)
+                throw std::runtime_error("--vad-threshold must be in [0.1, 0.9]");
         } else if (!arg.empty() && arg[0] != '-') {
             a.data_dir = arg;  // positional: data dir (mel_filters.bin)
         } else {

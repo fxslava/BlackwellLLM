@@ -149,6 +149,22 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         # include keeps it outside the /W4 /WX budget (/external:W0).
         nlohmann_json::nlohmann_json)
 
+    # Silero neural VAD. Optional by construction: with -DUSE_SILERO_VAD=OFF the
+    # target does not exist, cli_config.hpp's BLACKWELL_VAD_MODEL_PATH stays
+    # undefined, and the app runs the pipeline's built-in RMS threshold detector.
+    # blackwell_vad's PUBLIC include dir carries silero_vad.hpp; ONNXRuntime
+    # itself stays PRIVATE to that lib (PIMPL), so nothing here sees ORT headers.
+    if(TARGET blackwell_vad)
+        target_link_libraries(audio_translator PRIVATE blackwell_vad)
+        get_target_property(_vad_model blackwell_onnxruntime BLACKWELL_VAD_MODEL_PATH)
+        target_compile_definitions(audio_translator PRIVATE
+            BLACKWELL_VAD_MODEL_PATH="${_vad_model}")
+        # The DLL must sit next to the exe; the model is copied too so a deployed
+        # build resolves it beside the binary even without the configure-time path.
+        blackwell_copy_onnxruntime_dlls(audio_translator)
+        blackwell_copy_vad_model(audio_translator)
+    endif()
+
     target_compile_definitions(audio_translator PRIVATE UNICODE _UNICODE)
     if(MSVC)
         target_compile_definitions(audio_translator PRIVATE _CRT_SECURE_NO_WARNINGS)

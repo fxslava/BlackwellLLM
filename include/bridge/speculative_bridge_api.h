@@ -95,6 +95,21 @@ typedef void (*SpeechTokenCallback)(void* user, const SpeechTokenEvent* event, u
 typedef void (*SpeechStateCallback)(void* user, SpeechPipelineState prev,
                                     SpeechPipelineState next, uint64_t gen_id);
 
+/* VAD SCORER — the seam that swaps the built-in RMS-threshold detector for an
+ * external one (a neural VAD, a streaming ASR's own endpointer, anything).
+ *
+ * Invoked ON THE AUDIO THREAD, once per 10 ms block, with that block's samples.
+ * Returns a SPEECH PROBABILITY in [0, 1]; a negative return means "no opinion"
+ * and the previous decision stands. Must be non-blocking, allocation-free and
+ * must not throw across this boundary (it is called from a noexcept path); it
+ * must not re-enter the pipeline API.
+ *
+ * The scorer replaces ONLY the "is this block speech?" question. Every policy
+ * built on top of that answer — the silence hangover, the warm-prefill
+ * throttle, manual/push-to-talk muting, background listening, barge-in routing
+ * — is unchanged and continues to run exactly as it does on the RMS path. */
+typedef float (*SpeechVadScoreFn)(void* user, const float* block, size_t count);
+
 /* -------------------------------------------------------------------------- */
 /* Lifecycle.                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -158,6 +173,33 @@ BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHa
  * call this keep the automatic VAD behaviour. */
 BRIDGE_API BridgeStatus speech_pipeline_set_manual_mode(SpeechPipelineHandle handle,
                                                         bool enabled);
+
+/* Install (or clear, with a NULL fn) an external VAD scorer — see
+ * SpeechVadScoreFn. With no scorer installed the pipeline uses its built-in RMS
+ * threshold detector, which remains the compiled-in default: a caller that never
+ * touches this keeps the exact behaviour it has today.
+ *
+ * Lock-free (two atomic stores), callable from any thread, takes effect on the
+ * next VAD block. Install it before streaming starts; swapping a scorer
+ * mid-utterance is safe but the two stores are not atomic as a pair, so a single
+ * block may be scored with a mismatched user pointer — pass a stable `user` that
+ * outlives the pipeline. ADDITIVE ABI. */
+BRIDGE_API BridgeStatus speech_pipeline_set_vad_scorer(SpeechPipelineHandle handle,
+                                                       SpeechVadScoreFn fn, void* user);
+
+/* Speech-probability threshold for an installed scorer, in [0, 1] (default 0.5).
+ * Higher = less sensitive. Inert while no scorer is installed — the RMS path has
+ * its own dBFS thresholds in SpeechPipelineConfig.
+ *
+ * The RELEASE threshold (the level a block must stay above to count as still
+ * speaking, mirroring vad_release_db on the RMS path) is derived as
+ * threshold - 0.15, floored at 0.05, so the caller has one "sensitivity" knob
+ * and hysteresis comes along for free.
+ *
+ * Lock-free (one atomic store), callable from any thread, effective on the next
+ * VAD block. ADDITIVE ABI. */
+BRIDGE_API BridgeStatus speech_pipeline_set_vad_threshold(SpeechPipelineHandle handle,
+                                                          float threshold);
 
 #ifdef __cplusplus
 }  /* extern "C" */

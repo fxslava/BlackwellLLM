@@ -36,6 +36,10 @@ logits_comparison.csv
 /dumps/
 /backup/
 
+# Модели, скачиваемые на этапе configure (cmake/OnnxRuntime.cmake фетчит сюда
+# silero_vad.onnx по закреплённому тегу + SHA256). Артефакт сборки, не исходник.
+/models/
+
 # Deployment artifacts: make_staging.py payload + Inno Setup compiler output.
 # (The loose *.dll/*.exe rules above cover the binaries, but not build_staging's
 #  ui/ assets or the Output/ dir itself -- ignore the whole trees explicitly.)

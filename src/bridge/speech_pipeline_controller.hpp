@@ -53,6 +53,21 @@ public:
     void set_manual_mode(bool enabled) noexcept;
     bool manual_mode() const noexcept { return manual_mode_.load(std::memory_order_acquire); }
 
+    // EXTERNAL VAD SCORER (see SpeechVadScoreFn). Installing one replaces the
+    // built-in RMS threshold as the answer to "is this block speech?" and
+    // NOTHING else: hangover, warm-prefill throttle, manual mode and barge-in
+    // routing all keep running on top of that answer.
+    // With no scorer installed the RMS path runs, unchanged and by default.
+    // Any thread; effective on the next VAD block.
+    void set_vad_scorer(SpeechVadScoreFn fn, void* user) noexcept;
+    void set_vad_threshold(float threshold) noexcept;
+    bool has_vad_scorer() const noexcept {
+        return vad_scorer_.load(std::memory_order_acquire) != nullptr;
+    }
+    float vad_threshold() const noexcept {
+        return vad_threshold_.load(std::memory_order_relaxed);
+    }
+
     // ---- Engine-thread bookkeeping hooks (called by the IEngineControl impl) -
     // The engine owns the exact token accounting; it publishes it here so the
     // barge-in micro-rewind knows the verified prefix and the speculative depth.
@@ -71,7 +86,19 @@ private:
                              AudioStreamHandle stream) noexcept;
 
     void set_state(SpeechPipelineState next, uint64_t gen) noexcept;
-    void vad_on_block(float rms_db) noexcept;   // internal auto-VAD per 10 ms block
+
+    // The per-block speech verdict, split into the two questions the state
+    // machine asks. `onset` uses the higher threshold (start / barge in on
+    // this?), `sustain` the lower one (is the speaker still going?) — that
+    // difference IS the hysteresis, and it is identical in shape whether the
+    // numbers came from dBFS or from a neural probability.
+    struct VadDecision {
+        bool onset   = false;
+        bool sustain = false;
+    };
+    // Picks the scorer path or the RMS path and applies the matching thresholds.
+    VadDecision evaluate_block(const float* block, uint32_t count, float db) noexcept;
+    void vad_on_block(VadDecision decision) noexcept;  // internal auto-VAD per 10 ms block
     TokenSink make_token_sink() noexcept;
     void on_decode_final(uint64_t gen) noexcept;
     // Trampoline: adapt the engine's raw TokenSink callback into a SpeechTokenEvent.
@@ -103,11 +130,31 @@ private:
     std::atomic<SpeechStateCallback> state_cb_{nullptr};
     std::atomic<void*> cb_user_{nullptr};
 
+    // ---- External VAD scorer (optional; null => built-in RMS threshold) -------
+    // Read once per block on the audio thread, written from the UI/setup thread.
+    std::atomic<SpeechVadScoreFn> vad_scorer_{nullptr};
+    std::atomic<void*> vad_scorer_user_{nullptr};
+    std::atomic<float> vad_threshold_{0.5f};   // probability onset threshold
+    // Hysteresis for the probability path, mirroring vad_release_db on the RMS
+    // path: a block sustains speech while it stays above (threshold - kDrop),
+    // never below kFloor. Without it a probability hovering at the threshold
+    // would chatter the state machine every block.
+    static constexpr float kProbReleaseDrop  = 0.15f;
+    static constexpr float kProbReleaseFloor = 0.05f;
+
     // ---- Internal VAD accumulators --------------------------------------------
     // Pure block RMS is audio-thread-private; the two boundary counters are also
     // written by on_speech_start() (any thread) so they are atomic.
     double vad_sumsq_ = 0.0;             // audio thread only
     uint32_t vad_count_ = 0;             // audio thread only
+    // The block's samples, retained so an installed scorer can be handed the
+    // audio itself rather than a summary statistic. Audio thread only; sized to
+    // the fixed 10 ms block (the RMS path leaves it untouched and unread).
+    static constexpr uint32_t kVadBlockCapacity = 160;
+    float vad_block_[kVadBlockCapacity] = {};
+    // Last verdict from an installed scorer, held when it returns "no opinion"
+    // (a negative score). Audio thread only.
+    VadDecision last_decision_{};
     std::atomic<uint32_t> silence_samples_{0};
     std::atomic<uint32_t> samples_since_warm_{0};
 };

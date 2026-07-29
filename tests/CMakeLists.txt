@@ -127,7 +127,8 @@ if(TARGET blackwell_bridge)
     add_executable(bridge_tests
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_control_bridge_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/mock_vad_streaming_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_manual_mode_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_manual_mode_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_vad_scorer_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
@@ -195,6 +196,34 @@ if(TARGET agent_orchestrator)
     )
     gtest_discover_tests(agent_orchestrator_tests
         PROPERTIES LABELS agent_orchestrator
+        DISCOVERY_TIMEOUT 120
+    )
+endif()
+
+# Silero neural-VAD suite: CPU-only (ONNXRuntime), no CUDA / no engine / no
+# blackwell_kernels, so -- like the agent suites -- it gets its own minimal
+# target instead of the CUDA-flavoured macro at the top. Runs under the fast
+# `validation` label. Absent entirely with -DUSE_SILERO_VAD=OFF.
+#
+# The model path is baked in rather than passed as argv/CWD-relative, so the
+# suite runs identically under CTest, under F5, and from any directory.
+if(TARGET blackwell_vad)
+    add_executable(vad_tests "${CMAKE_CURRENT_SOURCE_DIR}/vad/silero_vad_test.cpp")
+    # audio_test_wav.hpp: the reference speech clip's path + WAV reader + the
+    # documented silence-valley geometry (header-only, STL-only, no CUDA).
+    target_include_directories(vad_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/integration")
+    target_link_libraries(vad_tests PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        blackwell_vad
+        psapi)  # GetProcessMemoryInfo (working-set smoke check)
+    get_target_property(_vad_model blackwell_onnxruntime BLACKWELL_VAD_MODEL_PATH)
+    target_compile_definitions(vad_tests PRIVATE BLACKWELL_VAD_MODEL_PATH="${_vad_model}")
+    # onnxruntime.dll must sit next to the test exe (see the CRT note in
+    # cmake/OnnxRuntime.cmake) -- without it the suite fails to launch at all.
+    blackwell_copy_onnxruntime_dlls(vad_tests)
+    gtest_discover_tests(vad_tests
+        PROPERTIES LABELS validation
         DISCOVERY_TIMEOUT 120
     )
 endif()
