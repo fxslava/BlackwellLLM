@@ -100,12 +100,28 @@ This is **not** two threads driving the engine. Exactly one thread may touch
 
 | Thread | Owns | Never touches |
 |---|---|---|
-| **A — audio/DSP** (exists) | mic callback, `SileroVAD`, `SpeechSegmenter`, the ring | the engine |
-| **B — encoder** | `WhisperEncoder` + projector on its **own CUDA stream**; turns a segment into `[n_soft, text_hidden]` in a pinned staging slot, pushes a descriptor onto an SPSC queue | the engine |
-| **C — engine** | the only `step_*` caller. Drains the descriptor queue, performs rewind / prefill / decode / commit | the ring, ORT |
+| **A — audio/DSP** (exists) | mic callback, `SileroVAD`, `SpeechSegmenter`, `AbsoluteAudioRing`, posting to `SegmentJobQueue` | the engine |
+| **B — engine** | the only `step_*` caller. Drains `SegmentJobQueue`, runs the redraft (encode → prefill → decode), commits, evicts | the ring's write end, ORT |
 
-Thread B on a separate stream is the one piece the ping-pong experiment did validate, and
-it carries over unchanged.
+### The encoder worker collapsed — and that is a consequence of re-translation
+
+The original plan called for a third thread producing soft tokens into an SPSC descriptor
+queue, ping-pong style. **Re-translation removes it.** Every redraft re-encodes the
+utterance *from its first sample* (that is the growing-window invariant), so there is no
+incremental soft-token stream to produce, no partial frames to hand across, and nothing
+for a descriptor queue to carry. `prefill_audio(begin, end)` encodes the whole window
+inline, on the engine thread, on its own CUDA stream.
+
+What remains of the original design is exactly one cross-thread handoff — `SegmentJobQueue`
+— and it carries *segment boundaries*, not encoded tensors. That is a strictly smaller and
+easier thing to get right: a dropped descriptor would have corrupted the audio timeline,
+whereas a dropped `Partial` merely costs draft freshness (and a `Final`, which must never
+drop, is protected explicitly).
+
+The cost is recomputation, and it is the same cost the architecture already accepted for
+the decode side. At a 500 ms cadence over a 15 s ceiling, the encoder re-runs on a window
+that grows to ~146 ms of work — the bucketed CUDA graphs from Phase 1 are what keep that
+affordable, and they carry over unchanged.
 
 Rate: 16 mel frames per soft token × 160 samples = **160 ms of audio per soft token**
 (6.25/s). A 500 ms `Partial` cadence is ~3 new soft tokens per redraft.
@@ -186,6 +202,10 @@ Do not start there.
 |---|---|---|---|
 | `SpeechSegmenter` | `src/vad/speech_segmenter.hpp` | CPU, header-only, STL-only | **done (T1)** |
 | `KvLedger` | `src/bridge/kv_ledger.hpp` | CPU, header-only, STL-only | **done (T2)** |
+| `RetranslationSession` | `src/bridge/retranslation_session.hpp` | CPU, header-only | **done (T4)** |
+| `SegmentJobQueue` | `src/bridge/segment_job_queue.hpp` | CPU, header-only | **done (T4)** |
+| `AbsoluteAudioRing` | `src/bridge/absolute_audio_ring.hpp` | CPU, header-only | **done (T4)** |
+| `IRetranslationEngine` impl | `audio_sandbox/translator/` | CUDA | **remaining** |
 | `evict_head` kernel | `src/kernels/kv_evict.cu` | CUDA | **done (T3)** |
 | `ContinuousStreamingConfig` | `src/bridge/continuous_streaming_config.hpp` | CPU, header-only | **done** |
 | Encoder worker + descriptor queue | `src/audio/` | CUDA | T4 |
@@ -210,8 +230,14 @@ cut and *where* the cache is cut, and both are now decidable at desk speed.
 - **T3b** `tests/integration/test_kv_evict_logit_equivalence.cpp` (3) — the same property
   inside the real engine at real geometry, plus the lossiness boundary above asserted in
   executable form. Green.
-- **T4** 10-minute synthetic stream at 2048 context → several evictions; assert the session
-  never resets and the transcript stays coherent across each boundary.
+- **T4** `tests/bridge/{retranslation_session,segment_job_queue,absolute_audio_ring}_test.cpp`
+  (33) — the redraft mechanic against a recording fake engine: call order, N partials as a
+  fixed point on the cache, Final-only commit, atomicity under every failure mode, and
+  eviction only-after-commit. **Verified to have teeth by mutation:** committing on every
+  segment instead of only on a `Final` fails 5 of 13. Green.
+- **T5** (remaining) the live `IRetranslationEngine` implementation, then an offline driver
+  over the reference WAV: real Silero → segmenter → ring → session → 8B backbone, asserting
+  the session never resets and the transcript stays coherent across an eviction.
 
 ---
 
