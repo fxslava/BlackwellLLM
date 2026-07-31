@@ -9,7 +9,9 @@ Double-buffering produced clean slot isolation but broke the LLM's semantic cont
 every swap — each slot began the world anew. The architecture here keeps a single
 sequence and instead makes the *tail* of that sequence cheap to throw away.
 
-> Status: design + CPU foundations (T1, T2). The GPU pieces (§5, §6) are not built yet.
+> Status: **end to end on the 8B backbone** (T1–T5). The loop, the eviction kernel and the
+> live engine adapter are built and exercised together by an offline driver over the
+> reference clip (§6). What remains is the live/mic wiring and the latency work — see §7.
 
 ---
 
@@ -205,11 +207,18 @@ Do not start there.
 | `RetranslationSession` | `src/bridge/retranslation_session.hpp` | CPU, header-only | **done (T4)** |
 | `SegmentJobQueue` | `src/bridge/segment_job_queue.hpp` | CPU, header-only | **done (T4)** |
 | `AbsoluteAudioRing` | `src/bridge/absolute_audio_ring.hpp` | CPU, header-only | **done (T4)** |
-| `IRetranslationEngine` impl | `audio_sandbox/translator/` | CUDA | **remaining** |
+| `RetranslationEngine` (the live `IRetranslationEngine`) | `audio_sandbox/translator/retranslation_engine.hpp` | CUDA | **done (T5)** |
 | `evict_head` kernel | `src/kernels/kv_evict.cu` | CUDA | **done (T3)** |
 | `ContinuousStreamingConfig` | `src/bridge/continuous_streaming_config.hpp` | CPU, header-only | **done** |
-| Encoder worker + descriptor queue | `src/audio/` | CUDA | T4 |
-| Engine-thread redraft loop | `src/bridge/` | CUDA | T4 |
+| `offline_retranslate` driver | `audio_sandbox/translator/offline_retranslate.cpp` | CUDA | **done (T5)** |
+| Live mic wiring (`SegmentJobQueue` in the path) | `audio_sandbox/translator/` | CUDA | remaining |
+
+There is no "encoder worker" row: it collapsed into `prefill_audio` (see §4). The live
+adapter deliberately does NOT subclass `RealEngineControl` — that class carries the
+barge-in epoch, command ring, pause checkpoint and injected-soft-token history the
+SUPERSEDED strategies need, and re-translation must have none of them. It reuses the
+primitives (the `forward_status` prefill, the white-box `step_*` sweep, `kv_mgr->rewind`,
+the penalized decode step) and nothing else.
 
 `SpeechSegmenter` and `KvLedger` are deliberately free of CUDA, ORT and the engine: the two
 places this design can be wrong in a way that is expensive to debug are *when* a segment is
@@ -235,16 +244,53 @@ cut and *where* the cache is cut, and both are now decidable at desk speed.
   fixed point on the cache, Final-only commit, atomicity under every failure mode, and
   eviction only-after-commit. **Verified to have teeth by mutation:** committing on every
   segment instead of only on a `Final` fails 5 of 13. Green.
-- **T5** (remaining) the live `IRetranslationEngine` implementation, then an offline driver
-  over the reference WAV: real Silero → segmenter → ring → session → 8B backbone, asserting
-  the session never resets and the transcript stays coherent across an eviction.
+- **T5** `audio_sandbox/translator/offline_retranslate.cpp` — the whole pipeline over the
+  reference clip on the real 8B AWQ backbone: Silero → segmenter → ring → session →
+  engine, single-threaded (a file has no real-time constraint, so `SegmentJobQueue` is
+  deliberately out of the path — mixing it in would make every failure ambiguous between
+  a wrong loop and a dropped handoff). Three invariants are checked on EVERY segment:
+  `ledger.tail() == the engine's write cursor`, every `Partial` rewound to its utterance's
+  commit pointer, and `S` never moved. **Green.** Measured (Debug, RTX 5070):
+
+  | Run | Result |
+  |---|---|
+  | 1 pass, default watermarks | 10 partials + 1 Final. `begin_sample` pinned at 0.32 s while `end` grew 1.08 → 5.73 s; `C` pinned at 44 across all 10 rewinds; `draft == framing + audio + text` exactly every time; the draft refined "Г-н Кв." → "Мистер Квилтер - апостол среднего пути." → the full sentence. Commit moved C 44 → 138 and drained the draft to 0. |
+  | 5 passes, watermarks 200/100 | 20 segments, 5 commits, **2 evictions, 378 tokens reclaimed**, 0 violations. Each eviction cut EXACTLY two utterance spans (188 = 94+94, then 190 = 94+96) — the ledger's turn-boundary rule, never a ragged cut. Cursor tracked the ledger through both (232→138, 234→134). |
+
+  The watermarks were lowered from the shipping 3000/1000 to reach an eviction inside a
+  short offline run (~96 committed tokens per utterance would otherwise need ~31 of them);
+  the mechanism is watermark-independent, but the number is a test setting, not a default.
+
+  **Transcript coherence across an eviction is printed, not asserted** — whether a
+  translation still reads correctly is a human judgement, and a driver that claimed
+  otherwise would be lying about what it measured. Observed: the first utterance drafted on
+  an evicted cache came back fully coherent. But by the fifth, the model rendered
+  "Mr. Quilter is the apostle..." as *"Он является апостолом..."* ("He is the apostle") —
+  it pronominalized a subject the surviving committed context had already established.
+  That is the shared-session design working as specified AND a translation-quality
+  regression at the same time, and it is the strongest argument yet for §7's open question
+  about what committed history should retain. See also §5's lossiness table: eviction fades
+  history rather than erasing it, so the conditioning survives the cut.
 
 ---
 
 ## 7. Open questions
 
-- **Partial cadence vs. GPU budget.** Every `Partial` re-prefills the utterance and
-  re-decodes it. 500 ms is a starting point, not a measurement.
+- **Partial cadence vs. GPU budget — now measured, and it does not fit.** A redraft costs
+  the whole utterance, so its wall time grows with the window: **15.7 s** at 0.76 s of
+  audio, 23.2 s at 2.26 s, **36.1 s** at 5.26 s (T5 run 1, DEBUG build, RTX 5070). At a
+  500 ms cadence that is roughly 7x slower than real time, so the offline driver is not
+  evidence that the cadence is achievable — it only proves the loop is CORRECT. The
+  Release build, and the fact that the growth is linear in utterance length rather than
+  quadratic, are what the latency case rests on; neither has been measured yet. **Measure
+  Release before tuning `partial_cadence_ms`** — tuning against Debug numbers would size
+  the knob against the wrong constant by an order of magnitude.
+- **What should committed history retain?** T5 observed the backbone pronominalizing a
+  subject that earlier committed turns had established ("He is the apostle..." for audio
+  saying "Mr. Quilter is the apostle..."). Each utterance is supposed to be translated on
+  its own terms; the shared session makes that not quite true. Options: translate each
+  utterance against the frozen prefix only, keep committed audio but drop committed
+  translations, or instruct against it in the turn prefix. Not yet decided.
 - **Eviction high-water and block size.** Needs the draft zone's worst case
   (`max_utterance_ms` of audio + `max_new_tokens`) as headroom above `C`.
 - **Sink width.** The frozen prefix is currently the whole system prompt. StreamingLLM

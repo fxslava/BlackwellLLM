@@ -187,6 +187,59 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     endif()
 endif()
 
+# --- offline_retranslate: the T5 offline driver for continuous streaming --------
+# (docs/CONTINUOUS_STREAMING.md). The SAME engine trio + audio frontend as
+# audio_translator, but HEADLESS: no window, no mic, no ImGui/Direct2D — it reads
+# a WAV and drives Silero -> SpeechSegmenter -> AbsoluteAudioRing ->
+# RetranslationSession -> the 8B backbone on one thread. Gated on the same targets
+# (a standalone `cmake -S audio_sandbox` skips it and stays CUDA-free) but NOT on
+# WIN32: nothing here touches the Win32 GUI stack.
+if(TARGET blackwell_bridge AND TARGET blackwell_core_obj)
+    add_executable(offline_retranslate
+        translator/offline_retranslate.cpp
+        # dr_wav lives here (load_wav_mono16k); recompiled into this target so
+        # audio_realtime's and audio_translator's own targets stay untouched.
+        src/audio_recorder.cpp)
+
+    target_include_directories(offline_retranslate PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/translator  # retranslation_engine.hpp, cli_config.hpp
+        ${CMAKE_SOURCE_DIR}/src                  # common.h
+        ${CMAKE_SOURCE_DIR}/src/core             # device_buffer.h, engine_impl.h, rope_config.h
+        ${CMAKE_SOURCE_DIR}/src/audio            # audio_embedding_pipeline.h
+        ${CMAKE_SOURCE_DIR}/src/bridge           # kv_ledger / retranslation_session / ring
+        ${CMAKE_SOURCE_DIR}/src/vad)             # silero_vad.hpp + speech_segmenter.hpp
+
+    target_link_libraries(offline_retranslate PRIVATE
+        whisper_dsp blackwell::sandbox_headers
+        blackwell_bridge blackwell_kernels blackwell_core_obj
+        blackwell_audio                          # WhisperEncoder + UltravoxProjector
+        nlohmann_json::nlohmann_json)            # cli_config.hpp config.json parsing
+
+    # Silero is NOT optional here, unlike the live app: the driver's whole point is
+    # to exercise the real segmentation policy, and the RMS fallback would change
+    # WHERE the boundaries fall. Without it the target still builds, and main()
+    # exits with a clear message rather than silently measuring something else.
+    if(TARGET blackwell_vad)
+        target_link_libraries(offline_retranslate PRIVATE blackwell_vad)
+        get_target_property(_vad_model_ofl blackwell_onnxruntime BLACKWELL_VAD_MODEL_PATH)
+        target_compile_definitions(offline_retranslate PRIVATE
+            BLACKWELL_VAD_MODEL_PATH="${_vad_model_ofl}")
+        blackwell_copy_onnxruntime_dlls(offline_retranslate)
+        blackwell_copy_vad_model(offline_retranslate)
+    endif()
+
+    if(MSVC)
+        target_compile_definitions(offline_retranslate PRIVATE _CRT_SECURE_NO_WARNINGS)
+        # The decoded drafts are UTF-8 (Cyrillic targets); tell MSVC the source AND
+        # execution charset so /WX never trips C4819 and the console gets real bytes.
+        target_compile_options(offline_retranslate PRIVATE /utf-8)
+        set_target_properties(offline_retranslate PROPERTIES
+            VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+
+    blackwell_copy_dstorage_dlls(offline_retranslate)
+endif()
+
 # --- warnings: strict /W4 /WX on ALL first-party code, quarantining third-party -
 # When integrated, the root CMakeLists already imposes /W4 /WX /external:W0 as a
 # directory property (audio_sandbox is added after that block), so we add nothing.
