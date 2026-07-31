@@ -282,8 +282,7 @@ cut and *where* the cache is cut, and both are now decidable at desk speed.
 ## 7. Open questions
 
 - **Partial cadence vs. GPU budget — MEASURED in Release (RTX 5070).** Same clip, same
-  args, bit-identical output to the Debug run (greedy determinism across optimization
-  levels):
+  args:
 
   | Audio window | Draft tokens | Debug | Release |
   |---|---|---|---|
@@ -309,14 +308,40 @@ cut and *where* the cache is cut, and both are now decidable at desk speed.
   they start), so the system degrades to its achievable rate rather than falling behind —
   but the config number lies about observed behaviour. Extrapolating the fit,
   `latency ~= 667 ms + 261 ms per second of audio`, a 15 s utterance's last redraft costs
-  **~4.6 s**, which is not "simultaneous". Three levers, in order of leverage:
-    1. **Cut `max_utterance_ms` to 6–8 s** — bounds the worst case to ~2.5 s. The forced cut
-       is already contiguous (no pre-roll), so it costs nothing semantically.
-    2. **Stop re-prefilling the turn prefix.** Those 29 framing tokens are byte-identical on
-       every redraft of every utterance yet cost 29 x 20.5 ~= **600 ms each time** — 30% of
-       the budget on a short draft. Prefill them once after each commit and rewind to
-       `C + prefix_len` instead of `C`; it is a change to the rewind TARGET and nothing else.
-    3. Set `partial_cadence_ms` to ~1000 so the knob states what the GPU can deliver.
+  **~4.6 s**, which is not "simultaneous".
+
+  **All three levers are now applied** (defaults changed; see the struct):
+  `max_utterance_ms` 15000 -> **8000**, `partial_cadence_ms` 500 -> **1000**, and the turn
+  prefix is resident (THE RESIDENT TURN PREFIX in `retranslation_session.hpp`). Measured
+  A/B on the same windows, with the resident prefix as the only variable:
+
+  | Window | Before | After | Saved |
+  |---|---|---|---|
+  | 0.76 s | 865 ms | **428 ms** | -50% |
+  | 2.76 s | 1254 ms | **846 ms** | -33% |
+  | 5.26 s | 2039 ms | **1674 ms** | -18% |
+  | Final  | 1943 ms | 2080 ms | **+137 ms** |
+
+  Per utterance: **15 345 ms -> 11 416 ms of GPU work, -25.6%**. The framing is 29 tokens
+  TOTAL — 24 prefix + 5 suffix — and only the prefix can be made resident; the suffix sits
+  ABOVE the audio and must be re-prefilled every redraft. A flat ~390-440 ms comes off each
+  Partial, which is the 24 tokens the model predicts.
+
+  The Final got *slower* on purpose: arming the next prefix moved into it, so it is paid
+  once per utterance instead of once per redraft. The driver times the whole `on_segment`,
+  so the arming lands inside that number; the user-visible speech-end -> subtitle latency is
+  the redraft portion only, and is NOT separately instrumented yet.
+
+- **The greedy decode is NOT run-to-run deterministic.** Three runs of the same clip (one
+  pre-optimization, two post-) agree on 10 of 11 segments and disagree on the 11th — and the
+  two IDENTICAL post-optimization runs disagree with each other, while one of them
+  reproduces the pre-optimization output exactly. The flip is a leading-space token
+  (`"Мистер"` vs `" Мистер"`), i.e. a near-tie in the argmax resolved differently by float
+  noise out of the AWQ GEMV / cuBLAS reductions. Semantically identical every time.
+  **Consequence for anyone validating a change here: never assert an exact token sequence
+  against a previous run.** Assert the mechanic (counts, pointers, ledger/cache agreement)
+  and treat text as advisory. An earlier version of this section claimed Debug and Release
+  were bit-identical; that was luck, not a property.
 - **What should committed history retain?** T5 observed the backbone pronominalizing a
   subject that earlier committed turns had established ("He is the apostle..." for audio
   saying "Mr. Quilter is the apostle..."). Each utterance is supposed to be translated on

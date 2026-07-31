@@ -19,6 +19,7 @@
 // =============================================================================
 #include "retranslation_session.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -189,12 +190,66 @@ TEST_F(Session, FinalAdvancesTheCommitPointerPastTheWholeTurn) {
     ASSERT_TRUE(r.ok);
     EXPECT_TRUE(r.committed);
 
+    // The turn itself, PLUS the next turn's prefix armed on the way out (see THE
+    // RESIDENT TURN PREFIX): C deliberately ends with an open user turn, which is
+    // what lets the next utterance's redrafts skip step 2 entirely.
     const std::uint32_t turn = engine_.prefix_tokens + engine_.audio_tokens +
                                engine_.suffix_tokens + engine_.decode_tokens;
-    EXPECT_EQ(ledger_->commit_point(), c0 + turn);
+    EXPECT_EQ(ledger_->commit_point(), c0 + turn + engine_.prefix_tokens);
     EXPECT_EQ(ledger_->tail(), ledger_->commit_point());
     EXPECT_FALSE(ledger_->has_draft());
     EXPECT_EQ(session_->commits(), 1u);
+    EXPECT_EQ(session_->resident_prefix(), engine_.prefix_tokens);
+}
+
+// THE OPTIMIZATION, stated as a property: once a prefix is resident, a redraft
+// must not call prefill_turn_prefix at all. At ~20.5 ms/token on the 8B backbone
+// those ~29 tokens are ~600 ms of pure recomputation per redraft.
+TEST_F(Session, AnArmedPrefixIsNotRePrefilledByLaterRedrafts) {
+    session_->on_segment(final_seg(1, 0, 16000));      // commits, then arms
+    ASSERT_EQ(session_->resident_prefix(), engine_.prefix_tokens);
+
+    engine_.calls.clear();
+    const RedraftResult r = session_->on_segment(partial(2, 20000, 28000));
+    ASSERT_TRUE(r.ok);
+    for (const std::string& call : engine_.calls) EXPECT_NE(call, "prefix");
+    // What it paid for vs. what it was handed.
+    EXPECT_EQ(r.framing_tokens, engine_.suffix_tokens);
+    EXPECT_EQ(r.resident_prefix_tokens, engine_.prefix_tokens);
+    // The draft is still exactly what the ledger says it is.
+    EXPECT_EQ(ledger_->draft_tokens(),
+              r.framing_tokens + r.audio_tokens + r.text_tokens);
+}
+
+// begin_session() extends the same saving to utterance 1, which otherwise pays
+// for its own framing on every one of its redrafts.
+TEST_F(Session, BeginSessionArmsThePrefixBeforeTheFirstSegment) {
+    session_->begin_session();
+    EXPECT_EQ(session_->resident_prefix(), engine_.prefix_tokens);
+
+    engine_.calls.clear();
+    const RedraftResult r = session_->on_segment(partial(1, 0, 16000));
+    ASSERT_TRUE(r.ok);
+    const std::vector<std::string> want = {"rewind:45", "audio:0-16000", "suffix", "decode"};
+    EXPECT_EQ(engine_.calls, want);
+    EXPECT_EQ(r.framing_tokens, engine_.suffix_tokens);
+}
+
+// The optimization must DEGRADE, never corrupt: an engine that cannot arm leaves
+// the loop on its original cold path rather than desyncing the ledger.
+TEST_F(Session, AFailedArmFallsBackToPrefillingThePrefixPerRedraft) {
+    engine_.prefix_tokens = 0;          // arming yields nothing
+    session_->begin_session();
+    EXPECT_EQ(session_->resident_prefix(), 0u);
+
+    engine_.calls.clear();
+    const RedraftResult r = session_->on_segment(partial(1, 0, 16000));
+    ASSERT_TRUE(r.ok);
+    // It still went looking for a prefix, exactly as the pre-optimization loop did.
+    EXPECT_NE(std::find(engine_.calls.begin(), engine_.calls.end(), "prefix"),
+              engine_.calls.end());
+    EXPECT_EQ(ledger_->draft_tokens(),
+              r.framing_tokens + r.audio_tokens + r.text_tokens);
 }
 
 // Drafts of utterance N+1 build ON TOP of N's committed translation.
@@ -214,12 +269,19 @@ TEST_F(Session, SuccessiveUtterancesStackOnCommittedHistory) {
 
 TEST_F(Session, LedgerSpansDescribeTheTurnStructure) {
     session_->on_segment(final_seg(1, 0, 16000));
-    ASSERT_EQ(ledger_->spans().size(), 4u);
+    // Four spans for the turn, plus a fifth: the NEXT turn's prefix, armed on the
+    // way out of the commit. It carries utterance_id 0 because the utterance it
+    // frames has not arrived yet.
+    ASSERT_EQ(ledger_->spans().size(), 5u);
     EXPECT_EQ(ledger_->spans()[0].kind, KvSpanKind::TurnMarker);
     EXPECT_EQ(ledger_->spans()[1].kind, KvSpanKind::Audio);
     EXPECT_EQ(ledger_->spans()[2].kind, KvSpanKind::TurnMarker);
     EXPECT_EQ(ledger_->spans()[3].kind, KvSpanKind::Text);
-    for (const auto& s : ledger_->spans()) EXPECT_EQ(s.utterance_id, 1u);
+    for (std::size_t i = 0; i < 4; ++i) EXPECT_EQ(ledger_->spans()[i].utterance_id, 1u);
+
+    EXPECT_EQ(ledger_->spans()[4].kind, KvSpanKind::TurnMarker);
+    EXPECT_EQ(ledger_->spans()[4].len, engine_.prefix_tokens);
+    EXPECT_EQ(ledger_->spans()[4].utterance_id, 0u);
 }
 
 // ---- atomicity --------------------------------------------------------------

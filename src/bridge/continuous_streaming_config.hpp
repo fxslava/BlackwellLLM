@@ -41,13 +41,25 @@ struct ContinuousStreamingConfig {
     // ---- audio gating (consumed by SpeechSegmenter) -------------------------
     int pre_roll_ms        = 250;    // audio prepended before the onset block
     int hangover_ms        = 400;    // sub-release audio that closes an utterance
-    int max_utterance_ms   = 15000;  // forced commit for a speaker who never pauses
+    // Forced commit for a speaker who never pauses. 8 s, NOT the 15 s the design
+    // started with: the redraft is linear in draft tokens (~20.5 ms/token measured
+    // in Release on the 8B backbone), so the worst-case redraft grows with this
+    // knob — 15 s extrapolates to a ~4.6 s redraft, which is not "simultaneous".
+    // 8 s bounds it to ~2 s. The forced cut is contiguous (no pre-roll, the audio
+    // never stopped), so shortening it costs nothing semantically.
+    int max_utterance_ms   = 8000;
 
     // ---- redraft cadence ----------------------------------------------------
     // Every Partial costs a rewind + re-prefill + re-decode of the utterance so
     // far, so this trades translation latency against GPU budget. It is not a
     // detection knob: it cannot change WHERE a boundary falls.
-    int partial_cadence_ms = 500;
+    //
+    // 1000 ms, not 500: measured redraft latency is 0.87–2.0 s, so a 500 ms cadence
+    // asks for 2 redrafts/s from an engine that delivers 0.5–1.15. Nothing breaks
+    // (the job slot is latest-wins, so a superseded Partial is dropped before it
+    // starts, and the system degrades to its achievable rate) — but a knob that
+    // names a rate the GPU cannot produce misleads everyone who reads it.
+    int partial_cadence_ms = 1000;
 
     // ---- KV eviction watermarks (see the header block) ----------------------
     int eviction_high_water_mark = 3000;

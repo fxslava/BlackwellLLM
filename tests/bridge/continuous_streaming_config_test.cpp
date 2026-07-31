@@ -31,10 +31,13 @@ using Cfg = ContinuousStreamingConfig;
 
 // ---- defaults ---------------------------------------------------------------
 
+// Both of these moved once the Release profile landed (docs/CONTINUOUS_STREAMING.md
+// §7): the redraft is ~20.5 ms/token, so 15 s utterances extrapolate to a ~4.6 s
+// redraft and a 500 ms cadence names a rate the GPU cannot produce.
 TEST(ContinuousStreamingConfig, DefaultsAreTheAgreedOperatingPoint) {
     const Cfg cfg{};
-    EXPECT_EQ(cfg.partial_cadence_ms, 500);
-    EXPECT_EQ(cfg.max_utterance_ms, 15000);
+    EXPECT_EQ(cfg.partial_cadence_ms, 1000);
+    EXPECT_EQ(cfg.max_utterance_ms, 8000);
     EXPECT_EQ(cfg.eviction_high_water_mark, 3000);
     EXPECT_EQ(cfg.eviction_target_tokens, 1000);
     EXPECT_EQ(cfg.pre_roll_ms, 250);

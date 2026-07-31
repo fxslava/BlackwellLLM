@@ -293,6 +293,12 @@ int main(int argc, char** argv) {
         blackwell::bridge::KvLedger ledger(S);
         blackwell::bridge::RetranslationSession session(
             &adapter, &ledger, args.cfg, static_cast<std::uint32_t>(args.max_new_tokens));
+        // Arm utterance 1's framing too, so the very first redraft is as cheap as
+        // every later one (otherwise only utterances 2+ get the saving).
+        session.begin_session();
+        std::printf("[turn-prefix] %u token(s) resident below C — redrafts skip step 2\n\n",
+                    session.resident_prefix());
+        std::fflush(stdout);
 
         Invariants inv;
         std::vector<std::string> transcript;      // committed finals, in order
@@ -375,12 +381,13 @@ int main(int argc, char** argv) {
             }
 
             if (final_seg || args.verbose_drafts) {
-                std::printf("[U%u %s] %.2f-%.2f s  audio=%u frame=%u text=%u | "
+                std::printf("[U%u %s] %.2f-%.2f s  audio=%u frame=%u(+%u res) text=%u | "
                             "S=%u C=%u tail=%u draft=%u | %.0f ms | %s\n",
                             seg->utterance_id, final_seg ? "F" : "P",
                             static_cast<double>(seg->begin_sample) / sample_rate,
                             static_cast<double>(seg->end_sample) / sample_rate,
-                            res.audio_tokens, res.framing_tokens, res.text_tokens,
+                            res.audio_tokens, res.framing_tokens,
+                            res.resident_prefix_tokens, res.text_tokens,
                             ledger.frozen_prefix(), ledger.commit_point(), ledger.tail(),
                             ledger.draft_tokens(), ms, res.text.c_str());
                 std::fflush(stdout);
