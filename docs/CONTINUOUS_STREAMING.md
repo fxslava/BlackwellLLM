@@ -125,6 +125,11 @@ the decode side. At a 500 ms cadence over a 15 s ceiling, the encoder re-runs on
 that grows to ~146 ms of work — the bucketed CUDA graphs from Phase 1 are what keep that
 affordable, and they carry over unchanged.
 
+> **Measured (T5, Release): the encoder cost is not what matters.** The graphs work so well
+> that the re-encode disappears into the noise, and the redraft turns out to be linear in
+> TOTAL draft tokens at ~20.5 ms/token — i.e. bounded by the per-token engine step, not by
+> the audio front end. See §7 for the numbers and what to do about them.
+
 Rate: 16 mel frames per soft token × 160 samples = **160 ms of audio per soft token**
 (6.25/s). A 500 ms `Partial` cadence is ~3 new soft tokens per redraft.
 
@@ -276,15 +281,42 @@ cut and *where* the cache is cut, and both are now decidable at desk speed.
 
 ## 7. Open questions
 
-- **Partial cadence vs. GPU budget — now measured, and it does not fit.** A redraft costs
-  the whole utterance, so its wall time grows with the window: **15.7 s** at 0.76 s of
-  audio, 23.2 s at 2.26 s, **36.1 s** at 5.26 s (T5 run 1, DEBUG build, RTX 5070). At a
-  500 ms cadence that is roughly 7x slower than real time, so the offline driver is not
-  evidence that the cadence is achievable — it only proves the loop is CORRECT. The
-  Release build, and the fact that the growth is linear in utterance length rather than
-  quadratic, are what the latency case rests on; neither has been measured yet. **Measure
-  Release before tuning `partial_cadence_ms`** — tuning against Debug numbers would size
-  the knob against the wrong constant by an order of magnitude.
+- **Partial cadence vs. GPU budget — MEASURED in Release (RTX 5070).** Same clip, same
+  args, bit-identical output to the Debug run (greedy determinism across optimization
+  levels):
+
+  | Audio window | Draft tokens | Debug | Release |
+  |---|---|---|---|
+  | 0.76 s | 42 | 15 761 ms | **865 ms** |
+  | 2.76 s | 65 | 24 739 ms | **1 254 ms** |
+  | 5.26 s | 93 | 36 142 ms | **2 039 ms** |
+
+  ~19x across the board. The cost model is linear in TOTAL draft tokens with a near-zero
+  fixed term — every measured point sits in 19.3–21.9 ms/token:
+
+  ```
+  redraft_ms ~= 20.5 * (framing + audio_soft + decoded) tokens
+  ```
+
+  **The encoder is not the bottleneck.** The bucketed CUDA graphs make the Whisper encode
+  effectively free; the redraft is dominated entirely by the per-token engine step. That
+  reverses the assumption §4 was written under ("~146 ms of encoder work per redraft is
+  what the bucketed graphs keep affordable") — the graphs did their job so well that the
+  cost moved somewhere else.
+
+  So `partial_cadence_ms = 500` is NOT achievable: the segmenter emits 2 Partials/s and the
+  engine delivers 0.5–1.15/s. It does not back up (latest-wins drops stale Partials before
+  they start), so the system degrades to its achievable rate rather than falling behind —
+  but the config number lies about observed behaviour. Extrapolating the fit,
+  `latency ~= 667 ms + 261 ms per second of audio`, a 15 s utterance's last redraft costs
+  **~4.6 s**, which is not "simultaneous". Three levers, in order of leverage:
+    1. **Cut `max_utterance_ms` to 6–8 s** — bounds the worst case to ~2.5 s. The forced cut
+       is already contiguous (no pre-roll), so it costs nothing semantically.
+    2. **Stop re-prefilling the turn prefix.** Those 29 framing tokens are byte-identical on
+       every redraft of every utterance yet cost 29 x 20.5 ~= **600 ms each time** — 30% of
+       the budget on a short draft. Prefill them once after each commit and rewind to
+       `C + prefix_len` instead of `C`; it is a change to the rewind TARGET and nothing else.
+    3. Set `partial_cadence_ms` to ~1000 so the knob states what the GPU can deliver.
 - **What should committed history retain?** T5 observed the backbone pronominalizing a
   subject that earlier committed turns had established ("He is the apostle..." for audio
   saying "Mr. Quilter is the apostle..."). Each utterance is supposed to be translated on
