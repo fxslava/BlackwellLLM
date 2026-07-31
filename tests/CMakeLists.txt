@@ -133,16 +133,24 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/continuous_streaming_config_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/retranslation_session_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/segment_job_queue_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/absolute_audio_ring_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/absolute_audio_ring_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/conversational_mode_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
         ${CMAKE_SOURCE_DIR}/src/core     # device_buffer.h (transitive)
         ${CMAKE_SOURCE_DIR}/src/bridge   # engine_control_bridge.hpp, bridge_internal.hpp
         ${CMAKE_SOURCE_DIR}/src/audio    # sliding_audio_window.h (center_slice_plan)
-        ${CMAKE_SOURCE_DIR}/src/vad)     # speech_segmenter.hpp (header-only, no ORT:
+        ${CMAKE_SOURCE_DIR}/src/vad      # speech_segmenter.hpp (header-only, no ORT:
                                          # continuous_streaming_config.hpp derives
                                          # SegmenterConfig from the streaming knobs)
+                                         # + silero_vad.hpp, DECLARATION ONLY: the
+                                         # Mode A test passes a null VAD, so no ORT
+                                         # symbol is referenced and blackwell_vad
+                                         # stays unlinked.
+        ${CMAKE_SOURCE_DIR}/audio_sandbox/translator)  # conversational_mode.hpp +
+                                                       # mock_engine_control.hpp (the
+                                                       # app-level classes under test)
     target_link_libraries(bridge_tests PRIVATE
         GTest::gtest
         GTest::gtest_main

@@ -59,8 +59,10 @@
 
 #include "cli_config.hpp"
 #include "control_panel.hpp"
+#include "conversational_mode.hpp"   // rt::ConversationalMode (Mode A behind ISpeechMode)
 #include "real_engine_control.hpp"
 #include "silero_vad.hpp"            // blackwell::vad::SileroVAD (neural VAD scorer)
+#include "speech_mode.hpp"           // rt::ISpeechMode
 #include "transcript_view.hpp"
 
 namespace {
@@ -107,6 +109,11 @@ void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next
 }
 
 // ---- neural-VAD scorer trampoline (SpeechVadScoreFn) -------------------------
+// Stays HERE, with the app that owns the SileroVAD instance, rather than moving
+// into ConversationalMode: the mode takes a SpeechVadScoreFn + user pointer, so
+// nothing downstream of this file has to know that Silero is what scores — which
+// also keeps ONNXRuntime out of every consumer of conversational_mode.hpp.
+//
 // Runs on the DSP worker thread, inside push_pcm, once per 10 ms block. feed()
 // accumulates to Silero's 512-sample chunk and runs an inference every 32 ms,
 // returning the latest probability in between — measured at ~0.1 ms per
@@ -355,41 +362,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[audio] WARN: audio head not loaded (%s) — text-only mode\n",
                          e.what());
         }
-        EngineHandle eng_handle = blackwell::bridge::bridge_wrap_engine(&control);
-        if (eng_handle == nullptr) throw std::runtime_error("bridge_wrap_engine failed");
-
-        AudioStreamHandle stream = nullptr;
-        if (BridgeStatus s = engine_create_audio_stream(eng_handle, &stream); s != BRIDGE_OK) {
-            blackwell::bridge::bridge_release_engine(eng_handle);
-            throw std::runtime_error(std::string("engine_create_audio_stream: ") +
-                                     bridge_status_to_string(s));
-        }
-
-        SpeechPipelineConfig scfg{};
-        scfg.engine = eng_handle;
-        scfg.audio_stream = stream;
-        scfg.sample_rate = static_cast<uint32_t>(cfg.sample_rate);
-        scfg.vad_threshold_db = -40.0f;   // onset
-        scfg.vad_release_db = -45.0f;     // hysteresis release (<= onset)
-        scfg.silence_hangover_ms = 800;   // stable-boundary hangover -> commit decode
-        scfg.warm_prefill_interval_ms = 320;  // speculative warm-prefill throttle
-
-        SpeechPipelineHandle pipe = nullptr;
-        if (BridgeStatus s = speech_pipeline_create(&scfg, &pipe); s != BRIDGE_OK) {
-            engine_destroy_audio_stream(stream);
-            blackwell::bridge::bridge_release_engine(eng_handle);
-            throw std::runtime_error(std::string("speech_pipeline_create: ") +
-                                     bridge_status_to_string(s));
-        }
-
         rt::TranscriptView transcript;
-        speech_pipeline_register_callbacks(pipe, &on_token, &on_state, &transcript);
 
         // ---- STEP 3c: Silero neural VAD (the boundary detector) ---------------
         // Installed as the pipeline's VAD scorer, replacing the RMS threshold as
         // the answer to "is this block speech?" — and ONLY that. The hangover,
-        // the warm-prefill throttle, push-to-talk muting, background listening
-        // and the ping-pong swap policy all keep running on top of its verdict.
+        // the warm-prefill throttle, push-to-talk muting and background listening
+        // all keep running on top of its verdict.
+        //
+        // Constructed BEFORE the mode and outliving it: the Silero session is a
+        // startup-cost resource that must survive a mode switch rather than be
+        // reloaded on every flip (ISpeechMode borrows it).
         //
         // Non-fatal, like the audio head: a missing or unloadable model leaves
         // the built-in threshold detector in place (the panel then says so)
@@ -399,32 +382,46 @@ int main(int argc, char** argv) {
             try {
                 neural_vad = std::make_unique<blackwell::vad::SileroVAD>(args.vad_model);
                 neural_vad->set_threshold(args.vad_threshold);
-                (void)speech_pipeline_set_vad_threshold(pipe, args.vad_threshold);
-                (void)speech_pipeline_set_vad_scorer(pipe, &vad_score, neural_vad.get());
                 std::printf("[vad] Silero neural VAD armed (threshold %.2f) from %s\n",
                             args.vad_threshold, args.vad_model.c_str());
             } catch (const std::exception& e) {
                 std::fprintf(stderr,
                              "[vad] WARN: neural VAD not loaded (%s) — falling back to the "
-                             "RMS threshold detector (%.0f dBFS)\n",
-                             e.what(), static_cast<double>(scfg.vad_threshold_db));
+                             "RMS threshold detector\n", e.what());
                 neural_vad.reset();
             }
         } else {
-            std::printf("[vad] neural VAD disabled — RMS threshold detector (%.0f dBFS)\n",
-                        static_cast<double>(scfg.vad_threshold_db));
+            std::printf("[vad] neural VAD disabled — RMS threshold detector\n");
         }
 
-        // ---- engine thread: prefill the frozen prefix, then drain the ring -----
+        // ---- the active speech mode (ISpeechMode) ------------------------------
+        // Mode A. Every config value below was previously spelled out inline at the
+        // speech_pipeline_create call site; the mode owns the bridge plumbing and
+        // unwinds it in reverse order, exactly as the old shutdown block did.
+        rt::ConversationalMode::Config mcfg;
+        mcfg.sample_rate = static_cast<uint32_t>(cfg.sample_rate);
+        mcfg.vad_probability_threshold = args.vad_threshold;
+        mcfg.system_prompt = kSystemPrompt;
+        rt::ConversationalMode speech_mode(
+            &control,
+            [&control](const std::string& p) { return control.prefill_system_prompt(p); },
+            neural_vad ? &vad_score : nullptr, neural_vad.get(),
+            mcfg, &on_token, &on_state, &transcript);
+        rt::ISpeechMode* active = &speech_mode;
+
+        // ---- engine thread: ONE runner, mode-agnostic -------------------------
+        // The doctrine holds trivially: this is still the only thread that calls
+        // into the engine, whichever mode is active.
         std::atomic<bool> running{true};
         std::atomic<bool> prefilled{false};
         std::thread engine_thread([&] {
-            const uint32_t n = control.prefill_system_prompt(kSystemPrompt);
-            std::printf("[system-prefix] frozen %u tokens (KV rewind floor)\n", n);
+            active->start_on_engine_thread();
+            std::printf("[system-prefix] frozen %u tokens (KV rewind floor)\n",
+                        speech_mode.frozen_prefix_tokens());
             std::fflush(stdout);
             prefilled.store(true, std::memory_order_release);
             while (running.load(std::memory_order_acquire)) {
-                control.wait_and_pump();  // 0% CPU until a boundary event arrives
+                active->pump_engine();   // 0% CPU until a boundary event arrives
             }
         });
 
@@ -434,9 +431,10 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // PCM tap: the DSP worker becomes the pipeline's single producer.
-        realtime.set_pcm_tap([pipe](const float* samples, std::size_t count) {
-            (void)speech_pipeline_push_pcm(pipe, samples, count);
+        // PCM tap: the DSP worker becomes the active mode's single producer. ONE
+        // indirection, no per-callback branching on which mode is live.
+        realtime.set_pcm_tap([&active](const float* samples, std::size_t count) {
+            active->on_pcm_block(samples, count);
         });
         realtime.start();
 
@@ -450,9 +448,10 @@ int main(int argc, char** argv) {
         // kMaxContext at 2048 the default 3000-token high water does NOT fit, and
         // the panel says so rather than letting a redraft run off the cache.
         blackwell::bridge::LiveStreamingConfig streaming_cfg;
-        rt::ControlPanel settings(&control, pipe,
-                                  static_cast<int>(scfg.silence_hangover_ms),
-                                  neural_vad.get(), neural_vad ? &vad_score : nullptr,
+        rt::ControlPanel settings(&control, speech_mode.pipeline(),
+                                  static_cast<int>(mcfg.silence_hangover_ms),
+                                  neural_vad.get(),
+                                  neural_vad ? &vad_score : nullptr,
                                   &streaming_cfg, static_cast<int>(kMaxContext),
                                   args.max_new_tokens);
         rt::WindowD2D window(spectrogram, recorder, L"Real-time Speech Translator");
@@ -473,13 +472,11 @@ int main(int argc, char** argv) {
 
         running.store(false, std::memory_order_release);
         // Abort any in-flight decode, then wake the pump so the thread exits.
-        control.cancel_generation(control.active_generation() + 1);
-        control.stop();
+        active->stop();
         engine_thread.join();
 
-        speech_pipeline_destroy(pipe);
-        engine_destroy_audio_stream(stream);
-        blackwell::bridge::bridge_release_engine(eng_handle);
+        // The mode's destructor unwinds pipe -> stream -> engine handle in the
+        // same reverse order this block used to spell out.
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FATAL: %s\n", e.what());
