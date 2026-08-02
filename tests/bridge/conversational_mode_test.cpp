@@ -7,7 +7,7 @@
 // is only worth anything if it is checked, and "it compiles" does not check it.
 //
 // So this suite builds BOTH: the old wiring, spelled out by hand exactly as
-// main() did it, and a ConversationalMode — each over its own MockEngineControl —
+// main() did it, and a ConversationalMode — each over its own SimulatedEngineControl —
 // feeds them THE SAME audio, and asserts the two are indistinguishable in what
 // they marshal onto the engine thread and what text comes back out.
 //
@@ -15,7 +15,7 @@
 // ConversationalMode, the hand-written control path here will not follow, and the
 // A/B diverges. That is the entire point.
 //
-// CPU-only: MockEngineControl drives the REAL EngineControlBridge (SPSC ring,
+// CPU-only: SimulatedEngineControl drives the REAL EngineControlBridge (SPSC ring,
 // barge-in epoch, decode loop) with a canned payload, and the VAD stays null so
 // the pipeline uses its built-in RMS detector — no ONNXRuntime, no model file, no
 // GPU. Silero's own behaviour is pinned in tests/vad/silero_vad_test.cpp; what is
@@ -33,7 +33,7 @@
 
 #include <gtest/gtest.h>
 
-#include "mock_engine_control.hpp"
+#include "simulated_engine_control.hpp"
 
 namespace {
 
@@ -99,7 +99,7 @@ void drive_one_utterance(Sink* sink, PushFn push, PumpFn pump) {
 // Deliberately hand-written and deliberately NOT calling into ConversationalMode.
 class LegacyWiring {
 public:
-    explicit LegacyWiring(rt::MockEngineControl* control, Sink* sink) {
+    explicit LegacyWiring(rt::SimulatedEngineControl* control, Sink* sink) {
         eng_ = blackwell::bridge::bridge_wrap_engine(control);
         EXPECT_NE(eng_, nullptr);
         EXPECT_EQ(engine_create_audio_stream(eng_, &stream_), BRIDGE_OK);
@@ -133,7 +133,7 @@ TEST(ConversationalModeExtraction, IsIndistinguishableFromTheOldInlineWiring) {
     Sink legacy_sink;
     std::uint32_t legacy_prefix = 0;
     {
-        rt::MockEngineControl control;
+        rt::SimulatedEngineControl control;
         LegacyWiring w(&control, &legacy_sink);
         legacy_prefix = control.prefill_system_prompt(kSystemPrompt);
         drive_one_utterance(&legacy_sink,
@@ -144,7 +144,7 @@ TEST(ConversationalModeExtraction, IsIndistinguishableFromTheOldInlineWiring) {
     Sink mode_sink;
     std::uint32_t mode_prefix = 0;
     {
-        rt::MockEngineControl control;
+        rt::SimulatedEngineControl control;
         rt::ConversationalMode::Config cfg;
         cfg.sample_rate   = kSampleRate;
         cfg.system_prompt = kSystemPrompt;
@@ -179,7 +179,7 @@ TEST(ConversationalModeExtraction, IsIndistinguishableFromTheOldInlineWiring) {
 // want different system prompts) — which is what makes a mode switch a session
 // boundary rather than a free toggle.
 TEST(ConversationalModeExtraction, StartOnEngineThreadFreezesTheSystemPrefix) {
-    rt::MockEngineControl control;
+    rt::SimulatedEngineControl control;
     rt::ConversationalMode::Config cfg;
     cfg.system_prompt = kSystemPrompt;
     Sink sink;
@@ -198,7 +198,7 @@ TEST(ConversationalModeExtraction, StartOnEngineThreadFreezesTheSystemPrefix) {
 // stop() did not unblock the pump, the engine thread would hang at shutdown —
 // which is exactly the bug the two-step (cancel then stop) exists to avoid.
 TEST(ConversationalModeExtraction, StopUnblocksThePumpSoTheRunnerCanJoin) {
-    rt::MockEngineControl control;
+    rt::SimulatedEngineControl control;
     rt::ConversationalMode::Config cfg;
     Sink sink;
     rt::ConversationalMode mode(

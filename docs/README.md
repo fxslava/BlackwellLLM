@@ -56,3 +56,5 @@ matching code:
 - [TIERED_KV_AND_AOT.md](TIERED_KV_AND_AOT.md) — Phase 2: VRAM⇄RAM⇄NVMe paging, AOT context compiler.
 - [TRANSLATION_AGENT.md](TRANSLATION_AGENT.md) — the translation-agent product design.
 - [REACT_1STEP_ASSESSMENT.md](REACT_1STEP_ASSESSMENT.md) — strict 1-step ReAct assessment.
+- [TTS_INTEGRATION_AUDIT.md](TTS_INTEGRATION_AUDIT.md) — **proposal, not landed**: on-demand
+  speech synthesis for `audio_translator` over the existing ONNXRuntime CPU provider.

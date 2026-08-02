@@ -134,12 +134,17 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/retranslation_session_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/segment_job_queue_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/absolute_audio_ring_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/conversational_mode_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/conversational_mode_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/intent_commit_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
         ${CMAKE_SOURCE_DIR}/src/core     # device_buffer.h (transitive)
         ${CMAKE_SOURCE_DIR}/src/bridge   # engine_control_bridge.hpp, bridge_internal.hpp
+        ${CMAKE_SOURCE_DIR}/src/cloud    # intent_dispatcher/intent_transport, HEADER-ONLY:
+                                         # the offline dispatch tests use MockTransport, so
+                                         # no libcurl/simdjson symbol is referenced and
+                                         # blackwell_cloud stays unlinked (and unbuilt).
         ${CMAKE_SOURCE_DIR}/src/audio    # sliding_audio_window.h (center_slice_plan)
         ${CMAKE_SOURCE_DIR}/src/vad      # speech_segmenter.hpp (header-only, no ORT:
                                          # continuous_streaming_config.hpp derives
@@ -149,7 +154,7 @@ if(TARGET blackwell_bridge)
                                          # symbol is referenced and blackwell_vad
                                          # stays unlinked.
         ${CMAKE_SOURCE_DIR}/audio_sandbox/translator)  # conversational_mode.hpp +
-                                                       # mock_engine_control.hpp (the
+                                                       # simulated_engine_control.hpp (the
                                                        # app-level classes under test)
     target_link_libraries(bridge_tests PRIVATE
         GTest::gtest
@@ -248,3 +253,46 @@ if(TARGET blackwell_vad)
         DISCOVERY_TIMEOUT 120
     )
 endif()
+
+# =============================================================================
+# tts_tests -- the speech-synthesis foundation (docs/TTS_INTEGRATION_AUDIT.md,
+# Phase 1). CPU-only and dependency-light BY DESIGN: no CUDA, no ONNXRuntime, no
+# model file, no audio device, no GUI. That is the whole point of the seams under
+# test -- the lock-free ring, the text frontend and the transcript identity are
+# all reachable without a GPU or a voice pack, so they run in the fast
+# `validation` label alongside vad_tests.
+#
+# Ungated: unlike vad_tests, nothing here depends on blackwell_onnxruntime, so
+# the suite survives -DUSE_SILERO_VAD=OFF.
+# =============================================================================
+add_executable(tts_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/spsc_ring_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/phonemizer_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/transcript_model_test.cpp")
+
+# transcript_model.hpp is app-side UI storage (header-only, STL-only), so it is
+# consumed by PATH rather than by linking audio_sandbox -- which would drag in
+# ImGui, miniaudio and the engine for a class that needs none of them. It is
+# tested here because the TTS request path is what its stable ids exist for.
+target_include_directories(tts_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/audio_sandbox/translator")
+
+target_link_libraries(tts_tests PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+    blackwell_tts          # IPhonemizer + PassthroughPhonemizer + TtsVoice
+    blackwell::audio_rt)   # SpscRing (header-only INTERFACE target)
+
+if(MSVC)
+    # REQUIRED: phonemizer_test.cpp asserts on Cyrillic UTF-8 literals -- the
+    # translator's primary target language. Without /utf-8 MSVC reads them in the
+    # active code page and the byte sequences the phonemizer sees stop matching
+    # the symbol table, so the tests fail for an encoding reason that looks like a
+    # logic bug. /WX would also trip C4819 on the non-ASCII source.
+    target_compile_options(tts_tests PRIVATE /utf-8)
+endif()
+
+gtest_discover_tests(tts_tests
+    PROPERTIES LABELS validation
+    DISCOVERY_TIMEOUT 120
+)

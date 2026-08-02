@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assistant</title>
+
+<!-- Markdown renderer + syntax highlighter, the SAME pair agent_playground uses,
+     from the same CDN. Both are optional by construction: app.js ships a
+     self-contained fallback renderer and highlighter, so a machine with no
+     network (a very ordinary state for a local voice assistant) still gets
+     formatted answers and coloured code. See renderMarkdown() in app.js.
+     The theme is picked by media query rather than pinned dark: this window
+     follows the OS scheme, and a dark code theme on a light page is unreadable. -->
+<link rel="stylesheet" media="(prefers-color-scheme: dark)"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+<link rel="stylesheet" media="(prefers-color-scheme: light)"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true"></div>
+    <div class="brand-text">
+      <div class="brand-name">Assistant</div>
+      <div class="brand-sub" id="transportLabel">Offline</div>
+    </div>
+  </div>
+  <div class="status" id="status" data-phase="idle">
+    <span class="status-dot" aria-hidden="true"></span>
+    <span id="statusText">Idle</span>
+  </div>
+  <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Settings">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path fill="currentColor" d="M12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5m7.43-2.53a7.7 7.7 0 0 0 0-1.94l2.03-1.58a.5.5 0 0 0 .12-.63l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.4 7.4 0 0 0-1.68-.97l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7.4 7.4 0 0 0-1.68.97l-2.39-.96a.5.5 0 0 0-.6.22L2.42 8.82a.5.5 0 0 0 .12.63l2.03 1.58a7.7 7.7 0 0 0 0 1.94l-2.03 1.58a.5.5 0 0 0-.12.63l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96a7.4 7.4 0 0 0 1.68.97l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54a7.4 7.4 0 0 0 1.68-.97l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.63Z"/>
+    </svg>
+  </button>
+</header>
+
+<main class="chat" id="chat">
+  <div class="empty-state" id="emptyState">
+    <div class="empty-mark" aria-hidden="true"></div>
+    <h1>Say something, or type it</h1>
+    <p>Speak and pause &mdash; the assistant answers when your sentence is finished.</p>
+  </div>
+</main>
+
+<footer class="composer">
+  <button class="mic-btn" id="micBtn" data-on="true" title="Microphone" aria-label="Toggle microphone">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+      <path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3m5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11Z"/>
+    </svg>
+    <span class="mic-ring" aria-hidden="true"></span>
+  </button>
+  <div class="input-wrap">
+    <textarea id="input" rows="1" placeholder="Message the assistant&hellip;" spellcheck="true"></textarea>
+  </div>
+  <button class="send-btn" id="sendBtn" title="Send" aria-label="Send" disabled>
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path fill="currentColor" d="M3 20.5v-6l8-2.5-8-2.5v-6L21 12Z"/>
+    </svg>
+  </button>
+</footer>
+
+<!-- ---------------------------------------------------------------------------
+     SETTINGS. Everything technical lives here and nowhere else: checkpoint
+     paths, the CUDA device, VAD sensitivity, context policy. The main screen
+     shows none of it.
+     Fields marked data-restart choose what gets ALLOCATED at bring-up, so
+     changing one needs a fresh process -- the banner below appears the moment
+     any of them differs from what is running.
+--------------------------------------------------------------------------- -->
+<div class="overlay hidden" id="settingsOverlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-head">
+      <h2 id="settingsTitle">Settings</h2>
+      <button class="icon-btn" id="settingsClose" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.3 19.71 2.89 18.3 9.17 12 2.89 5.71 4.3 4.29l6.29 6.3 6.3-6.3Z"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="restart-banner hidden" id="restartBanner">
+      These changes load a different engine, so they take effect after a restart.
+    </div>
+
+    <div class="modal-body">
+      <section class="group">
+        <h3>Model</h3>
+        <label class="check">
+          <input type="checkbox" id="s_simulated" data-restart>
+          <span>Simulated backend <em>(no GPU, no checkpoint &mdash; for trying the app out)</em></span>
+        </label>
+        <div class="field">
+          <label for="s_model_dir">Model directory</label>
+          <div class="row">
+            <input id="s_model_dir" data-restart placeholder="e.g. F:/AI/llama-3.1-8B-Instruct-AWQ-INT4">
+            <button class="ghost" data-browse="model_dir">Browse&hellip;</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="s_audio_head">Audio head (speech encoder + projector)</label>
+          <div class="row">
+            <input id="s_audio_head" data-restart placeholder="e.g. F:/AI/ultravox-v0_5-llama-3_1-8b">
+            <button class="ghost" data-browse="audio_head">Browse&hellip;</button>
+          </div>
+        </div>
+        <details class="advanced">
+          <summary>Advanced paths</summary>
+          <div class="field">
+            <label for="s_projector_path">Projector config override</label>
+            <div class="row">
+              <input id="s_projector_path" data-restart placeholder="(optional)">
+              <button class="ghost" data-browse="projector_path">Browse&hellip;</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="s_data_dir">Data directory <em>(mel_filters.bin)</em></label>
+            <div class="row">
+              <input id="s_data_dir" data-restart placeholder="data">
+              <button class="ghost" data-browse="data_dir">Browse&hellip;</button>
+            </div>
+          </div>
+          <div class="row two">
+            <div class="field">
+              <label for="s_device_id">CUDA device</label>
+              <input id="s_device_id" data-restart type="number" min="0" step="1">
+            </div>
+            <div class="field">
+              <label for="s_max_context">Context window (tokens)</label>
+              <input id="s_max_context" data-restart type="number" min="512" step="256">
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="group">
+        <h3>Voice</h3>
+        <label class="check">
+          <input type="checkbox" id="s_neural_vad" data-restart>
+          <span>Neural voice detection <em>(off = simple loudness threshold)</em></span>
+        </label>
+        <div class="field">
+          <label for="s_vad_threshold">
+            Sensitivity <span class="hint-inline" id="vadValue"></span>
+          </label>
+          <input id="s_vad_threshold" type="range" min="0.1" max="0.9" step="0.05">
+          <div class="scale"><span>Picks up more</span><span>Picks up less</span></div>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="s_loopback_capture" data-restart>
+          <span>Listen to system audio instead of the microphone</span>
+        </label>
+      </section>
+
+      <section class="group">
+        <h3>Conversation</h3>
+        <div class="field">
+          <label for="s_system_prompt">System prompt</label>
+          <textarea id="s_system_prompt" data-restart rows="3"></textarea>
+        </div>
+        <div class="row two">
+          <div class="field">
+            <label for="s_context_mode">Memory</label>
+            <select id="s_context_mode">
+              <option value="bounded">Remember recent turns</option>
+              <option value="stateless">Forget after each turn</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="s_history_budget_tokens">History budget (tokens)</label>
+            <input id="s_history_budget_tokens" type="number" min="0" step="32">
+          </div>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="s_live_streaming">
+          <span>Start transcribing while you are still speaking <em>(lower latency)</em></span>
+        </label>
+      </section>
+
+      <details class="group diagnostics">
+        <summary><h3>Diagnostics</h3></summary>
+        <div class="diag" id="diag">
+          <div class="diag-row"><span>Backend</span><b id="d_backend">&mdash;</b></div>
+          <div class="diag-row"><span>Speech input</span><b id="d_audio">&mdash;</b></div>
+          <div class="diag-row"><span>Reply transport</span><b id="d_transport">&mdash;</b></div>
+          <div class="diag-row"><span>Sent to assistant</span><b id="d_committed">0</b></div>
+          <div class="diag-row"><span>Dropped &mdash; interrupted</span><b id="d_bargein">0</b></div>
+          <div class="diag-row warn-row" id="d_capRow"><span>Dropped &mdash; cut off before finishing</span><b id="d_tokencap">0</b></div>
+          <div class="diag-row"><span>Dropped &mdash; queue full</span><b id="d_queuefull">0</b></div>
+          <div class="diag-note hidden" id="d_capNote">
+            A reply hit its length ceiling before it finished, so it was never sent.
+            Raise the reply length limit if this keeps happening.
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <div class="modal-foot">
+      <span class="save-msg" id="saveMsg"></span>
+      <button class="ghost" id="settingsCancel">Cancel</button>
+      <button class="primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

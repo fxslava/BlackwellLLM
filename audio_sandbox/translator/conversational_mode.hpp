@@ -22,11 +22,11 @@
 //           survive a mode switch rather than be reloaded per flip.
 //
 // THE PREFILL SEAM. prefill_system_prompt() lives on the concrete control
-// (RealEngineControl / MockEngineControl), not on EngineControlBridge, so it
+// (RealEngineControl / SimulatedEngineControl), not on EngineControlBridge, so it
 // arrives as a callable rather than a virtual. That is not a testability
 // contortion — how a frozen prefix gets laid down genuinely differs per control
 // implementation, and taking it explicitly is what lets a CPU test drive this
-// exact class against MockEngineControl with no GPU.
+// exact class against SimulatedEngineControl with no GPU.
 //
 // THREADING: see ISpeechMode. Nothing here relaxes the single-engine-thread
 // doctrine — pump_engine() is still the only caller into the engine.

@@ -1,7 +1,7 @@
 #pragma once
 // -----------------------------------------------------------------------------
 // translator/real_engine_control.hpp — the PRODUCTION engine-assembly seam for
-// audio_translator. Replaces MockEngineControl: it drives a REAL BlackwellEngine
+// audio_translator. Replaces SimulatedEngineControl: it drives a REAL BlackwellEngine
 // (8B AWQ backbone) through the same EngineControlBridge control plane (SPSC
 // command ring + barge-in epoch + wait/pump), so every commit runs a real GPU
 // decode and streams real detokenized tokens to the GUI.
@@ -775,6 +775,22 @@ protected:
     // (the audio-derived transcript is the marked seam — see the header preamble);
     // everything downstream is the genuine GPU decode path.
     blackwell::EngineStatus do_commit_decode(const Command& cmd) override {
+        // TYPED TURN. Submitted from the UI thread through submit_text(), which
+        // parked the text and flagged the command. It skips every audio stage --
+        // no VAD boundary, no encoder, no soft-token splice -- and joins the
+        // pipeline at exactly the point the audio paths do: prefill a user turn,
+        // run THE decode loop, finalize, offer to the gate. Same loop, same
+        // guards, same EOS rule, so a typed intent is billed (or refused) by the
+        // identical arithmetic a spoken one is.
+        if (cmd.text_turn) {
+            std::string typed;
+            if (!take_text_turn(typed) || typed.empty()) {
+                clear_in_flight();
+                return finish(cmd, 0);
+            }
+            return commit_text_decode(cmd, typed);
+        }
+
         // The VAD's stable boundary IS the moment the user stopped speaking: start
         // the silence clock here, before the (possibly multi-second) commit work,
         // so a barge-in arriving later measures the true gap (see is_continuation).
@@ -803,9 +819,8 @@ protected:
             return commit_audio_decode(cmd);
         }
 
-        // Frame a user turn + assistant cue through the checkpoint's chat template,
-        // then prefill it. Cycle a few prompts so the live GUI shows varied real
-        // model output rather than one repeated answer.
+        // No audio head / no DSP: fall back to a canned text turn so the live GUI
+        // still shows varied real model output rather than one repeated answer.
         static constexpr const char* kPrompts[] = {
             "Briefly greet the user in Russian and English.",
             "Say one short encouraging sentence in Russian.",
@@ -813,14 +828,21 @@ protected:
         };
         const std::size_t idx =
             turn_counter_.fetch_add(1, std::memory_order_relaxed) % 3;
+        return commit_text_decode(cmd, kPrompts[idx]);
+    }
 
+    // ONE text-turn commit path, shared by the typed-input edge and the no-audio-
+    // head fallback: frame a user turn + assistant cue through the checkpoint's
+    // chat template, prefill it, then hand off to THE decode loop. Engine thread.
+    blackwell::EngineStatus commit_text_decode(const Command& cmd,
+                                               const std::string& user_text) {
         std::vector<int> turn = tok_->encode_chat_message(
-            blackwell::ChatMessage{"user", kPrompts[idx]});
+            blackwell::ChatMessage{"user", user_text});
         const std::vector<int> gen = tok_->encode_generation_prompt();
         turn.insert(turn.end(), gen.begin(), gen.end());
 
         int next = -1;
-        const auto t_turn0 = std::chrono::steady_clock::now();  // placeholder TTFT clock
+        const auto t_turn0 = std::chrono::steady_clock::now();  // text-path TTFT clock
         for (const int id : turn) {
             if (pos_ >= max_context_ ||
                 engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
@@ -838,6 +860,7 @@ protected:
         const TurnDecode d = decode_assistant_turn(cmd, next, t_turn0,
                                                    /*temperature=*/0.7f, /*top_p=*/0.9f);
         finalize_turn(d.reply, d.completed());
+        publish_turn(cmd, d);   // commit gate: dispatches iff reason == Eos
         clear_in_flight();
         return finish(cmd, d.emitted);
     }
@@ -1077,15 +1100,36 @@ private:
     static constexpr int   kMaxGeneratedTokens = 256;
     static constexpr int   kRepetitionWindow   = 64;
 
-    // What a decode loop produced. `completed` deliberately treats a max-token or
-    // context-cap stop as CLEAN: only a barge-in or an engine fault leaves the
-    // turn unusable.
+    // What a decode loop produced.
+    //
+    // TWO DIFFERENT QUESTIONS, TWO DIFFERENT FIELDS. Do not collapse them.
+    //
+    //   completed()  "is this turn usable as KV//text history?"  A max-token or
+    //                context-cap stop is CLEAN by this measure: the text is
+    //                well-formed, just short, so it is kept as history. Only a
+    //                barge-in or an engine fault leaves the turn unusable.
+    //
+    //   reason       "may this turn be DISPATCHED to the paid Cloud API?"  Here
+    //                a budget stop is NOT clean -- it is a severed thought, and
+    //                sending it burns prefill tokens on a fragment.
+    //
+    // Before `reason` existed, EOT / per-turn cap / context cap all produced
+    // completed()==true and the distinction survived only as a `const char*`
+    // stop_reason used for logging. Anything gating on completed() would have
+    // paid for truncated intents. Gate on `reason`; keep completed() for KV.
     struct TurnDecode {
         std::string reply;
         int  emitted = 0;
         bool interrupted = false;   // barge-in superseded this generation
         bool faulted = false;       // run_token / sampling reported != Success
+        blackwell::bridge::TerminationReason reason =
+            blackwell::bridge::TerminationReason::None;
         bool completed() const noexcept { return !interrupted && !faulted; }
+        // The commit gate's predicate, restated here so a call site cannot get
+        // it subtly wrong (e.g. by reaching for completed()).
+        bool dispatchable() const noexcept {
+            return blackwell::bridge::is_dispatchable(reason);
+        }
     };
 
     // THE decode loop — one implementation behind every live commit path
@@ -1102,9 +1146,14 @@ private:
         const char* stop_reason = "max length hit (context budget)";
         reset_repetition_window();
         auto t_tok = t_start;
+        // Default: falling out of the `while` means the CONTEXT budget ran out.
+        // Seeded here (not left None) so every exit path below carries a verdict
+        // and no path can leave `reason` at a value the gate treats as unset.
+        out.reason = blackwell::bridge::TerminationReason::TokenCap;
         while (pos_ < max_context_) {
             if (cancelled(cmd.gen)) {                              // wait-free barge-in
                 out.interrupted = true;
+                out.reason = blackwell::bridge::TerminationReason::BargeIn;
                 stop_reason = "barge-in detected (gen superseded)";
                 break;
             }
@@ -1114,11 +1163,20 @@ private:
                                  std::chrono::duration<double, std::milli>(now - t_tok).count());
                 t_tok = now;
             }
-            if (tok_->is_stop(next)) { stop_reason = "EOT token reached"; break; }
+            if (tok_->is_stop(next)) {
+                // THE COMMIT CASE. The model closed the thought itself; this is
+                // the only exit from this loop that may reach the Cloud API.
+                out.reason = blackwell::bridge::TerminationReason::Eos;
+                stop_reason = "EOT token reached";
+                break;
+            }
             // Checked AFTER the stop test so a natural EOT landing exactly on the
             // cap is still reported as an EOT, and BEFORE emitting so the turn
-            // ends at exactly kMaxGeneratedTokens streamed tokens.
+            // ends at exactly kMaxGeneratedTokens streamed tokens. That ordering
+            // also means a turn is only ever TokenCap when it genuinely had more
+            // to say -- which is what makes dropped_token_cap() actionable.
             if (out.emitted >= kMaxGeneratedTokens) {
+                out.reason = blackwell::bridge::TerminationReason::TokenCap;
                 stop_reason = "Max turn tokens reached";
                 break;
             }
@@ -1132,6 +1190,7 @@ private:
             if (decode_step(next, pos_, temperature, top_p, &next) !=
                 blackwell::EngineStatus::Success) {
                 out.faulted = true;
+                out.reason = blackwell::bridge::TerminationReason::Fault;
                 stop_reason = "engine fault (run_token/sample != Success)";
                 break;
             }
@@ -1139,6 +1198,52 @@ private:
         }
         log_decode_stop(stop_reason, pos_, out.emitted);
         return out;
+    }
+
+    // Hand the finished turn to the commit gate. Called on EVERY commit path,
+    // including the non-dispatchable ones -- that is deliberate. "Skip dispatch"
+    // must be implemented as "offer and let the gate reject", never as "do not
+    // offer", or dropped_token_cap() never increments and a mis-sized
+    // kMaxGeneratedTokens silently kills the cloud pathway with no telemetry.
+    //
+    // Returns true iff the intent was committed (i.e. reason == Eos).
+    bool publish_turn(const Command& cmd, const TurnDecode& d) noexcept {
+        const bool committed =
+            publish_intent(d.reason, cmd.gen, std::string(d.reply),
+                           static_cast<std::uint32_t>(d.emitted < 0 ? 0 : d.emitted));
+        // Every turn reports its verdict. Without this the gate is invisible from
+        // the console and the only way to tell a dispatched turn from a dropped
+        // one is to watch the UI -- which is exactly the silent-failure mode the
+        // whole Local Router design is trying to avoid.
+        if (committed) {
+            std::printf("[Commit Gate] EOS -> DISPATCHED (%d tokens)\n", d.emitted);
+        } else if (d.reason == blackwell::bridge::TerminationReason::TokenCap) {
+            // Loudest case: the user spoke, the local model answered, and nothing
+            // was ever dispatched -- with no error raised anywhere else.
+            std::printf("[Commit Gate] TRUNCATED at %d tokens (cap %d) -- NOT dispatched. "
+                        "Raise kMaxGeneratedTokens if this repeats.\n",
+                        d.emitted, kMaxGeneratedTokens);
+        } else {
+            std::printf("[Commit Gate] %s -- NOT dispatched (%d tokens)\n",
+                        blackwell::bridge::to_string(d.reason), d.emitted);
+        }
+        std::fflush(stdout);
+        return committed;
+    }
+
+    // The checkpoint's stop set (<|eot_id|>, <|end_of_text|>, <|im_end|>, ...),
+    // resolved by the tokenizer from generation_config.json.
+    //
+    // NOTE ON REACH: this override serves EngineControlBridge::run_decode_loop,
+    // which THIS class does not use — decode_assistant_turn is its own loop (it
+    // needs the repetition-penalty window and the per-token TTFT telemetry that
+    // the bridge loop has no notion of), and that loop calls tok_->is_stop
+    // directly. The override exists so the two loops cannot disagree about what
+    // EOS means, and so any consumer that does drive run_decode_loop against
+    // this control gets the real stop set instead of the base tier's
+    // fail-closed `false`.
+    bool is_eos(int token_id) const noexcept override {
+        return tok_ != nullptr && tok_->is_stop(token_id);
     }
 
     // One PENALIZED decode step. Mirrors BlackwellEngine::forward_status — the
@@ -1472,6 +1577,7 @@ private:
             std::fflush(stdout);
         }
         finalize_turn(d.reply, d.completed());
+        publish_turn(cmd, d);   // commit gate: dispatches iff reason == Eos
         reset_utterance();
         clear_in_flight();
         return finish(cmd, d.emitted);
@@ -1515,6 +1621,7 @@ private:
         const TurnDecode d = decode_assistant_turn(cmd, next, t_vad,
                                                    /*temperature=*/0.0f, /*top_p=*/1.0f);
         finalize_turn(d.reply, d.completed());
+        publish_turn(cmd, d);   // commit gate: dispatches iff reason == Eos
         clear_in_flight();
         return finish(cmd, d.emitted);
     }

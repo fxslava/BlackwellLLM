@@ -58,9 +58,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <string>
 
 #include "bridge_internal.hpp"        // IEngineControl, TokenSink, AudioStreamHandle, AudioRingBuffer
+#include "intent_commit.hpp"          // TerminationReason, IntentCommitQueue (the commit gate)
 #include "blackwell/engine.h"         // BlackwellEngine, blackwell::EngineStatus
 
 // The Ultravox projector lives in blackwell_audio; the leaf bridge lib only holds
@@ -110,6 +114,27 @@ public:
         projector_ = projector;
     }
 
+    // ---- Commit gate to the Cloud API (Local Router pattern) -----------------
+    // Bind the queue that carries EOS-terminated intents to the network
+    // dispatcher. Non-owning; the app owns the queue and outlives the bridge.
+    // Call once during setup (engine thread), before streaming begins.
+    //
+    // Leaving this null is a supported configuration: the local pipeline runs
+    // exactly as before and nothing is ever dispatched. Cloud routing is opt-in
+    // by binding a queue, never by default.
+    void set_commit_queue(IntentCommitQueue* queue) noexcept { commit_queue_ = queue; }
+    IntentCommitQueue* commit_queue() const noexcept { return commit_queue_; }
+
+    // How the most recent generation ended. Published by publish_intent(), which
+    // means it is correct for BOTH decode loops -- run_decode_loop AND an
+    // override's own loop (RealEngineControl::decode_assistant_turn) -- because
+    // both funnel through the same publish call. That is what lets the UI hold a
+    // single EngineControlBridge* and still render the right verdict whichever
+    // control is live. Recorded even when no commit queue is bound.
+    TerminationReason last_reason() const noexcept {
+        return static_cast<TerminationReason>(last_reason_.load(std::memory_order_acquire));
+    }
+
     // ---- System-prompt prefix-cache floor (frozen KV boundary) ---------------
     // The system prompt is prefilled ONCE at startup and frozen; its KV must never
     // be truncated by a barge-in micro-rewind. Publishing the prefix length here
@@ -143,6 +168,22 @@ public:
     blackwell::EngineStatus commit_and_decode(AudioStreamHandle stream,
                                               TokenSink sink,
                                               uint64_t gen) noexcept override;
+
+    // ---- TYPED user turn: the text edge onto the SAME command ring ------------
+    // A typed message must reach the commit gate by exactly the path a spoken one
+    // does -- marshaled onto the engine thread, decoded by the same loop, offered
+    // to the same IntentCommitQueue with the same EOS rule. Anything else would be
+    // a second, untested route to a billed cloud call.
+    //
+    // NOT the audio producer edge, and deliberately not held to its contract: this
+    // is driven by a human pressing Enter (single-digit events per minute), so it
+    // takes an OWNED copy of the text under a short mutex rather than borrowing the
+    // caller's buffer the way submit_multimodal does. The audio hot path never
+    // touches this lock. Callable from any thread (the UI thread, in practice).
+    //
+    // Returns StateMismatch if the command ring is full; the text is then dropped
+    // rather than queued behind a backlog the user can no longer see.
+    blackwell::EngineStatus submit_text(std::string text, TokenSink sink) noexcept;
 
     // ---- CONSUMER edge (the single engine-owning thread) ---------------------
 
@@ -190,8 +231,19 @@ protected:
         AudioRingBuffer*  ring = nullptr;    // one-shot submit_multimodal path
         const char*       prompt = nullptr;  // one-shot submit_multimodal path (caller-owned)
         uint32_t          keep_prompt_tokens = 0;
+        // This CommitDecode carries a TYPED user turn: the text itself is NOT in
+        // the POD (the ring stays allocation-free), it sits in the FIFO behind
+        // take_text_turn(). The flag is what tells a do_commit_decode override to
+        // go and fetch it instead of reading the audio ring.
+        bool              text_turn = false;
         TokenSink         sink{};
     };
+
+    // Consumer edge (engine thread): claim the text this CommitDecode was queued
+    // with. Returns false if the FIFO is empty (a superseded submission already
+    // consumed it). Exactly one successful take per `text_turn` command, so the
+    // FIFO stays in lockstep with the ring.
+    bool take_text_turn(std::string& out) noexcept;
 
     // Execute hooks, dispatched by pump() on the engine thread (virtual so the
     // engine assembly can supply the multimodal stages and tests can stub them).
@@ -208,16 +260,48 @@ protected:
     // tokens, emitting each through `sink` and checking cancelled(gen) BEFORE
     // every step so a barge-in aborts within one token. decode_one() is the
     // per-token engine call, virtual so a CPU test drives the loop without a GPU.
-    // Clears the in-flight flag and emits a final callback on exit (cancel, cap,
-    // or fault). A cancel is a clean supersede, not an error.
+    // Clears the in-flight flag and emits a final callback on exit.
+    //
+    // *out_reason receives WHY the loop stopped. This is load-bearing, not
+    // diagnostic: it is the local arbiter's verdict, and IntentCommitQueue
+    // dispatches to the paid Cloud API on TerminationReason::Eos and nothing
+    // else. Before this existed, EOS / barge-in / token-cap all exited as
+    // `is_final=1, BRIDGE_OK` and were indistinguishable to any consumer.
+    //
+    // A cancel is a clean supersede, not an error -- the returned EngineStatus
+    // is still Success for both BargeIn and TokenCap. Branch on *out_reason,
+    // never on the status, when deciding whether to dispatch.
     blackwell::EngineStatus run_decode_loop(uint64_t gen, int first_token_id,
                                             int start_pos, int max_new_tokens,
-                                            const TokenSink& sink);
+                                            const TokenSink& sink,
+                                            TerminationReason* out_reason = nullptr);
 
     // One decode step: consume `token_id` at `pos` on seq cfg_.seq_id, sampling
     // greedily; writes the next token id to *out_token. Default forwards to
     // BlackwellEngine::forward_status. Returns the runtime-tier status.
     virtual blackwell::EngineStatus decode_one(int token_id, int pos, int* out_token) noexcept;
+
+    // Is `token_id` the model's end-of-sequence marker (<|eot_id|>,
+    // <|end_of_text|>, <|im_end|>, ...)? THE commit predicate: a true here is
+    // what makes an utterance eligible for a paid cloud call.
+    //
+    // The base tier has no tokenizer (same reason do_warm_prefill is a stub),
+    // so it returns false and the loop can only ever terminate on cap/cancel/
+    // fault -- which fails CLOSED: no EOS means no dispatch, never a spurious
+    // one. The engine assembly overrides this with
+    // `tokenizer().is_stop(token_id)` (include/blackwell/tokenizer.h), which
+    // already resolves the stop set from generation_config.json.
+    virtual bool is_eos(int token_id) const noexcept;
+
+    // Hand a finished generation to the commit gate. The ONLY path from the
+    // engine thread to the network layer -- publish_intent applies no policy of
+    // its own, it just forwards to IntentCommitQueue::offer(), where the commit
+    // rule lives. Returns true iff the intent was committed for dispatch.
+    //
+    // Safe to call with any reason (and with no queue bound at all): a non-Eos
+    // reason is counted and dropped inside the queue.
+    bool publish_intent(TerminationReason reason, uint64_t gen, std::string&& payload,
+                        uint32_t token_count) noexcept;
 
     // Clear the single-in-flight guard (called by run_decode_loop on exit; also
     // available to an override that finishes decode by another path).
@@ -225,7 +309,7 @@ protected:
 
     // Apply the system-prompt prefix-cache floor: a rewind may keep MORE than the
     // requested prefix but never LESS than the frozen system prefix. Shared by the
-    // base do_rewind and any engine-assembly / mock override so the frozen-prefix
+    // base do_rewind and any engine-assembly / simulated override so the frozen-prefix
     // invariant holds no matter which override executes the rewind.
     uint32_t effective_keep_tokens(uint32_t requested) const noexcept {
         const uint32_t floor = system_prefix_tokens_.load(std::memory_order_acquire);
@@ -234,6 +318,7 @@ protected:
 
     BlackwellEngine*                     engine_ = nullptr;    // non-owning; the single-thread engine
     blackwell::audio::UltravoxProjector* projector_ = nullptr; // non-owning; bound by the engine assembly
+    IntentCommitQueue*                   commit_queue_ = nullptr; // non-owning; null = cloud routing off
     Config                               cfg_;
 
 private:
@@ -268,9 +353,20 @@ private:
     // barge-in path, so keep it off the SPSC cursors' lines (no false sharing).
     alignas(64) std::atomic<uint32_t> system_prefix_tokens_{0};
 
+    // Last generation's verdict. Written by publish_intent() on the engine thread,
+    // read by the UI thread for the status badge -- hence atomic.
+    std::atomic<uint32_t> last_reason_{static_cast<uint32_t>(TerminationReason::None)};
+
     // Doorbell: a free-running counter the producer bumps + notifies on every
     // enqueue / cancel; wait_and_pump() blocks on it (0% CPU) and wakes on change.
     alignas(64) std::atomic<uint64_t> doorbell_{0};
+
+    // Typed user turns, in submission order. Guarded by a plain mutex on purpose:
+    // its only producer is a human typing and its only consumer is the engine
+    // thread draining the ring, so the contention is nil and a lock-free FIFO
+    // here would be ceremony. NOT reachable from the audio path (see submit_text).
+    std::mutex              text_mu_;
+    std::deque<std::string> text_turns_;
 
     std::atomic<bool> decoding_{false};   // single-in-flight guard (generation_in_flight)
     std::atomic<bool> stopping_{false};   // shutdown latch for wait_and_pump()

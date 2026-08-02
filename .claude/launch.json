@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8137", "--directory", "src/tools/poc_overlay/web"],
       "port": 8137
+    },
+    {
+      "name": "assistant-ui-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8138", "--directory", "audio_sandbox/voice_assistant/web"],
+      "port": 8138
     }
   ]
 }

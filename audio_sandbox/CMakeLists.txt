@@ -106,7 +106,7 @@ endif()
 # engine control plane (blackwell_bridge) + the engine white-box tier
 # (blackwell_core_obj, which pulls CUDA), so it is built ONLY in the integrated
 # (root) build where those targets already exist. A standalone `cmake -S
-# audio_sandbox` skips it and stays CUDA-free. A GPU-free MockEngineControl drives
+# audio_sandbox` skips it and stays CUDA-free. A GPU-free SimulatedEngineControl drives
 # the REAL EngineControlBridge (SPSC command ring + barge-in epoch + wait/pump).
 # It now drives a REAL BlackwellEngine (8B AWQ) via RealEngineControl: --model-dir
 # selects the checkpoint, config.json is validated against the projector width
@@ -126,9 +126,9 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
 
     # Public bridge headers arrive via blackwell_bridge (PUBLIC include/); the
     # white-box bridge/engine headers it consumes are PRIVATE, so declare them here
-    # (mirrors tests/bridge). translator/ holds the app-local mock + transcript view.
+    # (mirrors tests/bridge). translator/ holds the simulated control + transcript view.
     target_include_directories(audio_translator PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/translator  # transcript_view.hpp, mock_engine_control.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/translator  # transcript_view.hpp, simulated_engine_control.hpp
         ${CMAKE_SOURCE_DIR}/src                  # common.h
         ${CMAKE_SOURCE_DIR}/src/core             # device_buffer.h, engine_impl.h (white-box step_*)
         ${CMAKE_SOURCE_DIR}/src/audio            # ping_pong_audio_buffer.h (audio prefill consumer)
@@ -139,7 +139,7 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     # whisper_dsp/sandbox_headers/imgui = the sandbox front-end (SYSTEM includes
     # quarantined from /W4); blackwell_bridge + blackwell_kernels + blackwell_core_obj
     # = the speech C-ABI and the engine symbols its control plane references (the
-    # same trio tests/bridge links; the engine is never invoked by the mock).
+    # same trio tests/bridge links; the simulated control never invokes the engine).
     target_link_libraries(audio_translator PRIVATE
         whisper_dsp blackwell::sandbox_headers imgui
         d3d11 dxgi d2d1 d3dcompiler user32 ole32
@@ -170,7 +170,7 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     target_compile_definitions(audio_translator PRIVATE UNICODE _UNICODE)
     if(MSVC)
         target_compile_definitions(audio_translator PRIVATE _CRT_SECURE_NO_WARNINGS)
-        # The mock's canned Russian translations are UTF-8 string literals: tell
+        # The simulated control's canned Russian replies are UTF-8 literals: tell
         # MSVC the source AND execution charset is UTF-8 so ImGui receives correct
         # bytes and /WX never trips C4819 on the non-ASCII source.
         target_compile_options(audio_translator PRIVATE /utf-8)
@@ -183,6 +183,117 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         # Anchor the debugger working dir so the default "data" arg (mel_filters.bin)
         # resolves under F5, matching audio_realtime.
         set_target_properties(audio_translator PROPERTIES
+            VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+endif()
+
+# --- voice_assistant: the Local Router voice loop, standalone -------------------
+# listen -> pause -> local generate -> [barge-in aborts | EOS commits] -> remote.
+#
+# THE UI IS CHROMIUM, NOT IMGUI. The main window is a WebView2 host
+# (voice_assistant/assistant_window.cpp) whose client area is the messenger in
+# voice_assistant/web/ -- the same virtual-host-mapped arrangement poc_overlay's
+# settings window uses, deployed next to the exe by the POST_BUILD copy below.
+# This target therefore links NEITHER imgui NOR the D3D11/D2D swap-chain stack,
+# and does not compile src/window_d2d.cpp: nothing here draws a spectrogram.
+#
+# TWO BACKENDS, ONE PIPELINE. A configured model directory brings up
+# RealEngineControl (real CUDA decode on a real checkpoint, audio head armed);
+# without one it falls back to SimulatedEngineControl (no GPU, no checkpoint).
+# Both derive from EngineControlBridge, so the app holds one base pointer and the
+# commit gate, the SPSC command ring, the barge-in epoch and the dispatcher are
+# byte-identical on both paths -- which is what makes the simulated path a
+# rehearsal of the real one rather than a parallel implementation.
+#
+# It therefore links the same engine stack audio_translator does. The GPU-free
+# configuration is preserved at RUNTIME (no checkpoint configured), not by
+# omitting the dependency -- a link-time split would have meant two binaries and
+# two code paths to keep honest.
+if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
+    if(NOT TARGET blackwell::webview2)
+        message(FATAL_ERROR
+            "voice_assistant needs blackwell::webview2 (cmake/WebView2.cmake), "
+            "included from the root CMakeLists.")
+    endif()
+
+    add_executable(voice_assistant
+        voice_assistant/main.cpp
+        voice_assistant/assistant_window.cpp   # WebView2 host for the messenger UI
+        # Recompiled here so audio_realtime's and audio_translator's own targets
+        # stay untouched (same convention as audio_translator above).
+        src/audio_capture.cpp
+        src/audio_recorder.cpp
+        src/realtime_dsp.cpp)
+
+    target_include_directories(voice_assistant PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/voice_assistant  # assistant_view/window, settings_store
+        ${CMAKE_CURRENT_SOURCE_DIR}/translator       # conversational_mode.hpp, cli_config.hpp,
+                                                     # engine_bootstrap.hpp, real/simulated control
+        ${CMAKE_SOURCE_DIR}/src                      # common.h
+        ${CMAKE_SOURCE_DIR}/src/core                 # device_buffer.h, engine_impl.h (white-box step_*)
+        ${CMAKE_SOURCE_DIR}/src/audio                # ping_pong_audio_buffer.h (audio prefill consumer)
+        ${CMAKE_SOURCE_DIR}/src/bridge               # engine_control_bridge.hpp, intent_commit.hpp
+        ${CMAKE_SOURCE_DIR}/src/cloud                # intent_dispatcher.hpp, intent_transport.hpp
+        ${CMAKE_SOURCE_DIR}/src/vad)                 # silero_vad.hpp (declaration only; ORT stays
+                                                     # PRIVATE to blackwell_vad)
+
+    target_link_libraries(voice_assistant PRIVATE
+        whisper_dsp blackwell::sandbox_headers
+        # Win32 + COM + the shell folder picker the Settings modal calls into.
+        user32 gdi32 ole32 shell32
+        blackwell::webview2   # Chromium UI: headers + static loader + version.lib
+        blackwell_bridge blackwell_kernels blackwell_core_obj
+        # audio frontend: WhisperEncoder + UltravoxProjector (the audio head
+        # engine_bootstrap loads); pulls CUDA::cublas transitively.
+        blackwell_audio
+        # config.json parsing (cli_config.hpp) -- header-only, angle-bracket
+        # include keeps it outside the /W4 /WX budget (/external:W0).
+        nlohmann_json::nlohmann_json)
+
+    # The LIVE Claude transport is opt-in and additive: without it the binary
+    # still builds and runs offline, which is the whole point of the seam.
+    if(TARGET blackwell_cloud)
+        target_link_libraries(voice_assistant PRIVATE blackwell_cloud)
+        target_compile_definitions(voice_assistant PRIVATE BLACKWELL_HAVE_CLOUD_CLIENT)
+    endif()
+
+    # Silero neural VAD, same optional wiring as audio_translator: with
+    # -DUSE_SILERO_VAD=OFF the target does not exist, BLACKWELL_VAD_MODEL_PATH
+    # stays undefined, and the app runs the pipeline's built-in RMS detector.
+    if(TARGET blackwell_vad)
+        target_link_libraries(voice_assistant PRIVATE blackwell_vad)
+        get_target_property(_va_vad_model blackwell_onnxruntime BLACKWELL_VAD_MODEL_PATH)
+        target_compile_definitions(voice_assistant PRIVATE
+            BLACKWELL_VAD_MODEL_PATH="${_va_vad_model}")
+        blackwell_copy_onnxruntime_dlls(voice_assistant)
+        blackwell_copy_vad_model(voice_assistant)
+    endif()
+
+    target_compile_definitions(voice_assistant PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+        target_compile_definitions(voice_assistant PRIVATE _CRT_SECURE_NO_WARNINGS)
+        # SimulatedEngineControl's canned replies carry UTF-8 literals, and the UI
+        # strings that reach the WebView2 channel must be real UTF-8 bytes.
+        target_compile_options(voice_assistant PRIVATE /utf-8)
+    endif()
+
+    # The messenger UI ships as external web assets served by WebView2 through a
+    # virtual-host->folder mapping, so iterating on the CSS/JS needs a reload and
+    # not a recompile. Deploy them next to the exe, where AssistantWindow resolves
+    # <exe dir>\web at runtime.
+    add_custom_command(TARGET voice_assistant POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/voice_assistant/web"
+            "$<TARGET_FILE_DIR:voice_assistant>/web"
+        COMMENT "Deploying voice_assistant UI assets (web/ -> next to the exe)")
+
+    blackwell_copy_dstorage_dlls(voice_assistant)
+
+    if(MSVC)
+        # Anchor to the sandbox root, NOT the repo root: the default positional
+        # data dir is "data", and mel_filters.bin lives at audio_sandbox/data.
+        # Matches audio_translator so F5 works identically for both.
+        set_target_properties(voice_assistant PROPERTIES
             VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
 endif()

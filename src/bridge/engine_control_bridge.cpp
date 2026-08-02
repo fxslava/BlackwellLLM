@@ -177,15 +177,57 @@ EngineStatus EngineControlBridge::submit_multimodal(AudioRingBuffer& ring,
     return EngineStatus::Success;
 }
 
+EngineStatus EngineControlBridge::submit_text(std::string text, TokenSink sink) noexcept {
+    // Park the payload FIRST, then publish the command: the engine thread must
+    // never observe a text_turn command whose text has not landed yet.
+    try {
+        std::lock_guard<std::mutex> lk(text_mu_);
+        text_turns_.push_back(std::move(text));
+    } catch (...) {
+        return EngineStatus::OutOfVram;  // allocation failed; nothing was queued
+    }
+
+    decoding_.store(true, std::memory_order_release);
+    Command cmd;
+    cmd.type = CommandType::CommitDecode;
+    cmd.gen = active_gen_.load(std::memory_order_acquire);
+    cmd.text_turn = true;
+    cmd.sink = sink;
+    if (!enqueue(cmd)) {
+        decoding_.store(false, std::memory_order_release);
+        std::string dropped;
+        (void)take_text_turn(dropped);  // unpark it again -- the ring refused the job
+        return EngineStatus::StateMismatch;
+    }
+    return EngineStatus::Success;
+}
+
 // -----------------------------------------------------------------------------
 // CONSUMER edge (the single engine-owning thread).
 // -----------------------------------------------------------------------------
+bool EngineControlBridge::take_text_turn(std::string& out) noexcept {
+    std::lock_guard<std::mutex> lk(text_mu_);
+    if (text_turns_.empty()) return false;
+    out = std::move(text_turns_.front());
+    text_turns_.pop_front();
+    return true;
+}
+
 size_t EngineControlBridge::pump() noexcept {
     size_t executed = 0;
     Command cmd;
     while (try_pop(cmd)) {
-        // Drop a command a barge-in superseded between enqueue and now.
-        if (superseded(cmd.gen)) continue;
+        // Drop a command a barge-in superseded between enqueue and now. A dropped
+        // text turn must take its parked payload with it, or the FIFO drifts out
+        // of lockstep and the NEXT typed message decodes this one's text.
+        if (superseded(cmd.gen)) {
+            if (cmd.text_turn) {
+                std::string dropped;
+                (void)take_text_turn(dropped);
+                clear_in_flight();
+            }
+            continue;
+        }
         // Runtime tier: no exception escapes the pump. A do_* override that raises
         // is caught and folded to a dropped command (its own sink/status already
         // carries any error).
@@ -274,11 +316,32 @@ EngineStatus EngineControlBridge::decode_one(int token_id, int pos, int* out_tok
     return st;
 }
 
+bool EngineControlBridge::is_eos(int /*token_id*/) const noexcept {
+    // Base tier has no tokenizer -- see the header. Fails CLOSED: never reports
+    // EOS, so the base bridge can never commit an intent to the Cloud API.
+    return false;
+}
+
+bool EngineControlBridge::publish_intent(TerminationReason reason, uint64_t gen,
+                                         std::string&& payload,
+                                         uint32_t token_count) noexcept {
+    // Record the verdict BEFORE the queue check: the UI badge must be correct
+    // even when cloud routing is not wired at all (the local-only configuration).
+    last_reason_.store(static_cast<uint32_t>(reason), std::memory_order_release);
+    if (commit_queue_ == nullptr) return false;  // cloud routing not wired
+    return commit_queue_->offer(reason, gen, std::move(payload), token_count);
+}
+
 EngineStatus EngineControlBridge::run_decode_loop(uint64_t gen, int first_token_id,
                                                   int start_pos, int max_new_tokens,
-                                                  const TokenSink& sink) {
+                                                  const TokenSink& sink,
+                                                  TerminationReason* out_reason) {
     EngineStatus st = EngineStatus::Success;
-    bool aborted = false;
+    // Start at TokenCap: that is what a loop which simply runs out the for-
+    // condition without ever seeing EOS actually did. Every other exit below
+    // overwrites it explicitly, so there is no path that leaves the reason
+    // unset and accidentally inherits a dispatchable verdict.
+    TerminationReason reason = TerminationReason::TokenCap;
     int token = first_token_id;
     int pos = start_pos;
     int emitted = 0;
@@ -287,12 +350,23 @@ EngineStatus EngineControlBridge::run_decode_loop(uint64_t gen, int first_token_
         // Wait-free barge-in: a newer epoch (on_speech_start) aborts within one
         // token. This is the zero-cost atomic check the doctrine mandates.
         if (cancelled(gen)) {
-            aborted = true;
+            reason = TerminationReason::BargeIn;  // the user interrupted
             break;
         }
         int next = 0;
         st = decode_one(token, pos, &next);
-        if (st != EngineStatus::Success) break;
+        if (st != EngineStatus::Success) {
+            reason = TerminationReason::Fault;
+            break;
+        }
+        // EOS is checked BEFORE the emit so the stop token itself never reaches
+        // the sink as content -- the intent payload must be the thought, not the
+        // thought plus its terminator. This is the branch the whole Local Router
+        // pattern hangs off: reaching it is the ONLY way a cloud call happens.
+        if (is_eos(next)) {
+            reason = TerminationReason::Eos;
+            break;
+        }
         // Base emits ids-only (no detokenizer at this tier); the engine assembly
         // override detokenizes `next` before emitting.
         sink.emit("", emitted, /*is_final=*/0, BRIDGE_OK);
@@ -301,10 +375,16 @@ EngineStatus EngineControlBridge::run_decode_loop(uint64_t gen, int first_token_
     }
 
     clear_in_flight();
-    // A barge-in is a clean supersede, not a fault: report OK on the final emit.
-    const BridgeStatus final_status = aborted ? BRIDGE_OK : to_bridge_status(st);
+    if (out_reason != nullptr) *out_reason = reason;
+
+    // A barge-in and a token cap are both clean supersedes at the TRANSPORT
+    // level -- neither is an engine fault, so both report OK here. The
+    // difference that matters (dispatch or drop) is carried by *out_reason, not
+    // by this status. Do not re-derive dispatchability from `final_status`.
+    const BridgeStatus final_status =
+        (reason == TerminationReason::Fault) ? to_bridge_status(st) : BRIDGE_OK;
     sink.emit("", emitted, /*is_final=*/1, final_status);
-    return aborted ? EngineStatus::Success : st;
+    return (reason == TerminationReason::Fault) ? st : EngineStatus::Success;
 }
 
 }  // namespace blackwell::bridge

@@ -59,25 +59,16 @@ target_include_directories(poc_overlay PRIVATE
 # functions expect.
 target_compile_definitions(poc_overlay PRIVATE UNICODE _UNICODE)
 
-# ------------------------------------------------------------------------------
-# WebView2 SDK (Chromium-based settings UI), fetched straight from NuGet -- same
-# approach the core uses for the DirectStorage SDK. The package is just a ZIP;
-# we point the compiler at its headers and link the STATIC loader so no extra
-# WebView2Loader.dll has to ship next to the exe. (The WebView2 *runtime* still
-# has to be installed on the machine; it ships with modern Windows/Edge.)
-# ------------------------------------------------------------------------------
-include(FetchContent)
-message(STATUS "Fetching Microsoft.Web.WebView2 SDK from NuGet...")
-FetchContent_Declare(
-    webview2_sdk
-    URL "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2792.45"
-    DOWNLOAD_NAME "webview2.zip"
-    TLS_VERIFY OFF
-)
-FetchContent_MakeAvailable(webview2_sdk)
-FetchContent_GetProperties(webview2_sdk SOURCE_DIR WV2_DIR)
-
-target_include_directories(poc_overlay PRIVATE ${WV2_DIR}/build/native/include)
+# The WebView2 (Chromium) settings UI links `blackwell::webview2` -- headers +
+# the static loader, fetched ONCE in cmake/WebView2.cmake so this target and
+# voice_assistant cannot pin two different SDK versions. (The WebView2 *runtime*
+# still has to be installed on the machine; it ships with modern Windows/Edge,
+# and settings_dialog.cpp reports its absence at runtime.)
+if(NOT TARGET blackwell::webview2)
+    message(FATAL_ERROR
+        "poc_overlay needs blackwell::webview2 (cmake/WebView2.cmake). It is "
+        "Windows-only and included from the root CMakeLists.")
+endif()
 
 target_link_libraries(poc_overlay PRIVATE
     user32
@@ -89,9 +80,8 @@ target_link_libraries(poc_overlay PRIVATE
     d2d1
     dwrite
     shell32            # Shell_NotifyIconW
-    version            # required by the WebView2 static loader
     nlohmann_json::nlohmann_json                       # config.json + WebView2 IPC
-    ${WV2_DIR}/build/native/x64/WebView2LoaderStatic.lib
+    blackwell::webview2  # Chromium settings window (headers + static loader + version.lib)
     CUDA::cudart_static  # smoke_test.cpp calls the CUDA Runtime API directly
                          # (cudaGetDeviceCount/cudaSetDevice) from a CXX TU.
                          # STATIC to match the rest of the build (-cudart static,
