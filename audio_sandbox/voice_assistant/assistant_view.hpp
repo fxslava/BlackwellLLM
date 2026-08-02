@@ -54,10 +54,18 @@ public:
     // must not touch the UI directly -- marshal.
     using EventSink = std::function<void(std::string)>;
 
-    // Bind the sink before any producer thread starts. A null sink is legal and
-    // makes every producer a no-op, which is what lets a headless test drive the
-    // same pipeline with no window at all.
-    void set_sink(EventSink sink) { sink_ = std::move(sink); }
+    // Bind (or rebind) the sink. A null sink is legal and makes every producer a
+    // no-op, which is what lets a headless test drive the same pipeline with no
+    // window at all.
+    //
+    // GUARDED, and not as a formality: the window is created AFTER the audio,
+    // engine and dispatcher threads are already running, so this assignment
+    // genuinely races their emit() calls -- a VAD transition arriving during the
+    // std::function assignment was aborting the process about half the time.
+    void set_sink(EventSink sink) {
+        std::lock_guard<std::mutex> lk(sink_mu_);
+        sink_ = std::move(sink);
+    }
 
     // ---- producer edges (any thread) ---------------------------------------
 
@@ -245,11 +253,34 @@ public:
     }
 
 private:
-    void emit(const nlohmann::json& j) const {
-        if (sink_) sink_(j.dump());
+    // NOTHROW, by contract. Every caller is a callback on the audio, engine or
+    // dispatcher thread, and an exception escaping one of those is std::terminate
+    // -- a UI event is never worth the process.
+    //
+    // Two things can throw here and both are real:
+    //   * dump() raises type_error.316 on invalid UTF-8, and a detokenized token
+    //     piece routinely splits a multi-byte sequence (any Cyrillic or CJK
+    //     reply). `replace` substitutes U+FFFD instead, so a torn code point
+    //     shows as one bad glyph for one frame and is healed by the next delta.
+    //   * the sink allocates (queue push).
+    //
+    // sink_mu_ is its OWN lock, not mu_: emit() is called from methods that have
+    // just released mu_, and reusing it would make the ordering a standing
+    // deadlock hazard for anyone adding a producer later.
+    void emit(const nlohmann::json& j) const noexcept {
+        try {
+            std::string payload =
+                j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            std::lock_guard<std::mutex> lk(sink_mu_);
+            if (sink_) sink_(std::move(payload));
+        } catch (...) {
+            // Dropping one UI event is the correct failure here: the pipeline is
+            // authoritative, and the next event re-establishes the view's state.
+        }
     }
 
     mutable std::mutex mu_;
+    mutable std::mutex sink_mu_;
     EventSink sink_;
     std::uint64_t local_gen_ = ~0ull;
     Phase phase_ = Phase::Idle;

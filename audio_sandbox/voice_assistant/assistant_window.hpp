@@ -91,7 +91,11 @@ private:
     void on_web_message(const std::wstring& json);
     void push_settings();                     // seed/refresh the Settings modal
     void browse_for_folder(const std::string& target);
-    void report_webview_unavailable();
+    // `stage` names the call that failed and `hr` is its status. Both end up in
+    // the dialog AND on stderr: a bare "could not initialize the runtime" sends
+    // the user off to reinstall a runtime that is already installed, which is
+    // exactly the wrong trail when the real cause is the COM apartment.
+    void report_webview_unavailable(const char* stage, HRESULT hr);
 
     std::wstring title_;
     HWND hwnd_ = nullptr;              // UI thread only
@@ -103,6 +107,11 @@ private:
     Impl* impl_ = nullptr;         // owns the WebView2 COM pointers
     bool page_ready_ = false;      // NavigationCompleted fired -> safe to post
     bool com_initialized_ = false;
+    // True when this thread was ALREADY in the multi-threaded apartment before we
+    // asked for STA (CoInitializeEx -> RPC_E_CHANGED_MODE). WebView2 is STA-only,
+    // so this single fact explains an otherwise inscrutable environment-creation
+    // failure and is reported as such.
+    bool mta_conflict_ = false;
 
     AssistantWindowCallbacks cb_;
     AssistantSettings settings_;

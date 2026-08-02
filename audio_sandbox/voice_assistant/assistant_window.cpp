@@ -89,10 +89,21 @@ AssistantWindow::~AssistantWindow() {
 }
 
 bool AssistantWindow::create(int client_w, int client_h) {
-    // WebView2 is STA. Initialising here (rather than in main) keeps the
-    // apartment requirement with the only code that actually has one.
+    // WebView2 is STA-only. main() claims the apartment before anything else
+    // touches COM, so this normally returns S_FALSE (already STA); asking again
+    // here keeps the class usable on its own. RPC_E_CHANGED_MODE means someone
+    // got in first with COINIT_MULTITHREADED and the thread is stuck in the MTA
+    // -- environment creation WILL fail, and this is the only place that knows
+    // why, so record it for the error message.
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     com_initialized_ = SUCCEEDED(co);
+    mta_conflict_ = (co == RPC_E_CHANGED_MODE);
+    if (mta_conflict_) {
+        std::fprintf(stderr,
+                     "[webview] FATAL: this thread is in the multi-threaded COM apartment; "
+                     "WebView2 requires STA. Something initialized COM as MTA before the "
+                     "window was created.\n");
+    }
 
     static bool registered = false;
     if (!registered) {
@@ -137,7 +148,8 @@ void AssistantWindow::create_webview() {
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [this](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(result) || env == nullptr) {
-                    report_webview_unavailable();
+                    report_webview_unavailable("CreateCoreWebView2Environment (callback)",
+                                               FAILED(result) ? result : E_POINTER);
                     return S_OK;
                 }
                 env->CreateCoreWebView2Controller(
@@ -145,13 +157,15 @@ void AssistantWindow::create_webview() {
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [this](HRESULT r2, ICoreWebView2Controller* controller) -> HRESULT {
                             if (FAILED(r2) || controller == nullptr) {
-                                report_webview_unavailable();
+                                report_webview_unavailable("CreateCoreWebView2Controller",
+                                                           FAILED(r2) ? r2 : E_POINTER);
                                 return S_OK;
                             }
                             impl_->controller = controller;
-                            impl_->controller->get_CoreWebView2(&impl_->webview);
+                            const HRESULT gw =
+                                impl_->controller->get_CoreWebView2(&impl_->webview);
                             if (!impl_->webview) {
-                                report_webview_unavailable();
+                                report_webview_unavailable("get_CoreWebView2", gw);
                                 return S_OK;
                             }
 
@@ -224,7 +238,11 @@ void AssistantWindow::create_webview() {
             })
             .Get());
 
-    if (FAILED(hr)) report_webview_unavailable();
+    // Synchronous failure: the loader could not even reach the runtime, or this
+    // thread is in the wrong apartment.
+    if (FAILED(hr)) {
+        report_webview_unavailable("CreateCoreWebView2EnvironmentWithOptions", hr);
+    }
 }
 
 bool AssistantWindow::map_assets_and_navigate() {
@@ -245,12 +263,30 @@ bool AssistantWindow::map_assets_and_navigate() {
     return SUCCEEDED(impl_->webview->Navigate(url.c_str()));
 }
 
-void AssistantWindow::report_webview_unavailable() {
-    MessageBoxW(hwnd_,
-                L"Could not initialize the Edge WebView2 runtime, which this app's "
-                L"interface is built on.\n\nInstall the Microsoft Edge WebView2 Runtime "
-                L"and start the assistant again.",
-                L"Voice Assistant", MB_ICONERROR | MB_OK);
+void AssistantWindow::report_webview_unavailable(const char* stage, HRESULT hr) {
+    std::fprintf(stderr, "[webview] %s failed: hr=0x%08lX\n", stage,
+                 static_cast<unsigned long>(hr));
+    std::fflush(stderr);
+
+    std::wstring msg;
+    if (mta_conflict_) {
+        // The cause we can actually name. Telling this user to install a runtime
+        // they already have is worse than useless -- it hides a code bug.
+        msg = L"The assistant's interface could not start because COM was already "
+              L"initialized in the multi-threaded apartment on this thread.\n\n"
+              L"WebView2 requires a single-threaded apartment (STA). This is a bug in "
+              L"the app's startup order, not a problem with your machine.";
+    } else {
+        msg = L"Could not initialize the Edge WebView2 runtime, which this app's "
+              L"interface is built on.\n\nIf the Microsoft Edge WebView2 Runtime is not "
+              L"installed, install it and start the assistant again.";
+    }
+    wchar_t detail[160];
+    wsprintfW(detail, L"\n\nStage: %hs\nError: 0x%08lX", stage,
+              static_cast<unsigned long>(hr));
+    msg += detail;
+
+    MessageBoxW(hwnd_, msg.c_str(), L"Voice Assistant", MB_ICONERROR | MB_OK);
     if (hwnd_ != nullptr) DestroyWindow(hwnd_);
 }
 

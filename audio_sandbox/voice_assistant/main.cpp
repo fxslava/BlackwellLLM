@@ -53,6 +53,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <objbase.h>   // CoInitializeEx / COINIT_APARTMENTTHREADED (WIN32_LEAN_AND_MEAN
+                       // drops <ole2.h> from <windows.h>, so pull it in explicitly)
 
 #include <atomic>
 #include <chrono>
@@ -273,6 +275,31 @@ bool relaunch_self() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // ---- COM apartment: STA, claimed FIRST, before anything else ------------
+    // THE FIRST CALLER WINS, PERMANENTLY. A thread's apartment cannot be changed
+    // once set: a later CoInitializeEx with a different model returns
+    // RPC_E_CHANGED_MODE and leaves the thread where it was.
+    //
+    // WebView2 is STA-only. miniaudio, meanwhile, initializes COM on whatever
+    // thread first opens a device and defaults to COINIT_MULTITHREADED -- and
+    // capture.start() runs on THIS thread, below, well before the window is
+    // created. That ordering put the main thread in the MTA and made
+    // CreateCoreWebView2EnvironmentWithOptions fail with an error the UI then
+    // reported as a missing runtime, sending anyone who hit it off to reinstall
+    // a runtime that was already installed.
+    //
+    // So the apartment is claimed here, at the top, where it is a stated decision
+    // rather than a side effect of whichever subsystem happened to boot first.
+    // miniaudio's own CoInitializeEx then returns RPC_E_CHANGED_MODE, which it
+    // tolerates -- WASAPI works fine from an STA host, and its device thread has
+    // its own apartment regardless.
+    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(com_hr)) {
+        std::fprintf(stderr, "FATAL: CoInitializeEx(STA) failed: 0x%08lX\n",
+                     static_cast<unsigned long>(com_hr));
+        return 2;
+    }
+
     // ---- configuration: persisted settings, then typed flags on top ---------
     rt::AssistantSettings settings = rt::load_settings();
 
@@ -594,8 +621,14 @@ int main(int argc, char** argv) {
         // panel. Deliberately its own thread and deliberately NOT on the chat
         // screen -- see the file preamble.
         std::thread stats_thread([&] {
+            // An exception escaping a std::thread is std::terminate. A telemetry
+            // poller is the last thing that should be allowed to take the app
+            // down, so it swallows and keeps going.
             while (running.load(std::memory_order_acquire)) {
-                view.publish_stats(commit_queue);
+                try {
+                    view.publish_stats(commit_queue);
+                } catch (...) {
+                }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         });
