@@ -277,24 +277,62 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         target_compile_options(voice_assistant PRIVATE /utf-8)
     endif()
 
-    # The messenger UI ships as external web assets served by WebView2 through a
-    # virtual-host->folder mapping, so iterating on the CSS/JS needs a reload and
-    # not a recompile. Deploy them next to the exe, where AssistantWindow resolves
-    # <exe dir>\web at runtime.
-    add_custom_command(TARGET voice_assistant POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/voice_assistant/web"
-            "$<TARGET_FILE_DIR:voice_assistant>/web"
-        COMMENT "Deploying voice_assistant UI assets (web/ -> next to the exe)")
+    # ---- runtime deployment: the exe directory must be self-sufficient --------
+    # THE RULE HERE: voice_assistant is a end-user app, so it has to launch the
+    # same way from F5, from Explorer, and from a copied output folder. Anchoring
+    # the debugger's working directory (below) fixes ONLY F5 and silently leaves
+    # every other launch broken -- which is exactly how "cannot open:
+    # data/mel_filters.bin" survived. So every asset the app opens is deployed
+    # next to the binary, and main.cpp resolves them from its own module path.
+    #
+    # WHAT IS *NOT* HERE, deliberately: Chromium runtime files. This app embeds
+    # Edge WebView2, not CEF -- there is no libcef.dll, no .pak, no icudtl.dat,
+    # no v8_context_snapshot.bin and no locales/ to copy. The browser is a
+    # machine-wide Evergreen runtime, and its loader is STATICALLY linked
+    # (WebView2LoaderStatic.lib in cmake/WebView2.cmake), so not even
+    # WebView2Loader.dll ships. A missing runtime is a runtime-detectable
+    # condition, and AssistantWindow reports it with an actionable message
+    # rather than failing to start.
 
+    # 1. The messenger UI. External assets served by WebView2 through a virtual
+    #    host->folder mapping, so iterating on CSS/JS needs a reload, not a
+    #    recompile. AssistantWindow resolves <exe dir>\web via GetModuleFileNameW.
+    blackwell_copy_asset_dir(voice_assistant
+        "${CMAKE_CURRENT_SOURCE_DIR}/voice_assistant/web" "web")
+
+    # 2. The DSP data (mel_filters.bin). ~0.35 MB, and the single reason a direct
+    #    launch used to die before the window ever appeared.
+    blackwell_copy_asset_dir(voice_assistant "${CMAKE_CURRENT_SOURCE_DIR}/data" "data")
+
+    # 3. DirectStorage runtime (blackwell_core_obj may load it) + the ONNXRuntime
+    #    DLL and silero_vad.onnx are copied by their own module helpers above.
     blackwell_copy_dstorage_dlls(voice_assistant)
 
+    # 4. cuBLAS. NOT copied by default (~481 MB); F5 gets it via the debugger's
+    #    PATH instead, and -DBLACKWELL_DEPLOY_CUDA_DLLS=ON produces a
+    #    self-contained folder when packaging. See cmake/BlackwellHelpers.cmake.
+    blackwell_set_cuda_debugger_path(voice_assistant)
+    blackwell_copy_cuda_dlls(voice_assistant)
+
+    # 5. libcurl + simdjson, only when the cloud leg is built. Under the vcpkg
+    #    toolchain VCPKG_APPLOCAL_DEPS handles this automatically; the explicit
+    #    copy covers a system//manual libcurl, where nothing else would.
+    if(TARGET blackwell_cloud AND TARGET CURL::libcurl)
+        get_target_property(_curl_type CURL::libcurl TYPE)
+        if(_curl_type STREQUAL "SHARED_LIBRARY")
+            add_custom_command(TARGET voice_assistant POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:CURL::libcurl>" "$<TARGET_FILE_DIR:voice_assistant>"
+                COMMENT "Copying libcurl next to voice_assistant...")
+        endif()
+    endif()
+
     if(MSVC)
-        # Anchor to the sandbox root, NOT the repo root: the default positional
-        # data dir is "data", and mel_filters.bin lives at audio_sandbox/data.
-        # Matches audio_translator so F5 works identically for both.
+        # Belt and braces with the deployment above: the app prefers its
+        # exe-adjacent assets, so this only decides where a RELATIVE --model-dir
+        # or a hand-typed data dir resolves from.
         set_target_properties(voice_assistant PROPERTIES
-            VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+            VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:voice_assistant>")
     endif()
 endif()
 

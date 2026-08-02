@@ -202,6 +202,52 @@ float vad_score(void* user, const float* block, size_t count) {
 }
 #endif
 
+// ---- asset resolution: the exe's own directory, not the caller's CWD ---------
+// A relative path like "data" is resolved against whoever launched us, so the
+// app used to start under F5 (where CMake anchors the debugger's working
+// directory) and die from Explorer with `cannot open: data/mel_filters.bin`.
+// The build deploys every asset next to the binary, so prefer THAT copy and fall
+// back to the CWD-relative one -- which keeps an explicitly passed --data-dir,
+// and a developer running out of the source tree, working exactly as before.
+
+std::string exe_dir() {
+    wchar_t buf[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0) return {};
+    std::wstring w(buf);
+    if (const size_t slash = w.find_last_of(L"\\/"); slash != std::wstring::npos) {
+        w.resize(slash + 1);
+    }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), n,
+                        nullptr, nullptr);
+    return out;
+}
+
+bool path_exists(const std::string& p) {
+    return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// `dir` is usable if it holds `probe`; otherwise try <exe dir>/<dir>. Returns
+// `dir` unchanged when neither works, so the caller still reports the original
+// path in its error rather than a rewritten one the user never typed.
+std::string resolve_asset_dir(const std::string& dir, const char* probe) {
+    if (path_exists(dir + "/" + probe)) return dir;
+    const std::string beside = exe_dir() + dir;
+    if (path_exists(beside + "/" + probe)) return beside;
+    return dir;
+}
+
+// Same idea for a single file (the VAD model, whose default is a configure-time
+// absolute path that does not survive being copied to another machine).
+std::string resolve_asset_file(const std::string& path, const char* fallback_name) {
+    if (!path.empty() && path_exists(path)) return path;
+    const std::string beside = exe_dir() + fallback_name;
+    if (path_exists(beside)) return beside;
+    return path;
+}
+
 // Relaunch this executable with NO arguments and let the current process exit.
 //
 // Restart-tier settings choose what gets ALLOCATED at bring-up, so applying them
@@ -263,7 +309,10 @@ int main(int argc, char** argv) {
     args.have_model_dir = !settings.model_dir.empty();
     if (!settings.audio_head.empty())     args.audio_head = settings.audio_head;
     if (!settings.projector_path.empty()) args.projector_path = settings.projector_path;
-    args.data_dir = settings.data_dir;
+    // Assets: prefer the copies the build deployed next to the exe, so the app
+    // launches identically from F5, Explorer, and a copied output folder.
+    args.data_dir = resolve_asset_dir(settings.data_dir, "mel_filters.bin");
+    args.vad_model = resolve_asset_file(args.vad_model, "silero_vad.onnx");
     args.vad_threshold = settings.vad_threshold;
     args.neural_vad = settings.neural_vad;
     args.context_mode = settings.context_mode;
