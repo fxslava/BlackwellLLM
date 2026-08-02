@@ -5,8 +5,15 @@
    PROTOCOL. One JSON message per direction, over the WebView2 host channel:
      app -> page   phase | local.delta | local.final | user.text | remote.start
                    | remote.delta | remote.final | transport | backend | stats
-                   | settings | settings.saved | browsed
+                   | settings | settings.saved | system_prompt.applied | mic
+                   | browsed
      page -> app   ready | send | mic | browse | settings.save | restart
+
+   MIC STATE IS THE APP'S, not this page's: the talk hotkey is global and can
+   flip it while the window is hidden, so the button RENDERS `mic` events and
+   only ever sends one in response to a click. Settings are the same shape --
+   the page never decides what is restart-tier, it renders the list the app
+   pushes (see restartKeys).
 
    WHO IS WHO IN THE BUBBLES. The LOCAL model transcribes what you said and
    decides whether it was a finished thought; the REMOTE model answers it. So
@@ -378,17 +385,47 @@ const restartBanner = $("#restartBanner");
 const saveMsg = $("#saveMsg");
 const saveBtn = $("#settingsSave");
 
-// id suffix -> {get, set}. One table drives load, save and the restart check, so
-// a field cannot be persisted but forgotten by the banner (or the reverse).
+// id suffix -> coercion. ONE table drives reading and writing the form, so a
+// field cannot be persisted but forgotten on load (or the reverse). The types
+// have to match settings_store.hpp's, because a value that arrives as a string
+// where C++ wants an int is dropped by from_json and silently keeps its old
+// value -- which looks exactly like a setting that will not stick.
 const FIELDS = {
+  // Tab 1
   model_dir: "value", audio_head: "value", projector_path: "value", data_dir: "value",
-  system_prompt: "value", device_id: "int", max_context: "int",
-  simulated: "check", neural_vad: "check", loopback_capture: "check",
-  vad_threshold: "float", context_mode: "value",
-  history_budget_tokens: "int", live_streaming: "check"
+  device_id: "int", max_context: "int", simulated: "check",
+  temperature: "float", top_p: "float", max_new_tokens: "int",
+  local_inference: "check",
+  // Tab 2
+  neural_vad: "check", loopback_capture: "check", vad_threshold: "float",
+  silence_hangover_ms: "int", warm_prefill_interval_ms: "int",
+  context_mode: "value", history_budget_tokens: "int", live_streaming: "check",
+  // Tab 3
+  hotkey_talk: "value", hotkey_cancel: "value", hotkey_show: "value",
+  hotkey_push_to_talk: "check",
+  // Tab 4 — the two prompts are separate fields, not one blob (see index.html)
+  system_prompt: "value", audio_task_prompt: "value", speech_task: "value"
 };
 
+// Sliders whose numeric value is echoed next to the label. Kept as a table for
+// the same reason FIELDS is one: a slider without a readout is a slider nobody
+// can set deliberately.
+const READOUTS = {
+  vad_threshold:            ["#vadValue",      v => Number(v).toFixed(2)],
+  temperature:              ["#tempValue",     v => Number(v) === 0 ? "greedy" : Number(v).toFixed(2)],
+  top_p:                    ["#toppValue",     v => Number(v) >= 1 ? "off" : Number(v).toFixed(2)],
+  silence_hangover_ms:      ["#hangoverValue", v => Number(v) === 0 ? "off" : Number(v) + " ms"],
+  warm_prefill_interval_ms: ["#warmValue",     v => Number(v) === 0 ? "off" : Number(v) + " ms"]
+};
+
+// Must match settings_store.hpp's defaults -- "Restore defaults" that restored
+// something the app never shipped with would be worse than no button.
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a concise voice assistant. Answer in one or two short sentences.";
+const DEFAULT_AUDIO_TASK_PROMPT = "Transcribe the following speech exactly as spoken: ";
+
 let current = {};            // what the app is actually running
+let restartKeys = [];        // pushed by the app; see refreshRestartBanner
 let seeded = false;          // has the form ever been filled from `current`?
 
 function el(k) { return $("#s_" + k); }
@@ -414,7 +451,8 @@ function writeForm(s) {
     if (FIELDS[k] === "check") e.checked = !!s[k];
     else e.value = s[k];
   }
-  $("#vadValue").textContent = Number(s.vad_threshold || 0).toFixed(2);
+  refreshReadouts();
+  refreshPromptCount();
   // Only a REAL payload counts as seeded. Opening the modal before the app's
   // first push writes an empty form, and marking that as seeded would lock the
   // blank state in for the rest of the session.
@@ -422,17 +460,19 @@ function writeForm(s) {
   refreshRestartBanner();
 }
 
-// A restart-tier field is any input tagged data-restart in the markup -- the
-// same set settings_store.hpp's requires_restart() compares. Keeping the tag in
-// the HTML means the banner is declarative rather than a second list to forget.
+function refreshReadouts() {
+  for (const k in READOUTS) {
+    const e = el(k), out = $(READOUTS[k][0]);
+    if (e && out) out.textContent = READOUTS[k][1](e.value);
+  }
+}
+
+// A restart-tier field is one the APP named in `restart_fields`. That list comes
+// straight from settings_store.hpp's tier table, so the banner cannot claim a
+// restart the app does not perform, or stay quiet about one it does.
 function restartNeeded() {
   const form = readForm();
-  for (const k in FIELDS) {
-    const e = el(k);
-    if (!e || !e.hasAttribute("data-restart")) continue;
-    if (String(form[k]) !== String(current[k])) return true;
-  }
-  return false;
+  return restartKeys.some(k => k in FIELDS && String(form[k]) !== String(current[k]));
 }
 function refreshRestartBanner() {
   const need = restartNeeded();
@@ -440,13 +480,122 @@ function refreshRestartBanner() {
   saveBtn.textContent = need ? "Save & Restart" : "Save";
 }
 
-overlay.addEventListener("input", refreshRestartBanner);
-overlay.addEventListener("change", () => {
-  $("#vadValue").textContent = Number(el("vad_threshold").value).toFixed(2);
+overlay.addEventListener("input", () => { refreshReadouts(); refreshRestartBanner(); });
+overlay.addEventListener("change", () => { refreshReadouts(); refreshRestartBanner(); });
+
+/* ---- tabs ----------------------------------------------------------------
+   Plain show/hide rather than separate documents: the form is ONE payload, and
+   Save must send every field whether or not its tab was ever opened. */
+const tabs = Array.from(document.querySelectorAll(".tab"));
+const panels = Array.from(document.querySelectorAll(".panel"));
+
+function selectTab(name) {
+  tabs.forEach(t => {
+    const on = t.dataset.tab === name;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", String(on));
+  });
+  panels.forEach(p => p.classList.toggle("active", p.dataset.panel === name));
+}
+tabs.forEach(t => t.addEventListener("click", () => selectTab(t.dataset.tab)));
+
+/* ---- hotkey capture -------------------------------------------------------
+   The field records a chord instead of accepting typed text: "Ctrl+Alt+Space"
+   is a format people mistype, and a hotkey that silently failed to parse would
+   just look like a hotkey that does not work. Modifier-only presses are ignored
+   so the field does not settle on "Ctrl" while the user is still reaching for
+   the second key. The strings produced here are exactly what parse_hotkey()
+   accepts in assistant_window.cpp. */
+const KEY_LABEL = {
+  " ": "Space", Spacebar: "Space", Escape: "Escape", Enter: "Enter", Tab: "Tab",
+  ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down",
+  PageUp: "PageUp", PageDown: "PageDown", Home: "Home", End: "End",
+  Insert: "Insert", Delete: "Delete", Pause: "Pause"
+};
+const MODIFIER_KEYS = ["Control", "Alt", "Shift", "Meta", "OS", "AltGraph", "CapsLock"];
+
+function keyName(e) {
+  if (KEY_LABEL[e.key]) return KEY_LABEL[e.key];
+  if (/^F([1-9]|1\d|2[0-4])$/.test(e.key)) return e.key;
+  if (e.key.length === 1) {
+    const c = e.key.toUpperCase();
+    return /[A-Z0-9]/.test(c) ? c : "";     // punctuation varies by layout: refuse it
+  }
+  return "";
+}
+
+document.querySelectorAll("[data-hotkey]").forEach(input => {
+  input.addEventListener("focus", () => {
+    input.classList.add("recording");
+    input.dataset.prev = input.value;
+    input.value = "Press a combination…";
+  });
+  input.addEventListener("blur", () => {
+    input.classList.remove("recording");
+    // Nothing was captured -- put back what was there rather than leaving the
+    // prompt text in a field that gets saved verbatim.
+    if (input.value === "Press a combination…") input.value = input.dataset.prev || "";
+    refreshRestartBanner();
+  });
+  input.addEventListener("keydown", e => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Backspace" || e.key === "Delete") {   // clear the binding
+      input.value = "";
+      input.dataset.prev = "";
+      refreshRestartBanner();
+      return;
+    }
+    if (MODIFIER_KEYS.includes(e.key)) return;           // still reaching
+    const base = keyName(e);
+    if (!base) return;                                   // not a key we can register
+    const parts = [];
+    if (e.ctrlKey) parts.push("Ctrl");
+    if (e.altKey) parts.push("Alt");
+    if (e.shiftKey) parts.push("Shift");
+    if (e.metaKey) parts.push("Win");
+    parts.push(base);
+    input.value = parts.join("+");
+    input.dataset.prev = input.value;
+    refreshRestartBanner();
+  });
+});
+
+/* ---- system prompts tab ---------------------------------------------------
+   Only the PERSONA carries a token count and a cache state, and that asymmetry
+   is the point: it is the prompt whose length is prefilled once and paid for on
+   every launch. The audio task instruction is re-prefilled every turn, so its
+   size is noise and reporting it would imply a cost that is not there. */
+const promptBox = $("#s_system_prompt");
+
+function refreshPromptCount() {
+  const n = promptBox.value.length;
+  // A rough token estimate, labelled as rough. The real count comes back from
+  // the engine after a precompute (prefixState below) -- this is only here so
+  // the box is not silent while it is being edited.
+  $("#promptCount").textContent =
+    n + " characters · ~" + Math.ceil(n / 4) + " tokens";
+}
+promptBox.addEventListener("input", refreshPromptCount);
+
+$("#promptReset").addEventListener("click", () => {
+  promptBox.value = DEFAULT_SYSTEM_PROMPT;
+  el("audio_task_prompt").value = DEFAULT_AUDIO_TASK_PROMPT;
+  el("speech_task").value = "transcribe";
+  refreshPromptCount();
   refreshRestartBanner();
 });
-el("vad_threshold").addEventListener("input", () => {
-  $("#vadValue").textContent = Number(el("vad_threshold").value).toFixed(2);
+
+// Apply & precompute IS the Save button, with a progress label. Delegating
+// rather than sending its own message is deliberate: the form is ONE payload, so
+// this click persists every tab's fields either way, and giving it a second set
+// of semantics would mean a restart-tier edit could be saved here and silently
+// never applied -- the banner would clear itself on the echo while the old
+// engine kept running.
+$("#promptApply").addEventListener("click", () => {
+  $("#prefixState").textContent = "Precomputing…";
+  $("#prefixState").className = "prefix-state busy";
+  saveBtn.click();
 });
 
 function openSettings() {
@@ -568,8 +717,16 @@ function onMessage(msg) {
       $("#d_audio").textContent = msg.audio_ready ? "Speech input ready" : "Text only";
       break;
 
+    case "mic":
+      // The app owns mic state: the talk hotkey flips it while this window may
+      // not even be visible. Painted only -- echoing it back would ping-pong.
+      micBtn.dataset.on = String(!!msg.on);
+      if (!msg.on) micBtn.classList.remove("hearing");
+      break;
+
     case "settings":
       current = msg.payload || {};
+      if (Array.isArray(msg.restart_fields)) restartKeys = msg.restart_fields;
       // Refill only when the modal is closed -- an update that arrives while the
       // user is typing must not wipe their edits. The `seeded` escape hatch
       // covers the race where the modal was opened before the app's first push:
@@ -579,10 +736,42 @@ function onMessage(msg) {
       break;
 
     case "settings.saved":
-      saveMsg.textContent = msg.live_only ? "Saved — applied now."
-                                          : "Saved — restarting…";
-      if (msg.live_only) setTimeout(closeSettings, 550);
+      // A prompt rebuild is engine work and answers separately; saying "applied
+      // now" while the GPU is still prefilling would be a lie, and closing the
+      // modal would hide the answer when it arrives.
+      if (msg.prompt_rebuilding) {
+        saveMsg.textContent = "Saved — rebuilding the prompt cache…";
+      } else {
+        // No rebuild means no system_prompt.applied is coming, so a
+        // "Precomputing…" left by the Apply button would hang there forever.
+        // Editing only the audio task instruction lands here, and it genuinely
+        // needed no cache work -- say so rather than showing nothing.
+        const state = $("#prefixState");
+        if (state.textContent === "Precomputing…") {
+          state.textContent = "Applied — no cache rebuild needed";
+          state.className = "prefix-state ok";
+        }
+        saveMsg.textContent = msg.live_only ? "Saved — applied now."
+                                            : "Saved — restarting…";
+        if (msg.live_only) setTimeout(closeSettings, 550);
+      }
       break;
+
+    case "system_prompt.applied": {
+      const state = $("#prefixState");
+      if (msg.ok) {
+        state.textContent = "Cached — " + msg.tokens + " tokens frozen";
+        state.className = "prefix-state ok";
+        $("#d_prefix").textContent = msg.tokens + " tokens cached";
+        saveMsg.textContent = "Saved — applied now.";
+        setTimeout(closeSettings, 700);
+      } else {
+        state.textContent = msg.detail || "Could not apply the prompt.";
+        state.className = "prefix-state err";
+        saveMsg.textContent = "Saved, but the prompt was not applied.";
+      }
+      break;
+    }
 
     case "browsed": {
       const e = el(msg.target);

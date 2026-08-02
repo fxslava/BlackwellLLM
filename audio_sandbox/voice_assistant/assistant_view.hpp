@@ -41,6 +41,7 @@
 
 #include "bridge/speculative_bridge_api.h"  // SpeechPipelineState
 #include "intent_commit.hpp"                // TerminationReason, IntentCommitQueue
+#include "utf8_stream.hpp"                  // Utf8StreamAssembler (remote chunk splits)
 
 namespace rt {
 
@@ -161,6 +162,7 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             phase_ = Phase::Dispatching;
+            remote_utf8_.reset();   // no fragment may survive into a new reply
         }
         nlohmann::json j;
         j["type"] = "remote.start";
@@ -169,19 +171,47 @@ public:
     }
 
     // Dispatcher thread: one piece of the REMOTE model's reply.
+    //
+    // A TRANSPORT CHUNK IS NOT A CHARACTER. Whatever is on the other end delivers
+    // bytes on its own schedule -- an SSE text_delta, a simulated slice, a future
+    // transport nobody has written yet -- and none of them owes this view a whole
+    // code point. Reassembling here rather than trusting each transport is what
+    // makes that a non-issue: the assembler holds a trailing partial sequence
+    // until the bytes completing it arrive, so a Cyrillic or CJK reply cannot be
+    // torn no matter who produced it. (It matters: OfflineTransport sliced its
+    // echo every 12 BYTES and cut two-byte Cyrillic characters in half, and each
+    // orphaned byte then reached the page as its own U+FFFD.)
     void on_remote_token(std::string_view utf8) {
         if (utf8.empty()) return;
+        std::string whole;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            whole = remote_utf8_.push(utf8);
+        }
+        if (whole.empty()) return;   // this chunk was only part of a character
         nlohmann::json j;
         j["type"] = "remote.delta";
-        j["text"] = std::string(utf8);
+        j["text"] = std::move(whole);
         emit(j);
     }
 
     // Dispatcher thread: the remote exchange finished.
     void on_remote_final(bool ok, const std::string& detail) {
+        std::string tail;
         {
             std::lock_guard<std::mutex> lk(mu_);
             phase_ = Phase::Idle;
+            // Non-empty only if the reply genuinely stopped mid-character (a
+            // truncated or aborted stream). Surrender it as a last delta rather
+            // than dropping bytes the model did produce -- one visible glyph beats
+            // silently losing a character.
+            tail = remote_utf8_.flush();
+        }
+        if (!tail.empty()) {
+            nlohmann::json t;
+            t["type"] = "remote.delta";
+            t["text"] = std::move(tail);
+            emit(t);
         }
         nlohmann::json j;
         j["type"] = "remote.final";
@@ -258,10 +288,13 @@ private:
     // -- a UI event is never worth the process.
     //
     // Two things can throw here and both are real:
-    //   * dump() raises type_error.316 on invalid UTF-8, and a detokenized token
-    //     piece routinely splits a multi-byte sequence (any Cyrillic or CJK
-    //     reply). `replace` substitutes U+FFFD instead, so a torn code point
-    //     shows as one bad glyph for one frame and is healed by the next delta.
+    //   * dump() raises type_error.316 on invalid UTF-8. Torn code points are now
+    //     healed UPSTREAM -- Utf8StreamAssembler holds a partial sequence in the
+    //     decode loop until the token completing it arrives, so a Cyrillic or CJK
+    //     reply reaches this point already whole. `replace` stays as the backstop
+    //     for what the assembler deliberately does not fix: genuinely malformed
+    //     model output, and the tail it surrenders at flush() when a generation
+    //     stops mid-character. One U+FFFD beats losing the event.
     //   * the sink allocates (queue push).
     //
     // sink_mu_ is its OWN lock, not mu_: emit() is called from methods that have
@@ -282,6 +315,11 @@ private:
     mutable std::mutex mu_;
     mutable std::mutex sink_mu_;
     EventSink sink_;
+    // Heals code points split across transport chunks. Touched only by the three
+    // remote_* producers, all of which run on the single dispatcher thread -- mu_
+    // guards it anyway, because "only one thread calls these" is a property of the
+    // dispatcher that this class cannot enforce.
+    blackwell::bridge::Utf8StreamAssembler remote_utf8_;
     std::uint64_t local_gen_ = ~0ull;
     Phase phase_ = Phase::Idle;
     SpeechPipelineState pipeline_state_ = SPEECH_STATE_IDLE;

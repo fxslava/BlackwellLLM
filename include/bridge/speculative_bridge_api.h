@@ -163,6 +163,22 @@ BRIDGE_API BridgeStatus speech_pipeline_on_silence_timeout(SpeechPipelineHandle 
 BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHandle handle,
                                                                 uint32_t silence_hangover_ms);
 
+/* Retune the SPECULATIVE WARM-PREFILL throttle at RUNTIME (the second UI slider
+ * seam). This is the cadence at which audio buffered so far is speculatively
+ * prefilled while the user is still speaking, so it trades GPU budget against
+ * how much work is left to do at the commit boundary. It is NOT a detection
+ * knob: it cannot change where a boundary falls or what is transcribed, only how
+ * much of the prefill has already happened when the boundary arrives.
+ *
+ * 0 disables speculative warming entirely -- the pipeline stays correct and
+ * simply pays the full prefill at commit time.
+ *
+ * Lock-free (one atomic store), callable from any thread, takes effect on the
+ * next VAD block. ADDITIVE ABI: existing callers that never call this keep the
+ * construction-time SpeechPipelineConfig value. */
+BRIDGE_API BridgeStatus speech_pipeline_set_warm_prefill_interval_ms(
+    SpeechPipelineHandle handle, uint32_t warm_prefill_interval_ms);
+
 /* MANUAL (push-to-talk) mode switch. While enabled, the internal threshold VAD
  * is muted for ALL state transitions — no auto speech onset, no auto barge-in,
  * no silence auto-commit — so boundaries are driven EXCLUSIVELY by the explicit

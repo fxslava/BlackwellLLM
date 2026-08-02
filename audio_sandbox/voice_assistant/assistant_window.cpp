@@ -11,6 +11,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdio>    // fprintf (hotkey registration warnings)
+#include <cstdlib>   // atoi (F-key parsing)
 #include <string>
 #include <vector>
 
@@ -33,6 +35,100 @@ constexpr wchar_t kAssetUrl[]  = L"https://appassets.voiceassistant/index.html";
 // UI-thread wake-up: "the cross-thread queue has something in it". Carries no
 // payload, so a post that outlives the window leaks nothing.
 constexpr UINT kMsgDrain = WM_APP + 1;
+
+// RegisterHotKey ids. Small and window-scoped, so they cannot collide with
+// another app's global hotkeys (the OS namespaces them per window).
+constexpr int kHotkeyTalk   = 1;
+constexpr int kHotkeyCancel = 2;
+constexpr int kHotkeyShow   = 3;
+
+// Hold-to-talk release watchdog. WM_HOTKEY is a key-DOWN notification and there
+// is no matching key-up message, so a hold has to be closed by polling the chord.
+// 60 ms is comfortably below the point where a released key still feels held, and
+// the timer only runs while a chord is actually down.
+constexpr UINT_PTR kPttTimerId = 1;
+constexpr UINT     kPttPollMs  = 60;
+
+struct Hotkey {
+    UINT mods = 0;   // MOD_* flags
+    UINT vk = 0;     // 0 == "no hotkey" (an empty or unparseable string)
+};
+
+// Uppercase ASCII compare; the page sends what the user typed and case is not a
+// meaningful distinction in a key name.
+bool iequals(const std::string& a, const char* b) {
+    size_t i = 0;
+    for (; a[i] != '\0' && b[i] != '\0'; ++i) {
+        const char ca = (a[i] >= 'a' && a[i] <= 'z') ? static_cast<char>(a[i] - 32) : a[i];
+        const char cb = (b[i] >= 'a' && b[i] <= 'z') ? static_cast<char>(b[i] - 32) : b[i];
+        if (ca != cb) return false;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+// One key NAME (no modifiers) -> virtual-key code. 0 means "not a key we accept",
+// which is what makes an unparseable chord register nothing rather than register
+// something the user did not ask for.
+UINT vk_from_name(const std::string& name) {
+    if (name.size() == 1) {
+        const char c = name[0];
+        if (c >= 'a' && c <= 'z') return static_cast<UINT>(c - 32);
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return static_cast<UINT>(c);
+    }
+    if (name.size() >= 2 && (name[0] == 'F' || name[0] == 'f')) {
+        const int n = std::atoi(name.c_str() + 1);
+        if (n >= 1 && n <= 24) return static_cast<UINT>(VK_F1 + n - 1);
+    }
+    static const struct { const char* name; UINT vk; } kNamed[] = {
+        {"Space", VK_SPACE},   {"Enter", VK_RETURN},  {"Return", VK_RETURN},
+        {"Tab", VK_TAB},       {"Escape", VK_ESCAPE}, {"Esc", VK_ESCAPE},
+        {"Backspace", VK_BACK},{"Delete", VK_DELETE}, {"Insert", VK_INSERT},
+        {"Home", VK_HOME},     {"End", VK_END},       {"PageUp", VK_PRIOR},
+        {"PageDown", VK_NEXT}, {"Left", VK_LEFT},     {"Right", VK_RIGHT},
+        {"Up", VK_UP},         {"Down", VK_DOWN},     {"Pause", VK_PAUSE},
+    };
+    for (const auto& k : kNamed) {
+        if (iequals(name, k.name)) return k.vk;
+    }
+    return 0;
+}
+
+// "Ctrl+Alt+Space" -> {MOD_CONTROL|MOD_ALT, VK_SPACE}. An empty string, a chord
+// with no non-modifier key, or an unknown key name all yield vk == 0, i.e. "this
+// hotkey is off" -- there is no partially-registered outcome.
+Hotkey parse_hotkey(const std::string& spec) {
+    Hotkey hk;
+    std::string token;
+    auto take = [&] {
+        if (token.empty()) return;
+        if (iequals(token, "Ctrl") || iequals(token, "Control")) hk.mods |= MOD_CONTROL;
+        else if (iequals(token, "Alt")) hk.mods |= MOD_ALT;
+        else if (iequals(token, "Shift")) hk.mods |= MOD_SHIFT;
+        else if (iequals(token, "Win") || iequals(token, "Super")) hk.mods |= MOD_WIN;
+        else hk.vk = vk_from_name(token);   // last non-modifier token wins
+        token.clear();
+    };
+    for (const char c : spec) {
+        if (c == '+' || c == '-' || c == ' ') take();
+        else token.push_back(c);
+    }
+    take();
+    return hk;
+}
+
+// Is the chord still physically down? Used only by the hold-to-talk watchdog.
+// The modifiers are checked too, so releasing Ctrl while keeping Space held ends
+// the hold -- which is what a user who let go of the chord means.
+bool hotkey_is_down(const Hotkey& hk) {
+    if (hk.vk == 0) return false;
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    if (!down(static_cast<int>(hk.vk))) return false;
+    if ((hk.mods & MOD_CONTROL) && !down(VK_CONTROL)) return false;
+    if ((hk.mods & MOD_ALT) && !down(VK_MENU)) return false;
+    if ((hk.mods & MOD_SHIFT) && !down(VK_SHIFT)) return false;
+    if ((hk.mods & MOD_WIN) && !down(VK_LWIN) && !down(VK_RWIN)) return false;
+    return true;
+}
 
 std::string to_utf8(const std::wstring& w) {
     if (w.empty()) return {};
@@ -132,6 +228,18 @@ bool AssistantWindow::create(int client_w, int client_h) {
     // already has a real (non-zero) client area.
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
+
+    // Hotkeys need only the HWND, so they are live before the page has loaded --
+    // the window is usable by keyboard while Chromium is still starting up.
+    register_hotkeys();
+    // Push-to-talk means the chord opens the mic; anything else would leave it
+    // open until the first press, which is the opposite of what the mode is for.
+    // Through set_listening, NOT by assigning listening_: the pipeline has to be
+    // muted for real, and only the callback does that. The page has not loaded
+    // yet, so the event it would post is redundant -- push_settings() re-asserts
+    // the state on NavigationCompleted.
+    if (settings_.hotkey_push_to_talk) set_listening(false, /*tell_page=*/false);
+
     create_webview();
     return true;
 }
@@ -209,6 +317,47 @@ void AssistantWindow::create_webview() {
                                     })
                                     .Get(),
                                 &token);
+
+                            // ---- always revalidate the app's own assets -------
+                            // The build REDEPLOYS web/ next to the exe on every
+                            // compile, but the WebView keeps a persistent HTTP
+                            // cache in its user-data folder -- so a rebuilt
+                            // style.css or app.js can lose to the copy cached by
+                            // the previous run. The failure is badly misleading:
+                            // a NEW index.html paired with a CACHED stylesheet
+                            // renders every settings panel at once, because the
+                            // markup has `.panel` sections the old CSS has no
+                            // display:none rule for. It reads as "the tabs
+                            // overlap and the modal is unstyled", not as a stale
+                            // file, and it survives restarts.
+                            //
+                            // Forcing revalidation costs nothing here (the assets
+                            // are on local disk, a few KB) and makes what the app
+                            // renders always the code that was last built.
+                            ComPtr<ICoreWebView2> wv = impl_->webview;
+                            wv->AddWebResourceRequestedFilter(
+                                L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                            EventRegistrationToken res_token{};
+                            wv->add_WebResourceRequested(
+                                Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                                    [](ICoreWebView2*,
+                                       ICoreWebView2WebResourceRequestedEventArgs* args)
+                                        -> HRESULT {
+                                        if (args == nullptr) return S_OK;
+                                        ComPtr<ICoreWebView2WebResourceRequest> req;
+                                        if (FAILED(args->get_Request(&req)) || !req) return S_OK;
+                                        ComPtr<ICoreWebView2HttpRequestHeaders> headers;
+                                        if (FAILED(req->get_Headers(&headers)) || !headers) {
+                                            return S_OK;
+                                        }
+                                        // no-cache, not no-store: a 304 is still
+                                        // allowed, so an unchanged asset costs a
+                                        // stat rather than a re-read.
+                                        headers->SetHeader(L"Cache-Control", L"no-cache");
+                                        return S_OK;
+                                    })
+                                    .Get(),
+                                &res_token);
 
                             // A shipping messenger is not a browser: no context
                             // menu, no dev-tools chrome, no zoom-by-scroll.
@@ -290,6 +439,104 @@ void AssistantWindow::report_webview_unavailable(const char* stage, HRESULT hr) 
     if (hwnd_ != nullptr) DestroyWindow(hwnd_);
 }
 
+// ---- hotkeys ------------------------------------------------------------------
+// GLOBAL, by design: the point of an activation keybind on a voice assistant is
+// that it works while another application has focus. RegisterHotKey is the right
+// primitive for that -- unlike a WH_KEYBOARD_LL hook it neither sees nor can
+// swallow anything but the chord it asked for, which is what keeps this app off
+// the list of things that quietly observe everything you type.
+//
+// A chord another process already owns simply fails to register. That is
+// reported, not retried: silently rebinding to something the user did not choose
+// would be worse than the hotkey not working.
+
+void AssistantWindow::register_hotkeys() {
+    if (hwnd_ == nullptr) return;
+    unregister_hotkeys();
+
+    const struct { int id; const std::string& spec; const char* label; } binds[] = {
+        {kHotkeyTalk,   settings_.hotkey_talk,   "talk"},
+        {kHotkeyCancel, settings_.hotkey_cancel, "cancel"},
+        {kHotkeyShow,   settings_.hotkey_show,   "show"},
+    };
+    for (const auto& b : binds) {
+        const Hotkey hk = parse_hotkey(b.spec);
+        if (hk.vk == 0) continue;   // "" or unparseable -> this binding is off
+        // MOD_NOREPEAT: auto-repeat while a chord is held would otherwise fire
+        // the toggle dozens of times a second. Hold-to-talk gets its release from
+        // the watchdog timer, never from repeats.
+        if (!RegisterHotKey(hwnd_, b.id, hk.mods | MOD_NOREPEAT, hk.vk)) {
+            std::fprintf(stderr,
+                         "[hotkey] WARN: could not register %s hotkey '%s' -- another "
+                         "application already owns that combination.\n",
+                         b.label, b.spec.c_str());
+        }
+    }
+    hotkeys_registered_ = true;
+}
+
+void AssistantWindow::unregister_hotkeys() {
+    if (hwnd_ == nullptr || !hotkeys_registered_) return;
+    UnregisterHotKey(hwnd_, kHotkeyTalk);
+    UnregisterHotKey(hwnd_, kHotkeyCancel);
+    UnregisterHotKey(hwnd_, kHotkeyShow);
+    hotkeys_registered_ = false;
+}
+
+void AssistantWindow::set_listening(bool on, bool tell_page) {
+    if (listening_ == on) return;
+    listening_ = on;
+    if (cb_.on_mic_toggle) cb_.on_mic_toggle(on);
+    if (!tell_page) return;
+    json out;
+    out["type"] = "mic";
+    out["on"] = on;
+    post_event(out.dump());
+}
+
+void AssistantWindow::on_hotkey(int id) {
+    switch (id) {
+        case kHotkeyTalk:
+            if (settings_.hotkey_push_to_talk) {
+                // HOLD: open the mic now and let the watchdog close it. Re-arming
+                // the timer on a repeat press is harmless and keeps the hold alive
+                // if the OS did deliver one.
+                ptt_held_ = true;
+                set_listening(true, /*tell_page=*/true);
+                SetTimer(hwnd_, kPttTimerId, kPttPollMs, nullptr);
+            } else {
+                set_listening(!listening_, /*tell_page=*/true);
+            }
+            return;
+        case kHotkeyCancel:
+            if (cb_.on_cancel) cb_.on_cancel();
+            return;
+        case kHotkeyShow:
+            if (hwnd_ == nullptr) return;
+            // Restore-and-raise. SetForegroundWindow is subject to the foreground
+            // lock, so this can legitimately do nothing when another app is
+            // actively being typed into -- the window still un-minimizes, which is
+            // the visible half of what the user asked for.
+            if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+            else ShowWindow(hwnd_, SW_SHOW);
+            SetForegroundWindow(hwnd_);
+            return;
+        default:
+            return;
+    }
+}
+
+void AssistantWindow::poll_push_to_talk() {
+    if (!ptt_held_) {
+        KillTimer(hwnd_, kPttTimerId);
+        return;
+    }
+    if (hotkey_is_down(parse_hotkey(settings_.hotkey_talk))) return;   // still held
+    ptt_held_ = false;
+    KillTimer(hwnd_, kPttTimerId);
+    set_listening(false, /*tell_page=*/true);
+}
+
 // ---- cross-thread event queue ----------------------------------------------
 
 void AssistantWindow::post_event(std::string json) {
@@ -334,7 +581,9 @@ void AssistantWindow::on_web_message(const std::wstring& message_json) {
             return;
         }
         if (type == "mic") {
-            if (cb_.on_mic_toggle) cb_.on_mic_toggle(j.value("on", true));
+            // The page reports what the BUTTON now shows; it is already painted,
+            // so the echo back is suppressed.
+            set_listening(j.value("on", true), /*tell_page=*/false);
             return;
         }
         if (type == "browse") {
@@ -347,63 +596,75 @@ void AssistantWindow::on_web_message(const std::wstring& message_json) {
         }
         if (type != "settings.save") return;
 
+        // Start from what is RUNNING and overlay whatever the payload carries, so
+        // a tab the user never opened cannot blank the fields it owns. from_json
+        // clamps, so nothing out of range gets past this line.
         const json& p = j.contains("payload") && j["payload"].is_object() ? j["payload"] : j;
         AssistantSettings next = settings_;
-        next.model_dir      = p.value("model_dir", next.model_dir);
-        next.audio_head     = p.value("audio_head", next.audio_head);
-        next.projector_path = p.value("projector_path", next.projector_path);
-        next.data_dir       = p.value("data_dir", next.data_dir);
-        next.system_prompt  = p.value("system_prompt", next.system_prompt);
-        next.device_id      = p.value("device_id", next.device_id);
-        next.max_context    = p.value("max_context", next.max_context);
-        next.simulated      = p.value("simulated", next.simulated);
-        next.neural_vad     = p.value("neural_vad", next.neural_vad);
-        next.loopback_capture = p.value("loopback_capture", next.loopback_capture);
-        next.vad_threshold  = p.value("vad_threshold", next.vad_threshold);
-        next.context_mode   = p.value("context_mode", next.context_mode);
-        next.history_budget_tokens =
-            p.value("history_budget_tokens", next.history_budget_tokens);
-        next.live_streaming = p.value("live_streaming", next.live_streaming);
-        clamp_settings(next);
+        from_json(p, next);
 
         // THE restart question, answered in one place (settings_store.hpp) and
         // handed to both the app and the page -- so the "needs restart" badge in
         // the modal can never disagree with what the app actually did.
-        const bool live_only = !settings_.requires_restart(next);
+        const bool live_only = !requires_restart(settings_, next);
+        // The system prompt is live but NOT free: it is a KV cache rebuild on the
+        // engine thread. Fire it only on a real change -- re-prefilling an
+        // identical prompt would throw away a warm prefix cache and several
+        // seconds for nothing.
+        const bool prompt_changed = settings_.system_prompt != next.system_prompt;
+
         settings_ = next;
         if (cb_.on_settings_apply) cb_.on_settings_apply(next, live_only);
+        // AFTER on_settings_apply: that call is what publishes the new hotkey
+        // strings to the app, and re-registering reads them from settings_.
+        register_hotkeys();
+        // Entering push-to-talk closes the mic; the chord is what opens it. Doing
+        // this on the flip (rather than continuously) leaves a user who toggled
+        // the mic back on by hand alone.
+        if (settings_.hotkey_push_to_talk && !ptt_held_) {
+            set_listening(false, /*tell_page=*/true);
+        }
+        if (prompt_changed && cb_.on_system_prompt_apply) {
+            cb_.on_system_prompt_apply(settings_.system_prompt);
+        }
         push_settings();
 
         json out;
         out["type"] = "settings.saved";
         out["live_only"] = live_only;
+        // The modal keeps its "precomputing…" state until the engine answers.
+        out["prompt_rebuilding"] = prompt_changed;
         post_event(out.dump());
     } catch (const std::exception&) {
         // Ignore malformed messages rather than take down the UI thread.
     }
 }
 
-void AssistantWindow::push_settings() {
-    json p;
-    p["model_dir"]      = settings_.model_dir;
-    p["audio_head"]     = settings_.audio_head;
-    p["projector_path"] = settings_.projector_path;
-    p["data_dir"]       = settings_.data_dir;
-    p["system_prompt"]  = settings_.system_prompt;
-    p["device_id"]      = settings_.device_id;
-    p["max_context"]    = settings_.max_context;
-    p["simulated"]      = settings_.simulated;
-    p["neural_vad"]     = settings_.neural_vad;
-    p["loopback_capture"] = settings_.loopback_capture;
-    p["vad_threshold"]  = settings_.vad_threshold;
-    p["context_mode"]   = settings_.context_mode;
-    p["history_budget_tokens"] = settings_.history_budget_tokens;
-    p["live_streaming"] = settings_.live_streaming;
+void AssistantWindow::post_system_prompt_applied(bool ok, unsigned tokens,
+                                                 const std::string& detail) {
+    json out;
+    out["type"] = "system_prompt.applied";
+    out["ok"] = ok;
+    out["tokens"] = tokens;
+    out["detail"] = detail;
+    post_event(out.dump());
+}
 
+void AssistantWindow::push_settings() {
     json out;
     out["type"] = "settings";
-    out["payload"] = std::move(p);
+    out["payload"] = to_json(settings_);
+    // The restart-tier field names travel WITH the payload: the page computes its
+    // "needs restart" banner from this list instead of a parallel set of markup
+    // attributes, so the banner cannot disagree with requires_restart().
+    out["restart_fields"] = restart_fields();
     post_event(out.dump());
+    // The mic button follows C++ state (the talk hotkey can flip it while the
+    // page is not even visible), so re-assert it whenever settings are pushed.
+    json mic;
+    mic["type"] = "mic";
+    mic["on"] = listening_;
+    post_event(mic.dump());
 }
 
 void AssistantWindow::browse_for_folder(const std::string& target) {
@@ -468,6 +729,17 @@ LRESULT AssistantWindow::handle(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case kMsgDrain:
             drain_pending();
             return 0;
+        case WM_HOTKEY:
+            on_hotkey(static_cast<int>(wParam));
+            return 0;
+        case WM_TIMER:
+            // Only OUR timer is claimed; anything else belongs to a component that
+            // set it on this HWND and must reach the default handler.
+            if (wParam == kPttTimerId) {
+                poll_push_to_talk();
+                return 0;
+            }
+            break;
         case WM_GETMINMAXINFO: {
             // Below this the composer and the bubbles start fighting for room.
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -477,6 +749,12 @@ LRESULT AssistantWindow::handle(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case WM_DESTROY:
             page_ready_ = false;
+            // Global hotkeys are a PROCESS-WIDE registration: releasing them here
+            // (rather than leaving it to the window dying) is what lets the
+            // relaunched instance re-register the same chords immediately after a
+            // Save & Restart.
+            KillTimer(hwnd, kPttTimerId);
+            unregister_hotkeys();
             // Stop the producers posting BEFORE the view goes away, so nothing
             // races the controller teardown below.
             post_target_.store(nullptr, std::memory_order_release);

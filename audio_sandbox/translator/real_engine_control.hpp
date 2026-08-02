@@ -40,7 +40,7 @@
 //   * DEGENERATE-LOOP GUARDS. Every live decode runs through ONE loop
 //     (decode_assistant_turn) carrying a repetition penalty (kRepetitionPenalty,
 //     applied in the sampler over this turn's rolling window) and a hard
-//     per-turn ceiling (kMaxGeneratedTokens) that force-closes the turn cleanly.
+//     per-turn ceiling (max_new_tokens()) that force-closes the turn cleanly.
 // -----------------------------------------------------------------------------
 #include <algorithm>
 #include <atomic>
@@ -50,8 +50,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -71,6 +74,7 @@
 
 #include "engine_control_bridge.hpp"    // EngineControlBridge, Command
 #include "bridge/engine_api.h"          // BRIDGE_OK for the token sink
+#include "utf8_stream.hpp"              // Utf8StreamAssembler (sub-character token splits)
 
 #include "language_table.hpp"           // rt::kLanguages (forced-language prompt directives)
 
@@ -164,6 +168,36 @@ public:
         return tgt_lang_.load(std::memory_order_acquire);
     }
 
+    // ---- Live sampling knobs (Settings -> Inference) --------------------------
+    // Same UI-thread -> engine-thread handoff as the languages: plain atomics read
+    // at the START of each decode loop, so a change applies from the next turn and
+    // never mutates a generation already in flight.
+    //
+    // DEFAULT IS GREEDY (0.0 / 1.0), and that is the shipping behaviour for a
+    // reason: the local model's job here is transcription and intent extraction,
+    // where sampling buys nothing and costs fidelity. The knob exists because a
+    // user running the text path as a chat assistant wants it; it is not a
+    // recommendation. (The canned no-audio-head path previously hardcoded 0.7/0.9
+    // and now follows this setting like everything else -- one decode loop, one
+    // sampling policy, which is the whole point of decode_assistant_turn.)
+    void set_sampling(float temperature, float top_p) noexcept {
+        temperature_.store(temperature < 0.0f ? 0.0f : temperature, std::memory_order_release);
+        top_p_.store(top_p <= 0.0f || top_p > 1.0f ? 1.0f : top_p, std::memory_order_release);
+    }
+    float temperature() const noexcept { return temperature_.load(std::memory_order_acquire); }
+    float top_p() const noexcept { return top_p_.load(std::memory_order_acquire); }
+
+    // Per-turn generated-token ceiling: the hard brake behind the degenerate-loop
+    // guards. NOT cosmetic -- a turn that hits it terminates as TokenCap and is
+    // therefore NOT dispatched, so this value directly decides whether long
+    // answers reach the cloud at all (see IntentCommitQueue's telemetry).
+    void set_max_new_tokens(int n) noexcept {
+        max_new_tokens_.store(n < 1 ? 1 : n, std::memory_order_release);
+    }
+    int max_new_tokens() const noexcept {
+        return max_new_tokens_.load(std::memory_order_acquire);
+    }
+
     // ---- Task selection (Transcribe / Translate) ------------------------------
     // Narrowing the task is the cheapest way to cut the 8B backbone's cognitive
     // load: asking for one output instead of two roughly halves the tokens a turn
@@ -180,6 +214,40 @@ public:
     void set_tasks(bool transcribe, bool translate) noexcept {
         task_transcribe_.store(transcribe, std::memory_order_release);
         task_translate_.store(translate, std::memory_order_release);
+    }
+
+    // ---- the AUDIO TASK PROMPT (Settings -> System prompts) -------------------
+    // The second of the two prompts, and a genuinely different thing from the
+    // frozen system prefix:
+    //
+    //   PERSONA  prefill_system_prompt() -- who the assistant IS. Prefilled ONCE
+    //            and reused by every turn, so editing it is a KV cache rebuild.
+    //   AUDIO    this -- what to DO with the next chunk of speech. It lives in
+    //   TASK     the per-turn user block, which is re-prefilled every utterance,
+    //            so editing it costs nothing and applies on the very next turn.
+    //
+    // Conflating the two is what made the model translate when the user wanted a
+    // transcript: the task verb was hardcoded in build_user_instruction() and the
+    // only prompt anyone could edit was the persona, which is the one prompt that
+    // does NOT decide the task.
+    //
+    // SCOPE, deliberately narrow. This replaces the task VERB only; the language
+    // directives and the output-tag contract are still generated, because
+    // encode_history_turn() parses those tags back out and the UI splits on them.
+    // A prompt that could silently drop them would corrupt the history parser --
+    // so the user owns the instruction, and the machinery keeps its invariants.
+    // Empty (the default) restores the generated phrase verbatim.
+    //
+    // A std::string cannot be an atomic, and this is read at turn boundaries on
+    // the engine thread while the UI thread writes it -- hence the mutex. It is
+    // never touched from the audio hot path.
+    void set_audio_task_prompt(std::string prompt) {
+        std::lock_guard<std::mutex> lk(audio_task_mu_);
+        audio_task_prompt_ = std::move(prompt);
+    }
+    std::string audio_task_prompt() const {
+        std::lock_guard<std::mutex> lk(audio_task_mu_);
+        return audio_task_prompt_;
     }
     bool task_transcribe() const noexcept {
         return task_transcribe_.load(std::memory_order_acquire);
@@ -198,19 +266,132 @@ public:
     // Engine-thread setup: prefill the frozen system prompt through the REAL
     // engine (BOS + system block via the checkpoint's chat template) and freeze
     // its length as the KV rewind floor. Returns the prefix token count.
+    // THE FLOOR IS WHAT LANDED, not what was asked for. A forward that faults
+    // part-way through leaves only `done` columns in the KV, and publishing
+    // ids.size() as the floor would put the rewind clamp ABOVE the real extent of
+    // the cache -- kv_cache_rollback's max(cp.pos, floor) would then park pos_ on
+    // uninitialized KV columns and the next turn would decode against garbage.
+    // So the floor tracks the actual prefill, and the failure is raised only
+    // AFTER the published state is self-consistent (INIT tier: this throws, and
+    // rebuild_system_prompt's caller reports it to the user).
     uint32_t prefill_system_prompt(const std::string& system_prompt) {
         const std::vector<int> ids = tok_->encode_chat_prelude(system_prompt);
         int next = -1;
+        auto status = blackwell::EngineStatus::Success;
+        uint32_t done = 0;
         for (const int id : ids) {
-            if (engine_->forward_status(id, pos_, /*temperature=*/0.0f, /*top_p=*/1.0f,
-                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
-                break;
+            status = engine_->forward_status(id, pos_, /*temperature=*/0.0f, /*top_p=*/1.0f,
+                                             cfg_.seq_id, &next);
+            if (status != blackwell::EngineStatus::Success) break;
+            ++pos_;
+            ++done;
+        }
+        set_system_prefix_tokens(done);   // KV rewind floor (barge-in never truncates it)
+        history_base_pos_.store(pos_, std::memory_order_relaxed);  // no history yet
+        if (status != blackwell::EngineStatus::Success) {
+            throw blackwell::engine_error(
+                status, "system-prompt prefill failed after " + std::to_string(done) + " of " +
+                            std::to_string(ids.size()) + " tokens");
+        }
+        return done;
+    }
+
+    // Re-lay the frozen system prefix after the user edits it. ENGINE THREAD ONLY
+    // (marshal through EngineControlBridge::post_engine_task).
+    //
+    // This is the precompute poc_overlay does for a language branch, applied to
+    // the one prefix every turn sits on top of. The system prompt is prefilled
+    // ONCE and its KV is then reused by every utterance forever -- that is what
+    // makes TTFT a decode-latency number instead of a re-prefill of the whole
+    // prompt on every turn. So changing the prompt is not a config edit, it is a
+    // cache rebuild, and it has to happen in the right order:
+    //
+    //   1. DROP THE FLOOR FIRST. kv_cache_rollback clamps UP to
+    //      system_prefix_tokens(), so rolling back while the old floor is still
+    //      published would refuse to discard the very tokens being replaced.
+    //   2. Roll the sequence to 0 -- the new prefix is prefilled from position 0
+    //      (prefill_system_prompt appends at pos_ and assumes an empty sequence).
+    //   3. Drop retained history: it was encoded under the OLD system prompt and
+    //      its KV is about to be invalid.
+    //   4. Prefill, which republishes the floor and re-anchors history_base_pos_.
+    //
+    // Returns the new prefix length in tokens (what the UI reports back).
+    uint32_t rebuild_system_prompt(const std::string& system_prompt) {
+        set_system_prefix_tokens(0);                       // 1. unpin the floor
+        kv_cache_rollback({0, 0}, "system prompt changed (prefix cache rebuild)");  // 2.
+        turn_history_.clear();                             // 3. old-prompt history
+        history_text_tokens_ = 0;
+        if (audio_pipeline_) audio_pipeline_->reset_history();
+        return prefill_system_prompt(system_prompt);       // 4. re-freeze
+    }
+
+    // ---- FULLY LOCAL INFERENCE: answer an intent without leaving the machine --
+    // Generate an assistant reply to `user_text` on the local backbone, streaming
+    // each detokenized chunk through `emit`. ENGINE THREAD ONLY (marshal through
+    // EngineControlBridge::post_engine_task).
+    //
+    // WHY THIS IS NOT submit_text(). The typed-input path ends in publish_turn(),
+    // which offers the finished turn to the commit gate. That is exactly right for
+    // a user's words and exactly wrong for the assistant's: this text IS the answer
+    // to an intent that already passed the gate, so re-offering it would dispatch
+    // the model's own reply back into the pipeline as a fresh intent, and answer
+    // that, forever. The gate is bypassed here for that one reason, and it is the
+    // ONLY difference from commit_text_decode.
+    //
+    // The turn is a NORMAL dialog turn on the live sequence -- same KV, same
+    // history policy, same repetition guards -- so the reply sees the persona
+    // prefix and the conversation so far, and is retained by the bounded-history
+    // policy like any other. The barge-in epoch still cancels it mid-stream: a
+    // local answer must be interruptible by speech exactly as a remote one is.
+    //
+    // Returns Success even when the turn was cut short (cancel / cap); *out_reason
+    // carries the verdict for the caller to report.
+    blackwell::EngineStatus generate_local_reply(
+        const std::string& user_text,
+        const std::function<void(std::string_view)>& emit,
+        blackwell::bridge::TerminationReason* out_reason = nullptr) {
+        using blackwell::bridge::TerminationReason;
+        if (out_reason != nullptr) *out_reason = TerminationReason::None;
+        if (user_text.empty()) return blackwell::EngineStatus::InvalidArgument;
+
+        // decode_assistant_turn streams through a Command's TokenSink, so wrap the
+        // caller's std::function in one rather than duplicating the loop. The gen
+        // is the LIVE epoch: a barge-in raised while this reply is streaming
+        // supersedes it on the next token, which is what makes the local path
+        // interruptible on the same mechanism the remote one uses.
+        struct EmitCtx { const std::function<void(std::string_view)>* fn; };
+        EmitCtx ctx{&emit};
+        Command cmd;
+        cmd.gen = active_generation();
+        cmd.sink.user = &ctx;
+        cmd.sink.fn = [](void* user, const char* utf8, std::int32_t, std::int32_t is_final,
+                         BridgeStatus) {
+            if (is_final != 0 || utf8 == nullptr || *utf8 == '\0') return;
+            const auto* c = static_cast<EmitCtx*>(user);
+            (*c->fn)(utf8);
+        };
+
+        std::vector<int> turn = tok_->encode_chat_message(
+            blackwell::ChatMessage{"user", user_text});
+        const std::vector<int> gen = tok_->encode_generation_prompt();
+        turn.insert(turn.end(), gen.begin(), gen.end());
+
+        int next = -1;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (const int id : turn) {
+            if (pos_ >= max_context_ ||
+                engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                    blackwell::EngineStatus::Success) {
+                finalize_turn(std::string(), /*completed=*/false);   // drop partial prefill
+                return blackwell::EngineStatus::CudaRuntimeError;
+            }
             ++pos_;
         }
-        const auto n = static_cast<uint32_t>(ids.size());
-        set_system_prefix_tokens(n);   // KV rewind floor (barge-in never truncates it)
-        history_base_pos_.store(pos_, std::memory_order_relaxed);  // no history yet
-        return n;
+
+        const TurnDecode d = decode_assistant_turn(cmd, next, t0, temperature(), top_p());
+        finalize_turn(d.reply, d.completed());
+        if (out_reason != nullptr) *out_reason = d.reason;
+        return blackwell::EngineStatus::Success;
     }
 
     // The keep count the most recent barge-in rewind resolved to (after the floor
@@ -519,6 +700,19 @@ public:
             into = " into ";
             into += rt::kLanguages[ti];
         }
+        // The user's own task verb, when they supplied one (Settings -> System
+        // prompts -> Audio task). Everything above this point is machinery the
+        // history parser depends on and is generated either way; only the verb is
+        // theirs. It must still end abutting the audio soft-tokens, so a prompt
+        // that forgot its trailing separator gets one -- the placeholder slot
+        // follows IMMEDIATELY, and "...exactly as spoken.<audio>" reads to the
+        // model as one word.
+        if (std::string custom = audio_task_prompt(); !custom.empty()) {
+            s += custom;
+            if (const char last = custom.back(); last != ' ') s += ' ';
+            return s;
+        }
+
         if (transcribe && translate) {
             s += "Translate" + into + ". Transcribe the following audio: ";
         } else if (translate) {
@@ -858,7 +1052,7 @@ protected:
         // seeds the per-token clock, so the first [Decode] line reports the
         // prefill-to-first-token wall time (no VAD trigger on this text path).
         const TurnDecode d = decode_assistant_turn(cmd, next, t_turn0,
-                                                   /*temperature=*/0.7f, /*top_p=*/0.9f);
+                                                   temperature(), top_p());
         finalize_turn(d.reply, d.completed());
         publish_turn(cmd, d);   // commit gate: dispatches iff reason == Eos
         clear_in_flight();
@@ -1089,7 +1283,7 @@ private:
     //   * kRepetitionPenalty shapes the logits (in the sampler, before argmax /
     //     top-p) so an exact repeat becomes strictly less likely — this breaks
     //     the loop mathematically rather than just truncating it;
-    //   * kMaxGeneratedTokens is the hard ceiling for when it does not. Hitting
+    //   * max_new_tokens() is the hard ceiling for when it does not. Hitting
     //     it force-closes the turn CLEANLY (counts as completed -> finalize_turn
     //     emits the EOT / stateless flush), so the pipeline returns to IDLE and
     //     the next utterance is a normal fresh start, not a wedged state.
@@ -1097,7 +1291,8 @@ private:
     // utterances would suppress legitimately repeated words forever, and an
     // unbounded window would suppress common words within one long reply.
     static constexpr float kRepetitionPenalty  = 1.15f;
-    static constexpr int   kMaxGeneratedTokens = 256;
+    // Default for the live ceiling below; the effective value is set_max_new_tokens().
+    static constexpr int   kDefaultMaxGeneratedTokens = 256;
     static constexpr int   kRepetitionWindow   = 64;
 
     // What a decode loop produced.
@@ -1145,6 +1340,17 @@ private:
         int next = first_token;
         const char* stop_reason = "max length hit (context budget)";
         reset_repetition_window();
+        // A vocabulary is built over BYTES: one Cyrillic/CJK character is
+        // routinely split across two tokens, so a per-token piece is often
+        // invalid UTF-8 on its own. The assembler holds the trailing fragment
+        // until the token that completes it arrives, so every chunk that leaves
+        // this loop is a whole number of code points. Fresh per turn -- a
+        // superseded generation's dangling bytes must never prepend themselves
+        // to the next turn's first token.
+        utf8_.reset();
+        // Snapshot the ceiling ONCE: a mid-turn change from the UI must not move
+        // the finish line under a generation that is already running.
+        const int cap = max_new_tokens();
         auto t_tok = t_start;
         // Default: falling out of the `while` means the CONTEXT budget ran out.
         // Seeded here (not left None) so every exit path below carries a verdict
@@ -1172,18 +1378,25 @@ private:
             }
             // Checked AFTER the stop test so a natural EOT landing exactly on the
             // cap is still reported as an EOT, and BEFORE emitting so the turn
-            // ends at exactly kMaxGeneratedTokens streamed tokens. That ordering
+            // ends at exactly `cap` streamed tokens. That ordering
             // also means a turn is only ever TokenCap when it genuinely had more
             // to say -- which is what makes dropped_token_cap() actionable.
-            if (out.emitted >= kMaxGeneratedTokens) {
+            if (out.emitted >= cap) {
                 out.reason = blackwell::bridge::TerminationReason::TokenCap;
                 stop_reason = "Max turn tokens reached";
                 break;
             }
             const std::string piece = tok_->decode(next, /*render_special=*/false);
             if (!piece.empty()) {
-                cmd.sink.emit(piece.c_str(), out.emitted, /*is_final=*/0, BRIDGE_OK);
+                // reply accumulates the RAW bytes (concatenation is lossless and
+                // is what the commit gate dispatches); only the STREAMED chunk
+                // goes through the assembler. An empty chunk means this token was
+                // half a character -- emit nothing rather than an empty event.
                 out.reply += piece;
+                const std::string chunk = utf8_.push(piece);
+                if (!chunk.empty()) {
+                    cmd.sink.emit(chunk.c_str(), out.emitted, /*is_final=*/0, BRIDGE_OK);
+                }
             }
             ++out.emitted;
             push_repetition_token(next);   // this turn's rolling penalty window
@@ -1196,6 +1409,13 @@ private:
             }
             ++pos_;
         }
+        // The turn is over: surrender any held fragment. Non-empty only when the
+        // generation genuinely stopped mid-character (a cap or barge-in landing
+        // between the two halves of a code point) -- dropping it silently would
+        // lose a character the model did produce.
+        if (const std::string tail = utf8_.flush(); !tail.empty()) {
+            cmd.sink.emit(tail.c_str(), out.emitted, /*is_final=*/0, BRIDGE_OK);
+        }
         log_decode_stop(stop_reason, pos_, out.emitted);
         return out;
     }
@@ -1204,7 +1424,7 @@ private:
     // including the non-dispatchable ones -- that is deliberate. "Skip dispatch"
     // must be implemented as "offer and let the gate reject", never as "do not
     // offer", or dropped_token_cap() never increments and a mis-sized
-    // kMaxGeneratedTokens silently kills the cloud pathway with no telemetry.
+    // max_new_tokens() silently kills the cloud pathway with no telemetry.
     //
     // Returns true iff the intent was committed (i.e. reason == Eos).
     bool publish_turn(const Command& cmd, const TurnDecode& d) noexcept {
@@ -1221,8 +1441,8 @@ private:
             // Loudest case: the user spoke, the local model answered, and nothing
             // was ever dispatched -- with no error raised anywhere else.
             std::printf("[Commit Gate] TRUNCATED at %d tokens (cap %d) -- NOT dispatched. "
-                        "Raise kMaxGeneratedTokens if this repeats.\n",
-                        d.emitted, kMaxGeneratedTokens);
+                        "Raise the reply-length limit in Settings if this repeats.\n",
+                        d.emitted, max_new_tokens());
         } else {
             std::printf("[Commit Gate] %s -- NOT dispatched (%d tokens)\n",
                         blackwell::bridge::to_string(d.reason), d.emitted);
@@ -1552,7 +1772,7 @@ private:
         // Seed the per-token clock at the VAD trigger: the FIRST [Decode] line
         // then reports the true wall-clock TTFT, not ~0.
         const TurnDecode d = decode_assistant_turn(cmd, next, t_vad,
-                                                   /*temperature=*/0.0f, /*top_p=*/1.0f);
+                                                   temperature(), top_p());
 
         if (d.interrupted && pause_pending_) {
             // Speech returned before the turn finalized. WHICH kind of return it
@@ -1619,7 +1839,7 @@ private:
         // Seed the per-token clock at the VAD trigger: the FIRST [Decode] line
         // then reports the true wall-clock TTFT, not ~0.
         const TurnDecode d = decode_assistant_turn(cmd, next, t_vad,
-                                                   /*temperature=*/0.0f, /*top_p=*/1.0f);
+                                                   temperature(), top_p());
         finalize_turn(d.reply, d.completed());
         publish_turn(cmd, d);   // commit gate: dispatches iff reason == Eos
         clear_in_flight();
@@ -1667,8 +1887,24 @@ protected:
     std::atomic<int> tgt_lang_{0};            // rt::kLanguages index (0 = Auto)
     std::atomic<bool> task_transcribe_{true}; // emit [Speech]      (see set_tasks)
     std::atomic<bool> task_translate_{true};  // emit [Translation] (see set_tasks)
+
+    // User-supplied audio task verb; empty = the generated phrase. Read at turn
+    // boundaries (engine thread), written by the UI thread. See
+    // set_audio_task_prompt for why this is a mutex and not an atomic.
+    mutable std::mutex audio_task_mu_;
+    std::string        audio_task_prompt_;
     std::atomic<bool> live_center_{false};    // UI streaming toggle (utterance-latched)
     std::atomic<float> last_ttft_ms_{0.0f};   // VAD->first-token, panel readout (0 = none)
+
+    // ---- live sampling (Settings -> Inference); see set_sampling ---------------
+    // Greedy by default: this model transcribes, and sampling only costs fidelity.
+    std::atomic<float> temperature_{0.0f};
+    std::atomic<float> top_p_{1.0f};
+    std::atomic<int>   max_new_tokens_{kDefaultMaxGeneratedTokens};
+
+    // Heals sub-character token splits before anything leaves the decode loop.
+    // Engine-thread-only, like every other decode-loop member (no atomic needed).
+    blackwell::bridge::Utf8StreamAssembler utf8_;
 
     // Bounded-history state. The deque/counter are engine-thread-only; the base
     // position is atomic solely for the cross-thread invariant readout (the

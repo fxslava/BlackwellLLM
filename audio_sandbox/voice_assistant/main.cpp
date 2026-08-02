@@ -62,6 +62,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -83,6 +84,7 @@
 #include "intent_commit.hpp"          // blackwell::bridge::IntentCommitQueue
 #include "intent_dispatcher.hpp"      // blackwell::cloud::IntentDispatcher
 #include "offline_transport.hpp"      // blackwell::cloud::OfflineTransport
+#include "local_transport.hpp"        // rt::LocalEngineTransport, rt::RoutedTransport
 
 #if defined(BLACKWELL_HAVE_CLOUD_CLIENT)
 #include "claude_stream_client.hpp"
@@ -300,6 +302,15 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // The console renders in the OEM codepage (866/850) unless told otherwise, so
+    // every Cyrillic transcript this app logs -- the decode trace, the commit-gate
+    // lines, the system-prefix readout -- comes out as mojibake or question marks
+    // in a terminal while the SAME string renders perfectly in the WebView. That
+    // asymmetry is worth naming: it makes the log look like the bug when the
+    // pipeline is fine. src/apps/main.cpp and benchmark.cpp already do this; this
+    // app was the one that did not.
+    SetConsoleOutputCP(CP_UTF8);
+
     // ---- configuration: persisted settings, then typed flags on top ---------
     rt::AssistantSettings settings = rt::load_settings();
 
@@ -413,7 +424,7 @@ int main(int argc, char** argv) {
 
         // ---- the remote transport -------------------------------------------
         blackwell::cloud::OfflineTransport offline_transport;
-        blackwell::cloud::IIntentTransport* transport = &offline_transport;
+        blackwell::cloud::IIntentTransport* remote = &offline_transport;
 
 #if defined(BLACKWELL_HAVE_CLOUD_CLIENT)
         std::unique_ptr<blackwell::cloud::ClaudeStreamClient> live_client;
@@ -424,7 +435,7 @@ int main(int argc, char** argv) {
             ccfg.beta = "server-side-fallback-2026-07-01";
             live_client = std::make_unique<blackwell::cloud::ClaudeStreamClient>(std::move(ccfg));
             live_transport = std::make_unique<blackwell::cloud::ClaudeTransport>(*live_client);
-            transport = live_transport.get();
+            remote = live_transport.get();
             std::printf("[cloud] ANTHROPIC_API_KEY present -- LIVE transport armed\n");
         } else {
             std::printf("[cloud] no ANTHROPIC_API_KEY -- Mode: Offline (Simulated)\n");
@@ -433,16 +444,58 @@ int main(int argc, char** argv) {
         std::printf("[cloud] built without BUILD_CLOUD_CLIENT -- Mode: Offline (Simulated)\n");
 #endif
 
+        // ---- fully local inference: the second leg of the router -------------
+        // The same committed intent, answered by the local backbone instead of
+        // sent anywhere. The generator lives on the CONCRETE control (that is
+        // where the decode loop is), so it arrives as a callable -- the same seam
+        // prefill_system_prompt uses -- and LocalEngineTransport marshals it onto
+        // the engine thread. See local_transport.hpp for why this is a transport.
+        rt::LocalEngineTransport::GenerateFn generate_locally;
+        if (use_real) {
+            auto* rc = real_stack.control.get();
+            generate_locally = [rc](const std::string& intent,
+                                    const std::function<void(std::string_view)>& emit,
+                                    blackwell::bridge::TerminationReason* reason) {
+                return rc->generate_local_reply(intent, emit, reason);
+            };
+        } else {
+            auto* sc = simulated.get();
+            generate_locally = [sc](const std::string& intent,
+                                    const std::function<void(std::string_view)>& emit,
+                                    blackwell::bridge::TerminationReason* reason) {
+                return sc->generate_local_reply(intent, emit, reason);
+            };
+        }
+        rt::LocalEngineTransport local_transport(control, std::move(generate_locally));
+
+        // The dispatcher binds ONE transport for its lifetime, so the router is
+        // what makes "answer locally" a live toggle rather than a restart.
+        rt::RoutedTransport router(&local_transport, remote);
+        router.set_use_local(settings.local_inference);
+        blackwell::cloud::IIntentTransport* transport = &router;
+
         // ---- the dispatcher: gate -> remote ---------------------------------
-        const std::string system_prompt = settings.system_prompt;
+        // The system prompt is EDITABLE at runtime, and the dispatcher thread
+        // reads it on every commit -- so it cannot be a plain captured string.
+        // A mutex is right here rather than an atomic: the value is a std::string
+        // (no lock-free store exists for one), the reader runs once per cloud
+        // call, and the writer is a person clicking Save.
+        std::mutex prompt_mu;
+        std::string system_prompt = settings.system_prompt;
         blackwell::cloud::IntentDispatcher dispatcher(
             commit_queue, *transport,
-            [&system_prompt] {
+            [&prompt_mu, &system_prompt] {
                 blackwell::cloud::RequestContext c;
-                // FROZEN. Nothing volatile may appear here: a timestamp or a
-                // session id in this string drives the prompt-cache hit rate to
-                // zero, silently and expensively. See intent_request.hpp.
-                c.instructions = system_prompt;
+                // FROZEN BETWEEN EDITS. Nothing volatile may appear here: a
+                // timestamp or a session id in this string drives the prompt-cache
+                // hit rate to zero, silently and expensively (intent_request.hpp).
+                // A user editing the system prompt DOES invalidate that cache --
+                // correctly, since it is a different prompt -- but only once, and
+                // only when they asked for it.
+                {
+                    std::lock_guard<std::mutex> lk(prompt_mu);
+                    c.instructions = system_prompt;
+                }
                 c.glossary = "This is a spoken-language voice assistant session.";
                 c.committed_prefix = "";
                 return c;
@@ -488,7 +541,11 @@ int main(int argc, char** argv) {
         rt::ConversationalMode::Config mcfg;
         mcfg.sample_rate = static_cast<std::uint32_t>(cfg.sample_rate);
         mcfg.vad_probability_threshold = settings.vad_threshold;
-        mcfg.system_prompt = system_prompt;
+        mcfg.silence_hangover_ms =
+            static_cast<std::uint32_t>(settings.silence_hangover_ms);
+        mcfg.warm_prefill_interval_ms =
+            static_cast<std::uint32_t>(settings.warm_prefill_interval_ms);
+        mcfg.system_prompt = settings.system_prompt;
 
         // prefill_system_prompt lives on the CONCRETE control, not the bridge
         // (how a frozen prefix is laid down genuinely differs per backend), so it
@@ -510,16 +567,50 @@ int main(int argc, char** argv) {
         // Live-tier settings, applied to the RUNNING pipeline. Everything here is
         // an atomic store read at the next VAD block or turn boundary -- no
         // marshaling, no engine work, doctrine intact (see settings_store.hpp).
+        //
+        // The system prompt is the ONE live setting absent from this function: it
+        // is a KV cache rebuild, not a store, and goes through post_engine_task
+        // (see cb.on_system_prompt_apply below).
         auto apply_live_settings = [&](const rt::AssistantSettings& s) {
-            (void)speech_pipeline_set_vad_threshold(speech_mode.pipeline(), s.vad_threshold);
+            SpeechPipelineHandle pipe = speech_mode.pipeline();
+            (void)speech_pipeline_set_vad_threshold(pipe, s.vad_threshold);
+            (void)speech_pipeline_set_silence_hangover_ms(
+                pipe, static_cast<std::uint32_t>(s.silence_hangover_ms));
+            (void)speech_pipeline_set_warm_prefill_interval_ms(
+                pipe, static_cast<std::uint32_t>(s.warm_prefill_interval_ms));
+
+            // The sampling knobs and the reply ceiling exist on BOTH controls (the
+            // simulated one honours the ceiling and stores the rest), so they are
+            // applied without asking which backend is live -- the only branch left
+            // is the handful of settings that are genuinely real-engine-only.
             if (real_stack.control) {
+                real_stack.control->set_sampling(s.temperature, s.top_p);
+                real_stack.control->set_max_new_tokens(s.max_new_tokens);
                 real_stack.control->set_context_mode(
                     s.context_mode == "bounded"
                         ? rt::RealEngineControl::ContextMode::BoundedHistory
                         : rt::RealEngineControl::ContextMode::Stateless);
                 real_stack.control->set_history_budget_tokens(s.history_budget_tokens);
                 real_stack.control->set_live_center_slice(s.live_streaming);
+                // The AUDIO TASK, the second of the two prompts. Both live in the
+                // per-turn user block, so they apply on the next utterance with no
+                // KV work at all -- unlike the persona prompt, which is the frozen
+                // prefix and costs a rebuild.
+                real_stack.control->set_tasks(
+                    /*transcribe=*/s.speech_task != "translate",
+                    /*translate=*/s.speech_task != "transcribe");
+                real_stack.control->set_audio_task_prompt(s.audio_task_prompt);
+            } else if (simulated) {
+                simulated->set_sampling(s.temperature, s.top_p);
+                simulated->set_max_new_tokens(s.max_new_tokens);
             }
+
+            // Where the NEXT intent gets answered. One atomic; an answer already
+            // streaming finishes on the leg it started on (local_transport.hpp).
+            router.set_use_local(s.local_inference);
+            // The badge must follow the routing, or a user who switched to local
+            // still sees "billed" on a turn that never leaves the machine.
+            view.set_transport(router.name(), router.is_live());
         };
 
         // ---- engine thread ---------------------------------------------------
@@ -591,16 +682,63 @@ int main(int argc, char** argv) {
             // down. No explicit on_speech_start follows, so nothing commits.
             (void)speech_pipeline_set_manual_mode(speech_mode.pipeline(), !listening);
         };
+        cb.on_cancel = [&] {
+            // The cancel hotkey IS a barge-in, minus the speech: bump the epoch
+            // and the in-flight decode loop aborts at its next token check. Same
+            // mechanism the VAD uses, so a cancelled turn lands as BargeIn and is
+            // correctly NOT dispatched.
+            control->cancel_generation(control->active_generation() + 1);
+        };
         cb.on_settings_apply = [&](const rt::AssistantSettings& next, bool live_only) {
             settings = next;
             if (!rt::save_settings(settings)) {
                 std::fprintf(stderr, "[settings] WARN: could not write %s\n",
                              rt::settings_path().c_str());
             }
-            if (live_only) apply_live_settings(settings);
+            // Live settings apply on EVERY save, restart-tier or not: refusing to
+            // update the VAD threshold because an unrelated checkpoint path also
+            // changed would be a worse answer than doing what can be done now.
+            // `live_only` decides whether the app also restarts, nothing else.
+            apply_live_settings(settings);
+            (void)live_only;
             // Restart-tier changes are persisted here and picked up by the next
             // process; the app keeps running on the OLD engine until then, which
             // is the honest state and is what the modal's banner says.
+        };
+        cb.on_system_prompt_apply = [&](const std::string& prompt) {
+            // The cloud side first, because it is a plain string swap and must not
+            // be left describing the old prompt if the GPU rebuild fails.
+            {
+                std::lock_guard<std::mutex> lk(prompt_mu);
+                system_prompt = prompt;
+            }
+            // THE marshal. This runs on the UI thread; prefill is CUDA work on a
+            // 5.3 GB weight set and belongs to the engine thread alone (CLAUDE.md).
+            // post_engine_task runs it at the next command-batch boundary -- after
+            // any turn already decoding, before any turn not yet started.
+            const bool queued = control->post_engine_task([&, prompt] {
+                try {
+                    const std::uint32_t n =
+                        real_stack.control
+                            ? real_stack.control->rebuild_system_prompt(prompt)
+                            : simulated->rebuild_system_prompt(prompt);
+                    std::printf("[system-prefix] rebuilt: %u tokens frozen (KV rewind floor)\n",
+                                n);
+                    std::fflush(stdout);
+                    window.post_system_prompt_applied(true, n, {});
+                } catch (const std::exception& e) {
+                    // A failed rebuild leaves a SHORTER but valid prefix (see
+                    // prefill_system_prompt), so the app keeps working -- the user
+                    // just has to be told the prompt is not what they typed.
+                    std::fprintf(stderr, "[system-prefix] rebuild FAILED: %s\n", e.what());
+                    window.post_system_prompt_applied(false, 0, e.what());
+                }
+            });
+            if (!queued) {
+                window.post_system_prompt_applied(
+                    false, 0, "Could not reach the engine thread — the prompt was saved "
+                              "but not applied. Restart to load it.");
+            }
         };
         cb.on_restart = [&] {
             restart_requested.store(true, std::memory_order_release);

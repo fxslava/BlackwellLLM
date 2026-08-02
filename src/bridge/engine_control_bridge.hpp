@@ -59,6 +59,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -185,6 +186,31 @@ public:
     // rather than queued behind a backlog the user can no longer see.
     blackwell::EngineStatus submit_text(std::string text, TokenSink sink) noexcept;
 
+    // ---- ENGINE TASK: run arbitrary engine work on the owning thread ----------
+    // The general marshaling seam, and the ONLY sanctioned way for a non-engine
+    // thread to reach the engine (CLAUDE.md's single-threaded doctrine; this is
+    // the port of poc_overlay's LiveTranslationTracker::PostEngineTask). `fn` is
+    // executed by pump() on the engine thread and may do anything an engine-thread
+    // caller may do -- prefill, rewind, reconfigure.
+    //
+    // WHY THIS IS NOT A COMMAND ON THE RING. The ring is a pre-allocated POD ring
+    // on the AUDIO hot path (Rule #2: no allocation, wait-free). A task owns a
+    // heap-allocated closure and is raised by a human clicking a button, so it
+    // gets the same treatment submit_text's payload does: an owned copy behind a
+    // short mutex, off the ring entirely. The audio path never touches this lock.
+    //
+    // ORDERING, which is the load-bearing part. Tasks run at a COMMAND-BATCH
+    // BOUNDARY -- pump() drains every pending task BEFORE dispatching that
+    // batch's commands, and a decode already in flight runs to completion first
+    // (the engine thread is inside do_commit_decode, not inside pump). So a task
+    // never observes a half-decoded turn, and it can safely invalidate the KV
+    // cache out from under work that has not started yet.
+    //
+    // Callable from any thread. noexcept: a throwing `fn` is caught by the pump
+    // like any other engine work. Returns false only if the closure could not be
+    // queued (allocation failure), in which case it will never run.
+    bool post_engine_task(std::function<void()> fn) noexcept;
+
     // ---- CONSUMER edge (the single engine-owning thread) ---------------------
 
     // Drain and execute every queued command that is not superseded. Non-blocking;
@@ -244,6 +270,13 @@ protected:
     // consumed it). Exactly one successful take per `text_turn` command, so the
     // FIFO stays in lockstep with the ring.
     bool take_text_turn(std::string& out) noexcept;
+
+    // Consumer edge (engine thread): run every task post_engine_task() queued.
+    // Returns how many ran. Called by pump() ahead of the command batch; exposed
+    // to subclasses so an override that owns its own inner loop can also reach a
+    // task boundary. noexcept -- a throwing task is swallowed exactly like a
+    // throwing do_* hook.
+    size_t drain_engine_tasks() noexcept;
 
     // Execute hooks, dispatched by pump() on the engine thread (virtual so the
     // engine assembly can supply the multimodal stages and tests can stub them).
@@ -367,6 +400,15 @@ private:
     // here would be ceremony. NOT reachable from the audio path (see submit_text).
     std::mutex              text_mu_;
     std::deque<std::string> text_turns_;
+
+    // Engine tasks (post_engine_task). Same rationale as text_turns_: a human-rate
+    // producer and a single consumer, so a plain mutex is the honest primitive.
+    // `pending_tasks_` mirrors the deque's size so wait_and_pump()'s park loop can
+    // test for work WITHOUT taking the lock -- the audio thread parks there every
+    // idle moment, and it must not contend with the UI thread to do so.
+    std::mutex                         task_mu_;
+    std::deque<std::function<void()>>  tasks_;
+    std::atomic<size_t>                pending_tasks_{0};
 
     std::atomic<bool> decoding_{false};   // single-in-flight guard (generation_in_flight)
     std::atomic<bool> stopping_{false};   // shutdown latch for wait_and_pump()

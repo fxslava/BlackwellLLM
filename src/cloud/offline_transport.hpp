@@ -63,7 +63,7 @@ public:
                 r.status = Status::ShuttingDown;
                 return r;
             }
-            const size_t n = std::min(static_cast<size_t>(cfg_.chunk_chars), reply.size() - i);
+            const size_t n = chunk_len(reply, i, static_cast<size_t>(cfg_.chunk_chars));
             if (cb.on_text) cb.on_text(std::string_view(reply).substr(i, n));
             i += n;
             if (i < reply.size() && !sleep_interruptibly(cfg_.chunk_delay_ms)) {
@@ -93,6 +93,36 @@ public:
     void shutdown() noexcept override { shutting_down_.store(true, std::memory_order_release); }
 
 private:
+    // How many bytes to take from `s` at `pos`, aiming for `want` but never
+    // stopping INSIDE a UTF-8 sequence.
+    //
+    // WHY THIS IS NOT JUST cfg_.chunk_chars. The field is named chars and the
+    // reply is bytes, and a Cyrillic or CJK character is two to four of them --
+    // so a fixed byte stride cuts characters in half. That is not a cosmetic
+    // difference for a class whose whole job is to imitate the real transport:
+    // an SSE text_delta carries a complete JSON string, so a live reply NEVER
+    // arrives half a character, and a fallback that emits something worse than
+    // the thing it stands in for is a fallback that tests the wrong contract.
+    // (It also shipped: the offline echo of a Russian utterance reached the UI
+    // with a pair of U+FFFD wherever a 12-byte boundary landed mid-character.)
+    //
+    // The scan is open-coded rather than pulled from bridge/utf8_stream.hpp on
+    // purpose -- this header's stated invariant is that it includes nothing but
+    // intent_transport.hpp, which is what keeps BUILD_CLOUD_CLIENT=OFF a real
+    // configuration rather than a build-only one.
+    static size_t chunk_len(const std::string& s, size_t pos, size_t want) noexcept {
+        const size_t remaining = s.size() - pos;
+        if (want >= remaining) return remaining;
+        // Walk FORWARD off any continuation byte (10xxxxxx): the next sequence's
+        // lead byte is the nearest legal split point at or after `want`. Bounded
+        // by the string end, so malformed input terminates instead of scanning on.
+        size_t n = want;
+        while (n < remaining && (static_cast<unsigned char>(s[pos + n]) & 0xC0) == 0x80) {
+            ++n;
+        }
+        return n;
+    }
+
     // Sliced so shutdown() is not held up for a whole simulated round trip.
     [[nodiscard]] bool sleep_interruptibly(int ms) noexcept {
         constexpr int kSlice = 20;

@@ -14,19 +14,33 @@
 // silently become the permanent configuration. Everything else falls back to the
 // persisted file, then to the built-in defaults below.
 //
-// THE RESTART SPLIT is the load-bearing part of this file. `requires_restart()`
-// answers exactly one question -- "can this change be applied to the running
-// engine, or does it need a fresh process?" -- and the UI is driven off that
-// answer rather than a hand-maintained list in the JS:
+// ONE FIELD LIST, FIVE CONSUMERS. visit_fields() below is the single declaration
+// of what a setting is. Loading, saving, the JSON the page is seeded with, the
+// JSON it saves back, and the restart question are all LOOPS OVER IT -- none of
+// them carries its own list. That is not tidiness: the previous shape had the
+// same field spelled out in four places plus a `data-restart` attribute in the
+// markup, and adding a knob meant editing five files in agreement. The failure
+// mode was silent (a setting that persists but never loads, or one the restart
+// banner does not know about), which is the kind that ships.
 //
-//   LIVE     vad_threshold / context_mode / history_budget / live_streaming
-//            -> plain atomics on the control + one speech_pipeline_* setter,
-//               read at the next turn boundary. No engine work at all.
+// THE TIER SPLIT is the load-bearing part. Tier answers exactly one question --
+// "can this change be applied to the running engine, or does it need a fresh
+// process?" -- and the UI is driven off that answer, which is now PUSHED to the
+// page (restart_fields()) rather than re-declared in the HTML:
+//
+//   LIVE     sampling / reply cap / VAD / cadence / context policy / hotkeys
+//            -> plain atomics on the control + the speech_pipeline_* setters,
+//               read at the next VAD block or turn boundary. No engine work.
+//   LIVE*    system_prompt -> the ONE live setting that costs engine work: its KV
+//            is the frozen prefix every turn is built on, so changing it is a
+//            cache REBUILD marshaled onto the engine thread, not an atomic store.
+//            See rebuild_system_prompt(). Still live -- the user does not have to
+//            restart the app to change how the assistant behaves.
 //   RESTART  model_dir / audio_head / projector_path / data_dir / device_id /
-//            simulated / neural_vad / system_prompt / max_context / capture_mode
+//            simulated / neural_vad / max_context / capture_mode
 //            -> these choose what gets ALLOCATED at bring-up (5.3 GB of weights,
-//               the frozen system prefix, the mel geometry). Mutating them under
-//               a live engine is not a settings change, it is a different engine.
+//               the mel geometry). Mutating them under a live engine is not a
+//               settings change, it is a different engine.
 //
 // nlohmann/json arrives through angle brackets so the root's /external:W0
 // quarantine keeps it outside the /W4 /WX budget.
@@ -36,44 +50,223 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 namespace rt {
 
+// Can this change be applied to the running engine? See the header preamble.
+enum class Tier { Live, Restart };
+
 // The persisted, user-editable configuration. Defaults here are the ones a fresh
 // install boots with -- deliberately the simulated backend, so the app starts and
 // is usable before any 5.3 GB checkpoint has been pointed at.
+//
+// ADDING A FIELD: declare it here AND add one line to visit_fields(). Nothing
+// else in this file needs to change, and nothing outside it may keep its own list.
 struct AssistantSettings {
-    // ---- restart tier: what gets allocated at bring-up ----------------------
+    // ---- Tab 1: inference & paths -------------------------------------------
     std::string model_dir;             // backbone checkpoint dir ("" = none -> simulated)
     std::string audio_head;            // Ultravox audio head (encoder + projector)
     std::string projector_path;        // projector config override (optional)
     std::string data_dir = "data";     // mel_filters.bin etc.
-    std::string system_prompt =
-        "You are a concise voice assistant. Answer in one or two short sentences.";
     int  device_id  = 0;               // CUDA device
     int  max_context = 4096;           // KV ceiling (~256 KB/token at 8B geometry)
     bool simulated  = true;            // run the GPU-free stand-in backend
+
+    // Greedy by default, and that is the shipping behaviour on purpose: the local
+    // model transcribes and extracts intent, where sampling buys nothing and
+    // costs fidelity. The knobs exist for the text path used as a chat assistant.
+    float temperature = 0.0f;          // 0 = greedy
+    float top_p       = 1.0f;          // 1 = no nucleus truncation
+    // Per-turn generated-token ceiling. NOT cosmetic: a turn that hits it
+    // terminates as TokenCap and is therefore NEVER dispatched to the cloud, so
+    // this value decides whether long answers get through at all.
+    int   max_new_tokens = 256;
+
+    // ---- Tab 2: audio & speculative decoding --------------------------------
     bool neural_vad = true;            // Silero; false = the built-in RMS detector
     bool loopback_capture = false;     // capture system audio instead of the mic
-
-    // ---- live tier: applied to the running engine at the next turn boundary --
     float vad_threshold = 0.5f;        // speech probability in [0.1, 0.9]
+    // How much stable silence closes an utterance. The single biggest lever on
+    // perceived responsiveness, and the one most worth a user's time: too short
+    // cuts people off mid-sentence, too long makes the assistant feel deaf.
+    int  silence_hangover_ms = 800;
+    // Speculative warm-prefill cadence: how often audio buffered so far is
+    // prefilled while the user is still speaking. Trades GPU budget against how
+    // much prefill is left at the commit boundary. 0 disables warming.
+    int  warm_prefill_interval_ms = 320;
     std::string context_mode = "bounded";   // "stateless" | "bounded"
-    int  history_budget_tokens = 256;  // bounded-mode text budget
+    int  history_budget_tokens = 256;  // bounded-mode text budget (the KV a turn may retain)
     bool live_streaming = true;        // center-slice streaming (if armed at launch)
 
-    // Does moving from `*this` to `other` need a fresh process? Compares ONLY the
-    // restart-tier fields -- see the header preamble.
-    [[nodiscard]] bool requires_restart(const AssistantSettings& other) const {
-        return model_dir != other.model_dir || audio_head != other.audio_head ||
-               projector_path != other.projector_path || data_dir != other.data_dir ||
-               system_prompt != other.system_prompt || device_id != other.device_id ||
-               max_context != other.max_context || simulated != other.simulated ||
-               neural_vad != other.neural_vad || loopback_capture != other.loopback_capture;
-    }
+    // ---- Tab 3: hotkeys & triggers ------------------------------------------
+    // "Ctrl+Alt+Space" style chords; "" disables one. Parsed by parse_hotkey()
+    // in assistant_window.cpp and registered with RegisterHotKey on the UI thread.
+    std::string hotkey_talk   = "Ctrl+Alt+Space";  // listen on/off, or hold-to-talk
+    std::string hotkey_cancel = "Ctrl+Alt+X";      // interrupt the turn in flight
+    std::string hotkey_show   = "Ctrl+Alt+A";      // bring the window to the front
+    // Hold-to-talk rather than toggle. WM_HOTKEY has no key-up event, so hold
+    // mode is driven by polling the chord while it is held -- see the window.
+    bool hotkey_push_to_talk = false;
+
+    // Answer locally instead of calling out. Swaps the transport under the
+    // dispatcher (see local_transport.hpp); everything above it is unchanged, so
+    // the same commit rule gates a local answer and a billed one.
+    bool local_inference = false;
+
+    // ---- Tab 4: the TWO prompts ---------------------------------------------
+    // They are different things and were previously conflated, which is why the
+    // model translated when the user wanted a transcript -- the only editable
+    // prompt was the persona, and the persona does not decide the audio task.
+    //
+    // PERSONA: who the assistant IS. Prefilled ONCE and reused by every turn, so
+    // editing it is a KV cache rebuild (live, but it costs engine work).
+    std::string system_prompt =
+        "You are a concise voice assistant. Answer in one or two short sentences.";
+    // AUDIO TASK: what to DO with the next chunk of speech. Lives in the per-turn
+    // user block, so editing it is free and applies on the very next utterance.
+    // Empty = the engine's generated phrase, which follows the task toggle below.
+    std::string audio_task_prompt = "Transcribe the following speech exactly as spoken: ";
+    // Which output tags a turn must produce: "transcribe" | "translate" | "both".
+    // DEFAULT IS TRANSCRIBE-ONLY. It used to be both, which is why every reply
+    // carried a [Translation] nobody asked for -- and asking an 8B backbone for
+    // two outputs instead of one roughly doubles the tokens a turn must generate.
+    std::string speech_task = "transcribe";
 };
+
+// THE field list. Every other function in this file is a loop over it.
+// `S` is AssistantSettings or const AssistantSettings, which is what lets the
+// same list serve both the readers (save / push) and the writers (load / parse).
+template <class S, class Fn>
+void visit_fields(S& s, Fn&& f) {
+    // ---- Tab 1 -------------------------------------------------------------
+    f("model_dir",                s.model_dir,                Tier::Restart);
+    f("audio_head",               s.audio_head,               Tier::Restart);
+    f("projector_path",           s.projector_path,           Tier::Restart);
+    f("data_dir",                 s.data_dir,                 Tier::Restart);
+    f("device_id",                s.device_id,                Tier::Restart);
+    f("max_context",              s.max_context,              Tier::Restart);
+    f("simulated",                s.simulated,                Tier::Restart);
+    f("temperature",              s.temperature,              Tier::Live);
+    f("top_p",                    s.top_p,                    Tier::Live);
+    f("max_new_tokens",           s.max_new_tokens,           Tier::Live);
+    // ---- Tab 2 -------------------------------------------------------------
+    f("neural_vad",               s.neural_vad,               Tier::Restart);
+    f("loopback_capture",         s.loopback_capture,         Tier::Restart);
+    f("vad_threshold",            s.vad_threshold,            Tier::Live);
+    f("silence_hangover_ms",      s.silence_hangover_ms,      Tier::Live);
+    f("warm_prefill_interval_ms", s.warm_prefill_interval_ms, Tier::Live);
+    f("context_mode",             s.context_mode,             Tier::Live);
+    f("history_budget_tokens",    s.history_budget_tokens,    Tier::Live);
+    f("live_streaming",           s.live_streaming,           Tier::Live);
+    // ---- Tab 3 -------------------------------------------------------------
+    f("hotkey_talk",              s.hotkey_talk,              Tier::Live);
+    f("hotkey_cancel",            s.hotkey_cancel,            Tier::Live);
+    f("hotkey_show",              s.hotkey_show,              Tier::Live);
+    f("hotkey_push_to_talk",      s.hotkey_push_to_talk,      Tier::Live);
+    f("local_inference",          s.local_inference,          Tier::Live);
+    // ---- Tab 4 -------------------------------------------------------------
+    f("system_prompt",            s.system_prompt,            Tier::Live);
+    f("audio_task_prompt",        s.audio_task_prompt,        Tier::Live);
+    f("speech_task",              s.speech_task,              Tier::Live);
+}
+
+// Coerce out-of-range values rather than trusting a hand-edited file or a page
+// that got creative. Applied on load, on save, and on every value arriving from
+// the UI, so a bad value can neither reach the engine nor persist.
+//
+// The ranges are the UI's ranges: a value the modal can produce is by
+// construction a value this function leaves alone.
+inline void clamp_settings(AssistantSettings& s) {
+    auto clamp_int = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+
+    if (s.vad_threshold < 0.1f) s.vad_threshold = 0.1f;
+    if (s.vad_threshold > 0.9f) s.vad_threshold = 0.9f;
+    if (s.temperature < 0.0f) s.temperature = 0.0f;
+    if (s.temperature > 2.0f) s.temperature = 2.0f;
+    // top_p == 0 would leave the nucleus empty and the sampler with nothing to
+    // pick from; 1.0 is "no truncation", which is the correct reading of "off".
+    if (s.top_p <= 0.0f || s.top_p > 1.0f) s.top_p = 1.0f;
+    s.max_new_tokens = clamp_int(s.max_new_tokens, 16, 4096);
+    s.max_context = clamp_int(s.max_context, 512, 131072);
+    // 0 hangover disables auto-commit entirely (push-to-talk only), which is a
+    // legitimate configuration -- so the floor is 0, not a minimum delay.
+    s.silence_hangover_ms = clamp_int(s.silence_hangover_ms, 0, 5000);
+    // 0 disables speculative warming; above that, anything under a VAD block is
+    // indistinguishable from every-block warming.
+    s.warm_prefill_interval_ms = clamp_int(s.warm_prefill_interval_ms, 0, 5000);
+    if (s.history_budget_tokens < 0) s.history_budget_tokens = 0;
+    if (s.device_id < 0) s.device_id = 0;
+    if (s.context_mode != "stateless" && s.context_mode != "bounded") {
+        s.context_mode = "bounded";
+    }
+    if (s.speech_task != "transcribe" && s.speech_task != "translate" &&
+        s.speech_task != "both") {
+        s.speech_task = "transcribe";
+    }
+    if (s.data_dir.empty()) s.data_dir = "data";
+    // No checkpoint means there is nothing to load -- the simulated backend is
+    // the only runnable configuration, so make the stored state say so instead
+    // of failing at bring-up with a flag that contradicts the paths.
+    if (s.model_dir.empty()) s.simulated = true;
+}
+
+// Serialize every field (both tiers). Used for the persisted file AND for the
+// payload the page is seeded with -- deliberately the same function, so what the
+// UI edits is exactly what is on disk.
+inline nlohmann::json to_json(const AssistantSettings& s) {
+    nlohmann::json j;
+    visit_fields(s, [&](const char* key, const auto& value, Tier) { j[key] = value; });
+    return j;
+}
+
+// Read every field present in `j`, leaving the rest at whatever `s` already
+// holds. That fallback is what makes both an OLD settings file (missing the
+// fields added since) and a PARTIAL payload from the page safe to apply.
+inline void from_json(const nlohmann::json& j, AssistantSettings& s) {
+    visit_fields(s, [&](const char* key, auto& value, Tier) {
+        using T = std::decay_t<decltype(value)>;
+        if (!j.contains(key)) return;
+        try {
+            value = j.at(key).get<T>();
+        } catch (const nlohmann::json::exception&) {
+            // A field of the wrong type keeps its current value rather than
+            // taking the whole load down: one bad key must not cost the user
+            // every other setting they have.
+        }
+    });
+    clamp_settings(s);
+}
+
+// The restart-tier field names, pushed to the page so the "needs restart" banner
+// is computed from THIS list rather than a duplicate set of markup attributes.
+inline std::vector<std::string> restart_fields() {
+    AssistantSettings probe;
+    std::vector<std::string> keys;
+    visit_fields(probe, [&](const char* key, const auto&, Tier tier) {
+        if (tier == Tier::Restart) keys.emplace_back(key);
+    });
+    return keys;
+}
+
+// A stable string of just the restart-tier fields. Two settings needing the same
+// engine produce the same signature, so THE restart question is one comparison.
+// (nlohmann orders object keys, so the dump is deterministic.)
+inline std::string restart_signature(const AssistantSettings& s) {
+    nlohmann::json j;
+    visit_fields(s, [&](const char* key, const auto& value, Tier tier) {
+        if (tier == Tier::Restart) j[key] = value;
+    });
+    return j.dump();
+}
+
+// Does moving from `a` to `b` need a fresh process?
+inline bool requires_restart(const AssistantSettings& a, const AssistantSettings& b) {
+    return restart_signature(a) != restart_signature(b);
+}
 
 // Where the file lives: %LOCALAPPDATA%\BlackwellVoiceAssistant\settings.json.
 // Falls back to a CWD-relative file when the variable is missing (a service
@@ -83,24 +276,6 @@ inline std::string settings_path() {
         return std::string(local) + "\\BlackwellVoiceAssistant\\settings.json";
     }
     return "voice_assistant_settings.json";
-}
-
-// Coerce out-of-range values rather than trusting a hand-edited file. Applied on
-// both load and save, so a bad value can neither reach the engine nor persist.
-inline void clamp_settings(AssistantSettings& s) {
-    if (s.vad_threshold < 0.1f) s.vad_threshold = 0.1f;
-    if (s.vad_threshold > 0.9f) s.vad_threshold = 0.9f;
-    if (s.max_context < 512) s.max_context = 512;
-    if (s.history_budget_tokens < 0) s.history_budget_tokens = 0;
-    if (s.device_id < 0) s.device_id = 0;
-    if (s.context_mode != "stateless" && s.context_mode != "bounded") {
-        s.context_mode = "bounded";
-    }
-    if (s.data_dir.empty()) s.data_dir = "data";
-    // No checkpoint means there is nothing to load -- the simulated backend is
-    // the only runnable configuration, so make the stored state say so instead
-    // of failing at bring-up with a flag that contradicts the paths.
-    if (s.model_dir.empty()) s.simulated = true;
 }
 
 // Best-effort load. A missing or corrupt file is NOT an error: the user gets the
@@ -116,21 +291,7 @@ inline AssistantSettings load_settings() {
     } catch (const nlohmann::json::exception&) {
         return s;
     }
-    s.model_dir      = j.value("model_dir", s.model_dir);
-    s.audio_head     = j.value("audio_head", s.audio_head);
-    s.projector_path = j.value("projector_path", s.projector_path);
-    s.data_dir       = j.value("data_dir", s.data_dir);
-    s.system_prompt  = j.value("system_prompt", s.system_prompt);
-    s.device_id      = j.value("device_id", s.device_id);
-    s.max_context    = j.value("max_context", s.max_context);
-    s.simulated      = j.value("simulated", s.simulated);
-    s.neural_vad     = j.value("neural_vad", s.neural_vad);
-    s.loopback_capture = j.value("loopback_capture", s.loopback_capture);
-    s.vad_threshold  = j.value("vad_threshold", s.vad_threshold);
-    s.context_mode   = j.value("context_mode", s.context_mode);
-    s.history_budget_tokens = j.value("history_budget_tokens", s.history_budget_tokens);
-    s.live_streaming = j.value("live_streaming", s.live_streaming);
-    clamp_settings(s);
+    from_json(j, s);   // clamps
     return s;
 }
 
@@ -148,25 +309,9 @@ inline bool save_settings(const AssistantSettings& in) {
         (void)_mkdir(path.substr(0, slash).c_str());
     }
 
-    nlohmann::json j;
-    j["model_dir"]      = s.model_dir;
-    j["audio_head"]     = s.audio_head;
-    j["projector_path"] = s.projector_path;
-    j["data_dir"]       = s.data_dir;
-    j["system_prompt"]  = s.system_prompt;
-    j["device_id"]      = s.device_id;
-    j["max_context"]    = s.max_context;
-    j["simulated"]      = s.simulated;
-    j["neural_vad"]     = s.neural_vad;
-    j["loopback_capture"] = s.loopback_capture;
-    j["vad_threshold"]  = s.vad_threshold;
-    j["context_mode"]   = s.context_mode;
-    j["history_budget_tokens"] = s.history_budget_tokens;
-    j["live_streaming"] = s.live_streaming;
-
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
-    f << j.dump(2);
+    f << to_json(s).dump(2);
     return static_cast<bool>(f);
 }
 

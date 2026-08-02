@@ -21,7 +21,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "engine_control_bridge.hpp"        // EngineControlBridge, Command
@@ -43,6 +45,91 @@ public:
         const uint32_t n = count_tokens(prompt);
         set_system_prefix_tokens(n);
         return n;
+    }
+
+    // Re-lay the frozen prefix after the user edits the system prompt. ENGINE
+    // THREAD ONLY (marshal through EngineControlBridge::post_engine_task), the
+    // same contract RealEngineControl::rebuild_system_prompt carries.
+    //
+    // There is no KV to invalidate here, so this collapses to a re-freeze -- but
+    // it EXISTS, and the app calls it through the same seam on both backends.
+    // That is the point: the offline path rehearses the marshaling, the UI round
+    // trip and the reported prefix length, so the only thing untested without a
+    // GPU is the CUDA prefill itself.
+    uint32_t rebuild_system_prompt(const std::string& prompt) {
+        return prefill_system_prompt(prompt);
+    }
+
+    // Fully-local reply, GPU-free. Mirrors RealEngineControl::generate_local_reply
+    // -- ENGINE THREAD ONLY, streams through `emit`, and never offers the result
+    // to the commit gate (this text IS the answer to an intent that already
+    // passed it; re-offering would answer the assistant's own words).
+    //
+    // Paced and cancellable exactly like the canned decode loop, because what this
+    // stand-in exists to rehearse is the ROUTING -- the dispatcher blocking on the
+    // engine thread, the stream reaching the UI as remote deltas, a barge-in
+    // cutting it off -- none of which needs real logits to be wrong.
+    blackwell::EngineStatus generate_local_reply(
+        const std::string& user_text,
+        const std::function<void(std::string_view)>& emit,
+        blackwell::bridge::TerminationReason* out_reason = nullptr) {
+        using blackwell::bridge::TerminationReason;
+        if (out_reason != nullptr) *out_reason = TerminationReason::None;
+        if (user_text.empty()) return blackwell::EngineStatus::InvalidArgument;
+
+        // Echo the intent back in a shape that makes the ROUTE obvious in the UI:
+        // if this text appears, the reply came from the local model and no cloud
+        // call was made. Cyrillic on purpose -- the offline path is where the
+        // UTF-8 streaming contract gets exercised without a checkpoint.
+        const std::string full =
+            "[Local] Понял: " + user_text + " — отвечаю локально, без облака.";
+
+        TerminationReason reason = TerminationReason::Eos;
+        const uint64_t gen = active_generation();
+        std::size_t pos = 0;
+        std::int32_t emitted = 0;
+        while (pos < full.size()) {
+            if (cancelled(gen)) { reason = TerminationReason::BargeIn; break; }
+            const std::int32_t cap = max_pieces_.load(std::memory_order_acquire);
+            if (cap > 0 && emitted >= cap) { reason = TerminationReason::TokenCap; break; }
+            const std::size_t space = full.find(' ', pos);
+            const std::size_t end = (space == std::string::npos) ? full.size() : space + 1;
+            emit(std::string_view(full).substr(pos, end - pos));
+            pos = end;
+            ++emitted;
+            std::this_thread::sleep_for(std::chrono::milliseconds(piece_delay_ms_));
+        }
+        if (out_reason != nullptr) *out_reason = reason;
+        return blackwell::EngineStatus::Success;
+    }
+
+    // ---- live sampling knobs (Settings -> Inference) --------------------------
+    // Accepted and stored so the UI wiring is identical on both backends; the
+    // canned decode loop below has no logits to shape, so they do not alter what
+    // this stand-in emits. max_new_tokens IS honoured -- it maps onto the piece
+    // ceiling that drives the TokenCap path, which is real behaviour the gate and
+    // its telemetry depend on.
+    void set_sampling(float temperature, float top_p) noexcept {
+        temperature_.store(temperature < 0.0f ? 0.0f : temperature, std::memory_order_release);
+        top_p_.store(top_p <= 0.0f || top_p > 1.0f ? 1.0f : top_p, std::memory_order_release);
+    }
+    float temperature() const noexcept { return temperature_.load(std::memory_order_acquire); }
+    float top_p() const noexcept { return top_p_.load(std::memory_order_acquire); }
+
+    void set_max_new_tokens(int n) noexcept {
+        const int clamped = n < 1 ? 1 : n;
+        max_new_tokens_.store(clamped, std::memory_order_release);
+        // This loop counts WORDS, not tokens, so the ceiling has to be converted
+        // or it would mean something different offline than on the GPU. A word
+        // averages ~1.4 tokens, hence 5/7: a default 256-token limit becomes ~182
+        // pieces and never bites on a handful-of-words canned utterance (correct
+        // -- it does not bite on a real reply either), while winding the limit
+        // down to a couple of dozen tokens truncates here exactly as it would
+        // there. Preserves set_max_pieces' 0 = unlimited by never storing 0.
+        set_max_pieces(static_cast<std::int32_t>(clamped * 5 / 7 < 1 ? 1 : clamped * 5 / 7));
+    }
+    int max_new_tokens() const noexcept {
+        return max_new_tokens_.load(std::memory_order_acquire);
     }
 
     // The keep count the most recent barge-in rewind resolved to (after the floor
@@ -177,6 +264,12 @@ private:
         {"The weather is nice this morning.", "Погода сегодня утром прекрасная."},
         {"Please send me the report by tomorrow.", "Пожалуйста, пришлите мне отчёт к завтрашнему дню."},
     };
+
+    // Live knobs, mirroring RealEngineControl's so main() wires ONE settings path
+    // for both backends (see set_sampling / set_max_new_tokens above).
+    std::atomic<float> temperature_{0.0f};
+    std::atomic<float> top_p_{1.0f};
+    std::atomic<int>   max_new_tokens_{256};
 
     std::atomic<uint32_t> last_rewind_keep_{0};
     std::atomic<std::size_t> utterance_counter_{0};

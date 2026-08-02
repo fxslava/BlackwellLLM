@@ -135,7 +135,9 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/segment_job_queue_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/absolute_audio_ring_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/conversational_mode_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/intent_commit_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/intent_commit_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/utf8_stream_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/local_transport_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
@@ -153,15 +155,28 @@ if(TARGET blackwell_bridge)
                                          # Mode A test passes a null VAD, so no ORT
                                          # symbol is referenced and blackwell_vad
                                          # stays unlinked.
-        ${CMAKE_SOURCE_DIR}/audio_sandbox/translator)  # conversational_mode.hpp +
+        ${CMAKE_SOURCE_DIR}/audio_sandbox/translator   # conversational_mode.hpp +
                                                        # simulated_engine_control.hpp (the
                                                        # app-level classes under test)
+        ${CMAKE_SOURCE_DIR}/audio_sandbox/voice_assistant)  # local_transport.hpp — the
+                                                       # fully-local routing leg (header-only,
+                                                       # no WebView2/Win32: it depends on the
+                                                       # transport seam and the bridge only)
     target_link_libraries(bridge_tests PRIVATE
         GTest::gtest
         GTest::gtest_main
         blackwell_bridge
         blackwell_kernels
         blackwell_core_obj)
+    # /utf-8 for the same reason audio_sandbox has it: SimulatedEngineControl's
+    # canned utterances and the UTF-8 streaming tests carry Cyrillic literals, and
+    # without this MSVC reads them in the system ANSI codepage. The app already
+    # compiled with /utf-8 while these tests did not, so the two disagreed about
+    # what the literals ARE -- which is exactly the class of bug the streaming
+    # tests exist to catch, and it must not be reintroduced by the build.
+    if(MSVC)
+        target_compile_options(bridge_tests PRIVATE /utf-8)
+    endif()
     blackwell_copy_dstorage_dlls(bridge_tests)
     gtest_discover_tests(bridge_tests
         PROPERTIES LABELS validation

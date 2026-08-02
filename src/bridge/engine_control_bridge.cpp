@@ -202,9 +202,51 @@ EngineStatus EngineControlBridge::submit_text(std::string text, TokenSink sink) 
     return EngineStatus::Success;
 }
 
+bool EngineControlBridge::post_engine_task(std::function<void()> fn) noexcept {
+    if (!fn) return false;
+    try {
+        std::lock_guard<std::mutex> lk(task_mu_);
+        tasks_.push_back(std::move(fn));
+    } catch (...) {
+        return false;   // nothing was queued; the caller's work will never run
+    }
+    // Publish the count AFTER the closure has landed, so a consumer that sees a
+    // non-zero count is guaranteed to find something in the deque.
+    pending_tasks_.fetch_add(1, std::memory_order_release);
+    ring_notify();      // wake a parked wait_and_pump()
+    return true;
+}
+
 // -----------------------------------------------------------------------------
 // CONSUMER edge (the single engine-owning thread).
 // -----------------------------------------------------------------------------
+size_t EngineControlBridge::drain_engine_tasks() noexcept {
+    // Fast path: one relaxed load per pump on the idle loop, no lock.
+    if (pending_tasks_.load(std::memory_order_acquire) == 0) return 0;
+
+    size_t executed = 0;
+    for (;;) {
+        std::function<void()> fn;
+        {
+            std::lock_guard<std::mutex> lk(task_mu_);
+            if (tasks_.empty()) break;
+            fn = std::move(tasks_.front());
+            tasks_.pop_front();
+        }
+        pending_tasks_.fetch_sub(1, std::memory_order_release);
+        // Run OUTSIDE the lock: a task prefills the engine and can take seconds,
+        // and holding task_mu_ across that would block the UI thread's next post.
+        // Runtime tier -- a throwing task is swallowed like a throwing do_* hook.
+        try {
+            fn();
+        } catch (const std::exception&) {
+        } catch (...) {
+        }
+        ++executed;
+    }
+    return executed;
+}
+
 bool EngineControlBridge::take_text_turn(std::string& out) noexcept {
     std::lock_guard<std::mutex> lk(text_mu_);
     if (text_turns_.empty()) return false;
@@ -214,7 +256,11 @@ bool EngineControlBridge::take_text_turn(std::string& out) noexcept {
 }
 
 size_t EngineControlBridge::pump() noexcept {
-    size_t executed = 0;
+    // Tasks FIRST, before this batch's commands. A task reconfigures the engine
+    // (a system-prompt rebuild invalidates the whole KV cache), so running it
+    // ahead of the batch means the batch executes against the new configuration
+    // rather than half of it. See post_engine_task's ordering contract.
+    size_t executed = drain_engine_tasks();
     Command cmd;
     while (try_pop(cmd)) {
         // Drop a command a barge-in superseded between enqueue and now. A dropped
@@ -257,7 +303,10 @@ size_t EngineControlBridge::wait_and_pump() noexcept {
         // doorbell) between pump() and here changes `observed`, so wait() returns
         // immediately instead of sleeping through the event.
         const uint64_t observed = doorbell_.load(std::memory_order_acquire);
-        if (!ring_empty() || stopping_.load(std::memory_order_acquire)) continue;
+        if (!ring_empty() || pending_tasks_.load(std::memory_order_acquire) != 0 ||
+            stopping_.load(std::memory_order_acquire)) {
+            continue;
+        }
         doorbell_.wait(observed, std::memory_order_acquire);  // 0% CPU until notified
     }
 }

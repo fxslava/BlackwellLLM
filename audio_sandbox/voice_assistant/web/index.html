@@ -69,11 +69,19 @@
 
 <!-- ---------------------------------------------------------------------------
      SETTINGS. Everything technical lives here and nowhere else: checkpoint
-     paths, the CUDA device, VAD sensitivity, context policy. The main screen
-     shows none of it.
-     Fields marked data-restart choose what gets ALLOCATED at bring-up, so
-     changing one needs a fresh process -- the banner below appears the moment
-     any of them differs from what is running.
+     paths, the CUDA device, VAD sensitivity, context policy, hotkeys. The main
+     screen shows none of it.
+
+     FOUR TABS, and the split is by WHEN you touch a thing, not by which
+     subsystem owns it: Inference is set up once, Audio is tuned when the
+     assistant mishears you, Hotkeys are set once and forgotten, and the System
+     prompt is the one people actually come back to edit -- so it gets a whole
+     tab and a real editor rather than a three-row textarea.
+
+     RESTART-TIER FIELDS ARE NOT MARKED HERE. The app pushes the list
+     (`restart_fields`) alongside the settings payload, because
+     settings_store.hpp's tier table is the only place that genuinely knows the
+     answer; a `data-restart` attribute in this file was a second list to forget.
 --------------------------------------------------------------------------- -->
 <div class="overlay hidden" id="settingsOverlay">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
@@ -86,120 +94,316 @@
       </button>
     </div>
 
+    <div class="tabs" role="tablist">
+      <button class="tab active" role="tab" data-tab="inference" aria-selected="true">Inference</button>
+      <button class="tab" role="tab" data-tab="audio" aria-selected="false">Audio</button>
+      <button class="tab" role="tab" data-tab="hotkeys" aria-selected="false">Hotkeys</button>
+      <button class="tab" role="tab" data-tab="prompt" aria-selected="false">System prompt</button>
+    </div>
+
     <div class="restart-banner hidden" id="restartBanner">
       These changes load a different engine, so they take effect after a restart.
     </div>
 
     <div class="modal-body">
-      <section class="group">
-        <h3>Model</h3>
-        <label class="check">
-          <input type="checkbox" id="s_simulated" data-restart>
-          <span>Simulated backend <em>(no GPU, no checkpoint &mdash; for trying the app out)</em></span>
-        </label>
-        <div class="field">
-          <label for="s_model_dir">Model directory</label>
-          <div class="row">
-            <input id="s_model_dir" data-restart placeholder="e.g. F:/AI/llama-3.1-8B-Instruct-AWQ-INT4">
-            <button class="ghost" data-browse="model_dir">Browse&hellip;</button>
-          </div>
-        </div>
-        <div class="field">
-          <label for="s_audio_head">Audio head (speech encoder + projector)</label>
-          <div class="row">
-            <input id="s_audio_head" data-restart placeholder="e.g. F:/AI/ultravox-v0_5-llama-3_1-8b">
-            <button class="ghost" data-browse="audio_head">Browse&hellip;</button>
-          </div>
-        </div>
-        <details class="advanced">
-          <summary>Advanced paths</summary>
+
+      <!-- ============================ TAB 1 ============================= -->
+      <section class="panel active" data-panel="inference">
+        <div class="group">
+          <h3>Model</h3>
+          <label class="check">
+            <input type="checkbox" id="s_simulated">
+            <span>Simulated backend <em>(no GPU, no checkpoint &mdash; for trying the app out)</em></span>
+          </label>
           <div class="field">
-            <label for="s_projector_path">Projector config override</label>
+            <label for="s_model_dir">Model directory</label>
             <div class="row">
-              <input id="s_projector_path" data-restart placeholder="(optional)">
-              <button class="ghost" data-browse="projector_path">Browse&hellip;</button>
+              <input id="s_model_dir" placeholder="e.g. F:/AI/llama-3.1-8B-Instruct-AWQ-INT4">
+              <button class="ghost" data-browse="model_dir">Browse&hellip;</button>
             </div>
           </div>
           <div class="field">
-            <label for="s_data_dir">Data directory <em>(mel_filters.bin)</em></label>
+            <label for="s_audio_head">Audio head (speech encoder + projector)</label>
             <div class="row">
-              <input id="s_data_dir" data-restart placeholder="data">
-              <button class="ghost" data-browse="data_dir">Browse&hellip;</button>
+              <input id="s_audio_head" placeholder="e.g. F:/AI/ultravox-v0_5-llama-3_1-8b">
+              <button class="ghost" data-browse="audio_head">Browse&hellip;</button>
             </div>
           </div>
-          <div class="row two">
+          <details class="advanced">
+            <summary>Advanced paths</summary>
             <div class="field">
-              <label for="s_device_id">CUDA device</label>
-              <input id="s_device_id" data-restart type="number" min="0" step="1">
+              <label for="s_projector_path">Projector config override</label>
+              <div class="row">
+                <input id="s_projector_path" placeholder="(optional)">
+                <button class="ghost" data-browse="projector_path">Browse&hellip;</button>
+              </div>
             </div>
             <div class="field">
-              <label for="s_max_context">Context window (tokens)</label>
-              <input id="s_max_context" data-restart type="number" min="512" step="256">
+              <label for="s_data_dir">Data directory <em>(mel_filters.bin)</em></label>
+              <div class="row">
+                <input id="s_data_dir" placeholder="data">
+                <button class="ghost" data-browse="data_dir">Browse&hellip;</button>
+              </div>
+            </div>
+            <div class="row two">
+              <div class="field">
+                <label for="s_device_id">CUDA device</label>
+                <input id="s_device_id" type="number" min="0" step="1">
+              </div>
+              <div class="field">
+                <label for="s_max_context">Context window (tokens)</label>
+                <input id="s_max_context" type="number" min="512" step="256">
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <div class="group">
+          <h3>Where answers come from</h3>
+          <label class="check">
+            <input type="checkbox" id="s_local_inference">
+            <span>Use the local model for responses
+              <em>(nothing leaves this machine &mdash; no API call, no cost)</em></span>
+          </label>
+          <p class="hint">
+            Off, the local model only transcribes what you said and the reply comes
+            from the remote assistant. On, the same local model also writes the
+            answer. Either way the reply is gated by the same rule &mdash; a turn
+            that was interrupted or cut off is never answered at all.
+            Takes effect on your next sentence.
+          </p>
+        </div>
+
+        <div class="group">
+          <h3>Generation</h3>
+          <p class="group-note">
+            The local model transcribes what you said and decides whether it was a
+            finished thought. Sampling costs fidelity there, so the shipping
+            default is greedy &mdash; raise it only if you use the text box as a chat.
+          </p>
+          <div class="field">
+            <label for="s_temperature">Temperature <span class="hint-inline" id="tempValue"></span></label>
+            <input id="s_temperature" type="range" min="0" max="2" step="0.05">
+            <div class="scale"><span>Deterministic</span><span>Creative</span></div>
+          </div>
+          <div class="field">
+            <label for="s_top_p">Top-p <span class="hint-inline" id="toppValue"></span></label>
+            <input id="s_top_p" type="range" min="0.05" max="1" step="0.05">
+            <div class="scale"><span>Narrow choices</span><span>All choices</span></div>
+          </div>
+          <div class="field">
+            <label for="s_max_new_tokens">Maximum reply length (tokens)</label>
+            <input id="s_max_new_tokens" type="number" min="16" max="4096" step="16">
+            <p class="hint">
+              A reply that hits this ceiling is treated as cut off and is
+              <b>never sent</b> to the assistant. If the &ldquo;cut off before
+              finishing&rdquo; counter below keeps climbing, raise this.
+            </p>
+          </div>
+        </div>
+
+        <details class="group diagnostics">
+          <summary><h3>Diagnostics</h3></summary>
+          <div class="diag" id="diag">
+            <div class="diag-row"><span>Backend</span><b id="d_backend">&mdash;</b></div>
+            <div class="diag-row"><span>Speech input</span><b id="d_audio">&mdash;</b></div>
+            <div class="diag-row"><span>Reply transport</span><b id="d_transport">&mdash;</b></div>
+            <div class="diag-row"><span>System prompt</span><b id="d_prefix">&mdash;</b></div>
+            <div class="diag-row"><span>Sent to assistant</span><b id="d_committed">0</b></div>
+            <div class="diag-row"><span>Dropped &mdash; interrupted</span><b id="d_bargein">0</b></div>
+            <div class="diag-row warn-row" id="d_capRow"><span>Dropped &mdash; cut off before finishing</span><b id="d_tokencap">0</b></div>
+            <div class="diag-row"><span>Dropped &mdash; queue full</span><b id="d_queuefull">0</b></div>
+            <div class="diag-note hidden" id="d_capNote">
+              A reply hit its length ceiling before it finished, so it was never sent.
+              Raise the maximum reply length above if this keeps happening.
             </div>
           </div>
         </details>
       </section>
 
-      <section class="group">
-        <h3>Voice</h3>
-        <label class="check">
-          <input type="checkbox" id="s_neural_vad" data-restart>
-          <span>Neural voice detection <em>(off = simple loudness threshold)</em></span>
-        </label>
-        <div class="field">
-          <label for="s_vad_threshold">
-            Sensitivity <span class="hint-inline" id="vadValue"></span>
+      <!-- ============================ TAB 2 ============================= -->
+      <section class="panel" data-panel="audio">
+        <div class="group">
+          <h3>Voice detection</h3>
+          <label class="check">
+            <input type="checkbox" id="s_neural_vad">
+            <span>Neural voice detection <em>(off = simple loudness threshold)</em></span>
           </label>
-          <input id="s_vad_threshold" type="range" min="0.1" max="0.9" step="0.05">
-          <div class="scale"><span>Picks up more</span><span>Picks up less</span></div>
+          <div class="field">
+            <label for="s_vad_threshold">
+              Sensitivity <span class="hint-inline" id="vadValue"></span>
+            </label>
+            <input id="s_vad_threshold" type="range" min="0.1" max="0.9" step="0.05">
+            <div class="scale"><span>Picks up more</span><span>Picks up less</span></div>
+          </div>
+          <div class="field">
+            <label for="s_silence_hangover_ms">
+              Pause before answering <span class="hint-inline" id="hangoverValue"></span>
+            </label>
+            <input id="s_silence_hangover_ms" type="range" min="0" max="3000" step="50">
+            <div class="scale"><span>Answers sooner</span><span>Lets you finish</span></div>
+            <p class="hint">
+              How much silence ends your turn. Too short and it interrupts you;
+              too long and it feels deaf. <b>0 disables it entirely</b> &mdash;
+              turns then end only on the talk hotkey.
+            </p>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="s_loopback_capture">
+            <span>Listen to system audio instead of the microphone</span>
+          </label>
         </div>
-        <label class="check">
-          <input type="checkbox" id="s_loopback_capture" data-restart>
-          <span>Listen to system audio instead of the microphone</span>
-        </label>
+
+        <div class="group">
+          <h3>Speculative decoding</h3>
+          <p class="group-note">
+            While you are still talking, audio captured so far is prefilled into
+            the model ahead of time, so less work is left when you stop. It cannot
+            change <em>what</em> is heard &mdash; only how much of the answer has
+            already been paid for by the time your sentence ends.
+          </p>
+          <div class="field">
+            <label for="s_warm_prefill_interval_ms">
+              Redraft cadence <span class="hint-inline" id="warmValue"></span>
+            </label>
+            <input id="s_warm_prefill_interval_ms" type="range" min="0" max="2000" step="20">
+            <div class="scale"><span>More GPU, less waiting</span><span>Less GPU</span></div>
+            <p class="hint">0 turns speculative prefill off: correct, just slower to answer.</p>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="s_live_streaming">
+            <span>Show the transcription while you are still speaking <em>(lower perceived latency)</em></span>
+          </label>
+        </div>
+
+        <div class="group">
+          <h3>Memory &amp; KV cache</h3>
+          <div class="row two">
+            <div class="field">
+              <label for="s_context_mode">Memory</label>
+              <select id="s_context_mode">
+                <option value="bounded">Remember recent turns</option>
+                <option value="stateless">Forget after each turn</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="s_history_budget_tokens">History budget (tokens)</label>
+              <input id="s_history_budget_tokens" type="number" min="0" step="32">
+            </div>
+          </div>
+          <p class="hint">
+            The budget is the KV eviction watermark: once retained turns exceed it,
+            the oldest are dropped from the cache. The system prompt is never
+            evicted &mdash; it is pinned as the cache floor.
+          </p>
+        </div>
       </section>
 
-      <section class="group">
-        <h3>Conversation</h3>
-        <div class="field">
-          <label for="s_system_prompt">System prompt</label>
-          <textarea id="s_system_prompt" data-restart rows="3"></textarea>
-        </div>
-        <div class="row two">
+      <!-- ============================ TAB 3 ============================= -->
+      <section class="panel" data-panel="hotkeys">
+        <div class="group">
+          <h3>Activation</h3>
+          <p class="group-note">
+            These work while another application has focus. Click a field and press
+            the combination you want; <kbd>Backspace</kbd> clears it. Only this
+            combination is ever registered &mdash; nothing else you type is seen.
+          </p>
+
           <div class="field">
-            <label for="s_context_mode">Memory</label>
-            <select id="s_context_mode">
-              <option value="bounded">Remember recent turns</option>
-              <option value="stateless">Forget after each turn</option>
+            <label for="s_hotkey_talk">Talk</label>
+            <input id="s_hotkey_talk" class="hotkey" data-hotkey readonly
+                   placeholder="Click, then press a combination">
+            <p class="hint">Turns the microphone on and off.</p>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="s_hotkey_push_to_talk">
+            <span>Hold to talk <em>(mic is open only while the keys are held, instead of toggling)</em></span>
+          </label>
+
+          <div class="field">
+            <label for="s_hotkey_cancel">Stop</label>
+            <input id="s_hotkey_cancel" class="hotkey" data-hotkey readonly
+                   placeholder="Click, then press a combination">
+            <p class="hint">
+              Interrupts the answer being generated right now. The interrupted turn
+              is discarded, exactly as if you had started speaking over it.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="s_hotkey_show">Show the window</label>
+            <input id="s_hotkey_show" class="hotkey" data-hotkey readonly
+                   placeholder="Click, then press a combination">
+            <p class="hint">Restores and focuses this window from anywhere.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================ TAB 4 =============================
+           TWO prompts, because they are two different things and conflating
+           them is what made the assistant translate when the user wanted a
+           transcript: the persona prompt does not decide the audio task.
+      ================================================================= -->
+      <section class="panel" data-panel="prompt">
+        <div class="group">
+          <h3>Assistant persona</h3>
+          <p class="group-note">
+            Who the assistant is, and how it should answer. It is prefilled into
+            the model <em>once</em> and that cache is reused by every utterance
+            afterwards &mdash; which is what makes answers start quickly. Changing
+            it therefore rebuilds the cache, so applying takes a moment on a real
+            checkpoint, and clears the conversation the model remembers.
+          </p>
+          <div class="field">
+            <textarea id="s_system_prompt" class="prompt-editor" rows="7" spellcheck="true"
+                      placeholder="You are a concise voice assistant&hellip;"></textarea>
+            <div class="prompt-foot">
+              <span class="hint-inline" id="promptCount"></span>
+              <span class="prefix-state" id="prefixState"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="group">
+          <h3>Speech task</h3>
+          <p class="group-note">
+            What to do with each thing you say. This one is <em>free</em> to change
+            &mdash; it lives in the per-turn instruction rather than the cached
+            prefix, so it applies on your very next sentence with no rebuild.
+          </p>
+          <div class="field">
+            <label for="s_speech_task">Task</label>
+            <select id="s_speech_task">
+              <option value="transcribe">Transcribe only</option>
+              <option value="translate">Translate only</option>
+              <option value="both">Transcribe, then translate</option>
             </select>
+            <p class="hint">
+              Asking for both roughly doubles what the model has to generate per
+              turn, so leave it on <b>Transcribe only</b> unless you want the
+              translation.
+            </p>
           </div>
           <div class="field">
-            <label for="s_history_budget_tokens">History budget (tokens)</label>
-            <input id="s_history_budget_tokens" type="number" min="0" step="32">
+            <label for="s_audio_task_prompt">Audio task instruction</label>
+            <textarea id="s_audio_task_prompt" class="prompt-editor short" rows="3"
+                      spellcheck="true"
+                      placeholder="Transcribe the following speech exactly as spoken: "></textarea>
+            <p class="hint">
+              Ends immediately before the audio, so finish it with a colon.
+              Leave it empty to use the built-in phrasing for the task above.
+              The language rules and the output tags are added automatically
+              &mdash; you only supply the instruction itself.
+            </p>
           </div>
         </div>
-        <label class="check">
-          <input type="checkbox" id="s_live_streaming">
-          <span>Start transcribing while you are still speaking <em>(lower latency)</em></span>
-        </label>
+
+        <div class="row prompt-actions">
+          <button class="ghost" id="promptReset">Restore defaults</button>
+          <button class="primary" id="promptApply">Apply &amp; precompute</button>
+        </div>
       </section>
 
-      <details class="group diagnostics">
-        <summary><h3>Diagnostics</h3></summary>
-        <div class="diag" id="diag">
-          <div class="diag-row"><span>Backend</span><b id="d_backend">&mdash;</b></div>
-          <div class="diag-row"><span>Speech input</span><b id="d_audio">&mdash;</b></div>
-          <div class="diag-row"><span>Reply transport</span><b id="d_transport">&mdash;</b></div>
-          <div class="diag-row"><span>Sent to assistant</span><b id="d_committed">0</b></div>
-          <div class="diag-row"><span>Dropped &mdash; interrupted</span><b id="d_bargein">0</b></div>
-          <div class="diag-row warn-row" id="d_capRow"><span>Dropped &mdash; cut off before finishing</span><b id="d_tokencap">0</b></div>
-          <div class="diag-row"><span>Dropped &mdash; queue full</span><b id="d_queuefull">0</b></div>
-          <div class="diag-note hidden" id="d_capNote">
-            A reply hit its length ceiling before it finished, so it was never sent.
-            Raise the reply length limit if this keeps happening.
-          </div>
-        </div>
-      </details>
     </div>
 
     <div class="modal-foot">

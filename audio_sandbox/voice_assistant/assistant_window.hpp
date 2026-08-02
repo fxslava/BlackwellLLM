@@ -46,12 +46,24 @@ struct AssistantWindowCallbacks {
     // The user sent a typed message. Routed to the same commit gate voice uses.
     std::function<void(const std::string& text)> on_send_text;
     // The mic toggle flipped. `listening` false mutes capture (push-to-talk off).
+    // Raised by the mic button AND by the talk hotkey -- deliberately the same
+    // callback, so a hotkey is not a second, differently-behaved path to the
+    // microphone.
     std::function<void(bool listening)> on_mic_toggle;
+    // Interrupt whatever is generating right now (the cancel hotkey). Equivalent
+    // to a barge-in, minus the speech.
+    std::function<void()> on_cancel;
     // Settings were saved. `live_only` is true when nothing restart-tier changed,
     // in which case the app applies them to the running engine and stays up.
     std::function<void(const AssistantSettings& next, bool live_only)> on_settings_apply;
     // The user asked to restart the app so restart-tier settings can take effect.
     std::function<void()> on_restart;
+    // The system prompt changed and must be re-frozen: tokenize, prefill, and
+    // republish the KV rewind floor. This is ENGINE work and is therefore
+    // asynchronous by nature -- the implementation marshals it onto the engine
+    // thread (post_engine_task) and reports back through system_prompt_applied().
+    // Called only when the text actually differs from what is running.
+    std::function<void(const std::string& prompt)> on_system_prompt_apply;
 };
 
 class AssistantWindow {
@@ -76,6 +88,13 @@ public:
     // ANY thread. Queues one JSON message for the page. Cheap and non-blocking.
     void post_event(std::string json);
 
+    // ANY thread. The engine finished (or failed) a system-prompt rebuild:
+    // `tokens` is the new frozen prefix length, `detail` is empty on success and
+    // carries the failure text otherwise. Closes the loop the Apply button opened
+    // -- a precompute that takes seconds must not look like a button that did
+    // nothing.
+    void post_system_prompt_applied(bool ok, unsigned tokens, const std::string& detail);
+
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
 
 private:
@@ -91,6 +110,13 @@ private:
     void on_web_message(const std::wstring& json);
     void push_settings();                     // seed/refresh the Settings modal
     void browse_for_folder(const std::string& target);
+
+    // ---- hotkeys (UI thread) -------------------------------------------------
+    void register_hotkeys();      // (re)register all three from settings_
+    void unregister_hotkeys();
+    void on_hotkey(int id);
+    void set_listening(bool on, bool tell_page);   // one place that owns mic state
+    void poll_push_to_talk();     // hold-to-talk release watchdog (see the .cpp)
     // `stage` names the call that failed and `hr` is its status. Both end up in
     // the dialog AND on stderr: a bare "could not initialize the runtime" sends
     // the user off to reinstall a runtime that is already installed, which is
@@ -115,6 +141,14 @@ private:
 
     AssistantWindowCallbacks cb_;
     AssistantSettings settings_;
+
+    // Mic state lives HERE, not in the page: the talk hotkey and the mic button
+    // both flip it, and a toggle that reads its previous value out of the DOM
+    // would desynchronize the first time a hotkey fired while the window was
+    // hidden. The page follows via the `mic` event.
+    bool listening_ = true;
+    bool ptt_held_ = false;       // a hold-to-talk chord is currently down
+    bool hotkeys_registered_ = false;
 
     std::mutex q_mu_;
     std::deque<std::string> pending_;

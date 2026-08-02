@@ -44,6 +44,11 @@ public:
     // Runtime retune of the auto-commit hangover (UI slider seam). Any thread;
     // one atomic store, effective on the next VAD block. 0 = auto-commit off.
     void set_silence_hangover_ms(uint32_t ms) noexcept;
+    // Runtime retune of the speculative warm-prefill throttle (the second UI
+    // slider seam). Any thread; one atomic store, effective on the next VAD
+    // block. 0 disables speculative warming entirely, which costs latency at the
+    // commit boundary but nothing else -- correctness never depended on it.
+    void set_warm_prefill_interval_ms(uint32_t ms) noexcept;
     // MANUAL (push-to-talk) mode: while enabled, the internal threshold VAD may
     // never drive a state transition — no auto onset, no auto barge-in, no
     // silence auto-commit. Boundaries come EXCLUSIVELY from the explicit
@@ -110,13 +115,19 @@ private:
     IEngineControl* control_ = nullptr;
     AudioStreamHandle stream_ = nullptr;
 
-    // Derived VAD geometry (sample counts). hangover_samples_ is atomic: it is
-    // the ONE knob retunable at runtime (set_silence_hangover_ms from the UI
-    // thread) while the audio thread reads it per 10 ms block.
+    // Derived VAD geometry (sample counts). The two CADENCE knobs are atomic
+    // because they are retunable at runtime from the UI thread while the audio
+    // thread reads them per 10 ms block; block_size_ and release_db_ are fixed at
+    // construction and are read-only afterwards.
     uint32_t block_size_ = 160;          // 10 ms @ sample_rate
     std::atomic<uint32_t> hangover_samples_{0};  // silence_hangover_ms -> samples (0 = off)
     std::atomic<bool> manual_mode_{false};       // true = auto-VAD transitions muted (PTT)
-    uint32_t warm_interval_samples_ = 0; // warm_prefill_interval_ms -> samples (0 = disabled)
+    // warm_prefill_interval_ms -> samples (0 = disabled). Atomic for the same
+    // reason as the hangover: it is a live slider, and the audio thread reads it
+    // once per block. A change lands on the next block; the accumulator is left
+    // alone so shortening the interval can fire the very next block rather than
+    // waiting out the old period.
+    std::atomic<uint32_t> warm_interval_samples_{0};
     float release_db_ = 0.0f;            // resolved hysteresis release threshold
 
     // ---- Shared epoch/state (atomic; read by engine thread + callbacks) -----

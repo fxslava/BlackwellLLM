@@ -37,8 +37,9 @@ SpeechPipelineController::SpeechPipelineController(const SpeechPipelineConfig& c
     hangover_samples_.store(static_cast<uint32_t>(
         static_cast<uint64_t>(cfg_.silence_hangover_ms) * sr / 1000u),
         std::memory_order_relaxed);
-    warm_interval_samples_ = static_cast<uint32_t>(
-        static_cast<uint64_t>(cfg_.warm_prefill_interval_ms) * sr / 1000u);
+    warm_interval_samples_.store(static_cast<uint32_t>(
+        static_cast<uint64_t>(cfg_.warm_prefill_interval_ms) * sr / 1000u),
+        std::memory_order_relaxed);
     // Hysteresis: release <= onset. 0 (unset) => no hysteresis (release == onset).
     release_db_ = (cfg_.vad_release_db != 0.0f) ? cfg_.vad_release_db : cfg_.vad_threshold_db;
 }
@@ -215,11 +216,16 @@ void SpeechPipelineController::vad_on_block(VadDecision decision) noexcept {
                 }
             }
             // TrackUpdate analogue: throttle speculative warming prefills.
-            if (warm_interval_samples_ != 0) {
+            // Snapshot the interval once -- a UI change landing between the test
+            // and the comparison would otherwise decide the two against different
+            // values.
+            if (const uint32_t warm_interval =
+                    warm_interval_samples_.load(std::memory_order_relaxed);
+                warm_interval != 0) {
                 const uint32_t acc = samples_since_warm_.fetch_add(block_size_,
                                                                    std::memory_order_relaxed) +
                                      block_size_;
-                if (acc >= warm_interval_samples_) {
+                if (acc >= warm_interval) {
                     samples_since_warm_.store(0, std::memory_order_relaxed);
                     (void)control_->warm_prefill(stream_,
                                                  current_gen_id_.load(std::memory_order_acquire));
@@ -242,6 +248,13 @@ void SpeechPipelineController::vad_on_block(VadDecision decision) noexcept {
 void SpeechPipelineController::set_silence_hangover_ms(uint32_t ms) noexcept {
     const uint32_t sr = (cfg_.sample_rate != 0) ? cfg_.sample_rate : 16000u;
     hangover_samples_.store(
+        static_cast<uint32_t>(static_cast<uint64_t>(ms) * sr / 1000u),
+        std::memory_order_relaxed);
+}
+
+void SpeechPipelineController::set_warm_prefill_interval_ms(uint32_t ms) noexcept {
+    const uint32_t sr = (cfg_.sample_rate != 0) ? cfg_.sample_rate : 16000u;
+    warm_interval_samples_.store(
         static_cast<uint32_t>(static_cast<uint64_t>(ms) * sr / 1000u),
         std::memory_order_relaxed);
 }
@@ -393,6 +406,13 @@ BRIDGE_API BridgeStatus speech_pipeline_set_silence_hangover_ms(SpeechPipelineHa
                                                                 uint32_t silence_hangover_ms) {
     if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
     to_ctrl(handle)->set_silence_hangover_ms(silence_hangover_ms);
+    return BRIDGE_OK;
+}
+
+BRIDGE_API BridgeStatus speech_pipeline_set_warm_prefill_interval_ms(
+    SpeechPipelineHandle handle, uint32_t warm_prefill_interval_ms) {
+    if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
+    to_ctrl(handle)->set_warm_prefill_interval_ms(warm_prefill_interval_ms);
     return BRIDGE_OK;
 }
 
