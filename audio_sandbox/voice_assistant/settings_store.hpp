@@ -73,7 +73,21 @@ struct AssistantSettings {
     std::string projector_path;        // projector config override (optional)
     std::string data_dir = "data";     // mel_filters.bin etc.
     int  device_id  = 0;               // CUDA device
-    int  max_context = 4096;           // KV ceiling (~256 KB/token at 8B geometry)
+    // KV ceiling. THE ONE MEMORY KNOB WITH REAL HEADROOM LEFT on a 12 GB card,
+    // so it is budgeted rather than set to the largest round number that fits.
+    //
+    // This app runs the paged (bf16) cache -- isolated_sessions forces it -- so
+    // the pool is 128 KB/token per sequence, over paged_branch_factor = 2
+    // sequences: 256 KB/token effective. 4096 tokens is ~1.05 GB; 2048 is
+    // ~0.52 GB. The rest of the stack measures ~5.3 GB backbone + ~2.2 GB TTS +
+    // the audio head + ~1 GB desktop, which puts 4096 over the ~10.5 GB line
+    // where WDDM starts paging to system RAM -- and WDDM paging does not fail,
+    // it just makes everything 10x slower with no diagnostic. 2048 is the
+    // largest value that leaves headroom for all four consumers at once.
+    //
+    // Raise it if you drop the audio head or the TTS model; watch the [vram]
+    // lines at startup, which report what was ACTUALLY committed at each stage.
+    int  max_context = 2048;
     bool simulated  = true;            // run the GPU-free stand-in backend
 
     // Greedy by default, and that is the shipping behaviour on purpose: the local
@@ -86,6 +100,45 @@ struct AssistantSettings {
     // this value decides whether long answers get through at all.
     int   max_new_tokens = 256;
 
+    // ---- speech output (F5-TTS) ---------------------------------------------
+    // Empty ckpt dir = speech output off. These defaults point at a real layout
+    // on the development machine so the feature is discoverable; on any other
+    // machine they simply fail to load and the app runs text-only, printing why.
+    //
+    // WHAT ckpt_dir MUST CONTAIN: the two EXPORTED ONNX graphs, f5_tts_dit.onnx
+    // and f5_tts_vocoder.onnx -- not the .safetensors checkpoint they were
+    // exported FROM. Point it at a folder of PyTorch weights and startup fails
+    // with "missing DiT graph"; run scripts/export_f5_tts_onnx.py first.
+    std::string tts_ckpt_dir   = "D:\\TTF";
+    std::string tts_vocab_path = "D:\\TTF\\vocab.txt";
+    // Reference clip. MUST be 24 kHz mono; the loader refuses other rates rather
+    // than resampling, because a wrong-rate reference does not fail -- it clones
+    // a voice pitched by the rate ratio, which sounds like a different person.
+    std::string tts_ref_audio  = "D:\\TTF\\ref_audio.wav";
+    // NOT optional when TTS is on, and NOT a label: F5 conditions on an
+    // (audio, TEXT) pair and treats generation as infilling, so this must be the
+    // literal transcript of tts_ref_audio. The default below is a PLACEHOLDER --
+    // leaving it produces confident nonsense, and main.cpp warns at startup if it
+    // is still set.
+    std::string tts_ref_text   = "Текст вашего референсного аудипоклипа";
+    int  tts_nfe_step = 16;            // solver steps: the latency/quality dial
+
+    // ---- chunking (time-to-first-audio vs. prosody continuity) --------------
+    // F5 is not streaming: TTFB equals full synthesis time for whatever text it
+    // is given, so the only latency lever is giving it less at once. Each split
+    // re-conditions the voice on the reference rather than on what was just
+    // spoken, so splitting harder is faster AND flatter.
+    bool tts_split_on_commas = true;   // clause-level splits; off = sentences only
+    int  tts_min_chunk_chars = 20;     // [5, 50]   stops "Да," becoming an utterance
+    int  tts_max_chunk_chars = 150;    // [50, 300] forces a split at the next space
+
+    // Gate the mic while the speaker is live. ON by default: there is no echo
+    // canceller in this build, so on open speakers the assistant otherwise hears
+    // itself, scores it as speech, and barges in on its own answer. The cost is
+    // real and is stated in the UI -- barge-in-while-speaking stops working, and
+    // the cancel button becomes the only way to interrupt.
+    bool tts_mic_gate = true;
+
     // ---- Tab 2: audio & speculative decoding --------------------------------
     bool neural_vad = true;            // Silero; false = the built-in RMS detector
     bool loopback_capture = false;     // capture system audio instead of the mic
@@ -94,6 +147,12 @@ struct AssistantSettings {
     // perceived responsiveness, and the one most worth a user's time: too short
     // cuts people off mid-sentence, too long makes the assistant feel deaf.
     int  silence_hangover_ms = 800;
+    // How much audio BEFORE the detector fired is kept. The hangover above says
+    // where a turn ends; this says where it begins. A VAD needs 45-110 ms to
+    // decide a block is speech, and the flush at speech onset used to discard
+    // exactly that window -- which is what clipped short first syllables. 0 =
+    // flush everything (the old behaviour).
+    int  pre_roll_ms = 250;
     // Speculative warm-prefill cadence: how often audio buffered so far is
     // prefilled while the user is still speaking. Trades GPU budget against how
     // much prefill is left at the commit boundary. 0 disables warming.
@@ -130,6 +189,15 @@ struct AssistantSettings {
     // user block, so editing it is free and applies on the very next utterance.
     // Empty = the engine's generated phrase, which follows the task toggle below.
     std::string audio_task_prompt = "Transcribe the following speech exactly as spoken: ";
+    // The language being SPOKEN, free text ("Russian", "English"); "" = let the
+    // model identify it. Not cosmetic and not a preference: the audio tower
+    // mistakes acoustically adjacent languages on short utterances (Russian heard
+    // as Polish, transcribed in Latin letters), and nothing downstream can undo
+    // that -- the wrong transcript is what gets committed and answered. Naming
+    // the language removes the guess. It is folded into the transcription
+    // session's frozen prefix AND the per-turn instruction, so editing it is a
+    // (cheap) prefix rebuild -- see RealEngineControl::set_speech_language.
+    std::string speech_language;
     // Which output tags a turn must produce: "transcribe" | "translate" | "both".
     // DEFAULT IS TRANSCRIBE-ONLY. It used to be both, which is why every reply
     // carried a [Translation] nobody asked for -- and asking an 8B backbone for
@@ -158,10 +226,25 @@ void visit_fields(S& s, Fn&& f) {
     f("loopback_capture",         s.loopback_capture,         Tier::Restart);
     f("vad_threshold",            s.vad_threshold,            Tier::Live);
     f("silence_hangover_ms",      s.silence_hangover_ms,      Tier::Live);
+    f("pre_roll_ms",              s.pre_roll_ms,              Tier::Live);
     f("warm_prefill_interval_ms", s.warm_prefill_interval_ms, Tier::Live);
     f("context_mode",             s.context_mode,             Tier::Live);
     f("history_budget_tokens",    s.history_budget_tokens,    Tier::Live);
     f("live_streaming",           s.live_streaming,           Tier::Live);
+    // ---- speech output ------------------------------------------------------
+    // All Restart tier: the engine loads a ~1.3 GB graph onto the GPU and the
+    // reference mel is uploaded once at startup, so none of these can be swapped
+    // under a running session without tearing the whole stack down. Changing the
+    // reference voice live is a real feature, but it is a rebuild, not a store.
+    f("tts_ckpt_dir",             s.tts_ckpt_dir,             Tier::Restart);
+    f("tts_vocab_path",           s.tts_vocab_path,           Tier::Restart);
+    f("tts_ref_audio",            s.tts_ref_audio,            Tier::Restart);
+    f("tts_ref_text",             s.tts_ref_text,             Tier::Restart);
+    f("tts_nfe_step",             s.tts_nfe_step,             Tier::Restart);
+    f("tts_split_on_commas",      s.tts_split_on_commas,      Tier::Restart);
+    f("tts_min_chunk_chars",      s.tts_min_chunk_chars,      Tier::Restart);
+    f("tts_max_chunk_chars",      s.tts_max_chunk_chars,      Tier::Restart);
+    f("tts_mic_gate",             s.tts_mic_gate,             Tier::Restart);
     // ---- Tab 3 -------------------------------------------------------------
     f("hotkey_talk",              s.hotkey_talk,              Tier::Live);
     f("hotkey_cancel",            s.hotkey_cancel,            Tier::Live);
@@ -171,6 +254,7 @@ void visit_fields(S& s, Fn&& f) {
     // ---- Tab 4 -------------------------------------------------------------
     f("system_prompt",            s.system_prompt,            Tier::Live);
     f("audio_task_prompt",        s.audio_task_prompt,        Tier::Live);
+    f("speech_language",          s.speech_language,          Tier::Live);
     f("speech_task",              s.speech_task,              Tier::Live);
 }
 
@@ -195,6 +279,12 @@ inline void clamp_settings(AssistantSettings& s) {
     // 0 hangover disables auto-commit entirely (push-to-talk only), which is a
     // legitimate configuration -- so the floor is 0, not a minimum delay.
     s.silence_hangover_ms = clamp_int(s.silence_hangover_ms, 0, 5000);
+    // The bounds are ContinuousStreamingConfig::kMin/kMaxPreRollMs, restated here
+    // rather than included: this header is the UI's contract and must not pull the
+    // segmenter in. 0 is legal and means "flush the whole ring", the pre-fix
+    // behaviour; past ~1 s the retained head stops being an onset and starts being
+    // the previous sentence.
+    s.pre_roll_ms = clamp_int(s.pre_roll_ms, 0, 1000);
     // 0 disables speculative warming; above that, anything under a VAD block is
     // indistinguishable from every-block warming.
     s.warm_prefill_interval_ms = clamp_int(s.warm_prefill_interval_ms, 0, 5000);
@@ -206,6 +296,16 @@ inline void clamp_settings(AssistantSettings& s) {
     if (s.speech_task != "transcribe" && s.speech_task != "translate" &&
         s.speech_task != "both") {
         s.speech_task = "transcribe";
+    }
+    // "" means Auto, so whitespace has to mean Auto too: a stray space would
+    // otherwise be a non-empty language that reads "The spoken language is  ."
+    // to the model, and would keep re-triggering the prefix rebuild diff.
+    if (const std::size_t first = s.speech_language.find_first_not_of(" \t\r\n");
+        first == std::string::npos) {
+        s.speech_language.clear();
+    } else {
+        s.speech_language = s.speech_language.substr(
+            first, s.speech_language.find_last_not_of(" \t\r\n") - first + 1);
     }
     if (s.data_dir.empty()) s.data_dir = "data";
     // No checkpoint means there is nothing to load -- the simulated backend is

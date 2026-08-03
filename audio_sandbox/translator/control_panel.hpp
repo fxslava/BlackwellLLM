@@ -117,6 +117,12 @@ private:
     void publish_streaming() {
         cfg_.clamp();
         if (streaming_ != nullptr) streaming_->store(cfg_);
+        // The pre-roll has a SECOND consumer: the live engine's speech-start ring
+        // flush (RealEngineControl::do_rewind), which is not driven by the
+        // publisher the offline re-translation driver reads. Push it to the
+        // control here, or this slider moves a number the live path never sees --
+        // which is exactly what it did before, and why first syllables clipped.
+        if (control_ != nullptr) control_->set_pre_roll_ms(cfg_.pre_roll_ms);
     }
     void draw_mode_section() {
         ImGui::SeparatorText("Context mode");

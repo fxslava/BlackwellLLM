@@ -283,7 +283,8 @@ endif()
 add_executable(tts_tests
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/spsc_ring_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/phonemizer_test.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tts/transcript_model_test.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/transcript_model_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/test_duplex_pipeline.cpp")
 
 # transcript_model.hpp is app-side UI storage (header-only, STL-only), so it is
 # consumed by PATH rather than by linking audio_sandbox -- which would drag in

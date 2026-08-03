@@ -63,6 +63,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -94,6 +95,21 @@
 #if defined(BLACKWELL_VAD_MODEL_PATH)
 #include "silero_vad.hpp"
 #define VOICE_ASSISTANT_HAS_SILERO 1
+#endif
+
+#if defined(BLACKWELL_HAVE_TTS_F5)
+// F5-TTS speech output. BLACKWELL_HAVE_TTS_F5 is blackwell_tts_f5's own PUBLIC
+// define, which exists only when the ONNXRuntime CUDA execution provider was
+// fetched (-DBLACKWELL_ORT_GPU=ON): the DiT measures ~0.2x realtime on CPU, so a
+// CPU-provider build would produce audio slower than it plays -- worse than no
+// speech at all. Without it the app is text-only and every use site below
+// compiles out.
+//
+// Do NOT gate this on BLACKWELL_HAVE_ORT_CUDA: that define belongs to
+// blackwell::onnxruntime, which blackwell_tts_f5 links PRIVATE, so it never
+// reaches here and the whole integration silently vanishes from the binary.
+#include "tts_runtime.hpp"
+#define VOICE_ASSISTANT_HAS_TTS 1
 #endif
 
 namespace {
@@ -166,12 +182,30 @@ struct AppContext {
     rt::AssistantView* view = nullptr;
     // The BASE type: this is what makes the callbacks backend-agnostic.
     blackwell::bridge::EngineControlBridge* control = nullptr;
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+    // Null when speech output is unavailable (no models, no GPU, ctor threw).
+    // Every use below is guarded, because "the assistant cannot speak" must
+    // never become "the assistant cannot answer".
+    rt::TtsRuntime* tts = nullptr;
+#endif
 };
 
 void on_token(void* user, const SpeechTokenEvent* event, std::uint64_t gen_id) {
     auto* ctx = static_cast<AppContext*>(user);
     if (ctx == nullptr || ctx->view == nullptr || event == nullptr) return;
     ctx->view->on_local_token(event->text, gen_id);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+    // THE LLM -> speech tap. Runs on the ENGINE thread, so it must not block:
+    // PushToken appends to a byte buffer under a short mutex and returns. All
+    // synthesis happens on the TTS worker.
+    //
+    // is_translation distinguishes a committed piece from a streaming ASR
+    // partial; only committed text is speakable -- speaking a partial would
+    // vocalise the user's own words back at them.
+    if (ctx->tts != nullptr && event->is_translation != 0) {
+        ctx->tts->PushToken(event->text);
+    }
+#endif
 }
 
 void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next,
@@ -179,11 +213,44 @@ void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next
     auto* ctx = static_cast<AppContext*>(user);
     if (ctx == nullptr || ctx->view == nullptr) return;
     ctx->view->on_pipeline_state(next);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+    if (ctx->tts != nullptr) {
+        switch (next) {
+            case SPEECH_STATE_PREFILL_SPEAKING:
+                // THE BARGE-IN EDGE. The user has started talking. Whether we are
+                // mid-answer or idle, anything still unspoken is now unwanted:
+                // this aborts the solver mid-step, drops buffered text, and marks
+                // queued audio stale so the device drops it on its next pull.
+                ctx->tts->BargeIn();
+                break;
+            case SPEECH_STATE_INTERRUPTION_REWIND:
+                // The pipeline's own barge-in path. Idempotent with the above.
+                ctx->tts->BargeIn();
+                break;
+            case SPEECH_STATE_DECODE_TRANSLATING:
+                // A new answer is starting: clear the cancelled latch so the
+                // tokens about to arrive are actually spoken.
+                ctx->tts->Resume();
+                break;
+            case SPEECH_STATE_IDLE:
+            default:
+                break;
+        }
+    }
+#endif
     // The return to IDLE is the turn boundary (SpeechTokenEvent carries no final
     // flag). The gate has already run by then, so the control's published verdict
     // is the authoritative reason this generation ended -- and it is what the UI
     // must show, because BargeIn and Eos both land on IDLE.
-    if (next == SPEECH_STATE_IDLE) ctx->view->on_local_final(ctx->control->last_reason());
+    if (next == SPEECH_STATE_IDLE) {
+        ctx->view->on_local_final(ctx->control->last_reason());
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+        // End of turn: flush the chunker so a tail shorter than min_chunk_chars
+        // is still spoken. BargeIn already reset the chunker on the interrupted
+        // path, so this is a no-op there rather than a re-speak.
+        if (ctx->tts != nullptr) ctx->tts->EndOfTurn();
+#endif
+    }
 }
 
 // TYPED-TURN sink. A typed message is already on screen as the user's bubble, so
@@ -403,10 +470,24 @@ int main(int argc, char** argv) {
         blackwell::bridge::EngineControlBridge* control = nullptr;
 
         if (use_real) {
+            // isolated_sessions: THIS app is the one that needs it. It runs both
+            // jobs -- transcribe the speech, then answer it -- and until now ran
+            // them on one sequence, so the transcription inherited the assistant
+            // persona and the conversation inherited the transcript's tag format.
+            // Two engine sequences (native CoW branching) is the fix; see
+            // RealEngineControl's Session block.
             real_stack = rt::bring_up_real_engine(args, dsp, settings.max_context,
                                                   settings.device_id,
-                                                  /*arm_streaming_plan=*/true);
+                                                  /*arm_streaming_plan=*/true,
+                                                  /*isolated_sessions=*/true);
             control = real_stack.bridge();
+            // Seed the transcription session's prefix source BEFORE the engine
+            // thread freezes it: prefill_system_prompt lays BOTH prefixes and
+            // reads this one from the control.
+            // Both halves of that prefix: the task text and the forced spoken
+            // language are composed into one system prompt for seq 1.
+            real_stack.control->set_audio_task_prompt(settings.audio_task_prompt);
+            real_stack.control->set_speech_language(settings.speech_language);
         } else {
             simulated = std::make_unique<rt::SimulatedEngineControl>();
             control = simulated.get();
@@ -545,6 +626,7 @@ int main(int argc, char** argv) {
             static_cast<std::uint32_t>(settings.silence_hangover_ms);
         mcfg.warm_prefill_interval_ms =
             static_cast<std::uint32_t>(settings.warm_prefill_interval_ms);
+        mcfg.pre_roll_ms = settings.pre_roll_ms;
         mcfg.system_prompt = settings.system_prompt;
 
         // prefill_system_prompt lives on the CONCRETE control, not the bridge
@@ -568,9 +650,21 @@ int main(int argc, char** argv) {
         // an atomic store read at the next VAD block or turn boundary -- no
         // marshaling, no engine work, doctrine intact (see settings_store.hpp).
         //
-        // The system prompt is the ONE live setting absent from this function: it
-        // is a KV cache rebuild, not a store, and goes through post_engine_task
-        // (see cb.on_system_prompt_apply below).
+        // The persona system prompt is the ONE live setting absent from this
+        // function: it is a KV cache rebuild, not a store, and goes through
+        // post_engine_task (see cb.on_system_prompt_apply below). Under session
+        // isolation the AUDIO TASK prompt joins it in that category -- it is the
+        // transcription sequence's frozen prefix -- so these track the values the
+        // engine is actually running, to rebuild only on a real edit.
+        //
+        // TWO settings compose that ONE prefix (the task text and the forced
+        // spoken language), and the retry is a FLAG rather than a poisoned shadow
+        // copy: clearing the copies cannot express "retry" when the value the user
+        // just chose is itself the empty string, which is exactly what "no forced
+        // language" is.
+        std::string applied_audio_task = settings.audio_task_prompt;
+        std::string applied_speech_language = settings.speech_language;
+        bool audio_prefix_dirty = false;
         auto apply_live_settings = [&](const rt::AssistantSettings& s) {
             SpeechPipelineHandle pipe = speech_mode.pipeline();
             (void)speech_pipeline_set_vad_threshold(pipe, s.vad_threshold);
@@ -578,6 +672,11 @@ int main(int argc, char** argv) {
                 pipe, static_cast<std::uint32_t>(s.silence_hangover_ms));
             (void)speech_pipeline_set_warm_prefill_interval_ms(
                 pipe, static_cast<std::uint32_t>(s.warm_prefill_interval_ms));
+            // The pre-roll goes to the CONTROL, not the pipeline: the flush it
+            // sizes happens on the engine thread, which is the only consumer
+            // allowed to move the ring's read cursor. It is on the base bridge, so
+            // it applies to whichever backend is live without a branch.
+            control->set_pre_roll_ms(s.pre_roll_ms);
 
             // The sampling knobs and the reply ceiling exist on BOTH controls (the
             // simulated one honours the ceiling and stores the rest), so they are
@@ -592,14 +691,56 @@ int main(int argc, char** argv) {
                         : rt::RealEngineControl::ContextMode::Stateless);
                 real_stack.control->set_history_budget_tokens(s.history_budget_tokens);
                 real_stack.control->set_live_center_slice(s.live_streaming);
-                // The AUDIO TASK, the second of the two prompts. Both live in the
-                // per-turn user block, so they apply on the next utterance with no
-                // KV work at all -- unlike the persona prompt, which is the frozen
-                // prefix and costs a rebuild.
+                // The task TOGGLES stay a plain store: they only change the
+                // generated directives in the per-turn user block.
                 real_stack.control->set_tasks(
                     /*transcribe=*/s.speech_task != "translate",
                     /*translate=*/s.speech_task != "transcribe");
-                real_stack.control->set_audio_task_prompt(s.audio_task_prompt);
+
+                // The AUDIO TASK PROMPT and the SPOKEN LANGUAGE compose the
+                // transcription session's frozen system prefix, so editing either
+                // is a KV rebuild on that sequence, not a store -- exactly like
+                // the persona prompt on the chat sequence. Marshal it (CUDA work
+                // belongs to the engine thread) and only when one of them actually
+                // changed: a settings push happens on every panel edit, and
+                // re-prefilling the prefix on each one would drop a live
+                // utterance's audio for nothing. Without isolation there is no
+                // second prefix, both values ride in the per-turn user block, and
+                // the stores below are the whole operation.
+                if (real_stack.isolated_sessions) {
+                    if (s.audio_task_prompt != applied_audio_task ||
+                        s.speech_language != applied_speech_language) {
+                        applied_audio_task = s.audio_task_prompt;
+                        applied_speech_language = s.speech_language;
+                        audio_prefix_dirty = true;
+                    }
+                    if (audio_prefix_dirty) {
+                        auto* rc = real_stack.control.get();
+                        const std::string prompt = applied_audio_task;
+                        const std::string language = applied_speech_language;
+                        if (control->post_engine_task([rc, prompt, language] {
+                                try {
+                                    // ORDER: the language is folded INTO the text
+                                    // the rebuild prefills, so it has to be
+                                    // current before the rebuild reads it.
+                                    rc->set_speech_language(language);
+                                    rc->rebuild_audio_task_prompt(prompt);
+                                } catch (const std::exception& e) {
+                                    std::fprintf(stderr,
+                                                 "[session] audio task prefix rebuild failed: "
+                                                 "%s\n", e.what());
+                                }
+                            })) {
+                            audio_prefix_dirty = false;
+                        }
+                        // Otherwise the task queue was full: stay dirty so the
+                        // next push retries rather than silently running the old
+                        // prefix forever.
+                    }
+                } else {
+                    real_stack.control->set_audio_task_prompt(s.audio_task_prompt);
+                    real_stack.control->set_speech_language(s.speech_language);
+                }
             } else if (simulated) {
                 simulated->set_sampling(s.temperature, s.top_p);
                 simulated->set_max_new_tokens(s.max_new_tokens);
@@ -654,8 +795,92 @@ int main(int argc, char** argv) {
                     speech_mode.frozen_prefix_tokens());
         apply_live_settings(settings);
 
+        // ---- speech output ---------------------------------------------------
+        // Built AFTER the engine so a TTS failure cannot delay the thing the app
+        // is actually for, and BEFORE the UI so the first reply can be spoken.
+        // INIT tier: a throw here disables speech and the assistant runs on --
+        // the same posture already taken for the neural VAD and the audio head.
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+        std::optional<rt::TtsRuntime> tts;
+        if (!settings.tts_ckpt_dir.empty()) {
+            rt::TtsRuntimeConfig tcfg;
+            tcfg.ckpt_dir   = settings.tts_ckpt_dir;
+            tcfg.vocab_path = settings.tts_vocab_path;
+            tcfg.ref_audio  = settings.tts_ref_audio;
+            tcfg.ref_text   = settings.tts_ref_text;
+            tcfg.nfe_step   = settings.tts_nfe_step;
+            tcfg.device_id  = device_id;
+            tcfg.split_on_commas  = settings.tts_split_on_commas;
+            tcfg.min_chunk_chars  = settings.tts_min_chunk_chars;
+            tcfg.max_chunk_chars  = settings.tts_max_chunk_chars;
+            tcfg.mic_gate_enabled = settings.tts_mic_gate;
+
+            // The shipped ref_text is a PLACEHOLDER, not a transcript. F5 treats
+            // generation as infilling against the (audio, text) pair, so leaving
+            // it produces fluent nonsense that sounds like a broken model rather
+            // than a misconfiguration. Say so before spending 10 s loading a
+            // 1.3 GB graph to produce it.
+            if (settings.tts_ref_text == rt::AssistantSettings{}.tts_ref_text) {
+                std::fprintf(stderr,
+                             "[tts] WARNING: reference transcript is still the placeholder. "
+                             "Set it to the literal text spoken in %s (Settings -> Audio -> "
+                             "TTS), or the voice will be wrong.\n",
+                             tcfg.ref_audio.c_str());
+            }
+            try {
+                tts.emplace(tcfg);
+                app_ctx.tts = &tts.value();
+                std::printf("[tts] ready: %s (nfe=%d, mic gate %s)\n",
+                            tcfg.ckpt_dir.c_str(), tcfg.nfe_step,
+                            tcfg.mic_gate_enabled ? "ON -- barge-in disabled" : "off");
+                // The last GPU consumer to load, so this line is the WHOLE
+                // budget: if it says OVER BUDGET, the box is already paging and
+                // every latency number after it is meaningless.
+                //
+                // MEASURED HEADROOM, so nobody re-litigates it from guesses:
+                // the F5 arena is bounded by F5TtsConfig::gpu_mem_limit_mb, and
+                // sweeping it showed 2048 MiB costs 2219 MiB committed, 1792
+                // costs the SAME 2219 (the arena never grows into the slack),
+                // and 1536 fails to initialize outright because the 1.31 GB of
+                // fp32 DiT weights are allocated THROUGH the arena, not beside
+                // it. There is no headroom left on this knob; the remaining
+                // reducible items are max_context and the fp32 audio head.
+                if (use_real) rt::report_vram("+ TTS (full stack)");
+                if (!tcfg.mic_gate_enabled) {
+                    // Said out loud because it is the difference between a demo
+                    // that works and one that talks over itself: there is no AEC
+                    // in this build, so on OPEN SPEAKERS the assistant's own
+                    // voice reaches the mic, Silero scores it as speech, and the
+                    // pipeline barges in on the answer it is currently giving.
+                    std::printf("[tts] NOTE: no echo canceller in this build. Use HEADPHONES, "
+                                "or enable the mic gate (costs barge-in-while-speaking).\n");
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[tts] disabled: %s\n", e.what());
+            }
+        } else {
+            std::printf("[tts] disabled (no --tts-ckpt-dir / persisted setting)\n");
+        }
+#endif
+
         realtime.set_pcm_tap(
-            [&active](const float* s, std::size_t n) { active->on_pcm_block(s, n); });
+            [&](const float* s, std::size_t n) {
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                // THE MIC INTERLOCK. While the speaker is live (plus a reverb
+                // tail) the mic carries our own voice, so feed the pipeline
+                // SILENCE rather than dropping the block: the VAD and the mel
+                // front-end are stateful and a gap would shift every subsequent
+                // frame. Off by default -- see tts_runtime.hpp for what enabling
+                // it costs.
+                if (app_ctx.tts != nullptr && app_ctx.tts->MicShouldBeGated()) {
+                    static thread_local std::vector<float> hush;
+                    hush.assign(n, 0.0f);
+                    active->on_pcm_block(hush.data(), n);
+                    return;
+                }
+#endif
+                active->on_pcm_block(s, n);
+            });
         realtime.start();
 
         // ---- UI: the Chromium messenger --------------------------------------
@@ -688,6 +913,12 @@ int main(int argc, char** argv) {
             // mechanism the VAD uses, so a cancelled turn lands as BargeIn and is
             // correctly NOT dispatched.
             control->cancel_generation(control->active_generation() + 1);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            // The button must also stop the SOUND, not just the decode. Without
+            // this the engine halts while the speaker keeps playing everything
+            // already synthesised -- which reads as the button not working.
+            if (app_ctx.tts != nullptr) app_ctx.tts->BargeIn();
+#endif
         };
         cb.on_settings_apply = [&](const rt::AssistantSettings& next, bool live_only) {
             settings = next;

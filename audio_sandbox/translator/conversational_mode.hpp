@@ -57,6 +57,11 @@ public:
         std::uint32_t silence_hangover_ms    = 800;      // stable boundary -> commit decode
         std::uint32_t warm_prefill_interval_ms = 320;    // speculative warm-prefill throttle
         float         vad_probability_threshold = 0.5f;  // neural scorer decision point
+        // Acoustic head kept when a speech-start flush clears the audio ring, in
+        // ms. The other half of "where does an utterance begin?" — the hangover
+        // above decides where it ENDS. Default mirrors
+        // ContinuousStreamingConfig::pre_roll_ms; see set_pre_roll_ms.
+        int           pre_roll_ms            = 250;
         std::string   system_prompt;
     };
 
@@ -108,6 +113,14 @@ public:
         }
 
         speech_pipeline_register_callbacks(pipe_, token_cb, state_cb, callback_user);
+
+        // The pre-roll is the one audio-gating knob that does NOT go to the
+        // pipeline: the pipeline never moves the ring's read cursor (SPSC — only
+        // the engine thread may), so the flush it triggers, and therefore the
+        // decision of how much acoustic head to spare, both live on the control.
+        // Set here so a mode is fully configured the moment it is constructed,
+        // rather than only after the first live-settings push.
+        control_->set_pre_roll_ms(cfg_.pre_roll_ms);
 
         // The scorer replaces the RMS threshold as the answer to "is this block
         // speech?" — and ONLY that. The hangover, the warm-prefill throttle and

@@ -401,7 +401,15 @@ details.think .think-body {
 
 .modal {
   width: min(620px, 100%);
-  max-height: 100%;
+  /* A REAL height, not just a cap. With only max-height the box auto-sizes to
+     whichever panel is showing, so switching tabs resized the whole modal and
+     moved the footer buttons out from under the pointer -- the tallest panel is
+     ~160px taller than the shortest. A settings dialog is a fixed frame with a
+     scrolling body; only the body's content changes with the tab.
+     min(...) rather than a flat 760px because the window's floor is 480px tall:
+     the modal must still fit, and 100% resolves against the overlay's padded
+     grid area, so it never overflows the frame. */
+  height: min(760px, 100%);
   display: flex; flex-direction: column;
   background: var(--bg-elev);
   border: 1px solid var(--line);
@@ -409,6 +417,15 @@ details.think .think-body {
   box-shadow: var(--shadow);
   overflow: hidden;
 }
+
+/* THE CHROME DOES NOT SHRINK. Now that .modal has a real height, its children
+   are flex items in a box that is often too small for their combined content --
+   and a flex item defaults to `flex-shrink: 1`, so the browser compresses the
+   head, the tab strip and the footer to make room. On .tabs that was visible
+   damage: the row squeezed below its line height and, because it carries
+   `overflow-x: auto`, clipped the tab labels through the middle of the glyphs.
+   Only .modal-body may absorb the slack (flex: 1 1 auto; min-height: 0). */
+.modal-head, .restart-banner, .modal-foot { flex: 0 0 auto; }
 
 .modal-head {
   display: flex; align-items: center;
@@ -430,6 +447,9 @@ details.think .think-body {
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
   scrollbar-width: none;
+  /* See the flex-shrink note on .modal-head: without this the fixed-height modal
+     squeezes this row and `overflow-x: auto` clips the labels mid-glyph. */
+  flex: 0 0 auto;
 }
 .tabs::-webkit-scrollbar { display: none; }
 .tab {
@@ -469,16 +489,17 @@ details.think .think-body {
 .restart-banner.hidden { display: none; }
 
 .modal-body {
+  /* The ONLY part that flexes: the head, the tab strip and the footer are fixed,
+     so the body absorbs whatever height is left and scrolls its own overflow.
+     min-height:0 is required, not decorative -- a flex child defaults to
+     min-height:auto, which refuses to shrink below its content and would push
+     the footer (and its Save button) off the bottom on a tall panel instead of
+     scrolling. */
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 6px 20px 14px;
   scrollbar-width: thin;
-  /* Tabs make each panel set the modal's height on its own, so the box visibly
-     resizes as you move between them -- which reads as a layout bug rather than
-     as a tab change. A floor keeps the short panels (Hotkeys, System prompt)
-     close to the tall ones. It is viewport-relative as well as absolute because
-     the window's minimum is 480px tall: a fixed 520px floor there would push the
-     footer, and its buttons, off the bottom of the modal. */
-  min-height: min(520px, 58vh);
 }
 
 .group { padding: 14px 0; border-bottom: 1px solid var(--line); }

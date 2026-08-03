@@ -219,6 +219,48 @@ TEST(ConversationalModeExtraction, StopUnblocksThePumpSoTheRunnerCanJoin) {
     EXPECT_TRUE(exited.load(std::memory_order_acquire));
 }
 
+// ---- the VAD pre-roll, and why it is pinned HERE -----------------------------
+// pre_roll_ms spent its first life as dead config: the struct held it, the panel
+// had a slider for it, and the only consumer was the OFFLINE re-translation
+// driver — so the live engine hard-flushed the ring at speech onset and clipped
+// the first syllable off every utterance. The flush itself lives in a CUDA-only
+// header, but the failure was never in the arithmetic: it was that the value the
+// user set never reached the control that flushes. That IS testable without a
+// GPU, and it is what these two pin.
+TEST(ConversationalModeExtraction, PreRollReachesTheControlAtConstruction) {
+    rt::SimulatedEngineControl control;
+    rt::ConversationalMode::Config cfg;
+    cfg.pre_roll_ms = 180;                   // deliberately not the default
+    Sink sink;
+    rt::ConversationalMode mode(
+        &control,
+        [&control](const std::string& p) { return control.prefill_system_prompt(p); },
+        nullptr, nullptr, cfg, &on_token, &on_state, &sink);
+
+    // Published by the ctor, not by a later live-settings push: a mode is fully
+    // configured the moment it exists, so the FIRST onset already honours it.
+    EXPECT_EQ(control.pre_roll_ms(), 180);
+
+    // And it stays live — the settings modal writes this while audio is flowing.
+    control.set_pre_roll_ms(400);
+    EXPECT_EQ(control.pre_roll_ms(), 400);
+    control.set_pre_roll_ms(-1);             // clamped at the setter, never negative
+    EXPECT_EQ(control.pre_roll_ms(), 0);
+}
+
+// The ms -> samples conversion the flush subtracts from available_samples().
+// 0 must mean "keep nothing" exactly (the pre-fix hard flush stays reachable).
+TEST(ConversationalModeExtraction, PreRollSamplesConvertsAtTheStreamRate) {
+    rt::SimulatedEngineControl control;
+
+    control.set_pre_roll_ms(250);
+    EXPECT_EQ(control.pre_roll_samples(16000), 4000u);   // the shipping default
+    control.set_pre_roll_ms(0);
+    EXPECT_EQ(control.pre_roll_samples(16000), 0u);
+    control.set_pre_roll_ms(1000);                        // the UI's ceiling
+    EXPECT_EQ(control.pre_roll_samples(16000), 16000u);
+}
+
 // The null-VAD fallback (a missing 2.3 MB model must not take the app down) is
 // covered by the A/B above rather than by a dedicated assertion: both paths there
 // run with vad == nullptr and still commit a full utterance, which is only

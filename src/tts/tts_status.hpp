@@ -35,6 +35,7 @@ enum class TtsStatus : std::int32_t {
     EmptyResult         = 3,  // input held nothing this voice can pronounce (see below)
     NotInitialized      = 4,  // used before its INIT-tier setup ran, or after teardown
     RuntimeFailure      = 5,  // backend (ORT / resampler) failed mid-stream; degrade, do not die
+    Interrupted         = 6,  // barge-in: abandoned on request, NOT a fault (see below)
 };
 
 inline const char* to_string(TtsStatus status) noexcept {
@@ -45,6 +46,7 @@ inline const char* to_string(TtsStatus status) noexcept {
         case TtsStatus::EmptyResult:         return "EmptyResult";
         case TtsStatus::NotInitialized:      return "NotInitialized";
         case TtsStatus::RuntimeFailure:      return "RuntimeFailure";
+        case TtsStatus::Interrupted:         return "Interrupted";
     }
     return "UnknownTtsStatus";
 }
@@ -62,6 +64,21 @@ inline const char* to_string(TtsStatus status) noexcept {
 // Malformed UTF-8 is neither: the offending bytes are skipped and counted, and
 // the request succeeds on whatever remained pronounceable. Only if that leaves
 // nothing does it surface, as EmptyResult.
+//
+// Interrupted is the third member of that family and the one most likely to be
+// mishandled, because it is the only status here that means "everything worked".
+// A barge-in abandons a solve that was proceeding correctly, so it must NOT
+// advance an error counter, must NOT be surfaced as a failure in the panel, and
+// must NOT be retried — the user asked for the audio to stop, and re-speaking a
+// line they just talked over is the exact behaviour barge-in exists to prevent.
+// Callers branch on it to skip the utterance silently.
 inline bool is_success(TtsStatus status) noexcept { return status == TtsStatus::Success; }
+
+// True when a request ended without producing audio AND without anything being
+// wrong. The predicate exists so call sites stop spelling out the disjunction and
+// getting it wrong in one of the two places.
+inline bool is_benign_empty(TtsStatus status) noexcept {
+    return status == TtsStatus::EmptyResult || status == TtsStatus::Interrupted;
+}
 
 }  // namespace blackwell::tts

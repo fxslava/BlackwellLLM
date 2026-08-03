@@ -151,6 +151,37 @@ public:
         return system_prefix_tokens_.load(std::memory_order_acquire);
     }
 
+    // ---- VAD PRE-ROLL: the acoustic head a speech-start flush must NOT eat ----
+    // A speech-start rewind flushes the audio ring, because everything buffered
+    // between two utterances is background noise and encoding it makes the model
+    // hallucinate. But the ring is fed CONTINUOUSLY, including while the VAD is
+    // idle — so at the instant the detector fires, the samples sitting at the head
+    // of the ring are not noise: they are the onset of the word the user just
+    // started saying. A neural VAD needs 45–110 ms of audio to decide, and a total
+    // flush throws exactly that window away, which is why short and plosive first
+    // syllables ("p", "k", "t") were being clipped off the transcript.
+    //
+    // This is the amount of audio a flush RETAINS at the ring's head, so it is
+    // consumed as the start of the new utterance instead of discarded. It is the
+    // live-engine counterpart of ContinuousStreamingConfig::pre_roll_ms (which the
+    // offline re-translation driver already honoured) and shares its default and
+    // its bounds. 0 restores the old hard-flush behaviour.
+    //
+    // UI thread writes, engine thread reads inside do_rewind — one atomic, read at
+    // an utterance boundary, so a change applies to the very next onset.
+    void set_pre_roll_ms(int ms) noexcept {
+        pre_roll_ms_.store(ms < 0 ? 0 : ms, std::memory_order_release);
+    }
+    int pre_roll_ms() const noexcept {
+        return pre_roll_ms_.load(std::memory_order_acquire);
+    }
+    // The same figure in samples at `sample_rate`. The conversion lives here so
+    // every flush site derives it identically (a rounding disagreement between two
+    // call sites would show up as a few clipped samples nobody could account for).
+    size_t pre_roll_samples(uint32_t sample_rate) const noexcept {
+        return static_cast<size_t>(static_cast<uint64_t>(pre_roll_ms()) * sample_rate / 1000u);
+    }
+
     // ---- IEngineControl: PRODUCER edge (audio / VAD / event thread) ----------
     // Every method here is wait-free and never touches CUDA. The speculative ones
     // are noexcept (they only bump an atomic + append a POD); a superseded op
@@ -385,6 +416,11 @@ private:
     // the engine thread by every rewind. Its own cache line: read on the hot
     // barge-in path, so keep it off the SPSC cursors' lines (no false sharing).
     alignas(64) std::atomic<uint32_t> system_prefix_tokens_{0};
+
+    // Pre-roll retained by a speech-start flush (see set_pre_roll_ms). Mirrors
+    // ContinuousStreamingConfig::pre_roll_ms's 250 ms default; not that type,
+    // because this header must not drag the segmenter into every bridge consumer.
+    std::atomic<int> pre_roll_ms_{250};
 
     // Last generation's verdict. Written by publish_intent() on the engine thread,
     // read by the UI thread for the status badge -- hence atomic.

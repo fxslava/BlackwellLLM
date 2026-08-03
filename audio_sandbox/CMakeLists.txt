@@ -269,6 +269,25 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         blackwell_copy_vad_model(voice_assistant)
     endif()
 
+    # F5-TTS speech output. Additive and optional in exactly the same way as the
+    # VAD above: blackwell_tts_f5 exists only when the ONNXRuntime CUDA execution
+    # provider was fetched, and without it VOICE_ASSISTANT_HAS_TTS stays
+    # undefined and every use site in main.cpp compiles out. The app is text-only
+    # rather than broken.
+    #
+    # BLACKWELL_HAVE_ORT_CUDA is what main.cpp actually gates on; it rides in on
+    # blackwell::onnxruntime's INTERFACE definitions via blackwell_tts_f5.
+    if(TARGET blackwell_tts_f5)
+        target_sources(voice_assistant PRIVATE
+            src/audio_playback.cpp                     # the ma_device_type_playback half
+            voice_assistant/tts_runtime.cpp)           # reference-WAV reader
+        target_link_libraries(voice_assistant PRIVATE
+            blackwell_tts_f5)                          # brings blackwell_tts + audio_rt
+        # cuDNN 9 as well: the CUDA EP loads without it and then dies at the first
+        # Conv node, after the model is already resident in VRAM.
+        blackwell_copy_cudnn_dlls(voice_assistant)
+    endif()
+
     target_compile_definitions(voice_assistant PRIVATE UNICODE _UNICODE)
     if(MSVC)
         target_compile_definitions(voice_assistant PRIVATE _CRT_SECURE_NO_WARNINGS)

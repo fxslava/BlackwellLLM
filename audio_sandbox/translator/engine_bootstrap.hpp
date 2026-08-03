@@ -50,6 +50,10 @@ struct RealEngineStack {
     BackboneConfig  backbone{};
     ProjectorParams projector{};
     bool            audio_head_ready = false;
+    // Whether the two-sequence topology actually came up (see
+    // bring_up_real_engine's isolated_sessions). False means every task shares
+    // one linear context, the pre-isolation behaviour.
+    bool            isolated_sessions = false;
 
     // The control, as the base type ConversationalMode and the UI hold. Never
     // null once bring_up_real_engine() returns.
@@ -71,15 +75,55 @@ inline void select_cuda_device(int device_id) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VRAM accounting. MEASURED, not estimated -- cudaMemGetInfo reports what the
+// driver has actually committed, including allocations this process did not
+// make (the desktop compositor, other apps) and the CUDA context itself.
+//
+// WHY THIS IS PRINTED RATHER THAN JUST BUDGETED. On Windows/WDDM, exceeding
+// VRAM does NOT fail an allocation: the driver silently migrates pages to
+// system RAM over PCIe. Throughput collapses by an order of magnitude and
+// nothing anywhere reports an error -- the app just appears to freeze. The
+// only way to catch it is to watch the committed total cross the line, which
+// is what these lines are for. Compare against `nvidia-smi` "Memory-Usage";
+// if Windows Task Manager shows "Shared GPU memory" above 0, paging has
+// already started and the numbers below will say why.
+// ---------------------------------------------------------------------------
+inline void report_vram(const char* stage) {
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    const double used_gb  = static_cast<double>(total_b - free_b) / (1024.0 * 1024.0 * 1024.0);
+    const double total_gb = static_cast<double>(total_b) / (1024.0 * 1024.0 * 1024.0);
+    std::printf("[vram] %-22s %5.2f / %5.2f GB committed (%.2f GB free)%s\n",
+                stage, used_gb, total_gb,
+                static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0),
+                // The practical ceiling is BELOW the nameplate: WDDM keeps a
+                // reserve for the desktop, so paging begins before `free` hits
+                // zero. 87.5% is where a 12 GB card starts spilling in practice.
+                used_gb > 0.875 * total_gb ? "  <-- OVER BUDGET: WDDM paging likely" : "");
+    std::fflush(stdout);
+}
+
 // Bring up the full GPU pipeline. `dsp` is borrowed and must outlive the stack
 // (the control holds a pointer to it for the live commit path).
 //
 // max_context caps persistent KV growth across utterances; at 8B geometry the
 // FP32 KV pool is ~256 KB/token, so 4096 tokens is ~1.05 GB on top of the
 // ~5.3 GB AWQ weights.
+//
+// isolated_sessions asks for the TWO-SESSION topology (see
+// RealEngineControl::enable_isolated_sessions): transcription and chat get their
+// own engine sequence instead of sharing one linear context. That is a request
+// for the engine's NATIVE CoW branching, and branching exists only under the
+// paged KV cache -- ContinuousKVManager::supports_branching() is false and
+// fork() throws there, so this flag necessarily switches the whole app from the
+// continuous cache to the paged one. Non-fatal: a model that cannot branch
+// (hybrid SSM) or a paged geometry the flash kernel cannot serve degrades to the
+// single-session path with a warning, exactly like the audio head.
 inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper::WhisperDSP& dsp,
                                             int max_context, int device_id,
-                                            bool arm_streaming_plan) {
+                                            bool arm_streaming_plan,
+                                            bool isolated_sessions = false) {
     RealEngineStack st;
 
     select_cuda_device(device_id);
@@ -114,11 +158,42 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
     req.audio_streaming.enable = arm_streaming_plan;
     req.source_language = args.src_lang;
     req.target_language = args.tgt_lang;
+    // Tier-2 intent, not a low-level poke: "I will fork sequences", which
+    // build_and_validate_runtime resolves to KVCacheMode::Paged (CLAUDE.md
+    // extension pattern #2). Rejected here, before any VRAM is touched, for a
+    // model whose recurrent state cannot be snapshot.
+    req.require_branching = isolated_sessions;
 
-    st.engine = std::make_unique<BlackwellEngine>(
-        args.model_dir + "/model.safetensors.index.json", req);
+    // Exactly the two sequences this app runs (chat + transcription). The
+    // default of 4 would inflate the paged host-mirror pool -- and the hybrid
+    // state stores -- by 2x for branches we never fork.
+    blackwell::RuntimeOverrides overrides;
+    if (isolated_sessions) overrides.paged_branch_factor = 2;
+
+    // The branching request is best-effort: a checkpoint the paged path cannot
+    // serve must still boot the app, single-session, rather than take the binary
+    // down over a context-isolation optimization.
+    try {
+        st.engine = std::make_unique<BlackwellEngine>(
+            args.model_dir + "/model.safetensors.index.json", req, overrides);
+    } catch (const std::exception& e) {
+        if (!isolated_sessions) throw;
+        std::fprintf(stderr,
+                     "[session] WARN: paged (branching) KV unavailable for this model (%s)"
+                     " -- falling back to a SINGLE shared context\n", e.what());
+        req.require_branching = false;
+        st.engine = std::make_unique<BlackwellEngine>(
+            args.model_dir + "/model.safetensors.index.json", req,
+            blackwell::RuntimeOverrides{});
+    }
     std::printf("[engine] loaded (hidden=%d vocab=%d quant=%s)\n", st.backbone.hidden_size,
                 st.backbone.vocab_size, st.backbone.quant_method.c_str());
+    // Weights + KV pool together. The KV half is the part max_context controls:
+    // the paged cache is bf16, so it costs
+    //     num_layers * num_kv_heads * head_dim * 2 (K,V) * 2 B * max_context
+    // per sequence -- 128 KB/token at 8B geometry, times paged_branch_factor.
+    // 4096 tokens over 2 branches is ~1.05 GB; halving max_context halves it.
+    report_vram("backbone + KV");
 
     st.control = std::make_unique<RealEngineControl>(st.engine.get(), st.tokenizer.get(),
                                                      max_context);
@@ -126,6 +201,20 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
                                      ? RealEngineControl::ContextMode::BoundedHistory
                                      : RealEngineControl::ContextMode::Stateless);
     st.control->set_history_budget_tokens(args.history_budget_tokens);
+
+    // Fork the ephemeral transcription sequence off the (still empty) root, so
+    // the two prompts never share a KV prefix. Capability-gated inside; reports
+    // what it actually got, because "isolated" silently degrading to "shared" is
+    // precisely the context poisoning this exists to prevent.
+    if (isolated_sessions) {
+        st.isolated_sessions = st.control->enable_isolated_sessions();
+        std::printf("[session] context isolation: %s (kv=%s, branch capacity=%d)\n",
+                    st.isolated_sessions ? "ON -- chat=seq 0, transcription=seq 1"
+                                         : "OFF -- single shared context",
+                    st.engine->get_capabilities().supports_cow_branching ? "paged" : "continuous",
+                    st.engine->branch_capacity());
+        std::fflush(stdout);
+    }
 
     // Audio head: NON-FATAL by design (see the header preamble).
     std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
@@ -136,6 +225,12 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
         st.audio_head_ready = true;
         std::printf("[audio] encoder + projector loaded (%d soft-tokens/frame); "
                     "live audio->text ARMED\n", st.control->audio_out_frames());
+        // The audio head is the LARGEST single reducible item in the budget and
+        // the least obvious: src/audio/whisper_encoder.h carries its weights as
+        // `const float*` throughout, so an fp16 Ultravox checkpoint is inflated
+        // 2x on upload. Whatever this line reports is roughly twice what the
+        // same weights would cost in fp16 -- see the note in main.cpp.
+        report_vram("+ audio head");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[audio] WARN: audio head not loaded (%s) -- text-only mode\n",
                      e.what());

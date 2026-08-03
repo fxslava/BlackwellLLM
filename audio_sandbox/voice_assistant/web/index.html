@@ -248,10 +248,145 @@
               turns then end only on the talk hotkey.
             </p>
           </div>
+          <div class="field">
+            <label for="s_pre_roll_ms">
+              Pre-roll <span class="hint-inline" id="prerollValue"></span>
+            </label>
+            <input id="s_pre_roll_ms" type="range" min="0" max="1000" step="10">
+            <div class="scale"><span>Nothing kept</span><span>Keeps more lead-in</span></div>
+            <p class="hint">
+              How much audio from just <em>before</em> you were detected is kept.
+              Voice detection needs a moment to be sure, so without this the first
+              syllable is thrown away &mdash; short and hard sounds
+              (<b>p</b>, <b>t</b>, <b>k</b>) go missing from the transcript.
+              <b>0 keeps nothing</b>, which is fastest but clips.
+            </p>
+          </div>
           <label class="check">
             <input type="checkbox" id="s_loopback_capture">
             <span>Listen to system audio instead of the microphone</span>
           </label>
+        </div>
+
+        <div class="group">
+          <h3>TTS / Voice Synthesis</h3>
+          <p class="group-note">
+            Speaks replies aloud in a cloned voice. Leave the model folder empty
+            to keep the assistant text-only. Every setting here needs a
+            <b>restart</b> &mdash; the model is a 1.3&nbsp;GB graph loaded onto the
+            GPU and the reference voice is prepared once at startup.
+          </p>
+
+          <div class="field">
+            <label for="s_tts_ckpt_dir">Model folder</label>
+            <input id="s_tts_ckpt_dir" type="text" spellcheck="false"
+                   placeholder="D:\TTF">
+            <p class="hint">
+              Must contain the two <b>exported</b> files
+              <code>f5_tts_dit.onnx</code> and <code>f5_tts_vocoder.onnx</code>
+              &mdash; not the <code>.safetensors</code> checkpoint they were
+              exported from. If you only have the checkpoint, run
+              <code>scripts/export_f5_tts_onnx.py</code> first.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="s_tts_vocab_path">Vocabulary file</label>
+            <input id="s_tts_vocab_path" type="text" spellcheck="false"
+                   placeholder="D:\TTF\vocab.txt">
+            <p class="hint">
+              The <code>vocab.txt</code> that shipped <b>with this checkpoint</b>.
+              Character IDs are line numbers, so a mismatched file maps every
+              letter to the wrong sound with no error.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="s_tts_ref_audio">Reference voice clip</label>
+            <input id="s_tts_ref_audio" type="text" spellcheck="false"
+                   placeholder="D:\TTF\ref_audio.wav">
+            <p class="hint">
+              5&ndash;10 s of one speaker, clean, <b>24&nbsp;kHz mono WAV</b>. Other
+              sample rates are refused rather than converted, because resampling
+              silently shifts the pitch and clones a different-sounding person.
+              Convert with
+              <code>ffmpeg -i in.wav -ar 24000 -ac 1 ref_24k.wav</code>.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="s_tts_ref_text">Reference transcript</label>
+            <textarea id="s_tts_ref_text" rows="3" spellcheck="false"></textarea>
+            <p class="hint">
+              <b>The exact words spoken in the clip above.</b> Not a label &mdash;
+              the model treats generation as continuing this pair, so a wrong or
+              placeholder transcript does not degrade politely, it produces
+              confident nonsense.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="s_tts_nfe_step">
+              Quality steps <span class="hint-inline" id="nfeValue"></span>
+            </label>
+            <input id="s_tts_nfe_step" type="range" min="8" max="32" step="1">
+            <div class="scale"><span>Faster</span><span>Better</span></div>
+            <p class="hint">
+              Solver steps per chunk. Time to speak scales almost linearly with
+              this; quality flattens out past ~16.
+            </p>
+          </div>
+
+          <label class="check">
+            <input type="checkbox" id="s_tts_split_on_commas">
+            <span>Split at commas as well as sentences
+              <em>(starts speaking sooner)</em></span>
+          </label>
+          <p class="hint">
+            Nothing can be spoken until its whole chunk is generated, so smaller
+            chunks start sooner. The trade is that the voice is re-anchored to the
+            reference at every split, which flattens intonation across the seam.
+          </p>
+
+          <div class="field">
+            <label for="s_tts_min_chunk_chars">
+              Shortest chunk <span class="hint-inline" id="minChunkValue"></span>
+            </label>
+            <input id="s_tts_min_chunk_chars" type="range" min="5" max="50" step="1">
+            <div class="scale"><span>Splits more</span><span>Splits less</span></div>
+            <p class="hint">
+              Stops a stray &ldquo;Yes,&rdquo; becoming its own utterance &mdash; a
+              clipped bark that costs a full synthesis to say one word.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="s_tts_max_chunk_chars">
+              Longest chunk <span class="hint-inline" id="maxChunkValue"></span>
+            </label>
+            <input id="s_tts_max_chunk_chars" type="range" min="50" max="300" step="5">
+            <div class="scale"><span>Speaks sooner</span><span>Smoother</span></div>
+            <p class="hint">
+              A run-on sentence with no punctuation is broken at the next space
+              once it reaches this length, so it cannot buffer until the reply
+              ends.
+            </p>
+          </div>
+
+          <label class="check">
+            <input type="checkbox" id="s_tts_mic_gate">
+            <span>Mute microphone during playback
+              <em>(recommended without echo cancellation)</em></span>
+          </label>
+          <p class="hint">
+            Mute microphone during TTS playback (recommended for open speakers
+            without AEC to prevent self-triggering). This build has
+            <b>no echo canceller</b>, so with it off and speakers on, the assistant
+            hears its own voice, correctly decides someone is talking, and
+            interrupts the answer it is in the middle of giving.
+            <b>The cost of leaving it on:</b> you cannot interrupt by talking over
+            it &mdash; use the cancel hotkey. Headphones let you turn it off safely.
+          </p>
         </div>
 
         <div class="group">
@@ -354,6 +489,12 @@
             it therefore rebuilds the cache, so applying takes a moment on a real
             checkpoint, and clears the conversation the model remembers.
           </p>
+          <p class="group-note">
+            This persona applies to <em>answering</em> only. Hearing you is a
+            separate context with its own instruction below, so the assistant's
+            personality can never talk the transcriber into replying to your
+            speech instead of writing it down.
+          </p>
           <div class="field">
             <textarea id="s_system_prompt" class="prompt-editor" rows="7" spellcheck="true"
                       placeholder="You are a concise voice assistant&hellip;"></textarea>
@@ -367,9 +508,10 @@
         <div class="group">
           <h3>Speech task</h3>
           <p class="group-note">
-            What to do with each thing you say. This one is <em>free</em> to change
-            &mdash; it lives in the per-turn instruction rather than the cached
-            prefix, so it applies on your very next sentence with no rebuild.
+            What to do with each thing you say. The task below is <em>free</em> to
+            change &mdash; it lives in the per-turn instruction rather than a
+            cached prefix, so it applies on your very next sentence with no
+            rebuild.
           </p>
           <div class="field">
             <label for="s_speech_task">Task</label>
@@ -385,15 +527,37 @@
             </p>
           </div>
           <div class="field">
-            <label for="s_audio_task_prompt">Audio task instruction</label>
+            <label for="s_speech_language">Spoken language</label>
+            <input id="s_speech_language"
+                   placeholder="e.g. Russian, English (leave empty for Auto)">
+            <p class="hint">
+              The language <em>you</em> speak. Leave it empty and the model works
+              it out from the sound &mdash; which it gets wrong on short phrases
+              between close languages, answering Russian speech in Polish words or
+              Latin letters. Naming the language here removes the guess: it is
+              written into the listening context and repeated on every utterance.
+            </p>
+            <p class="hint">
+              This is the <b>source</b> language only. It does not constrain a
+              translation &mdash; with <b>Translate</b> selected above you still
+              get the target language out.
+            </p>
+          </div>
+          <div class="field">
+            <label for="s_audio_task_prompt">Transcriber instruction</label>
             <textarea id="s_audio_task_prompt" class="prompt-editor short" rows="3"
                       spellcheck="true"
-                      placeholder="Transcribe the following speech exactly as spoken: "></textarea>
+                      placeholder="You are a speech transcription engine&hellip;"></textarea>
             <p class="hint">
-              Ends immediately before the audio, so finish it with a colon.
-              Leave it empty to use the built-in phrasing for the task above.
-              The language rules and the output tags are added automatically
-              &mdash; you only supply the instruction itself.
+              The persona of the context that <em>listens</em> &mdash; kept apart
+              from the assistant persona above so the two cannot bleed into each
+              other. Leave it empty for the built-in transcriber. The language
+              rules and the output tags are added automatically; you only supply
+              the instruction itself.
+            </p>
+            <p class="hint">
+              Changing it rebuilds that context's cache, but it keeps no history,
+              so it applies almost instantly and leaves your conversation alone.
             </p>
           </div>
         </div>

@@ -13,6 +13,20 @@
 //   edge (cancel_generation / rewind_kv / warm_prefill / commit_and_decode) on
 //   the base class — it never reaches into here and never touches CUDA.
 //
+// TWO ISOLATED SESSIONS (native CoW branching; see the Session block below)
+//   Transcription and conversation are separate jobs with separate system
+//   prompts, so they get separate engine SEQUENCES rather than sharing one
+//   linear context:
+//     seq 0  CHAT, persistent  -- the persona prompt + dialogue history.
+//     seq 1  AUDIO, ephemeral  -- the audio task prompt + the soft-tokens;
+//                                 rolled back to its prefix after every turn.
+//   The pipeline is therefore: audio -> seq 1 -> transcript TEXT -> commit gate
+//   -> user chat template -> seq 0 -> reply. The only thing crossing between the
+//   two is that transcript string; no KV is shared. enable_isolated_sessions()
+//   forks seq 1 off the empty root and is capability-gated -- when the engine
+//   cannot branch (continuous KV) everything below collapses to the single
+//   shared session it always was.
+//
 // THE AUDIO PATH (fully wired, two live modes)
 //   The full multimodal path is  live PCM -> Whisper log-mel (whisper_dsp) ->
 //   Whisper ENCODER (audio_tower) -> Ultravox projector -> prefill-from-embeddings
@@ -105,6 +119,84 @@ public:
                                    blackwell::AudioStreamingMode::CenterSlice,
                                std::memory_order_relaxed);
         }
+    }
+
+    // ---- ISOLATED SESSIONS (the engine's NATIVE CoW branching) ---------------
+    // Transcription and conversation are two different jobs with two different
+    // system prompts, and running them on one linear sequence poisons both: the
+    // transcriber inherits the assistant persona ("be helpful, be concise") and
+    // answers the audio instead of writing it down, while the chat context
+    // accumulates "[Speech] ... | [Translation] ..." formatting noise it then
+    // imitates. So they get one engine SEQUENCE each:
+    //
+    //   CHAT  (seq 0, PERSISTENT)  the persona system prompt + the dialogue
+    //         history. Survives every utterance; this is where a reply is
+    //         generated, locally or after the cloud round-trip.
+    //   AUDIO (seq 1, EPHEMERAL)   the transcription task prompt. Receives the
+    //         audio soft-tokens, produces the transcript, and is rolled back to
+    //         its own frozen prefix the moment the turn closes -- it never
+    //         retains history in ANY context mode, so a hallucinated transcript
+    //         cannot feed the next one.
+    //
+    // The two are genuinely independent KV: seq 1 is fork()ed off the EMPTY root
+    // before either prefix is laid down, so nothing is shared but the page
+    // allocator. That is only available under the paged (branching) cache --
+    // ContinuousKVManager::supports_branching() is false -- which is why
+    // bring_up_real_engine requests InferenceConfig::require_branching.
+    //
+    // isolated() == false is a fully supported configuration and is EXACTLY the
+    // pre-isolation behaviour: one session, one prefix, everything on seq 0.
+    struct Session {
+        int         seq_id        = 0;
+        int         pos           = 0;   // logical decode position on this sequence
+        uint32_t    system_prefix = 0;   // frozen prefix == this sequence's KV floor
+        uint32_t    verified      = 0;   // committed-prefix boundary (checkpoint/rollback)
+        int         history_base  = 0;   // system prefix + retained turns
+        bool        ephemeral     = false;  // discard every turn back to the prefix
+        const char* name          = "chat";
+    };
+
+    // Fork the ephemeral transcription sequence. ENGINE THREAD, SETUP ONLY: both
+    // sequences must still be empty (fork of a zero-length parent copies no
+    // pages, so the two prefixes below diverge from nothing rather than sharing a
+    // persona). Returns false -- leaving the single-session path intact -- when
+    // the loaded model or KV mode cannot branch, per the capability-gating rule:
+    // never guess what a checkpoint supports, ask.
+    bool enable_isolated_sessions() {
+        if (isolated_) return true;
+        if (engine_ == nullptr) return false;
+        if (pos_ != 0) return false;                       // prefixes already laid
+        if (!engine_->get_capabilities().supports_cow_branching) {
+            std::fprintf(stderr, "[session] branching unsupported by this engine "
+                                 "(continuous KV or non-snapshot-able state)\n");
+            return false;
+        }
+        if (engine_->branch_capacity() < 2) {
+            std::fprintf(stderr, "[session] branch capacity %d < 2 (raise "
+                                 "RuntimeOverrides::paged_branch_factor)\n",
+                         engine_->branch_capacity());
+            return false;
+        }
+        try {
+            engine_->fork(chat_.seq_id, audio_.seq_id);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[session] fork(%d -> %d) failed: %s\n",
+                         chat_.seq_id, audio_.seq_id, e.what());
+            return false;
+        }
+        isolated_ = true;
+        return true;
+    }
+    bool isolated() const noexcept { return isolated_; }
+
+    // The chat session's decode position -- the invariant readout that proves
+    // isolation is real: a transcription turn must leave this untouched. Any
+    // thread may read it (engine thread is the only writer).
+    int chat_position() const noexcept {
+        return active_ == &chat_ ? pos_ : chat_.pos;
+    }
+    int audio_position() const noexcept {
+        return active_ == &audio_ ? pos_ : audio_.pos;
     }
 
     // ---- Live streaming-mode toggle (UI thread writes, engine thread reads at
@@ -218,18 +310,22 @@ public:
 
     // ---- the AUDIO TASK PROMPT (Settings -> System prompts) -------------------
     // The second of the two prompts, and a genuinely different thing from the
-    // frozen system prefix:
+    // persona:
     //
-    //   PERSONA  prefill_system_prompt() -- who the assistant IS. Prefilled ONCE
-    //            and reused by every turn, so editing it is a KV cache rebuild.
-    //   AUDIO    this -- what to DO with the next chunk of speech. It lives in
-    //   TASK     the per-turn user block, which is re-prefilled every utterance,
-    //            so editing it costs nothing and applies on the very next turn.
+    //   PERSONA  prefill_system_prompt() -- who the assistant IS. The frozen
+    //            system prefix of the CHAT session (seq 0).
+    //   AUDIO    this -- what to do with speech. Under isolation it is the frozen
+    //   TASK     system prefix of the TRANSCRIPTION session (seq 1), so the two
+    //            never sit on one sequence; edits go through
+    //            rebuild_audio_task_prompt (cheap: that session keeps no history).
+    //            Without isolation it falls back to riding in the per-turn user
+    //            block, which is the pre-branching behaviour.
     //
     // Conflating the two is what made the model translate when the user wanted a
     // transcript: the task verb was hardcoded in build_user_instruction() and the
     // only prompt anyone could edit was the persona, which is the one prompt that
-    // does NOT decide the task.
+    // does NOT decide the task. Putting them on separate sequences is the
+    // structural version of that same fix.
     //
     // SCOPE, deliberately narrow. This replaces the task VERB only; the language
     // directives and the output-tag contract are still generated, because
@@ -249,6 +345,54 @@ public:
         std::lock_guard<std::mutex> lk(audio_task_mu_);
         return audio_task_prompt_;
     }
+
+    // ---- the SPOKEN LANGUAGE (Settings -> System prompts) ---------------------
+    // Free text ("Russian", "English", ""), NOT an rt::kLanguages index, and that
+    // is the point: the table is a fixed twelve-entry dropdown, while the failure
+    // this fixes is acoustic and can name any language the backbone knows.
+    //
+    // WHY IT EXISTS. The audio tower's language identification confuses
+    // neighbouring phonologies on short hops -- Russian heard as Polish is the
+    // reproducible case -- and once it has guessed wrong the backbone dutifully
+    // writes the wrong language in the wrong script (Latin transliteration, Polish
+    // vocabulary). Nothing downstream can recover from that: the transcript is
+    // what gets committed and answered. So the fix is upstream, and it is a
+    // constraint rather than a hint -- naming the language REMOVES the decision
+    // instead of biasing it.
+    //
+    // IT LANDS IN TWO PLACES, deliberately:
+    //   1. The transcription session's frozen SYSTEM prefix (see
+    //      resolve_audio_system_prompt) -- the persona itself is language-locked,
+    //      paid for once. Editing it is therefore a prefix rebuild, exactly like
+    //      editing the audio task text.
+    //   2. The per-turn user instruction (build_user_instruction) -- restated
+    //      immediately before the audio soft-tokens, which is the position that
+    //      actually kills the transliteration mode, and the ONLY position that
+    //      exists at all when isolation is off.
+    //
+    // Same mutex as the audio task text: both are std::strings read at turn
+    // boundaries on the engine thread and written by the UI thread, never touched
+    // from the audio hot path.
+    void set_speech_language(std::string language) {
+        std::lock_guard<std::mutex> lk(audio_task_mu_);
+        speech_language_ = std::move(language);
+    }
+    std::string speech_language() const {
+        std::lock_guard<std::mutex> lk(audio_task_mu_);
+        return speech_language_;
+    }
+
+    // The forced source language as a NAME, resolving the two ways one can be
+    // forced. Free text wins over the kLanguages index because it is the more
+    // specific statement: the index is a launch-time plan default (--src-lang),
+    // the text is what the user typed into this session's settings. "" = Auto,
+    // i.e. leave language identification to the model. Any thread.
+    std::string forced_source_language() const {
+        if (std::string named = speech_language(); !named.empty()) return named;
+        const int si = src_lang_.load(std::memory_order_acquire);
+        return si > 0 ? std::string(rt::kLanguages[si]) : std::string();
+    }
+
     bool task_transcribe() const noexcept {
         return task_transcribe_.load(std::memory_order_acquire);
     }
@@ -274,26 +418,63 @@ public:
     // So the floor tracks the actual prefill, and the failure is raised only
     // AFTER the published state is self-consistent (INIT tier: this throws, and
     // rebuild_system_prompt's caller reports it to the user).
+    //
+    // ISOLATION: this is the CHAT session's prefix (the persona). It also lays
+    // the AUDIO session's prefix in the same call, because both are startup KV
+    // work on the engine thread and ConversationalMode drives exactly one prefill
+    // seam -- splitting them into two callbacks would only create an ordering
+    // this function can guarantee for free. Returns the CHAT prefix length (what
+    // the seam and the UI report).
     uint32_t prefill_system_prompt(const std::string& system_prompt) {
-        const std::vector<int> ids = tok_->encode_chat_prelude(system_prompt);
-        int next = -1;
-        auto status = blackwell::EngineStatus::Success;
-        uint32_t done = 0;
-        for (const int id : ids) {
-            status = engine_->forward_status(id, pos_, /*temperature=*/0.0f, /*top_p=*/1.0f,
-                                             cfg_.seq_id, &next);
-            if (status != blackwell::EngineStatus::Success) break;
-            ++pos_;
-            ++done;
-        }
-        set_system_prefix_tokens(done);   // KV rewind floor (barge-in never truncates it)
-        history_base_pos_.store(pos_, std::memory_order_relaxed);  // no history yet
-        if (status != blackwell::EngineStatus::Success) {
-            throw blackwell::engine_error(
-                status, "system-prompt prefill failed after " + std::to_string(done) + " of " +
-                            std::to_string(ids.size()) + " tokens");
-        }
+        activate(chat_);
+        const uint32_t done = prefill_prefix_on_active(
+            tok_->encode_chat_prelude(system_prompt), "system");
+        if (isolated_) prefill_audio_task_prefix(audio_task_prompt());
         return done;
+    }
+
+    // The AUDIO session's frozen prefix: what THAT context is for. A dedicated
+    // transcription persona is the whole reason the audio task stopped being a
+    // sentence buried in the user block -- it now sits where a system prompt
+    // belongs, on a sequence the assistant persona cannot reach.
+    //
+    // Empty (the default) installs kDefaultAudioSystemPrompt; either way the
+    // forced spoken language is appended by resolve_audio_system_prompt, which is
+    // why a language edit is a rebuild through here and not a plain store.
+    // Engine thread only;
+    // a no-op without isolation, where there is no second sequence to prefix and
+    // the task verb keeps riding in the per-turn user block (build_user_instruction).
+    //
+    // IDEMPOTENT. A prefix is always laid on an EMPTY sequence, so calling this
+    // twice replaces the prefix rather than stacking a second copy above the
+    // first -- which matters because both setup (prefill_system_prompt) and every
+    // later edit come through here. The floor must be dropped BEFORE the
+    // rollback: kv_cache_rollback clamps UP to it and would otherwise refuse to
+    // discard the very tokens being replaced.
+    uint32_t prefill_audio_task_prefix(const std::string& audio_task) {
+        if (!isolated_) return 0;
+        activate(audio_);
+        set_system_prefix_tokens(0);
+        if (pos_ != 0)
+            kv_cache_rollback({0, 0}, "audio task prefix (re)build on session B");
+        // Everything that described the OLD prefix's sequence is now stale.
+        if (audio_pipeline_) audio_pipeline_->reset_history();
+        pause_pending_ = false;
+        reset_utterance();
+        const uint32_t done = prefill_prefix_on_active(
+            tok_->encode_chat_prelude(resolve_audio_system_prompt(audio_task)),
+            "audio-task");
+        activate(chat_);
+        return done;
+    }
+
+    // Re-lay the AUDIO session's prefix after the user edits the audio task.
+    // Cheap by construction: that session retains no history, so this is a
+    // rollback to 0 plus a ~30-token re-prefill, and the conversation on the chat
+    // sequence is untouched. ENGINE THREAD ONLY (marshal through post_engine_task).
+    uint32_t rebuild_audio_task_prompt(const std::string& audio_task) {
+        set_audio_task_prompt(audio_task);
+        return prefill_audio_task_prefix(audio_task);
     }
 
     // Re-lay the frozen system prefix after the user edits it. ENGINE THREAD ONLY
@@ -317,6 +498,7 @@ public:
     //
     // Returns the new prefix length in tokens (what the UI reports back).
     uint32_t rebuild_system_prompt(const std::string& system_prompt) {
+        activate(chat_);                                   // 0. the PERSONA's session
         set_system_prefix_tokens(0);                       // 1. unpin the floor
         kv_cache_rollback({0, 0}, "system prompt changed (prefix cache rebuild)");  // 2.
         turn_history_.clear();                             // 3. old-prompt history
@@ -354,6 +536,13 @@ public:
         if (out_reason != nullptr) *out_reason = TerminationReason::None;
         if (user_text.empty()) return blackwell::EngineStatus::InvalidArgument;
 
+        // SESSION A. `user_text` is the transcript the AUDIO session produced,
+        // already through the commit gate; it arrives here as plain text and is
+        // re-encoded below into a user turn on the persona's sequence. That text
+        // hand-off IS the isolation boundary -- no KV crosses it.
+        activate(chat_);
+        pending_user_text_ = user_text;   // history records what was said, verbatim
+
         // decode_assistant_turn streams through a Command's TokenSink, so wrap the
         // caller's std::function in one rather than duplicating the loop. The gen
         // is the LIVE epoch: a barge-in raised while this reply is streaming
@@ -380,7 +569,7 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         for (const int id : turn) {
             if (pos_ >= max_context_ ||
-                engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                     blackwell::EngineStatus::Success) {
                 finalize_turn(std::string(), /*completed=*/false);   // drop partial prefill
                 return blackwell::EngineStatus::CudaRuntimeError;
@@ -444,7 +633,7 @@ public:
         // Continuous KV rewind() delegates to VRAMArena::truncate_kv; safe below the
         // engine's public API (single-thread doctrine) and a no-op for a fully
         // resident model (nothing offloaded), so regular decode is unaffected.
-        engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, safe_pos);
+        engine_->get_impl()->kv_mgr->rewind(active_seq_, safe_pos);
 
         const double us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - t0).count();
@@ -515,7 +704,7 @@ public:
             for (const int id : ids) {
                 if (pos_ >= max_context_) return false;
                 if (engine_->forward_status(id, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
-                                            cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
+                                            active_seq_, &next) != blackwell::EngineStatus::Success)
                     return false;
                 ++pos_;
             }
@@ -563,6 +752,7 @@ public:
     // max_new_tokens of the assistant reply, returning the detokenized text. Used
     // by the --wav path; the live mic path streams the same decode via a sink.
     std::string transcribe(const float* d_mel, int max_new_tokens) {
+        activate(audio_);
         int next = -1;
         if (prefill_ultravox_turn(d_mel, &next) != blackwell::EngineStatus::Success)
             return std::string();
@@ -571,7 +761,7 @@ public:
             if (tok_->is_stop(next)) break;
             out += tok_->decode(next, /*render_special=*/false);
             if (engine_->forward_status(next, pos_, /*temp=*/0.0f, /*top_p=*/1.0f,
-                                        cfg_.seq_id, &next) != blackwell::EngineStatus::Success)
+                                        active_seq_, &next) != blackwell::EngineStatus::Success)
                 break;
             ++pos_;
         }
@@ -589,6 +779,7 @@ public:
                                      int total_frames, int max_new_tokens) {
         const auto& plan = engine_->get_impl()->m_runtime.audio_streaming;
         if (!plan.enabled || !audio_head_loaded() || total_frames <= 0) return std::string();
+        activate(audio_);
         const int W   = plan.window_tokens * blackwell::audio::kMelFramesPerSoftToken;
         const int hop = plan.hop_tokens    * blackwell::audio::kMelFramesPerSoftToken;
 
@@ -596,7 +787,7 @@ public:
         auto prefill_ids = [&](const std::vector<int>& ids) -> bool {
             for (const int id : ids) {
                 if (pos_ >= max_context_) return false;
-                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                     blackwell::EngineStatus::Success) return false;
                 ++pos_;
             }
@@ -641,7 +832,7 @@ public:
         for (int i = 0; i < max_new_tokens && pos_ < max_context_; ++i) {
             if (tok_->is_stop(next)) break;
             out += tok_->decode(next, /*render_special=*/false);
-            if (engine_->forward_status(next, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+            if (engine_->forward_status(next, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                 blackwell::EngineStatus::Success) break;
             ++pos_;
         }
@@ -665,14 +856,14 @@ public:
     // directives. It lives in the user turn (re-prefilled every utterance), NOT
     // the frozen system prompt, so a dropdown/checkbox change takes effect on the
     // very next turn. The explicit native-script constraint is what kills the
-    // Latin-transliteration failure mode on short audio hops. Any thread (reads
-    // four atomics).
+    // Latin-transliteration failure mode on short audio hops. Any thread (three
+    // atomics plus the audio-task mutex, which is only ever taken here at turn
+    // boundaries -- never from the audio hot path).
     //
     // ORDER IS LOAD-BEARING: language constraints, then the output-tag contract,
     // then the task phrase LAST — it ends in ": " and must abut the audio
     // soft-tokens that occupy the placeholder slot immediately after this text.
     std::string build_user_instruction() const {
-        const int si = src_lang_.load(std::memory_order_acquire);
         const int ti = tgt_lang_.load(std::memory_order_acquire);
         bool transcribe = task_transcribe_.load(std::memory_order_acquire);
         const bool translate = task_translate_.load(std::memory_order_acquire);
@@ -682,11 +873,16 @@ public:
         if (!transcribe && !translate) transcribe = true;
 
         std::string s;
-        if (si > 0) {
+        // The forced SOURCE language, however it was forced: the free-text
+        // setting or the --src-lang table index (see forced_source_language).
+        // Restated here even though the isolated session's frozen prefix already
+        // carries it, because THIS is the text that abuts the audio soft-tokens
+        // -- and because without isolation the prefix does not exist.
+        if (const std::string src = forced_source_language(); !src.empty()) {
             s += "The audio language is ";
-            s += rt::kLanguages[si];
+            s += src;
             s += ". Write the transcript in ";
-            s += rt::kLanguages[si];
+            s += src;
             s += " using its native script (never transliterate). ";
         }
         s += "Reply using exactly this format: ";
@@ -707,10 +903,18 @@ public:
         // that forgot its trailing separator gets one -- the placeholder slot
         // follows IMMEDIATELY, and "...exactly as spoken.<audio>" reads to the
         // model as one word.
-        if (std::string custom = audio_task_prompt(); !custom.empty()) {
-            s += custom;
-            if (const char last = custom.back(); last != ' ') s += ' ';
-            return s;
+        //
+        // UNDER ISOLATION this branch is dead, and deliberately so: the audio
+        // task prompt is the transcription session's frozen SYSTEM prefix (see
+        // prefill_audio_task_prefix), prefilled once instead of re-encoded into
+        // every user block. What stays here is only what genuinely varies per
+        // turn -- the language directives and the output-tag contract.
+        if (!isolated_) {
+            if (std::string custom = audio_task_prompt(); !custom.empty()) {
+                s += custom;
+                if (const char last = custom.back(); last != ' ') s += ' ';
+                return s;
+            }
         }
 
         if (transcribe && translate) {
@@ -737,23 +941,51 @@ public:
     // An interrupted (barge-in) or empty turn is never recorded — the rollback
     // here is idempotent with the barge-in's pending do_rewind.
     void finalize_turn(const std::string& reply, bool completed) {
+        // The known-user-text hint belongs to THIS turn: whichever of the exits
+        // below runs, the next turn must not inherit it and start recording a
+        // stale question against a fresh answer.
+        struct ClearPending {
+            std::string* s;
+            ~ClearPending() { s->clear(); }
+        } clear_pending{&pending_user_text_};
+
         pause_pending_ = false;   // the turn is over: the edge commit is resolved
-        const bool bounded = context_mode() == ContextMode::BoundedHistory;
+        // AN EPHEMERAL SESSION IS NEVER BOUNDED. The transcription context is
+        // rebuilt from its frozen prefix for every utterance in EVERY context
+        // mode -- retaining transcripts there is how a misheard word (or an
+        // outright hallucination over noise) becomes the next utterance's
+        // context and then its prior. Dialogue memory belongs to the chat
+        // session, which keeps it as clean text; see generate_local_reply.
+        const bool bounded = !active_->ephemeral &&
+                             context_mode() == ContextMode::BoundedHistory;
         if (!bounded) {
             // Also covers a live Bounded -> Stateless switch: drop the retained
             // text history and re-anchor the base to the frozen system prefix.
-            turn_history_.clear();
-            history_text_tokens_ = 0;
+            // turn_history_ belongs to the CHAT session alone, so an ephemeral
+            // turn re-anchors its own base without touching the dialogue -- were
+            // it to clear the deque, every transcription would silently wipe the
+            // conversation the user is having.
+            if (!active_->ephemeral) {
+                turn_history_.clear();
+                history_text_tokens_ = 0;
+            }
             history_base_pos_.store(static_cast<int>(system_prefix_tokens()),
                                     std::memory_order_relaxed);
         }
         if (!bounded || !completed || reply.empty()) {
-            kv_cache_rollback({history_base_pos_.load(std::memory_order_relaxed),
-                               verified_prompt_tokens_},
-                              !bounded ? "end-of-turn stateless flush (by design: audio + "
-                                         "generated text leave no trace)"
-                                       : "incomplete/empty turn discarded");
-            if (audio_pipeline_) audio_pipeline_->reset_history();
+            kv_cache_rollback(
+                {history_base_pos_.load(std::memory_order_relaxed), verified_prompt_tokens_},
+                !bounded ? (active_->ephemeral
+                                ? "transcription turn discarded (ephemeral session: neither "
+                                  "the audio nor the transcript becomes context)"
+                                : "end-of-turn stateless flush (by design: audio + generated "
+                                  "text leave no trace)")
+                         : "incomplete/empty turn discarded");
+            // The pipeline's injected-soft-token bookkeeping mirrors the AUDIO
+            // session's KV, so only that session's turns may reset it: a chat
+            // turn closing must not un-commit center tokens of a live utterance.
+            if (audio_pipeline_ && (!isolated_ || active_->ephemeral))
+                audio_pipeline_->reset_history();
             return;
         }
 
@@ -783,6 +1015,105 @@ public:
     }
 
 protected:
+    // ---- the session switch (engine thread only) ------------------------------
+    // Park the outgoing session's live decode state and make `s` current. It is
+    // NON-REENTRANT by construction and that is safe here: the engine thread runs
+    // one turn at a time, and the only two entry points that switch -- the ring's
+    // command drain (audio) and post_engine_task (chat) -- are drained
+    // sequentially by the same pump, never interleaved mid-turn.
+    //
+    // A no-op when isolation is off, so every call site below can switch
+    // unconditionally and the single-session build stays byte-for-byte the
+    // pre-isolation behaviour.
+    void activate(Session& s) {
+        if (!isolated_ || active_ == &s) return;
+        active_->pos           = pos_;
+        active_->verified      = verified_prompt_tokens_;
+        active_->system_prefix = system_prefix_tokens();
+        active_->history_base  = history_base_pos_.load(std::memory_order_relaxed);
+
+        active_     = &s;
+        pos_        = s.pos;
+        active_seq_ = s.seq_id;
+        verified_prompt_tokens_ = s.verified;
+        // The base's floor is what effective_keep_tokens() clamps every rewind
+        // to, so it MUST follow the session -- a barge-in resolved against the
+        // other sequence's floor would truncate into a live prefix.
+        set_system_prefix_tokens(s.system_prefix);
+        history_base_pos_.store(s.history_base, std::memory_order_relaxed);
+    }
+
+    // The AUDIO session's persona when the user has not written one. Deliberately
+    // narrow, and deliberately NOT the assistant's: this context exists to turn
+    // speech into text and must refuse to do anything else. Answering the audio
+    // instead of transcribing it is the exact failure a shared persona caused.
+    static constexpr const char* kDefaultAudioSystemPrompt =
+        "You are a speech transcription engine. You convert the user's audio into "
+        "text and output nothing else -- no commentary, no answers, no questions.";
+
+    // What actually gets frozen onto the transcription sequence: the user's task
+    // text (or the default persona) plus, when a spoken language is forced, the
+    // clause that removes language identification from the model's hands.
+    //
+    // THE CLAUSE CONSTRAINS THE TRANSCRIPT, NOT THE WHOLE REPLY. A translate turn
+    // legitimately emits a second language, so "output only in X" would contradict
+    // the very next instruction the model reads (expected_output_format's
+    // [Translation] tag) -- and a prompt that argues with itself is how a model
+    // learns to ignore both halves. Scoping it to the transcript keeps the two
+    // tasks compatible, which is why the language is named THREE ways: what was
+    // spoken, what to write it in, and what NOT to do (the two observed failure
+    // modes -- Latin transliteration and drifting into an acoustic neighbour).
+    //
+    // Any thread (reads the mutex-guarded strings); called on the engine thread.
+    std::string resolve_audio_system_prompt(const std::string& audio_task) const {
+        std::string s = audio_task.empty() ? kDefaultAudioSystemPrompt : audio_task;
+        const std::string lang = forced_source_language();
+        if (lang.empty()) return s;
+        if (!s.empty() && s.back() != ' ') s += ' ';
+        s += "The spoken language is always " + lang + ". Write what you hear in " +
+             lang + ", in its own native script -- never transliterate it into "
+             "Latin letters, and never render it as any other language.";
+        return s;
+    }
+
+    // Lay a frozen prefix on the ACTIVE session from position pos_ and publish its
+    // length as that session's KV rewind floor.
+    //
+    // THE FLOOR IS WHAT LANDED, not what was asked for. A forward that faults
+    // part-way through leaves only `done` columns in the KV, and publishing
+    // ids.size() as the floor would put the rewind clamp ABOVE the real extent of
+    // the cache -- kv_cache_rollback's max(cp.pos, floor) would then park pos_ on
+    // uninitialized KV columns and the next turn would decode against garbage.
+    // So the floor tracks the actual prefill, and the failure is raised only
+    // AFTER the published state is self-consistent (INIT tier: this throws, and
+    // the rebuild_*_prompt caller reports it to the user).
+    uint32_t prefill_prefix_on_active(const std::vector<int>& ids, const char* what) {
+        int next = -1;
+        auto status = blackwell::EngineStatus::Success;
+        uint32_t done = 0;
+        for (const int id : ids) {
+            status = engine_->forward_status(id, pos_, /*temperature=*/0.0f, /*top_p=*/1.0f,
+                                             active_seq_, &next);
+            if (status != blackwell::EngineStatus::Success) break;
+            ++pos_;
+            ++done;
+        }
+        set_system_prefix_tokens(done);   // KV rewind floor (barge-in never truncates it)
+        history_base_pos_.store(pos_, std::memory_order_relaxed);  // no history yet
+        active_->system_prefix = done;    // survives the next activate() swap
+        active_->history_base  = pos_;
+        if (status != blackwell::EngineStatus::Success) {
+            throw blackwell::engine_error(
+                status, std::string(what) + "-prompt prefill failed on session '" +
+                            active_->name + "' after " + std::to_string(done) + " of " +
+                            std::to_string(ids.size()) + " tokens");
+        }
+        std::printf("[session] '%s' prefix frozen: %u token(s) on seq %d\n",
+                    active_->name, done, active_seq_);
+        std::fflush(stdout);
+        return done;
+    }
+
     struct TurnFrame {
         std::vector<int> user_hdr;   // user header + forced-language instruction
         std::vector<int> user_eot;   // "<|eot_id|>"
@@ -815,6 +1146,16 @@ protected:
     //                              possibly hallucination-poisoned) audio, even
     //                              though a generation is still in flight.
     static constexpr float kContinuationTimeoutS = 2.0f;
+
+    // The ONE sample rate this control ever sees. Not a knob: the Whisper front
+    // end (whisper_dsp's mel geometry, the encoder's 30 s positional window) and
+    // Silero are both fixed at 16 kHz, so a stream at any other rate would be
+    // wrong long before it reached here. Named so the ms<->samples conversions
+    // below stop being a bare `16`.
+    static constexpr std::uint32_t kAudioSampleRate = 16000;
+    static double samples_to_ms(std::size_t n) noexcept {
+        return static_cast<double>(n) * 1000.0 / static_cast<double>(kAudioSampleRate);
+    }
 
     // Engine thread. *out_silence_s (optional) receives the measured gap. A turn
     // with no recorded speech end — the very first utterance of the session — is
@@ -851,6 +1192,14 @@ protected:
     // prefix, and re-anchor pos_ to the resolved keep so the next utterance decodes
     // on top of the system prefix, not on top of the previous (superseded) answer.
     blackwell::EngineStatus do_rewind(const Command& cmd) override {
+        // A barge-in is about SPEECH, so it rewinds the TRANSCRIPTION sequence:
+        // the stale utterance, its soft-tokens and the audio ring. It never
+        // touches the chat session's KV -- a local reply that the same barge-in
+        // superseded was already rolled back by its own finalize_turn, on its own
+        // sequence, before this command was drained (both run on this thread and
+        // cannot interleave).
+        activate(audio_);
+
         // ROUTING: continuation vs fresh utterance is decided by the SILENCE
         // DURATION, never by "were we decoding?" — see is_continuation(). A
         // degenerate decode can hold the engine for a minute, and the speech that
@@ -901,7 +1250,7 @@ protected:
         pos_ = static_cast<int>(keep);
         // Full host-mirror reconciliation (Phase 0 truncate_kv), safe below the
         // engine's public API on the single engine-owning thread.
-        engine_->get_impl()->kv_mgr->rewind(cfg_.seq_id, static_cast<int>(keep));
+        engine_->get_impl()->kv_mgr->rewind(active_seq_, static_cast<int>(keep));
         // The KV is rewound to (at most) the frozen system prefix, so no audio soft-
         // tokens survive: drop the overlap-reconciliation / center-slice history too
         // (reset_history covers both), any outstanding pause-edge commit, and the
@@ -910,28 +1259,44 @@ protected:
         pause_pending_ = false;
         reset_utterance();
 
-        // HARD AUDIO FLUSH: a fresh utterance starts from THIS moment's audio.
-        // Everything still buffered in the ring is pre-speech-start material —
-        // in auto mode the background noise accumulated since the last commit
-        // (unbounded between utterances), in manual mode anything that leaked in
-        // before the press — and encoding it makes the LLM hallucinate over
-        // noise. Discarded HERE because this runs on the engine thread, the only
-        // consumer allowed to move the ring's read cursor (SPSC contract). The
-        // few ms of samples pushed between the trigger and this command
-        // executing are dropped with the noise (the engine is idle at speech
-        // start, so that window is command-latency-small). The mid-utterance
-        // resume branch above deliberately does NOT flush: there the ring holds
-        // the freshly resumed speech.
+        // AUDIO FLUSH, MINUS THE PRE-ROLL. A fresh utterance starts from roughly
+        // THIS moment's audio: everything buffered further back is pre-speech-start
+        // material — in auto mode the background noise accumulated since the last
+        // commit (unbounded between utterances), in manual mode anything that
+        // leaked in before the press — and encoding it makes the LLM hallucinate
+        // over noise.
+        //
+        // But NOT everything in the ring is noise, which is what the original hard
+        // flush got wrong. The ring is fed continuously, including while the VAD is
+        // idle, and a neural detector needs 45–110 ms of audio before it can call a
+        // block speech. So at the instant the onset fires, the newest samples in
+        // the ring ARE the first phoneme of the word — flushing them clipped short
+        // and plosive first syllables off every transcript. pre_roll_ms() names how
+        // much of that acoustic head to keep; only the older remainder is dropped,
+        // and the retained tail is consumed naturally as the start of the new
+        // utterance by the next warm-prefill drain or commit.
+        //
+        // Discarded HERE because this runs on the engine thread, the only consumer
+        // allowed to move the ring's read cursor (SPSC contract). The mid-utterance
+        // resume branch above deliberately does not flush at all: there the whole
+        // ring holds the freshly resumed speech.
         if (cmd.stream != nullptr) {
             blackwell::bridge::AudioRingBuffer& ring = cmd.stream->ring;
-            const std::size_t stale = ring.available_samples();
+            const std::size_t avail = ring.available_samples();
+            // Unsigned-safe max(0, avail - preroll): a ring holding less than the
+            // pre-roll is entirely acoustic head, so nothing is dropped.
+            // `keep_pcm` is SAMPLES, deliberately not named `keep` — that one is
+            // the KV token count resolved above, and the two must never be confused.
+            const std::size_t keep_pcm = std::min(avail, pre_roll_samples(kAudioSampleRate));
+            const std::size_t stale    = avail - keep_pcm;
             if (stale != 0) {
                 pcm_stage_.resize(stale);
                 const std::size_t got = ring.read_samples(pcm_stage_.data(), stale);
                 if (std::getenv("BLACKWELL_AV_DEBUG")) {
                     std::printf("[flush] speech start: discarded %zu stale PCM samples"
-                                " (%.0f ms of pre-press audio)\n",
-                                got, static_cast<double>(got) / 16.0);
+                                " (%.0f ms of pre-onset audio), retained %zu (%.0f ms"
+                                " of pre-roll)\n",
+                                got, samples_to_ms(got), keep_pcm, samples_to_ms(keep_pcm));
                     std::fflush(stdout);
                 }
             }
@@ -957,6 +1322,7 @@ protected:
         // keeps hopping even if the UI toggled mid-speech (flip applies next turn).
         if (cmd.stream == nullptr || (!center_streaming_live() && !utterance_open_))
             return blackwell::EngineStatus::Success;
+        activate(audio_);   // warm hops grow the TRANSCRIPTION sequence, never the chat one
         drain_stream_pcm(cmd.stream->ring);
         open_utterance_if_needed();
         run_pending_center_hops(/*flush_tail=*/false);
@@ -984,6 +1350,15 @@ protected:
             }
             return commit_text_decode(cmd, typed);
         }
+
+        // SESSION B from here down. Every audio commit path -- center-slice,
+        // whole-utterance, and the no-audio-head canned fallback's sibling -- runs
+        // on the ephemeral transcription sequence, under the audio task prefix,
+        // and hands its result onward as TEXT through the commit gate.
+        activate(audio_);
+        // An audio turn has no known user text -- the transcript the model is
+        // about to write IS the record of what was said (encode_history_turn).
+        pending_user_text_.clear();
 
         // The VAD's stable boundary IS the moment the user stopped speaking: start
         // the silence clock here, before the (possibly multi-second) commit work,
@@ -1030,6 +1405,8 @@ protected:
     // chat template, prefill it, then hand off to THE decode loop. Engine thread.
     blackwell::EngineStatus commit_text_decode(const Command& cmd,
                                                const std::string& user_text) {
+        activate(chat_);   // typed words are a dialogue turn, not a transcription job
+        pending_user_text_ = user_text;   // history records what was asked, verbatim
         std::vector<int> turn = tok_->encode_chat_message(
             blackwell::ChatMessage{"user", user_text});
         const std::vector<int> gen = tok_->encode_generation_prompt();
@@ -1039,7 +1416,7 @@ protected:
         const auto t_turn0 = std::chrono::steady_clock::now();  // text-path TTFT clock
         for (const int id : turn) {
             if (pos_ >= max_context_ ||
-                engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                     blackwell::EngineStatus::Success) {
                 finalize_turn(std::string(), /*completed=*/false);  // drop partial prefill
                 clear_in_flight();
@@ -1091,7 +1468,7 @@ protected:
                 core->d_X_accum, pp.slot(frame) + static_cast<size_t>(a) * hidden,
                 static_cast<size_t>(hidden) * sizeof(float),
                 cudaMemcpyDeviceToDevice, /*stream 0*/ nullptr));
-            core->kv_mgr->prepare_decode_step(cfg_.seq_id, pos_);
+            core->kv_mgr->prepare_decode_step(active_seq_, pos_);
 
             bool ok = true;
             for (int l = 0; l < num_layers && ok; ++l) {
@@ -1127,7 +1504,7 @@ protected:
                 d_embeds + static_cast<size_t>(start_row + a) * hidden,
                 static_cast<size_t>(hidden) * sizeof(float),
                 cudaMemcpyDeviceToDevice, /*stream 0*/ nullptr));
-            core->kv_mgr->prepare_decode_step(cfg_.seq_id, pos_);
+            core->kv_mgr->prepare_decode_step(active_seq_, pos_);
             using S = blackwell::EngineStatus;
             bool ok = true;
             for (int l = 0; l < num_layers && ok; ++l) {
@@ -1428,8 +1805,16 @@ private:
     //
     // Returns true iff the intent was committed (i.e. reason == Eos).
     bool publish_turn(const Command& cmd, const TurnDecode& d) noexcept {
+        // WHAT CROSSES THE BOUNDARY. From the ephemeral transcription session the
+        // intent is the user's WORDS, not that session's output contract: its
+        // "[Speech] ... | [Translation] ..." framing is an artifact of how B was
+        // asked to answer, and forwarding it verbatim would make the chat session
+        // (and the paid API) reason about the tags. A chat-session turn is
+        // already plain text and passes through untouched.
+        std::string intent =
+            (isolated_ && active_->ephemeral) ? extract_transcript(d.reply, d.reply) : d.reply;
         const bool committed =
-            publish_intent(d.reason, cmd.gen, std::string(d.reply),
+            publish_intent(d.reason, cmd.gen, std::move(intent),
                            static_cast<std::uint32_t>(d.emitted < 0 ? 0 : d.emitted));
         // Every turn reports its verdict. Without this the gate is invisible from
         // the console and the only way to tell a dispatched turn from a dropped
@@ -1477,7 +1862,7 @@ private:
         auto* core = engine_->get_impl();
         try {
             const blackwell::EngineStatus st =
-                core->run_token(token_id, pos, cfg_.seq_id);
+                core->run_token(token_id, pos, active_seq_);
             if (st != blackwell::EngineStatus::Success) return st;
             launch_repetition_penalty_kernel(
                 core->d_logits, core->m_config.vocab_size, d_penalty_ids_,
@@ -1562,26 +1947,38 @@ private:
         int next = -1;
         for (const int id : tok_->encode("<|eot_id|>", /*add_special=*/false)) {
             if (pos_ >= max_context_) break;
-            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                 blackwell::EngineStatus::Success)
                 break;
             ++pos_;
         }
     }
 
-    // Recover the user-side text from the model's reply. Tolerates EVERY task
-    // mode's tag set (see expected_output_format): "[Speech] X | [Translation] Y",
-    // a bare "[Speech] X", or a translation-only reply with no transcript to
-    // recover. Anything that does not match degrades to an "(audio)" placeholder
-    // user turn rather than poisoning the retained history with the model's
-    // formatting noise.
-    std::vector<int> encode_history_turn(const std::string& reply) const {
+    // Recover the user-side text -- WHAT WAS SAID -- from the transcription
+    // session's tagged reply. Tolerates EVERY task mode's tag set (see
+    // expected_output_format): "[Speech] X | [Translation] Y", a bare
+    // "[Speech] X", or a translation-only reply with no transcript to recover.
+    // Anything that does not match degrades to an "(audio)" placeholder rather
+    // than carrying the model's formatting noise forward.
+    //
+    // This is the ISOLATION BOUNDARY's projection function: session B's output
+    // is a formatted transcript, and both the chat session and the cloud
+    // transport want the user's words, not B's output contract. Nothing but the
+    // string this returns ever crosses from B to A.
+    // `fallback` is what an UNTAGGED reply degrades to, and the two callers want
+    // different things: the retained history wants a neutral "(audio)" placeholder
+    // (a stray sentence of the model's formatting noise must not become the
+    // conversation's memory of what the user said), while the intent the gate
+    // dispatches wants the raw text -- a model that dropped the tags but still
+    // transcribed correctly should not have its transcript replaced by a
+    // placeholder on the way to the answer.
+    static std::string extract_transcript(const std::string& reply,
+                                          const std::string& fallback) {
         auto trim = [](const std::string& s) {
             const auto b = s.find_first_not_of(" \t\r\n");
             const auto e = s.find_last_not_of(" \t\r\n");
             return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
         };
-        std::string user_text = "(audio)";
         constexpr const char* kSpeech = "[Speech]";
         const auto sp = reply.find(kSpeech);
         if (sp != std::string::npos) {
@@ -1589,11 +1986,32 @@ private:
             // The transcript runs to the translation separator, or to the end of
             // the reply in transcribe-only mode.
             const auto cut = reply.find(" | [Translation]", beg);
-            const std::string t =
-                trim(cut == std::string::npos ? reply.substr(beg)
-                                              : reply.substr(beg, cut - beg));
-            if (!t.empty()) user_text = t;
+            const std::string t = trim(cut == std::string::npos
+                                           ? reply.substr(beg)
+                                           : reply.substr(beg, cut - beg));
+            if (!t.empty()) return t;
         }
+        // Translation-only mode: the tagged translation IS the user-side text.
+        constexpr const char* kTranslation = "[Translation]";
+        const auto tp = reply.find(kTranslation);
+        if (tp != std::string::npos) {
+            const std::string t =
+                trim(reply.substr(tp + std::char_traits<char>::length(kTranslation)));
+            if (!t.empty()) return t;
+        }
+        return fallback;
+    }
+
+    std::vector<int> encode_history_turn(const std::string& reply) const {
+        // WHAT THE USER ACTUALLY SAID. On a text turn we know it exactly (it was
+        // handed to us), so use it; the tag parsing below is the AUDIO session's
+        // recovery path, where the only record of the user's words is the
+        // transcript the model just wrote. Before the sessions were split every
+        // turn went through the parser, which meant a chat turn's history
+        // recorded the user as "(audio)" -- the reply's tags never matched.
+        const std::string user_text = pending_user_text_.empty()
+                                          ? extract_transcript(reply, "(audio)")
+                                          : pending_user_text_;
         const std::string turn =
             std::string(kUserHeader) + user_text + "<|eot_id|>" +
             "<|start_header_id|>assistant<|end_header_id|>\n\n" + reply + "<|eot_id|>";
@@ -1614,7 +2032,7 @@ private:
         for (const TurnRecord& t : turn_history_) {
             for (const int id : t.ids) {
                 if (pos_ >= max_context_) break;
-                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                     blackwell::EngineStatus::Success)
                     break;
                 ++pos_;
@@ -1664,7 +2082,7 @@ private:
         int next = -1;
         for (const int id : make_turn_frame().user_hdr) {
             if (pos_ >= max_context_) break;
-            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+            if (engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                 blackwell::EngineStatus::Success)
                 break;
             ++pos_;
@@ -1743,7 +2161,7 @@ private:
         auto prefill_ids = [&](const std::vector<int>& ids) -> bool {
             for (const int id : ids) {
                 if (pos_ >= max_context_) return false;
-                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, cfg_.seq_id, &next) !=
+                if (engine_->forward_status(id, pos_, 0.0f, 1.0f, active_seq_, &next) !=
                     blackwell::EngineStatus::Success)
                     return false;
                 ++pos_;
@@ -1872,8 +2290,24 @@ protected:
     //      do_* overrides use — white-box tier, engine thread only) -----------
     blackwell::ITokenizer* tok_ = nullptr;   // non-owning
     int  max_context_ = 0;
+
+    // THE ACTIVE SESSION'S LIVE STATE. pos_ / verified_prompt_tokens_ /
+    // active_seq_ / the base's system-prefix floor / history_base_pos_ all
+    // describe whichever session activate() last made current -- they are NOT
+    // global. Everything below the session switch (the decode loop, the step_*
+    // injection sweep, the rollback paths) reads them as before and needs no
+    // notion of sessions at all, which is the whole point: one swap at the
+    // entry points instead of a session argument threaded through 40 call sites.
     int  pos_ = 0;                            // logical decode position (engine thread only)
     uint32_t verified_prompt_tokens_ = 0;     // committed-prefix boundary (checkpoint/rollback)
+    int  active_seq_ = 0;                     // engine seq_id of the active session
+
+    // The two contexts (see the Session doc above). chat_ is active at
+    // construction, so a control with isolation OFF behaves exactly as before.
+    Session  chat_ {/*seq_id=*/0, 0, 0, 0, 0, /*ephemeral=*/false, "chat"};
+    Session  audio_{/*seq_id=*/1, 0, 0, 0, 0, /*ephemeral=*/true,  "audio"};
+    Session* active_ = &chat_;
+    bool     isolated_ = false;               // enable_isolated_sessions() succeeded
     KVCheckpoint pause_cp_{};                 // pre-edge-commit snapshot (CenterSlice pause)
     bool pause_pending_ = false;              // an edge commit awaits finalize-or-resume
     std::atomic<uint32_t> last_rewind_keep_{0};
@@ -1893,6 +2327,10 @@ protected:
     // set_audio_task_prompt for why this is a mutex and not an atomic.
     mutable std::mutex audio_task_mu_;
     std::string        audio_task_prompt_;
+    // Forced spoken language, free text; empty = Auto (model-side LID). Shares
+    // the mutex above: both are read together when the transcription prefix is
+    // composed, so one lock is the natural granularity. See set_speech_language.
+    std::string        speech_language_;
     std::atomic<bool> live_center_{false};    // UI streaming toggle (utterance-latched)
     std::atomic<float> last_ttft_ms_{0.0f};   // VAD->first-token, panel readout (0 = none)
 
@@ -1911,6 +2349,11 @@ protected:
     // engine thread is its only writer).
     std::deque<TurnRecord> turn_history_;
     std::size_t history_text_tokens_ = 0;     // sum of turn_history_ id counts
+    // The user text of the turn being decoded, when it is KNOWN rather than
+    // recovered from the reply (text turns: typed input, and the transcript fed
+    // to the chat session). Empty on an audio turn, where encode_history_turn
+    // must parse it back out. Engine thread only; cleared by finalize_turn.
+    std::string pending_user_text_;
     std::atomic<int> history_base_pos_{0};    // system floor + retained turns
 
     // Audio frontend (owned; loaded lazily via load_audio_head). Both are driven

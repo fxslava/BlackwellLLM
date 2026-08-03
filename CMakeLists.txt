@@ -77,7 +77,19 @@ option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading 
 # OFF drops the ~75 MB ONNXRuntime fetch and builds the pipeline with only its
 # built-in RMS-threshold VAD -- which stays the compiled-in default either way,
 # so nothing downstream breaks. Declared before the module that reads it.
-option(USE_SILERO_VAD "Enable the Silero neural VAD (fetches ONNXRuntime CPU + silero_vad.onnx)" ON)
+option(USE_SILERO_VAD "Enable the Silero neural VAD (fetches ONNXRuntime + silero_vad.onnx)" ON)
+
+# Which ONNXRuntime build to fetch. ON pulls the GPU archive (CUDA execution
+# provider); OFF pulls the CPU-only one. Consequences, because this is not just
+# a download-size knob:
+#   ON  -> ~349 MB (CUDA 13) / ~434 MB (CUDA 12) instead of 75 MB, a second CUDA
+#          runtime in-process, and blackwell_tts_f5 exists.
+#   OFF -> the pre-2026-08 behaviour exactly. blackwell_vad is UNCHANGED (it is
+#          CPU-only by design either way) and blackwell_tts_f5 is not built.
+# The F5-TTS DiT is the only consumer that needs the GPU: it measures ~0.2x
+# realtime on CPU, i.e. unusable rather than merely slow. Full reasoning lives
+# in the header of cmake/OnnxRuntime.cmake. Declared before that module.
+option(BLACKWELL_ORT_GPU "Fetch the ONNXRuntime GPU build (CUDA execution provider)" ON)
 
 # 3. Зависимости: pinned FetchContent + опциональный DirectStorage SDK
 # (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls())

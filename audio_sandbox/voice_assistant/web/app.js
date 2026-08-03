@@ -398,13 +398,23 @@ const FIELDS = {
   local_inference: "check",
   // Tab 2
   neural_vad: "check", loopback_capture: "check", vad_threshold: "float",
-  silence_hangover_ms: "int", warm_prefill_interval_ms: "int",
+  silence_hangover_ms: "int", pre_roll_ms: "int", warm_prefill_interval_ms: "int",
   context_mode: "value", history_budget_tokens: "int", live_streaming: "check",
+  // Tab 2 — TTS. Types MUST match settings_store.hpp: a value arriving as a
+  // string where C++ wants an int is dropped by from_json and silently keeps its
+  // old value, which looks exactly like a setting that will not stick.
+  tts_ckpt_dir: "value", tts_vocab_path: "value", tts_ref_audio: "value",
+  tts_ref_text: "value", tts_nfe_step: "int",
+  tts_split_on_commas: "check", tts_min_chunk_chars: "int",
+  tts_max_chunk_chars: "int", tts_mic_gate: "check",
   // Tab 3
   hotkey_talk: "value", hotkey_cancel: "value", hotkey_show: "value",
   hotkey_push_to_talk: "check",
-  // Tab 4 — the two prompts are separate fields, not one blob (see index.html)
-  system_prompt: "value", audio_task_prompt: "value", speech_task: "value"
+  // Tab 4 — the two prompts are separate fields, not one blob (see index.html).
+  // speech_language is free text on purpose: it names a language to the model,
+  // not an index into a list this page would have to keep in step with C++.
+  system_prompt: "value", audio_task_prompt: "value", speech_language: "value",
+  speech_task: "value"
 };
 
 // Sliders whose numeric value is echoed next to the label. Kept as a table for
@@ -415,7 +425,13 @@ const READOUTS = {
   temperature:              ["#tempValue",     v => Number(v) === 0 ? "greedy" : Number(v).toFixed(2)],
   top_p:                    ["#toppValue",     v => Number(v) >= 1 ? "off" : Number(v).toFixed(2)],
   silence_hangover_ms:      ["#hangoverValue", v => Number(v) === 0 ? "off" : Number(v) + " ms"],
-  warm_prefill_interval_ms: ["#warmValue",     v => Number(v) === 0 ? "off" : Number(v) + " ms"]
+  pre_roll_ms:              ["#prerollValue",  v => Number(v) === 0 ? "off" : Number(v) + " ms"],
+  warm_prefill_interval_ms: ["#warmValue",     v => Number(v) === 0 ? "off" : Number(v) + " ms"],
+  // Chunk sizes read as characters, not an abstract scale -- the whole point of
+  // the two knobs is "how much text before it starts talking".
+  tts_nfe_step:             ["#nfeValue",      v => Number(v) + " steps"],
+  tts_min_chunk_chars:      ["#minChunkValue", v => Number(v) + " chars"],
+  tts_max_chunk_chars:      ["#maxChunkValue", v => Number(v) + " chars"]
 };
 
 // Must match settings_store.hpp's defaults -- "Restore defaults" that restored
@@ -581,6 +597,7 @@ promptBox.addEventListener("input", refreshPromptCount);
 $("#promptReset").addEventListener("click", () => {
   promptBox.value = DEFAULT_SYSTEM_PROMPT;
   el("audio_task_prompt").value = DEFAULT_AUDIO_TASK_PROMPT;
+  el("speech_language").value = "";      // Auto: let the model identify it
   el("speech_task").value = "transcribe";
   refreshPromptCount();
   refreshRestartBanner();
