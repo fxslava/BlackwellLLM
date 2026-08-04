@@ -75,6 +75,14 @@ inline void append_json_string(std::string& out, std::string_view s) {
 
 // The stable/volatile split, made explicit in the type so a caller cannot put
 // a timestamp in the "frozen" slot without noticing what they are doing.
+//
+// EVERY FIELD IS A BORROWED VIEW. That is deliberate -- the caller already owns
+// these buffers (the persisted system prompt, the commit queue's payload) and
+// copying them per attempt would be pure waste on a path that runs per turn.
+// The cost is the usual one: `ctx.intent = std::string(...)` COMPILES and
+// leaves a dangling view at the end of the full expression. Assign from
+// something that outlives the send, and take the whole struct by value only to
+// override a field, never to extend a lifetime.
 struct RequestContext {
     std::string_view instructions;      // FROZEN. No timestamps, no session ids.
     std::string_view glossary;          // stable for the whole session

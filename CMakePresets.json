@@ -45,6 +45,7 @@
         { "name": "validation",         "inherits": "test-base", "filter": { "include": { "label": "^validation$" } } },
         { "name": "benchmark",          "inherits": "test-base", "filter": { "include": { "label": "^benchmark$" } } },
         { "name": "integration",        "inherits": "test-base", "filter": { "include": { "label": "^integration$" } } },
+        { "name": "cloud",              "inherits": "test-base", "filter": { "include": { "label": "^cloud$" } } },
         { "name": "agent",              "inherits": "test-base", "filter": { "include": { "label": "^agent$" } } },
         { "name": "agent-env",          "inherits": "test-base", "filter": { "include": { "label": "^agent_env$" } } },
         { "name": "agent-orchestrator", "inherits": "test-base", "filter": { "include": { "label": "^agent_orchestrator$" } } }

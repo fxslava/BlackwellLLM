@@ -14,6 +14,38 @@ function(blackwell_copy_runtime_dlls target)
     endforeach()
 endfunction()
 
+# Deploy the FULL runtime DLL closure of <target> next to its executable.
+#
+# Two passes, because neither is sufficient alone:
+#   1. $<TARGET_RUNTIME_DLLS> — every imported SHARED library <target> links.
+#      Knows the first level only: it deployed libcurl and simdjson and stopped,
+#      while libcurl in turn imports nghttp2 and zlib.
+#   2. CopyRuntimeDeps.cmake — walks the PE import tables of the built exe for
+#      everything pass 1 could not know about. See that file.
+#
+# Under the vcpkg TOOLCHAIN this is all automatic (VCPKG_APPLOCAL_DEPS); this
+# tree finds its cloud deps through CMAKE_PREFIX_PATH instead, so the walk is
+# ours. Symptom when it is missing: the target links and deploys fine, then
+# fails to START with a missing-DLL dialog naming a library that appears nowhere
+# in the build files.
+#
+# The $<IF:...> guard is the documented idiom for an empty list: with everything
+# statically linked the genex expands to nothing, and `cmake -E copy_if_different`
+# with no arguments is an error.
+function(blackwell_copy_runtime_deps target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E
+            $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:${target}>>,copy_if_different,true>
+            $<TARGET_RUNTIME_DLLS:${target}> "$<TARGET_FILE_DIR:${target}>"
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:${target}>
+            "-DDIRS=$<JOIN:$<TARGET_RUNTIME_DLL_DIRS:${target}>,;>"
+            -DDEST=$<TARGET_FILE_DIR:${target}>
+            -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeDeps.cmake"
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying runtime DLL closure next to ${target}...")
+endfunction()
+
 # Deploy an asset DIRECTORY (data files, web UI, models) next to <target>'s
 # executable as <exe dir>/<dst_name>.
 #

@@ -11,8 +11,20 @@
 #
 # On Windows the expected provider is vcpkg:
 #     vcpkg install curl[core,ssl,http2]:x64-windows simdjson:x64-windows
-# then configure with
-#     -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+# then configure EITHER with the toolchain
+#     -DBUILD_CLOUD_CLIENT=ON -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+# or, against an existing build tree, with just the prefix path
+#     -DBUILD_CLOUD_CLIENT=ON -DCMAKE_PREFIX_PATH=<vcpkg>/installed/x64-windows
+#
+# PREFER THE PREFIX PATH when a build tree already exists. CMAKE_TOOLCHAIN_FILE
+# cannot be added to a populated cache — CMake refuses, and the only way through
+# is deleting out/build and rebuilding every CUDA object. The prefix path is a
+# normal cache variable and finds the same CURLConfig.cmake / simdjsonConfig.cmake.
+#
+# THE ONE THING THE TOOLCHAIN DOES THAT THE PREFIX PATH DOES NOT is deploy
+# transitive runtime DLLs (VCPKG_APPLOCAL_DEPS): libcurl imports nghttp2 and
+# zlib, which are nobody's link dependency. Without the toolchain that walk is
+# ours — see cmake/CopyRuntimeDeps.cmake, wired into voice_assistant's POST_BUILD.
 #
 # Defines: blackwell::cloud_deps (INTERFACE) — link this, nothing else.
 # =============================================================================

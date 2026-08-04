@@ -16,12 +16,11 @@
 // produce identical event sequences. That is the regression test for the
 // chunk-boundary class of bug, which is the one that survives to production.
 // =============================================================================
-#include <simdjson.h>
-
 #include <cstdint>
 #include <string>
 #include <string_view>
 
+#include "simdjson_external.hpp"  // <simdjson.h>, warning-quarantined
 #include "sse_framer.hpp"
 
 namespace blackwell::cloud::detail {

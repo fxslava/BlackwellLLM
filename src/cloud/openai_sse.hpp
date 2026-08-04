@@ -32,12 +32,11 @@
 // as silence, because silence is indistinguishable from a model that answered
 // with nothing.
 // =============================================================================
-#include <simdjson.h>
-
 #include <cstdint>
 #include <string>
 #include <string_view>
 
+#include "simdjson_external.hpp"  // <simdjson.h>, warning-quarantined
 #include "sse_framer.hpp"
 
 namespace blackwell::cloud::detail {

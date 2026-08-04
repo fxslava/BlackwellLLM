@@ -40,7 +40,8 @@ Useful target names:
 | `agent_playground` | HTTP playground GUI (links core + orchestrator) |
 | `agent_core`, `agent_env`, `agent_orchestrator` | CUDA-free agent stack |
 | `awq_benchmark` | standalone experiment (`src/experiments/`) |
-| `validation_tests`, `benchmark_tests`, `integration_tests`, `agent_tests`, `agent_env_tests`, `agent_orchestrator_tests` | test executables |
+| `blackwell_cloud` | remote legs (Anthropic + OpenAI-compatible); needs `BUILD_CLOUD_CLIENT=ON` |
+| `validation_tests`, `benchmark_tests`, `integration_tests`, `cloud_tests`, `agent_tests`, `agent_env_tests`, `agent_orchestrator_tests` | test executables |
 
 Build only the target you need — a full build is slow (CUDA), and test suites glob their
 sources with `CONFIGURE_DEPENDS`, so a *new* test file is picked up on the next build
@@ -54,6 +55,7 @@ Test presets run from the repo root and map 1:1 onto the ctest labels:
 ctest --preset validation            :: fast kernel-correctness vs CPU references
 ctest --preset benchmark             :: stress shapes + CUDA-event performance
 ctest --preset integration           :: engine vs PyTorch golden dumps
+ctest --preset cloud                 :: remote-leg SSE/HTTP (needs BUILD_CLOUD_CLIENT=ON)
 ctest --preset agent                 :: tree-sitter agent core
 ctest --preset agent-env             :: sandbox OS layer
 ctest --preset agent-orchestrator    :: ReAct loop (MockLLM)
@@ -65,6 +67,12 @@ anchoring — plain `-L agent` regex-matches all three agent suites.)
 Sharp edges:
 - **Build the test target first** — ctest does not build, and `gtest_discover_tests`
   registers tests at build time.
+- **`cloud` needs libcurl + simdjson**, so `cloud_tests` does not exist in a default
+  configure (`BUILD_CLOUD_CLIENT` defaults OFF) and `ctest --preset cloud` finds nothing.
+  Arm it with vcpkg — see `cmake/CloudDeps.cmake` for the install line and why
+  `-DCMAKE_PREFIX_PATH=<vcpkg>/installed/x64-windows` is preferred over the toolchain
+  file on an existing build tree. No GPU and no network egress: the suite targets the
+  loopback discard port and never contacts a billed endpoint.
 - **Integration tests skip silently** when the local checkpoint / golden dumps are absent
   — a green integration run on a machine without models proves nothing. Check the output
   for skip messages. Regenerating dumps: skill `golden-dumps`.

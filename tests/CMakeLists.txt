@@ -184,6 +184,50 @@ if(TARGET blackwell_bridge)
     )
 endif()
 
+# Cloud suite: the remote legs of the Local Router — SSE framing, the two event
+# vocabularies, the /chat/completions body, and the curl core driven for real.
+#
+# ITS OWN TARGET, AND ITS OWN LABEL. bridge_tests deliberately includes
+# src/cloud as HEADERS ONLY so it stays buildable with BUILD_CLOUD_CLIENT=OFF
+# (see its include comment). These tests are the opposite: they exist to
+# exercise the code that only compiles when libcurl and simdjson are present,
+# so they are gated on the target rather than on the option, and land under a
+# `cloud` label the other presets do not pull in.
+#
+# No GPU, no checkpoint, no network egress: openai_client_test targets the
+# discard port on loopback and asserts the watchdogs bound it. Nothing here
+# contacts a billed endpoint — see that file's preamble.
+if(TARGET blackwell_cloud)
+    add_executable(cloud_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/cloud/sse_framer_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cloud/openai_request_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cloud/openai_sse_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cloud/openai_client_test.cpp")
+    # blackwell_cloud exports src/cloud PUBLIC and blackwell::cloud_deps
+    # (libcurl + simdjson, with simdjson's dllimport defines) as a PUBLIC link,
+    # so the internal headers under test — sse_framer/openai_sse — need nothing
+    # declared here beyond the link itself.
+    target_link_libraries(cloud_tests PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        blackwell_cloud)
+    # /utf-8 for the same reason bridge_tests has it: the SSE tests assert on
+    # Cyrillic literals (this is a RU/EN voice assistant, so \uXXXX-escaped
+    # Cyrillic is the COMMON path through the decoder, not an edge case), and
+    # without this MSVC reads them in the system ANSI codepage — so the test and
+    # the decoder would disagree about what the bytes ARE.
+    if(MSVC)
+        target_compile_options(cloud_tests PRIVATE /utf-8)
+    endif()
+    # libcurl + simdjson + the nghttp2/zlib level libcurl imports and nothing
+    # links directly. Without this the suite builds and then fails to start.
+    blackwell_copy_runtime_deps(cloud_tests)
+    gtest_discover_tests(cloud_tests
+        PROPERTIES LABELS cloud
+        DISCOVERY_TIMEOUT 120
+    )
+endif()
+
 # Agent-core suite: pure C++ (tree-sitter), no CUDA / no blackwell_kernels, so
 # it gets its own minimal target rather than going through the macro above.
 if(TARGET agent_core)

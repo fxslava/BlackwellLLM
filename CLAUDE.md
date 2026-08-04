@@ -100,7 +100,7 @@ over what-comments.
 cmake --preset x64-debug                                  :: configure (once, or after CMake edits)
 cmake --build --preset x64-debug --target poc_overlay
 ctest --preset validation                                 :: fast kernel-correctness suite
-:: other test presets: benchmark / integration / agent / agent-env / agent-orchestrator
+:: other test presets: benchmark / integration / cloud / agent / agent-env / agent-orchestrator
 
 :: One-shot from ANY shell (transitional wrapper: vcvars64 + CUDA include, then the preset build):
 .\build_target.bat poc_overlay

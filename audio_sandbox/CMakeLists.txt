@@ -333,17 +333,23 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
     blackwell_set_cuda_debugger_path(voice_assistant)
     blackwell_copy_cuda_dlls(voice_assistant)
 
-    # 5. libcurl + simdjson, only when the cloud leg is built. Under the vcpkg
-    #    toolchain VCPKG_APPLOCAL_DEPS handles this automatically; the explicit
-    #    copy covers a system//manual libcurl, where nothing else would.
-    if(TARGET blackwell_cloud AND TARGET CURL::libcurl)
-        get_target_property(_curl_type CURL::libcurl TYPE)
-        if(_curl_type STREQUAL "SHARED_LIBRARY")
-            add_custom_command(TARGET voice_assistant POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "$<TARGET_FILE:CURL::libcurl>" "$<TARGET_FILE_DIR:voice_assistant>"
-                COMMENT "Copying libcurl next to voice_assistant...")
-        endif()
+    # 5. libcurl + simdjson and everything THEY drag in, only when the cloud leg
+    #    is built.
+    #
+    #    TARGET_RUNTIME_DLLS, not a hand-written list of one. The previous
+    #    version copied $<TARGET_FILE:CURL::libcurl> and nothing else, which is
+    #    only sufficient under the vcpkg TOOLCHAIN -- there VCPKG_APPLOCAL_DEPS
+    #    quietly deploys the rest. Found via CMAKE_PREFIX_PATH instead (no
+    #    toolchain), nothing does, and the app links fine and then fails to
+    #    START: libcurl pulls nghttp2 and zlib, and simdjson is its own DLL.
+    #    A missing-DLL dialog at launch is the least diagnosable failure in the
+    #    whole deployment, so resolve the closure rather than enumerate it.
+    #
+    #    blackwell_copy_runtime_deps() resolves the whole closure, including the
+    #    nghttp2/zlib level that libcurl imports and nothing links directly.
+    #    See cmake/BlackwellHelpers.cmake for why one pass is not enough.
+    if(TARGET blackwell_cloud)
+        blackwell_copy_runtime_deps(voice_assistant)
     endif()
 
     if(MSVC)
