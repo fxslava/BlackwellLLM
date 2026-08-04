@@ -39,6 +39,7 @@
 #include <vector>
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "device_buffer.h"  // blackwell::DeviceBuffer
@@ -157,11 +158,34 @@ private:
         bool            ready = false;      // captured yet? (lazy on first covering call)
     };
 
+    // WEIGHT PRECISION: the six GEMM matrices are fp16, everything else is fp32.
+    //
+    // WHY THIS IS NOT A NUMERICAL CHANGE. kComputeType is already
+    // CUBLAS_COMPUTE_32F_FAST_16F (whisper_encoder.cu), which rounds BOTH
+    // operands to fp16 before the tensor-core multiply and accumulates in fp32.
+    // Storing these matrices as fp32 therefore bought nothing: cuBLAS threw the
+    // low mantissa bits away on every call anyway. Holding them as __half feeds
+    // the same numbers to the same kernel -- the rounding just happens once at
+    // upload instead of once per GEMM.
+    //
+    // WHY IT MATTERS. These six are the model: 4 x [D,D] + [ffn,D] + [D,ffn] is
+    // ~78.6 MB/layer in fp32, x32 layers = ~2.52 GB, and the Ultravox checkpoint
+    // is BF16 on disk (1.375 GB) -- so the fp32 upload was DOUBLING a file that
+    // never had those bits. Halving it returns ~1.26 GB, which is the difference
+    // between fitting under the WDDM paging cliff on a 12 GB card and not.
+    //
+    // The bias/LayerNorm vectors stay fp32 deliberately: they are [D] or [ffn],
+    // i.e. ~0.1% of the layer, and they are consumed by the fused epilogue
+    // kernels rather than by cuBLAS -- halving them would save nothing
+    // measurable and would put a rounding step in front of the residual adds,
+    // which is where precision actually shows up.
     struct DeviceLayer {
-        DeviceBuffer<float> attn_ln_w, attn_ln_b;
-        DeviceBuffer<float> q_w, q_b, k_w, v_w, v_b, out_w, out_b;
-        DeviceBuffer<float> final_ln_w, final_ln_b;
-        DeviceBuffer<float> fc1_w, fc1_b, fc2_w, fc2_b;
+        DeviceBuffer<float>  attn_ln_w, attn_ln_b;
+        DeviceBuffer<__half> q_w, k_w, v_w, out_w;
+        DeviceBuffer<float>  q_b, v_b, out_b;
+        DeviceBuffer<float>  final_ln_w, final_ln_b;
+        DeviceBuffer<__half> fc1_w, fc2_w;
+        DeviceBuffer<float>  fc1_b, fc2_b;
     };
 
     // Issues the full forward op sequence on `stream_` for a `conv_frames`-frame
@@ -170,10 +194,16 @@ private:
     void record(cudaStream_t s, int conv_frames);
     // Y[T,O] = X[T,K] @ W[O,K]^T on cuBLAS (row-major via a transposed col-major
     // formulation); no bias (added by a fused epilogue).
-    void gemm_linear(const float* X, const float* W, float* Y, int T, int K, int O,
+    // The activation operand arrives fp32 and is narrowed into act_h_ first --
+    // cublasGemmEx requires Atype == Btype, so an fp16 weight forces an fp16 X.
+    // That narrowing is free in accuracy terms (see DeviceLayer) and costs one
+    // elementwise kernel over at most [seq, ffn].
+    void gemm_linear(const float* X, const __half* W, float* Y, int T, int K, int O,
                      cudaStream_t s);
     // C[M,N] = A[M,K] @ B[K,N] on cuBLAS (both row-major); the im2col conv GEMM.
-    void gemm_ab(const float* A, const float* B, float* C, int M, int N, int K);
+    // A is the fp16 conv weight, B the fp32 im2col columns (narrowed as above).
+    void gemm_ab(const __half* A, const float* B, float* C, int M, int N, int K,
+                 cudaStream_t s);
     // Eager warm-up (resolve cuBLAS algorithms/workspace) at b.conv_frames, then
     // capture the graph into b.exec. Capture forbids new allocations, so the warm-up
     // must run first. Populates b.{graph,exec,ready}.
@@ -190,8 +220,10 @@ private:
     std::vector<GraphBucket> buckets_;  // sorted ascending by conv_frames; captured lazily
     int last_seq_ = 0;                  // valid output length of the last forward()
 
-    // Weights (device).
-    DeviceBuffer<float> conv1_w_, conv1_b_, conv2_w_, conv2_b_;
+    // Weights (device). conv1/conv2 weights are GEMM operands (im2col lowering),
+    // so they follow the same fp16 rule as the layer matrices; the biases do not.
+    DeviceBuffer<__half> conv1_w_, conv2_w_;
+    DeviceBuffer<float>  conv1_b_, conv2_b_;
     DeviceBuffer<float> embed_positions_;   // [max_source_positions, d_model] (full table)
     // Per-launch positional window the captured graph reads from: forward() copies
     // embed_positions_[enc_pos_offset .. +seq) into this fixed buffer before the graph
@@ -218,6 +250,12 @@ private:
     DeviceBuffer<float> mlp_hidden_;  // [seq, ffn_dim]
     DeviceBuffer<float> mlp_out_;     // [seq, d_model]
     DeviceBuffer<float> output_;      // [seq, d_model]  (post final LayerNorm)
+    // Narrowed activation operand, shared by EVERY GEMM. One buffer is safe
+    // because the convert and the GEMM that consumes it are consecutive on a
+    // single stream, so the next convert cannot outrun the previous multiply --
+    // the same ordering guarantee the captured graph already relies on. Sized
+    // for the widest operand any GEMM presents: max(seq*ffn, d_model*3*seq).
+    DeviceBuffer<__half> act_h_;
     DeviceBuffer<char> blas_ws_;      // cuBLAS workspace (fixed, capture-safe)
 
     bool weights_loaded_ = false;

@@ -50,6 +50,17 @@ constexpr cublasComputeType_t kComputeType = CUBLAS_COMPUTE_32F_FAST_16F;
 // k=64) -> CUBLAS_STATUS_INVALID_VALUE; TF32 tensor cores are accepted there.
 constexpr cublasComputeType_t kAttnCompute = CUBLAS_COMPUTE_32F_FAST_TF32;
 
+// fp32 -> fp16 narrowing for a GEMM's activation operand. Pure format change:
+// kComputeType (FAST_16F) was already rounding this operand to fp16 inside
+// cuBLAS, so doing it here changes nothing numerically -- it only lets the
+// weight sit in memory at the same width. See DeviceLayer in the header.
+__global__ void to_half_kernel(const float* __restrict__ src, __half* __restrict__ dst,
+                               long long total) {
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    dst[idx] = __float2half(src[idx]);
+}
+
 __device__ __forceinline__ float gelu_exact(float x) {
     // transformers "gelu" == exact erf GELU: 0.5 x (1 + erf(x / sqrt(2))).
     return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
@@ -261,6 +272,28 @@ void upload(DeviceBuffer<float>& d, const std::vector<float>& h, size_t expect,
                                 cudaMemcpyHostToDevice));
 }
 
+// Same contract, fp16 destination: the GEMM operands (see DeviceLayer). The
+// narrowing happens HOST-side into a staging vector so the device never holds
+// both widths of the same tensor at once -- uploading fp32 and converting in
+// place would need a 2.52 GB transient, which is the whole problem this is
+// solving. __float2half is __host__ __device__, so this is the same rounding
+// the tensor cores would have applied.
+//
+// Host peak is unchanged: WhisperWeights already materialises fp32 vectors, and
+// the staging buffer is one tensor (at most [ffn, d_model] = 12.5 MB) at a time.
+void upload_half(DeviceBuffer<__half>& d, const std::vector<float>& h, size_t expect,
+                 const char* what) {
+    if (h.size() != expect)
+        throw std::runtime_error(std::string("WhisperEncoder weight size mismatch: ") +
+                                 what + " has " + std::to_string(h.size()) +
+                                 ", expected " + std::to_string(expect));
+    std::vector<__half> staged(h.size());
+    for (size_t i = 0; i < h.size(); ++i) staged[i] = __float2half(h[i]);
+    d.allocate(staged.size());
+    CUDA_CHECK_THROW(cudaMemcpy(d.get(), staged.data(), staged.size() * sizeof(__half),
+                                cudaMemcpyHostToDevice));
+}
+
 }  // namespace
 
 WhisperEncoder::WhisperEncoder(const WhisperEncoderConfig& cfg) : cfg_(cfg) {
@@ -295,6 +328,12 @@ WhisperEncoder::WhisperEncoder(const WhisperEncoderConfig& cfg) : cfg_(cfg) {
     mlp_hidden_.allocate((size_t)seq * cfg_.ffn_dim);
     mlp_out_.allocate(sD);
     output_.allocate(sD);
+    // Widest activation any GEMM narrows: the MLP operands are [seq, ffn], the
+    // conv2 im2col columns are [d_model*3, conv_out_frames]. Take the max so no
+    // call site can overrun it -- forward() must never allocate, and a capture
+    // in progress cannot.
+    act_h_.allocate(std::max<size_t>((size_t)seq * cfg_.ffn_dim,
+                                     (size_t)cfg_.d_model * 3 * seq));
 
     // Resolve the graph-bucket set: sort ascending, drop duplicates and anything
     // larger than conv_frames (the workspace-sizing bound), and guarantee conv_frames
@@ -328,9 +367,9 @@ void WhisperEncoder::load_weights(const WhisperWeights& w) {
     const int ffn = cfg_.ffn_dim;
     const int seq = cfg_.max_source_positions;
 
-    upload(conv1_w_, w.conv1_w, (size_t)D * mel * 3, "conv1.weight");
+    upload_half(conv1_w_, w.conv1_w, (size_t)D * mel * 3, "conv1.weight");
     upload(conv1_b_, w.conv1_b, (size_t)D, "conv1.bias");
-    upload(conv2_w_, w.conv2_w, (size_t)D * D * 3, "conv2.weight");
+    upload_half(conv2_w_, w.conv2_w, (size_t)D * D * 3, "conv2.weight");
     upload(conv2_b_, w.conv2_b, (size_t)D, "conv2.bias");
     upload(embed_positions_, w.embed_positions, (size_t)seq * D, "embed_positions");
     upload(ln_post_w_, w.layer_norm_w, (size_t)D, "layer_norm.weight");
@@ -347,40 +386,49 @@ void WhisperEncoder::load_weights(const WhisperWeights& w) {
         DeviceLayer& dl = dlayers_[(size_t)l];
         upload(dl.attn_ln_w, s.self_attn_layer_norm_w, (size_t)D, "self_attn_ln.w");
         upload(dl.attn_ln_b, s.self_attn_layer_norm_b, (size_t)D, "self_attn_ln.b");
-        upload(dl.q_w, s.q_w, (size_t)D * D, "q_proj.w");
+        upload_half(dl.q_w, s.q_w, (size_t)D * D, "q_proj.w");
         upload(dl.q_b, s.q_b, (size_t)D, "q_proj.b");
-        upload(dl.k_w, s.k_w, (size_t)D * D, "k_proj.w");
-        upload(dl.v_w, s.v_w, (size_t)D * D, "v_proj.w");
+        upload_half(dl.k_w, s.k_w, (size_t)D * D, "k_proj.w");
+        upload_half(dl.v_w, s.v_w, (size_t)D * D, "v_proj.w");
         upload(dl.v_b, s.v_b, (size_t)D, "v_proj.b");
-        upload(dl.out_w, s.out_w, (size_t)D * D, "out_proj.w");
+        upload_half(dl.out_w, s.out_w, (size_t)D * D, "out_proj.w");
         upload(dl.out_b, s.out_b, (size_t)D, "out_proj.b");
         upload(dl.final_ln_w, s.final_layer_norm_w, (size_t)D, "final_ln.w");
         upload(dl.final_ln_b, s.final_layer_norm_b, (size_t)D, "final_ln.b");
-        upload(dl.fc1_w, s.fc1_w, (size_t)ffn * D, "fc1.w");
+        upload_half(dl.fc1_w, s.fc1_w, (size_t)ffn * D, "fc1.w");
         upload(dl.fc1_b, s.fc1_b, (size_t)ffn, "fc1.b");
-        upload(dl.fc2_w, s.fc2_w, (size_t)D * ffn, "fc2.w");
+        upload_half(dl.fc2_w, s.fc2_w, (size_t)D * ffn, "fc2.w");
         upload(dl.fc2_b, s.fc2_b, (size_t)D, "fc2.b");
     }
     weights_loaded_ = true;
 }
 
 // Y[T,O] = X[T,K] @ W[O,K]^T  (W stored row-major [O,K] == col-major [K,O] ld K).
-void WhisperEncoder::gemm_linear(const float* X, const float* W, float* Y, int T,
-                                 int K, int O, cudaStream_t /*s*/) {
+// W is fp16; X is narrowed into act_h_ first because cublasGemmEx requires
+// Atype == Btype. C stays fp32 (CUDA_R_32F output with an fp16 A/B and a 32F
+// compute type is a supported combination), so every downstream epilogue kernel
+// keeps reading the fp32 activations it always did.
+void WhisperEncoder::gemm_linear(const float* X, const __half* W, float* Y, int T,
+                                 int K, int O, cudaStream_t s) {
+    const long long n = (long long)T * K;
+    to_half_kernel<<<grid1d(n), kBlock, 0, s>>>(X, act_h_.get(), n);
     const float one = 1.0f, zero = 0.0f;
     CUBLAS_CHECK_THROW(cublasGemmEx(
         blas_, CUBLAS_OP_T, CUBLAS_OP_N, O, T, K, &one,
-        W, CUDA_R_32F, K, X, CUDA_R_32F, K, &zero, Y, CUDA_R_32F, O,
+        W, CUDA_R_16F, K, act_h_.get(), CUDA_R_16F, K, &zero, Y, CUDA_R_32F, O,
         kComputeType, CUBLAS_GEMM_DEFAULT));
 }
 
 // C[M,N] = A[M,K] @ B[K,N]  (both row-major). Used by the im2col conv lowering.
-void WhisperEncoder::gemm_ab(const float* A, const float* B, float* C, int M, int N,
-                             int K) {
+// A is the fp16 conv weight; B (the im2col columns) is narrowed as above.
+void WhisperEncoder::gemm_ab(const __half* A, const float* B, float* C, int M, int N,
+                             int K, cudaStream_t s) {
+    const long long n = (long long)K * N;
+    to_half_kernel<<<grid1d(n), kBlock, 0, s>>>(B, act_h_.get(), n);
     const float one = 1.0f, zero = 0.0f;
     CUBLAS_CHECK_THROW(cublasGemmEx(
         blas_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &one,
-        B, CUDA_R_32F, N, A, CUDA_R_32F, K, &zero, C, CUDA_R_32F, N,
+        act_h_.get(), CUDA_R_16F, N, A, CUDA_R_16F, K, &zero, C, CUDA_R_32F, N,
         kComputeType, CUBLAS_GEMM_DEFAULT));
 }
 
@@ -398,10 +446,10 @@ void WhisperEncoder::record(cudaStream_t s, int conv_frames) {
 
     // --- Feature extractor: 2x (im2col + GEMM + bias/GELU), permute ---
     launch_im2col_k3(d_input_, cols1_, mel, cf, cf, /*stride=*/1, s);
-    gemm_ab(conv1_w_, cols1_, conv1_out_, D, cf, mel * 3);        // [D, cf]
+    gemm_ab(conv1_w_, cols1_, conv1_out_, D, cf, mel * 3, s);     // [D, cf]
     launch_row_bias_gelu(conv1_out_, conv1_b_, D, cf, s);
     launch_im2col_k3(conv1_out_, cols2_, D, cf, c2, /*stride=*/2, s);
-    gemm_ab(conv2_w_, cols2_, conv2_out_, D, c2, D * 3);          // [D, c2==seq]
+    gemm_ab(conv2_w_, cols2_, conv2_out_, D, c2, D * 3, s);       // [D, c2==seq]
     launch_row_bias_gelu(conv2_out_, conv2_b_, D, c2, s);
     launch_transpose(conv2_out_, conv_out_, D, c2, s);           // [D,seq] -> [seq,D]
     // Add positions from the per-launch window (filled by forward() with the absolute
