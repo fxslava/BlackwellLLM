@@ -21,12 +21,17 @@
 // ProjectorWorkspace, allocated once at construction; weights are uploaded once
 // via load_weights(). forward() only launches kernels over pre-owned buffers.
 //
-// Numerics: the isolated projector weights are FP32, so RMSNorm and both linears
-// run in FP32 (F.linear-equivalent, accumulate in float) to match the FP32
-// PyTorch reference — the engine's quantized Linear kernels take bf16/fp8/int4
-// weights, not these. Reuses the verified launch_stack_audio_frames / launch_swiglu.
+// Numerics: activations and accumulation are FP32 throughout (F.linear-
+// equivalent) to match the FP32 PyTorch reference; only the two linear WEIGHT
+// matrices are stored fp16, to stop a BF16 checkpoint costing double its own
+// width in VRAM. RMSNorm is untouched. See the note on the members below and
+// linear_wt_f16w_kernel in the .cu — the engine's quantized Linear kernels take
+// bf16/fp8/int4 weights, not these.
+// Reuses the verified launch_stack_audio_frames / launch_swiglu.
 // -----------------------------------------------------------------------------
 #include <vector>
+
+#include <cuda_fp16.h>
 
 #include "device_buffer.h"          // blackwell::DeviceBuffer
 #include "ultravox_projector.cuh"   // launch_stack_audio_frames, launch_swiglu
@@ -84,7 +89,20 @@ public:
 private:
     ProjectorConfig cfg_;
     int max_input_frames_;
-    DeviceBuffer<float> w_ln_pre_, w_linear_1_, w_ln_mid_, w_linear_2_;
+    // The two linear matrices are fp16, the two RMSNorm gains stay fp32.
+    //
+    // linear_1 is [4096, 10240] and linear_2 is [4096, 2048] -- ~201 MB in fp32,
+    // ~100 MB here, and they are ~99% of the projector's weight memory. The
+    // gains are [10240] and [2048], i.e. noise, and they are consumed by the
+    // RMSNorm kernel rather than the matmul.
+    //
+    // The narrowing is WEIGHT-ONLY, unlike the encoder: linear_wt_f16w_kernel
+    // still reads the activation as fp32 and still accumulates in fp32, so the
+    // only precision lost is in the stored weight -- which came from a BF16
+    // checkpoint and therefore never carried more than 8 mantissa bits to begin
+    // with. fp16 carries 11. See the kernel in the .cu.
+    DeviceBuffer<float>  w_ln_pre_, w_ln_mid_;
+    DeviceBuffer<__half> w_linear_1_, w_linear_2_;
     ProjectorWorkspace ws_;
 };
 

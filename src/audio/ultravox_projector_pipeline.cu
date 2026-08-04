@@ -39,24 +39,38 @@ __global__ void rmsnorm_f32_kernel(const float* __restrict__ x,
         yr[i] = xr[i] * inv_rms * w[i];
 }
 
-// Y[T,O] = X[T,K] @ W[O,K]^T  (F.linear with bias-free weight [O,K]). One thread
-// per output element; float4 over the contiguous K (K % 4 == 0). Accumulates in
-// float to mirror the FP32 PyTorch reference.
-__global__ void linear_wt_f32_kernel(const float* __restrict__ X,
-                                     const float* __restrict__ W,
-                                     float* __restrict__ Y,
-                                     int T, int K, int O) {
+// Y[T,O] = X[T,K] @ W[O,K]^T  (F.linear with bias-free weight [O,K]), with W
+// stored fp16. One thread per output element; float4 over the contiguous K
+// (K % 4 == 0), the weight read as two __half2 per float4 of activation.
+//
+// PRECISION: the activation stays fp32 and the accumulator stays float, exactly
+// as the fp32 kernel this replaces -- the ONLY change is the width of the stored
+// weight. That matters because the weight came from a BF16 checkpoint (8
+// mantissa bits) and fp16 carries 11, so the round-trip through fp16 is lossless
+// with respect to what the file actually held; the fp32 buffer was storing
+// zero-extended bits. Contrast the encoder, where cuBLAS was already rounding
+// both operands to fp16 anyway.
+//
+// ALIGNMENT: the __half2 reads require the row base to be 4-byte aligned.
+// W + o*K is (o*K*2) bytes in, and K is even for both call sites (10240, 2048),
+// so every row starts on a 4-byte boundary.
+__global__ void linear_wt_f16w_kernel(const float* __restrict__ X,
+                                      const __half* __restrict__ W,
+                                      float* __restrict__ Y,
+                                      int T, int K, int O) {
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (o >= O || t >= T) return;
 
-    const float4* xr = reinterpret_cast<const float4*>(X + (size_t)t * K);
-    const float4* wr = reinterpret_cast<const float4*>(W + (size_t)o * K);
+    const float4*  xr = reinterpret_cast<const float4*>(X + (size_t)t * K);
+    const __half2* wr = reinterpret_cast<const __half2*>(W + (size_t)o * K);
     const int K4 = K >> 2;
     float acc = 0.f;
     for (int k = 0; k < K4; ++k) {
-        const float4 a = xr[k], b = wr[k];
-        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        const float4 a = xr[k];
+        const float2 b0 = __half22float2(wr[2 * k]);
+        const float2 b1 = __half22float2(wr[2 * k + 1]);
+        acc += a.x * b0.x + a.y * b0.y + a.z * b1.x + a.w * b1.y;
     }
     Y[(size_t)t * O + o] = acc;
 }
@@ -66,10 +80,10 @@ void launch_rmsnorm_f32(const float* d_x, const float* d_w, float* d_y,
     rmsnorm_f32_kernel<<<rows, kBlock, 0, stream>>>(d_x, d_w, d_y, rows, H, eps);
 }
 
-void launch_linear_wt_f32(const float* d_x, const float* d_w, float* d_y,
-                          int T, int K, int O, cudaStream_t stream) {
+void launch_linear_wt_f16w(const float* d_x, const __half* d_w, float* d_y,
+                           int T, int K, int O, cudaStream_t stream) {
     dim3 grid((O + kBlock - 1) / kBlock, T);
-    linear_wt_f32_kernel<<<grid, kBlock, 0, stream>>>(d_x, d_w, d_y, T, K, O);
+    linear_wt_f16w_kernel<<<grid, kBlock, 0, stream>>>(d_x, d_w, d_y, T, K, O);
 }
 
 }  // namespace
@@ -99,10 +113,20 @@ void UltravoxProjector::load_weights(const std::vector<float>& ln_pre,
         CUDA_CHECK_THROW(cudaMemcpy(d.get(), h.data(), h.size() * sizeof(float),
                                     cudaMemcpyHostToDevice));
     };
+    // Narrowed HOST-side, so the device never holds both widths of the same
+    // matrix -- uploading fp32 and converting in place would need the 168 MB
+    // transient this exists to avoid. __float2half is __host__ __device__.
+    auto upload_half = [](DeviceBuffer<__half>& d, const std::vector<float>& h) {
+        std::vector<__half> staged(h.size());
+        for (size_t i = 0; i < h.size(); ++i) staged[i] = __float2half(h[i]);
+        d.allocate(staged.size());
+        CUDA_CHECK_THROW(cudaMemcpy(d.get(), staged.data(), staged.size() * sizeof(__half),
+                                    cudaMemcpyHostToDevice));
+    };
     upload(w_ln_pre_, ln_pre);
-    upload(w_linear_1_, linear_1);
+    upload_half(w_linear_1_, linear_1);
     upload(w_ln_mid_, ln_mid);
-    upload(w_linear_2_, linear_2);
+    upload_half(w_linear_2_, linear_2);
 }
 
 const float* UltravoxProjector::forward(const float* d_whisper_out, int num_frames,
@@ -117,13 +141,13 @@ const float* UltravoxProjector::forward(const float* d_whisper_out, int num_fram
     // 2. RMSNorm(ln_pre)   -> [T,10240]
     launch_rmsnorm_f32(ws_.stacked, w_ln_pre_, ws_.norm0, T, stacked, cfg_.eps, stream);
     // 3. Linear_1          -> [T,4096]
-    launch_linear_wt_f32(ws_.norm0, w_linear_1_, ws_.linear1, T, stacked, cfg_.proj_hidden, stream);
+    launch_linear_wt_f16w(ws_.norm0, w_linear_1_, ws_.linear1, T, stacked, cfg_.proj_hidden, stream);
     // 4. SwiGLU            -> [T,2048]
     launch_swiglu(ws_.linear1, ws_.swiglu, T, cfg_.proj_hidden, stream);
     // 5. RMSNorm(ln_mid)   -> [T,2048]
     launch_rmsnorm_f32(ws_.swiglu, w_ln_mid_, ws_.norm1, T, mid, cfg_.eps, stream);
     // 6. Linear_2          -> [T, text_hidden]  (4096 for the 8B default, 2048 for 1B)
-    launch_linear_wt_f32(ws_.norm1, w_linear_2_, ws_.out, T, mid, cfg_.text_hidden, stream);
+    launch_linear_wt_f16w(ws_.norm1, w_linear_2_, ws_.out, T, mid, cfg_.text_hidden, stream);
 
     return ws_.out.get();
 }
