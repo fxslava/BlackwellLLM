@@ -28,11 +28,33 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_CUDA_ARCHITECTURES": "120-real"
             }
+        },
+        {
+            "name": "cloud",
+            "hidden": true,
+            "cacheVariables": {
+                "BUILD_CLOUD_CLIENT": "ON",
+                "CMAKE_PREFIX_PATH": "$env{VCPKG_ROOT}/installed/x64-windows"
+            }
+        },
+        {
+            "name": "x64-debug-cloud",
+            "displayName": "x64 Debug (+ remote cloud leg)",
+            "inherits": ["cloud", "x64-debug"],
+            "binaryDir": "${sourceDir}/out/build/x64-Debug"
+        },
+        {
+            "name": "x64-release-cloud",
+            "displayName": "x64 Release (+ remote cloud leg)",
+            "inherits": ["cloud", "x64-release"],
+            "binaryDir": "${sourceDir}/out/build/x64-Release"
         }
     ],
     "buildPresets": [
-        { "name": "x64-debug",   "configurePreset": "x64-debug",   "configuration": "Debug" },
-        { "name": "x64-release", "configurePreset": "x64-release", "configuration": "Release" }
+        { "name": "x64-debug",         "configurePreset": "x64-debug",         "configuration": "Debug" },
+        { "name": "x64-release",       "configurePreset": "x64-release",       "configuration": "Release" },
+        { "name": "x64-debug-cloud",   "configurePreset": "x64-debug-cloud",   "configuration": "Debug" },
+        { "name": "x64-release-cloud", "configurePreset": "x64-release-cloud", "configuration": "Release" }
     ],
     "testPresets": [
         {
