@@ -930,17 +930,32 @@ int main(int argc, char** argv) {
             tcfg.max_chunk_chars  = settings.tts_max_chunk_chars;
             tcfg.mic_gate_enabled = settings.tts_mic_gate;
 
-            // The shipped ref_text is a PLACEHOLDER, not a transcript. F5 treats
-            // generation as infilling against the (audio, text) pair, so leaving
-            // it produces fluent nonsense that sounds like a broken model rather
-            // than a misconfiguration. Say so before spending 10 s loading a
-            // 1.3 GB graph to produce it.
-            if (settings.tts_ref_text == rt::AssistantSettings{}.tts_ref_text) {
+            // THE PAIR MUST MATCH. F5 treats generation as infilling against
+            // (reference audio, reference text), so a transcript that is not
+            // what the clip says makes the model invent content to reconcile
+            // them -- the reference bleeds into every utterance, which reads as
+            // a broken model rather than a misconfiguration.
+            //
+            // The shipped default is now a REAL matched pair (a FLEURS clip and
+            // its ground-truth transcript), so "equals the default" is no longer
+            // the fault condition -- it is the good case. What is still worth
+            // catching is an empty transcript, and the half-edited state: a
+            // custom clip still carrying the shipped text. Both are silent
+            // otherwise, and both cost a 1.3 GB graph load to discover by ear.
+            const rt::AssistantSettings kDefaults{};
+            if (settings.tts_ref_text.empty()) {
                 std::fprintf(stderr,
-                             "[tts] WARNING: reference transcript is still the placeholder. "
-                             "Set it to the literal text spoken in %s (Settings -> Audio -> "
-                             "TTS), or the voice will be wrong.\n",
+                             "[tts] WARNING: reference transcript is EMPTY. Set it to the "
+                             "literal text spoken in %s (Settings -> Audio -> TTS), or the "
+                             "voice will be wrong.\n",
                              tcfg.ref_audio.c_str());
+            } else if (settings.tts_ref_audio != kDefaults.tts_ref_audio &&
+                       settings.tts_ref_text == kDefaults.tts_ref_text) {
+                std::fprintf(stderr,
+                             "[tts] WARNING: reference clip was changed to %s but the "
+                             "transcript is still the one shipped for %s. They must "
+                             "describe the SAME audio (Settings -> Audio -> TTS).\n",
+                             tcfg.ref_audio.c_str(), kDefaults.tts_ref_audio.c_str());
             }
             try {
                 tts.emplace(tcfg);

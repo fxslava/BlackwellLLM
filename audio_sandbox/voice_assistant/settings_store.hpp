@@ -114,13 +114,31 @@ struct AssistantSettings {
     // Reference clip. MUST be 24 kHz mono; the loader refuses other rates rather
     // than resampling, because a wrong-rate reference does not fail -- it clones
     // a voice pitched by the rate ratio, which sounds like a different person.
-    std::string tts_ref_audio  = "D:\\TTF\\ref_audio.wav";
+    //
+    // Ships with the repo (models/f5_tts/, alongside the ONNX graphs): a 4.43 s
+    // female Russian clip from google/fleurs ru_ru (CC-BY-4.0), resampled to
+    // 24 kHz mono 16-bit, silence-trimmed, peak-normalised. Measured SNR 52 dB,
+    // no clipping. scripts/make_f5_reference.py rebuilds it from scratch.
+    // Absolute, like tts_ckpt_dir above and for the same reason: the app's CWD
+    // is its own exe directory, so a repo-relative path resolves to nothing.
+    // The clip lives NEXT TO the ONNX graphs, so this tracks tts_ckpt_dir.
+    std::string tts_ref_audio  =
+        "D:\\Projects\\BlackwellLLM\\models\\f5_tts\\ref_female_24k.wav";
     // NOT optional when TTS is on, and NOT a label: F5 conditions on an
     // (audio, TEXT) pair and treats generation as infilling, so this must be the
-    // literal transcript of tts_ref_audio. The default below is a PLACEHOLDER --
-    // leaving it produces confident nonsense, and main.cpp warns at startup if it
-    // is still set.
-    std::string tts_ref_text   = "Текст вашего референсного аудипоклипа";
+    // literal transcript of tts_ref_audio.
+    //
+    // THIS IS WHAT "PROMPT BLEEDING" ACTUALLY IS. If the text does not match the
+    // audio, the model still has to reconcile the two -- and it does so by
+    // inventing content, so the reference leaks into every utterance. The
+    // previous value here was a placeholder, and a hand-set one in the field had
+    // become "мяу мяу мяу...", which is why synthesis sounded possessed rather
+    // than merely wrong. Change the clip and you MUST change this line with it.
+    //
+    // Ground truth from the dataset, not a transcription: every character is
+    // verified present in the checkpoint's vocab.txt.
+    std::string tts_ref_text   =
+        "Это не казалось мне имеющим смысл; конечно это не было справедливым.";
     int  tts_nfe_step = 16;            // solver steps: the latency/quality dial
 
     // ---- chunking (time-to-first-audio vs. prosody continuity) --------------
