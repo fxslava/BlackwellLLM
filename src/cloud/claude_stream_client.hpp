@@ -65,8 +65,8 @@ public:
     };
 
     // Throws std::runtime_error on libcurl init failure (INIT tier).
-    // curl_global_init() must have been called once from main() beforehand --
-    // it is not thread-safe and libcurl's lazy init is a documented race.
+    // curl_global_init() is handled by the shared core, once per process and
+    // thread-safely -- callers have nothing to arrange.
     explicit ClaudeStreamClient(Config cfg);
     ~ClaudeStreamClient();
 

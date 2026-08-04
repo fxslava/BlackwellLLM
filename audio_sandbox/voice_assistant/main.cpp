@@ -90,6 +90,8 @@
 #if defined(BLACKWELL_HAVE_CLOUD_CLIENT)
 #include "claude_stream_client.hpp"
 #include "claude_transport.hpp"
+#include "openai_stream_client.hpp"
+#include "openai_transport.hpp"
 #endif
 
 #if defined(BLACKWELL_VAD_MODEL_PATH)
@@ -190,22 +192,24 @@ struct AppContext {
 #endif
 };
 
+// THIS STREAM IS THE USER'S OWN WORDS. Do not connect it to the TTS.
+//
+// Everything arriving here is decoded by session B, the ephemeral audio
+// sequence (RealEngineControl's `audio_`), whose job is to write down what the
+// user just said. publish_turn() runs extract_transcript() over it and offers
+// the result to the commit gate as an INTENT; the reply to that intent is a
+// separate generation entirely, and it surfaces through the dispatcher
+// callbacks above -- which is where speech output is wired.
+//
+// The earlier version gated this on event->is_translation, which reads as if it
+// separated the two. It does not: speech_pipeline_controller.cpp sets that flag
+// to a hardcoded `true` for ALL decode-loop output, because at that layer there
+// is only one decode loop and it cannot see which session ran it. So the gate
+// was always open and the assistant recited the user's sentence back at them.
 void on_token(void* user, const SpeechTokenEvent* event, std::uint64_t gen_id) {
     auto* ctx = static_cast<AppContext*>(user);
     if (ctx == nullptr || ctx->view == nullptr || event == nullptr) return;
     ctx->view->on_local_token(event->text, gen_id);
-#if defined(VOICE_ASSISTANT_HAS_TTS)
-    // THE LLM -> speech tap. Runs on the ENGINE thread, so it must not block:
-    // PushToken appends to a byte buffer under a short mutex and returns. All
-    // synthesis happens on the TTS worker.
-    //
-    // is_translation distinguishes a committed piece from a streaming ASR
-    // partial; only committed text is speakable -- speaking a partial would
-    // vocalise the user's own words back at them.
-    if (ctx->tts != nullptr && event->is_translation != 0) {
-        ctx->tts->PushToken(event->text);
-    }
-#endif
 }
 
 void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next,
@@ -228,9 +232,12 @@ void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next
                 ctx->tts->BargeIn();
                 break;
             case SPEECH_STATE_DECODE_TRANSLATING:
-                // A new answer is starting: clear the cancelled latch so the
-                // tokens about to arrive are actually spoken.
-                ctx->tts->Resume();
+                // NOT a Resume point. This state means the TRANSCRIPTION decode
+                // has started -- the user's words are being written down. The
+                // answer does not exist yet and may never (the commit gate can
+                // reject the turn). Clearing the barge-in latch here would arm
+                // the speaker for a generation that is not this one; it is done
+                // on the dispatcher's dispatch-start edge instead.
                 break;
             case SPEECH_STATE_IDLE:
             default:
@@ -244,12 +251,13 @@ void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next
     // must show, because BargeIn and Eos both land on IDLE.
     if (next == SPEECH_STATE_IDLE) {
         ctx->view->on_local_final(ctx->control->last_reason());
-#if defined(VOICE_ASSISTANT_HAS_TTS)
-        // End of turn: flush the chunker so a tail shorter than min_chunk_chars
-        // is still spoken. BargeIn already reset the chunker on the interrupted
-        // path, so this is a no-op there rather than a re-speak.
-        if (ctx->tts != nullptr) ctx->tts->EndOfTurn();
-#endif
+        // NO EndOfTurn() here. IDLE is the end of the TRANSCRIPTION pass, which
+        // happens BEFORE the intent is gated and long before the answer starts
+        // streaming. Flushing the chunker at this point would push the tail of
+        // whatever was buffered -- in practice nothing, now that the transcript
+        // no longer feeds it -- and would then arrive a second time, mid-answer,
+        // as a spurious boundary. The answer's real end is the dispatcher's
+        // completion edge, which is where the flush now lives.
     }
 }
 
@@ -508,18 +516,77 @@ int main(int argc, char** argv) {
         blackwell::cloud::IIntentTransport* remote = &offline_transport;
 
 #if defined(BLACKWELL_HAVE_CLOUD_CLIENT)
+        // PRECEDENCE: the configured OpenAI-compatible endpoint wins, then
+        // ANTHROPIC_API_KEY, then the offline stand-in. The settings file is
+        // checked first because it is the surface the user can actually SEE --
+        // an environment variable silently overriding what the Settings modal
+        // shows would be the worst of both.
+        std::unique_ptr<blackwell::cloud::OpenAiStreamClient> openai_client;
+        std::unique_ptr<blackwell::cloud::OpenAiTransport>    openai_transport;
         std::unique_ptr<blackwell::cloud::ClaudeStreamClient> live_client;
-        std::unique_ptr<blackwell::cloud::ClaudeTransport> live_transport;
-        if (const char* key = std::getenv("ANTHROPIC_API_KEY"); key != nullptr && *key != '\0') {
-            blackwell::cloud::ClaudeStreamClient::Config ccfg;
-            ccfg.api_key = key;
-            ccfg.beta = "server-side-fallback-2026-07-01";
-            live_client = std::make_unique<blackwell::cloud::ClaudeStreamClient>(std::move(ccfg));
-            live_transport = std::make_unique<blackwell::cloud::ClaudeTransport>(*live_client);
-            remote = live_transport.get();
-            std::printf("[cloud] ANTHROPIC_API_KEY present -- LIVE transport armed\n");
-        } else {
-            std::printf("[cloud] no ANTHROPIC_API_KEY -- Mode: Offline (Simulated)\n");
+        std::unique_ptr<blackwell::cloud::ClaudeTransport>    live_transport;
+
+        // The key may come from the Settings modal (persisted per machine under
+        // %LOCALAPPDATA%) or from OPENAI_API_KEY. It is deliberately NOT
+        // checked into settings_store.hpp's defaults: a default in a tracked
+        // header enters git history permanently and is compiled into every
+        // binary built from the tree. The settings file wins when both are set,
+        // because it is the one the user can see.
+        std::string remote_key = settings.remote_api_key;
+        if (remote_key.empty()) {
+            if (const char* env = std::getenv("OPENAI_API_KEY"); env != nullptr) {
+                remote_key = env;
+            }
+        }
+
+        if (!remote_key.empty() && !settings.remote_api_url.empty()) {
+            // INIT tier: a curl handle we cannot create is fatal for this leg
+            // only, so it degrades to offline rather than taking the app down.
+            // The user still has a working assistant and a log line saying why.
+            try {
+                blackwell::cloud::OpenAiStreamClient::Config ocfg;
+                ocfg.api_key = remote_key;
+                ocfg.base_url = settings.remote_api_url;
+                openai_client =
+                    std::make_unique<blackwell::cloud::OpenAiStreamClient>(std::move(ocfg));
+
+                // max_tokens mirrors the LOCAL per-turn cap so one number bounds
+                // a turn wherever it is answered -- a remote leg with no ceiling
+                // is an unbounded bill on a runaway generation.
+                blackwell::cloud::OpenAiRequestOptions oopt;
+                oopt.max_tokens = settings.max_new_tokens;
+                openai_transport = std::make_unique<blackwell::cloud::OpenAiTransport>(
+                    *openai_client, settings.remote_model, oopt);
+                remote = openai_transport.get();
+                // The KEY IS NEVER PRINTED. The endpoint is, because a wrong
+                // base URL is the likeliest misconfiguration and otherwise only
+                // surfaces as a 404 on the first real utterance.
+                std::printf("[cloud] remote leg: %s (model %s) -- LIVE\n",
+                            openai_client->endpoint().c_str(), settings.remote_model.c_str());
+            } catch (const std::exception& e) {
+                openai_transport.reset();
+                openai_client.reset();
+                std::fprintf(stderr, "[cloud] remote leg failed to arm (%s) -- falling back\n",
+                             e.what());
+            }
+        }
+
+        if (remote == &offline_transport) {
+            if (const char* key = std::getenv("ANTHROPIC_API_KEY");
+                key != nullptr && *key != '\0') {
+                blackwell::cloud::ClaudeStreamClient::Config ccfg;
+                ccfg.api_key = key;
+                ccfg.beta = "server-side-fallback-2026-07-01";
+                live_client =
+                    std::make_unique<blackwell::cloud::ClaudeStreamClient>(std::move(ccfg));
+                live_transport =
+                    std::make_unique<blackwell::cloud::ClaudeTransport>(*live_client);
+                remote = live_transport.get();
+                std::printf("[cloud] ANTHROPIC_API_KEY present -- LIVE transport armed\n");
+            } else {
+                std::printf("[cloud] no remote API key (Settings -> Remote API endpoint, or "
+                            "OPENAI_API_KEY) -- Mode: Offline (Simulated)\n");
+            }
         }
 #else
         std::printf("[cloud] built without BUILD_CLOUD_CLIENT -- Mode: Offline (Simulated)\n");
@@ -555,6 +622,13 @@ int main(int argc, char** argv) {
         router.set_use_local(settings.local_inference);
         blackwell::cloud::IIntentTransport* transport = &router;
 
+        // Declared HERE, above the dispatcher, because the dispatcher's reply
+        // callbacks are the TTS tap (see set_on_text below) and they need a
+        // handle that is still empty at this point -- app_ctx.tts is filled in
+        // once the engine is up. The speech-pipeline callbacks further down take
+        // the same object.
+        AppContext app_ctx{&view, control};
+
         // ---- the dispatcher: gate -> remote ---------------------------------
         // The system prompt is EDITABLE at runtime, and the dispatcher thread
         // reads it on every commit -- so it cannot be a plain captured string.
@@ -581,16 +655,57 @@ int main(int argc, char** argv) {
                 c.committed_prefix = "";
                 return c;
             });
-        dispatcher.set_on_dispatch_start([&view](const blackwell::bridge::IntentRecord& r) {
+        // ---------------------------------------------------------------------
+        // THE SPEECH TAP LIVES HERE, on the ANSWER stream, and nowhere else.
+        //
+        // These three callbacks are the only place the ASSISTANT'S REPLY exists
+        // as text. Everything the speech pipeline emits through on_token is the
+        // TRANSCRIPT of what the USER said -- session B (the ephemeral audio
+        // sequence) decodes the user's words, publish_turn extracts them, and
+        // the gate hands them here as an intent. Tapping on_token therefore
+        // reads the user their own sentence back; tapping the dispatcher reads
+        // them the answer.
+        //
+        // It also means local and cloud replies are spoken by the same code:
+        // RoutedTransport picks the leg, and neither branch is visible from
+        // here (local_transport.hpp's whole argument).
+        // ---------------------------------------------------------------------
+        dispatcher.set_on_dispatch_start([&view, &app_ctx](const blackwell::bridge::IntentRecord& r) {
             view.on_dispatch_start(r.sequence);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            // A new answer is starting: clear the cancelled latch that the
+            // barge-in edge set when the user began speaking, so the tokens
+            // about to arrive are actually spoken. This is the ANSWER's start,
+            // which is why it is here and not on a pipeline state -- the
+            // pipeline's DECODE state belongs to the transcription pass.
+            if (app_ctx.tts != nullptr) app_ctx.tts->Resume();
+#endif
         });
-        dispatcher.set_on_text([&view](std::string_view s) { view.on_remote_token(s); });
+        dispatcher.set_on_text([&view, &app_ctx](std::string_view s) {
+            view.on_remote_token(s);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            // Runs on the ENGINE thread for the local leg and the dispatcher
+            // thread for the remote one; PushToken appends under a short mutex
+            // and returns, so neither is blocked and all synthesis stays on the
+            // TTS worker.
+            if (app_ctx.tts != nullptr) app_ctx.tts->PushToken(s);
+#endif
+        });
         dispatcher.set_on_complete(
-            [&view](const blackwell::bridge::IntentRecord&, const blackwell::cloud::Result& r) {
+            [&view, &app_ctx](const blackwell::bridge::IntentRecord&,
+                              const blackwell::cloud::Result& r) {
                 view.on_remote_final(r.status == blackwell::cloud::Status::Ok,
                                      r.error_detail.empty()
                                          ? std::string(blackwell::cloud::to_string(r.status))
                                          : r.error_detail);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                // EOS / stop / error -- whichever ended the generation, the turn
+                // is over. Flush so a tail shorter than min_chunk_chars is still
+                // spoken. Unconditional on status: a failed answer may still have
+                // streamed a partial sentence, and leaving it buffered would
+                // splice it onto the FRONT of the next reply.
+                if (app_ctx.tts != nullptr) app_ctx.tts->EndOfTurn();
+#endif
             });
         dispatcher.start();
 
@@ -618,7 +733,7 @@ int main(int argc, char** argv) {
         if (vad_fn == nullptr) std::printf("[vad] built-in RMS threshold detector\n");
 
         // ---- the speech mode (Mode A, reused unchanged) ---------------------
-        AppContext app_ctx{&view, control};
+        // app_ctx is declared above the dispatcher (it is the TTS tap's handle).
         rt::ConversationalMode::Config mcfg;
         mcfg.sample_rate = static_cast<std::uint32_t>(cfg.sample_rate);
         mcfg.vad_probability_threshold = settings.vad_threshold;

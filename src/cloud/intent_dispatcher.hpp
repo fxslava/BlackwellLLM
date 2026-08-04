@@ -162,7 +162,10 @@ private:
         if (!ctx_) return;
         RequestContext c = ctx_();
         c.intent = "ping";  // placeholder; it sits AFTER the last breakpoint
-        (void)transport_.prewarm(build_prewarm_request(c));
+        // Rendered BY THE TRANSPORT: what a warm-up looks like is protocol
+        // knowledge (Anthropic's is a free max_tokens:0 request; an
+        // OpenAI-compatible endpoint has no such shape and declines to send).
+        (void)transport_.prewarm(transport_.build_prewarm_body(c));
     }
 
     Result send_with_retry(const bridge::IntentRecord& rec) {
@@ -179,7 +182,10 @@ private:
 
             RequestContext c = ctx_ ? ctx_() : RequestContext{};
             c.intent = rec.payload;
-            const std::string body = build_intent_request(c);
+            // The TRANSPORT renders the body, so the same committed context
+            // becomes an Anthropic Messages payload or an OpenAI-compatible
+            // one without this loop knowing which (intent_transport.hpp).
+            const std::string body = transport_.build_body(c);
             // `body` is a local: send() is synchronous, so it outlives the
             // transfer. That is the whole reason CURLOPT_POSTFIELDS is safe
             // in the live transport without COPYPOSTFIELDS.

@@ -1,5 +1,6 @@
 # =============================================================================
-# blackwell_cloud — Anthropic Messages API streaming client (Local Router leg).
+# blackwell_cloud — the remote legs of the Local Router: the Anthropic Messages
+# API and any OpenAI-compatible /chat/completions endpoint.
 #
 # CUDA-free and engine-free. Its only coupling to the rest of the tree is
 # src/bridge/intent_commit.hpp (header-only, no link dependency), so the
@@ -9,10 +10,14 @@
 # Explicit source list (src/kernels/ convention; never file(GLOB)).
 # =============================================================================
 add_library(blackwell_cloud STATIC
-    claude_stream_client.cpp)   # the ONLY TU that sees libcurl + simdjson
+    # The ONLY two TUs that see libcurl + simdjson. Everything protocol-agnostic
+    # (the poll loop, the watchdogs, SSE framing) is shared between them via
+    # curl_stream_core.hpp / sse_framer.hpp rather than duplicated.
+    claude_stream_client.cpp
+    openai_stream_client.cpp)
 
 target_include_directories(blackwell_cloud
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}      # claude_stream_client.hpp, intent_dispatcher.hpp
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}      # *_stream_client.hpp, intent_dispatcher.hpp
     PRIVATE ${CMAKE_SOURCE_DIR}/src/bridge)  # intent_commit.hpp (header-only)
 
 # intent_dispatcher.hpp is a PUBLIC header that includes intent_commit.hpp, so

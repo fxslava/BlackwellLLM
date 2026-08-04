@@ -230,6 +230,27 @@ public:
         return use_local() ? local_->is_live() : remote_->is_live();
     }
 
+    // Delegated for the same reason name()/is_live() are: the body must be the
+    // one the leg that will actually SEND it can parse. A router that rendered
+    // the default (Anthropic) shape would hand an OpenAI-compatible endpoint a
+    // payload it answers with a 400 -- and only when the toggle is off, which
+    // is the worst possible place for that failure to appear.
+    //
+    // The local leg ignores the body entirely (it answers from req.intent), so
+    // it inherits the default and nothing is wasted either way.
+    [[nodiscard]] std::string build_body(
+        const blackwell::cloud::RequestContext& ctx) const override {
+        return use_local() ? local_->build_body(ctx) : remote_->build_body(ctx);
+    }
+
+    [[nodiscard]] std::string build_prewarm_body(
+        const blackwell::cloud::RequestContext& ctx) const override {
+        // Prewarm only ever reaches the remote leg (see prewarm() below), so
+        // the remote leg is what renders it -- unconditionally, because the
+        // toggle at startup does not decide what is warmed later.
+        return remote_ != nullptr ? remote_->build_prewarm_body(ctx) : std::string{};
+    }
+
     [[nodiscard]] blackwell::cloud::Result send(
         const blackwell::cloud::TransportRequest& req,
         const blackwell::cloud::Callbacks& cb) noexcept override {

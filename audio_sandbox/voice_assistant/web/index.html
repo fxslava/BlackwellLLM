@@ -172,6 +172,36 @@
             that was interrupted or cut off is never answered at all.
             Takes effect on your next sentence.
           </p>
+          <details class="advanced">
+            <summary>Remote API endpoint</summary>
+            <p class="hint">
+              Any OpenAI-compatible service: replies are requested from
+              <b>&lt;base URL&gt;/chat/completions</b>. Used only while the box
+              above is unchecked. Clear the key to fall back to the offline
+              stand-in.
+            </p>
+            <div class="field">
+              <label for="s_remote_api_url">Base URL</label>
+              <input id="s_remote_api_url" placeholder="https://router.cheap/v1"
+                     spellcheck="false" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="s_remote_api_key">API key
+                <em>(stored in plain text with your other settings; leave empty to
+                use <b>OPENAI_API_KEY</b> from the environment)</em></label>
+              <div class="row">
+                <input id="s_remote_api_key" type="password" placeholder="sk-&hellip;"
+                       spellcheck="false" autocomplete="off">
+                <button class="ghost" type="button" id="revealKey"
+                        aria-pressed="false">Show</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="s_remote_model">Model</label>
+              <input id="s_remote_model" placeholder="gpt-4o-mini"
+                     spellcheck="false" autocomplete="off">
+            </div>
+          </details>
         </div>
 
         <div class="group">

@@ -262,6 +262,64 @@ TEST(RoutedTransport, NameAndLivenessFollowTheSelectedLeg) {
     EXPECT_FALSE(router.is_live());
 }
 
+// The body must be rendered by the leg that will actually SEND it. This is the
+// regression guard for the failure the seam was added to prevent: a router that
+// rendered the default (Anthropic) shape would hand an OpenAI-compatible
+// endpoint a payload it answers with a 400 -- and only while the toggle is off,
+// which is the worst possible place for it to appear.
+TEST(RoutedTransport, BodyIsRenderedByTheSelectedLeg) {
+    struct ShapedTransport final : blackwell::cloud::IIntentTransport {
+        explicit ShapedTransport(const char* s) : shape(s) {}
+        [[nodiscard]] const char* name() const noexcept override { return shape; }
+        [[nodiscard]] bool is_live() const noexcept override { return false; }
+        [[nodiscard]] std::string build_body(
+            const blackwell::cloud::RequestContext& ctx) const override {
+            return std::string(shape) + ":" + std::string(ctx.intent);
+        }
+        [[nodiscard]] std::string build_prewarm_body(
+            const blackwell::cloud::RequestContext&) const override {
+            return std::string(shape) + ":warm";
+        }
+        [[nodiscard]] blackwell::cloud::Result send(
+            const blackwell::cloud::TransportRequest&,
+            const blackwell::cloud::Callbacks&) noexcept override {
+            return {};
+        }
+        const char* shape;
+    };
+    ShapedTransport local_leg("local"), remote_leg("remote");
+    RoutedTransport router(&local_leg, &remote_leg);
+
+    blackwell::cloud::RequestContext ctx;
+    ctx.intent = "hello";
+
+    router.set_use_local(false);
+    EXPECT_EQ(router.build_body(ctx), "remote:hello");
+
+    router.set_use_local(true);
+    EXPECT_EQ(router.build_body(ctx), "local:hello");
+    // Pre-warm only ever reaches the remote leg, so it is rendered there
+    // regardless of where the toggle is pointing.
+    EXPECT_EQ(router.build_prewarm_body(ctx), "remote:warm");
+}
+
+// The default rendering is the Anthropic Messages shape, so a transport that
+// does not care about the body (the local leg, which answers from req.intent)
+// inherits something the live client would have accepted.
+TEST(RoutedTransport, DefaultBodyIsTheAnthropicShape) {
+    RecordingTransport local_leg("local"), remote_leg("remote");
+    RoutedTransport router(&local_leg, &remote_leg);
+
+    blackwell::cloud::RequestContext ctx;
+    ctx.instructions = "be brief";
+    ctx.intent = "hello";
+    const std::string body = router.build_body(ctx);
+
+    EXPECT_NE(body.find("\"max_tokens\""), std::string::npos);
+    EXPECT_NE(body.find("\"system\""), std::string::npos);
+    EXPECT_NE(body.find("hello"), std::string::npos);
+}
+
 // Teardown must not depend on where the toggle happens to be pointing.
 TEST(RoutedTransport, ShutdownReachesBothLegs) {
     struct CountingTransport final : blackwell::cloud::IIntentTransport {

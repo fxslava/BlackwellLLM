@@ -176,6 +176,34 @@ struct AssistantSettings {
     // the same commit rule gates a local answer and a billed one.
     bool local_inference = false;
 
+    // ---- the remote leg: any OpenAI-compatible /chat/completions endpoint ----
+    // Used when local_inference is OFF. All three are RESTART tier, and that is
+    // structural rather than a shortcut: the HTTP client builds its auth header
+    // list and pins its endpoint string ONCE at construction (the slist must
+    // outlive every transfer), and the model is bound to the transport object
+    // that renders each body. Rebuilding them under a dispatcher thread that may
+    // be parked inside send() is a lifetime problem, not a settings change.
+    //
+    // BASE url, exactly as a provider documents it -- "/chat/completions" is
+    // appended by the client (openai_request.hpp::join_url), so a trailing slash
+    // or none both work. Empty disables the remote leg: the app falls back to
+    // ANTHROPIC_API_KEY if that is set, and to the offline stand-in otherwise.
+    std::string remote_api_url = "https://router.cheap/v1";
+    // Sent as `Authorization: Bearer <key>`. PERSISTED IN CLEARTEXT under
+    // %LOCALAPPDATA% -- this is a settings file, not a credential store, and the
+    // UI says so. Empty = the remote leg is not armed.
+    //
+    // EMPTY BY DEFAULT, AND IT MUST STAY THAT WAY. A key written here is not a
+    // convenience: this is a tracked header, so it would enter git history
+    // permanently (rewriting history is the only way back out) and it would be
+    // compiled into every binary built from this tree. The key belongs in the
+    // per-machine settings.json under %LOCALAPPDATA%, or in the environment --
+    // both of which are already how a developer's own key reaches the app.
+    std::string remote_api_key = "";
+    // The model id the endpoint expects. Free text, not a list: which ids a
+    // gateway serves is the gateway's business and changes without us.
+    std::string remote_model = "gpt-4o-mini";
+
     // ---- Tab 4: the TWO prompts ---------------------------------------------
     // They are different things and were previously conflated, which is why the
     // model translated when the user wanted a transcript -- the only editable
@@ -251,6 +279,11 @@ void visit_fields(S& s, Fn&& f) {
     f("hotkey_show",              s.hotkey_show,              Tier::Live);
     f("hotkey_push_to_talk",      s.hotkey_push_to_talk,      Tier::Live);
     f("local_inference",          s.local_inference,          Tier::Live);
+    // Restart tier -- see the declarations for why the HTTP client cannot be
+    // reconfigured under a live dispatcher.
+    f("remote_api_url",           s.remote_api_url,           Tier::Restart);
+    f("remote_api_key",           s.remote_api_key,           Tier::Restart);
+    f("remote_model",             s.remote_model,             Tier::Restart);
     // ---- Tab 4 -------------------------------------------------------------
     f("system_prompt",            s.system_prompt,            Tier::Live);
     f("audio_task_prompt",        s.audio_task_prompt,        Tier::Live);
@@ -266,6 +299,19 @@ void visit_fields(S& s, Fn&& f) {
 // construction a value this function leaves alone.
 inline void clamp_settings(AssistantSettings& s) {
     auto clamp_int = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    // Strip surrounding whitespace in place. Pasted credentials and URLs arrive
+    // with a trailing newline or a leading space often enough that not doing
+    // this is a real bug: a key with a stray "\n" is a well-formed Authorization
+    // header that comes back as an opaque 401, with nothing on screen to
+    // distinguish it from a wrong key.
+    auto trim = [](std::string& v) {
+        const std::size_t first = v.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            v.clear();
+        } else {
+            v = v.substr(first, v.find_last_not_of(" \t\r\n") - first + 1);
+        }
+    };
 
     if (s.vad_threshold < 0.1f) s.vad_threshold = 0.1f;
     if (s.vad_threshold > 0.9f) s.vad_threshold = 0.9f;
@@ -306,6 +352,15 @@ inline void clamp_settings(AssistantSettings& s) {
     } else {
         s.speech_language = s.speech_language.substr(
             first, s.speech_language.find_last_not_of(" \t\r\n") - first + 1);
+    }
+    trim(s.remote_api_url);
+    trim(s.remote_api_key);
+    trim(s.remote_model);
+    // A base URL without a scheme is the other common paste error. Defaulting to
+    // https rather than rejecting it keeps "router.cheap/v1" working, and https
+    // rather than http because a bearer token must never go out in the clear.
+    if (!s.remote_api_url.empty() && s.remote_api_url.find("://") == std::string::npos) {
+        s.remote_api_url.insert(0, "https://");
     }
     if (s.data_dir.empty()) s.data_dir = "data";
     // No checkpoint means there is nothing to load -- the simulated backend is

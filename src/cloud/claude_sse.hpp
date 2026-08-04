@@ -1,25 +1,28 @@
 #pragma once
 // =============================================================================
-// cloud/claude_sse.hpp — incremental SSE framing + Anthropic event extraction.
+// cloud/claude_sse.hpp — Anthropic Messages API event extraction.
 //
 // INTERNAL header: only claude_stream_client.cpp includes it, so simdjson stays
 // out of every other TU (same discipline as src/vad/silero_vad.hpp and
 // ONNXRuntime -- exactly one TU sees the third-party API).
 //
+// SSE FRAMING LIVES IN sse_framer.hpp and is shared with the OpenAI-compatible
+// decoder. This file is now only the Anthropic-specific half: what a `data:`
+// payload MEANS. SseDecoder's public surface (feed / reset) is unchanged, so
+// the byte-at-a-time regression test still exercises the same contract.
+//
 // Header-only and templated on the sink so it is unit-testable WITHOUT libcurl:
 // feed a captured fixture one byte at a time and whole, and assert the two
 // produce identical event sequences. That is the regression test for the
 // chunk-boundary class of bug, which is the one that survives to production.
-//
-// INVARIANT: feed() must tolerate arbitrary split points. TCP will split a
-// `data:` line mid-JSON, mid-UTF-8, and between the \r and the \n.
 // =============================================================================
 #include <simdjson.h>
 
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <string_view>
+
+#include "sse_framer.hpp"
 
 namespace blackwell::cloud::detail {
 
@@ -31,84 +34,20 @@ namespace blackwell::cloud::detail {
 //   void on_api_error(std::string_view type, std::string_view message);
 
 template <class Sink>
-class SseDecoder {
+class ClaudeEventParser {
 public:
-    explicit SseDecoder(Sink& sink) : sink_(sink) {
-        line_.reserve(256);
-        ev_.reserve(kEventReserve);
-    }
+    explicit ClaudeEventParser(Sink& sink) : sink_(sink) {}
 
-    void reset() noexcept {
-        line_.clear();
-        ev_.clear();
-    }
-
-    // Returns false on an unrecoverable framing/JSON error -> caller aborts.
-    [[nodiscard]] bool feed(const char* p, size_t n) {
-        const char* const end = p + n;
-        while (p < end) {
-            const auto* nl =
-                static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
-            if (nl == nullptr) {
-                // Partial line -- carry it over to the next chunk.
-                line_.append(p, static_cast<size_t>(end - p));
-                return true;
-            }
-
-            std::string_view line;
-            if (line_.empty()) {
-                // Fast path: the whole line arrived in this chunk. Zero copy.
-                line = std::string_view(p, static_cast<size_t>(nl - p));
-            } else {
-                line_.append(p, static_cast<size_t>(nl - p));
-                line = line_;
-            }
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-
-            const bool ok = handle_line(line);
-            line_.clear();
-            if (!ok) return false;
-            p = nl + 1;
-        }
-        return true;
-    }
-
-private:
-    static constexpr size_t kEventReserve = 4096;
-
-    [[nodiscard]] bool handle_line(std::string_view line) {
-        if (line.empty()) return dispatch();   // blank line terminates the event
-        if (line.front() == ':') return true;  // comment / keep-alive
-
-        constexpr std::string_view kData = "data:";
-        if (line.size() >= kData.size() && line.compare(0, kData.size(), kData) == 0) {
-            std::string_view v = line.substr(kData.size());
-            if (!v.empty() && v.front() == ' ') v.remove_prefix(1);
-            if (!ev_.empty()) ev_.push_back('\n');  // multi-line data:, per spec
-            ev_.append(v);
-        }
-        // `event:` / `id:` / `retry:` deliberately ignored -- the JSON "type"
-        // field is authoritative and always present on this endpoint.
-        return true;
-    }
-
-    [[nodiscard]] bool dispatch() {
-        if (ev_.empty()) return true;
-        const bool ok = parse_event();
-        ev_.clear();
-        return ok;
-    }
-
-    [[nodiscard]] bool parse_event() {
+    [[nodiscard]] bool parse_event(std::string& ev) {
         namespace sj = simdjson;
 
         // simdjson reads up to SIMDJSON_PADDING bytes past the document end.
         // Over-reserving is NOT optional -- an unpadded buffer is a heap
         // overread that passes every test and crashes in production.
-        if (ev_.capacity() - ev_.size() < sj::SIMDJSON_PADDING) {
-            ev_.reserve(ev_.size() + sj::SIMDJSON_PADDING);
+        if (ev.capacity() - ev.size() < sj::SIMDJSON_PADDING) {
+            ev.reserve(ev.size() + sj::SIMDJSON_PADDING);
         }
-        sj::padded_string_view view(ev_.data(), ev_.size(), ev_.capacity());
+        sj::padded_string_view view(ev.data(), ev.size(), ev.capacity());
 
         sj::ondemand::document doc;
         if (parser_.iterate(view).get(doc) != sj::SUCCESS) return false;
@@ -191,6 +130,7 @@ private:
         return true;
     }
 
+private:
     static uint32_t u32(simdjson::ondemand::object& obj, const char* key) {
         uint64_t v = 0;
         if (obj[key].get_uint64().get(v) != simdjson::SUCCESS) return 0;
@@ -207,8 +147,25 @@ private:
 
     Sink& sink_;
     simdjson::ondemand::parser parser_;  // reused: owns the tape + string buffers
-    std::string line_;                   // partial line carried across chunks
-    std::string ev_;                     // accumulated `data:` payload, padded
+};
+
+// Framing + Anthropic semantics, glued. Member order is the dependency order:
+// the framer holds a reference to the parser, so the parser is declared first.
+template <class Sink>
+class SseDecoder {
+public:
+    explicit SseDecoder(Sink& sink) : parser_(sink), framer_(parser_) {}
+
+    SseDecoder(const SseDecoder&) = delete;
+    SseDecoder& operator=(const SseDecoder&) = delete;
+
+    void reset() noexcept { framer_.reset(); }
+
+    [[nodiscard]] bool feed(const char* p, size_t n) { return framer_.feed(p, n); }
+
+private:
+    ClaudeEventParser<Sink>            parser_;
+    SseFramer<ClaudeEventParser<Sink>> framer_;
 };
 
 }  // namespace blackwell::cloud::detail

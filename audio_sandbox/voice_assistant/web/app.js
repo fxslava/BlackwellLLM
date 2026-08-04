@@ -396,6 +396,10 @@ const FIELDS = {
   device_id: "int", max_context: "int", simulated: "check",
   temperature: "float", top_p: "float", max_new_tokens: "int",
   local_inference: "check",
+  // The remote leg. All three are plain strings on the C++ side, so "value" --
+  // the key in particular must NOT be coerced: it is opaque to us and any
+  // parsing would be a way to corrupt it.
+  remote_api_url: "value", remote_api_key: "value", remote_model: "value",
   // Tab 2
   neural_vad: "check", loopback_capture: "check", vad_threshold: "float",
   silence_hangover_ms: "int", pre_roll_ms: "int", warm_prefill_interval_ms: "int",
@@ -498,6 +502,28 @@ function refreshRestartBanner() {
 
 overlay.addEventListener("input", () => { refreshReadouts(); refreshRestartBanner(); });
 overlay.addEventListener("change", () => { refreshReadouts(); refreshRestartBanner(); });
+
+/* ---- API key reveal -------------------------------------------------------
+   A masked field you cannot read back is how a key with a stray character in it
+   stays a mystery: the only symptom is a 401, which looks identical to a wrong
+   key. This flips the input type only -- the value is never copied anywhere,
+   and the field returns to masked when the modal closes. */
+const revealKey = $("#revealKey");
+const keyField = $("#s_remote_api_key");
+function maskKey() {
+  if (!keyField || !revealKey) return;
+  keyField.type = "password";
+  revealKey.textContent = "Show";
+  revealKey.setAttribute("aria-pressed", "false");
+}
+if (revealKey && keyField) {
+  revealKey.addEventListener("click", () => {
+    const show = keyField.type === "password";
+    keyField.type = show ? "text" : "password";
+    revealKey.textContent = show ? "Hide" : "Show";
+    revealKey.setAttribute("aria-pressed", String(show));
+  });
+}
 
 /* ---- tabs ----------------------------------------------------------------
    Plain show/hide rather than separate documents: the form is ONE payload, and
@@ -618,9 +644,13 @@ $("#promptApply").addEventListener("click", () => {
 function openSettings() {
   writeForm(current);
   saveMsg.textContent = "";
+  maskKey();   // a key left revealed from last time must not survive a reopen
   overlay.classList.remove("hidden");
 }
-function closeSettings() { overlay.classList.add("hidden"); }
+function closeSettings() {
+  maskKey();
+  overlay.classList.add("hidden");
+}
 
 $("#settingsBtn").addEventListener("click", openSettings);
 $("#settingsClose").addEventListener("click", closeSettings);
