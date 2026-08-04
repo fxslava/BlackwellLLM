@@ -155,6 +155,7 @@ public:
         curl_multi_add_handle(multi_, easy_);
 
         Status timeout_status = Status::Ok;
+        std::string timeout_detail;
         int running = 1;
         while (running > 0) {
             curl_multi_perform(multi_, &running);
@@ -164,16 +165,32 @@ public:
             // long server-side prefill reads as alive, not as a stall -- which
             // is why TTFT must be its own (longer) budget rather than reusing
             // the stall one.
+            //
+            // EACH BUDGET REPORTS ITSELF, with what it measured and what it was
+            // allowed. The old message was a bare "watchdog fired", which does
+            // not say WHICH watchdog or how close the call was -- so the only
+            // way to act on it was to guess at the numbers, and the number
+            // people find by grepping is the deliberately-tiny one in the tests.
             if (!t.got_first_byte && ms_since(t.started) > opts_.ttft_timeout_ms) {
                 timeout_status = Status::TtftTimeout;
+                timeout_detail = "no first byte after " + std::to_string(ms_since(t.started)) +
+                                 " ms (TTFT budget " + std::to_string(opts_.ttft_timeout_ms) +
+                                 " ms)";
                 break;
             }
             if (t.got_first_byte && ms_since(t.last_byte) > opts_.stall_timeout_ms) {
                 timeout_status = Status::StallTimeout;
+                timeout_detail = "stream stalled for " + std::to_string(ms_since(t.last_byte)) +
+                                 " ms (stall budget " + std::to_string(opts_.stall_timeout_ms) +
+                                 " ms)";
                 break;
             }
             if (shutting_down_.load(std::memory_order_acquire)) {
+                // NOT a watchdog, and it must not read as one: this is teardown
+                // cutting a live transfer loose, which is normal shutdown and
+                // not a symptom of anything.
                 timeout_status = Status::ShuttingDown;
+                timeout_detail = "aborted at teardown";
                 break;
             }
 
@@ -215,7 +232,7 @@ public:
         if (r.status == Status::Ok) {
             if (timeout_status != Status::Ok) {
                 r.status = timeout_status;
-                if (r.error_detail.empty()) r.error_detail = "watchdog fired";
+                if (r.error_detail.empty()) r.error_detail = timeout_detail;
             } else if (!have_rc) {
                 r.status = Status::NetworkError;
                 r.error_detail = "transfer ended without a completion message";

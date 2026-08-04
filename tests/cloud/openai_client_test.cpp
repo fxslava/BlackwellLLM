@@ -155,6 +155,56 @@ TEST(OpenAiClient, UnreachableEndpointIsClassifiedAndBounded) {
     EXPECT_LT(ms, kConnectMs + kTtftMs + 2000) << "took " << ms << "ms";
 }
 
+// A FIRED WATCHDOG MUST SAY WHICH ONE, AND BY HOW MUCH.
+//
+// This is a regression test for a diagnosis, not for behaviour. The message
+// used to be a bare "watchdog fired" -- which reached the UI verbatim, named
+// neither budget, and gave no way to tell a genuinely slow endpoint from a
+// mistuned timeout. The only way to act on it was to go looking for the
+// numbers, and the number that turns up first is the deliberately-tiny one in
+// THIS file, which production never uses. That cost a bug report.
+//
+// A zero TTFT budget fires on the first poll iteration, before the connect
+// budget can expire, so this needs no server and no timing tolerance.
+TEST(OpenAiClient, TtftWatchdogNamesItselfAndReportsWhatItMeasured) {
+    OpenAiStreamClient::Config c = unreachable_config();
+    c.ttft_timeout_ms = 0;
+    OpenAiStreamClient client(std::move(c));
+    OpenAiTransport t(client, "m");
+
+    RequestContext ctx;
+    ctx.intent = "hello";
+    const std::string body = t.build_body(ctx);
+    const TransportRequest req{body, "hello", 1};
+    Callbacks cb;
+
+    const Result r = t.send(req, cb);
+    EXPECT_EQ(r.status, Status::TtftTimeout) << "got " << to_string(r.status);
+    EXPECT_NE(r.error_detail.find("no first byte"), std::string::npos) << r.error_detail;
+    EXPECT_NE(r.error_detail.find("TTFT budget"), std::string::npos) << r.error_detail;
+    // The bare string is what this test exists to keep out of the UI.
+    EXPECT_EQ(r.error_detail.find("watchdog fired"), std::string::npos) << r.error_detail;
+}
+
+// Teardown is not a watchdog and must not read as one -- it is the normal way a
+// transfer ends when the app is closing, and reporting it as a timeout sends
+// people looking for a performance problem that does not exist.
+TEST(OpenAiClient, TeardownIsNotReportedAsAWatchdog) {
+    OpenAiStreamClient client(unreachable_config());
+    OpenAiTransport t(client, "m");
+
+    RequestContext ctx;
+    ctx.intent = "hello";
+    const std::string body = t.build_body(ctx);
+    const TransportRequest req{body, "hello", 1};
+    Callbacks cb;
+
+    t.shutdown();
+    const Result r = t.send(req, cb);
+    ASSERT_EQ(r.status, Status::ShuttingDown);
+    EXPECT_EQ(r.error_detail.find("watchdog"), std::string::npos) << r.error_detail;
+}
+
 // The easy handle is REUSED across requests -- that is what keeps the
 // connection pooled. A failed transfer must not leave it poisoned (the
 // completion message has to be drained even when a watchdog fired).
