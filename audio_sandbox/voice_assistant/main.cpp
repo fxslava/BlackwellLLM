@@ -117,6 +117,10 @@
 // loudspeaker that creates the problem it solves: with no speech output there is
 // no echo, and no far-end reference to cancel one with.
 #include "aec_capture_filter.hpp"
+#if defined(BLACKWELL_HAVE_AEC3)
+// PIMPL'd: this pulls in no WebRTC header, only the seam and a unique_ptr.
+#include "aec3_echo_canceller.hpp"
+#endif
 #define VOICE_ASSISTANT_HAS_TTS 1
 #endif
 
@@ -456,6 +460,10 @@ struct AppContext {
     // it belongs to the capture side -- the settings handler and the PCM tap
     // touch it, and neither of them has any business in the TTS stack.
     blackwell::audio_rt::AecCaptureFilter* aec = nullptr;
+    // The loopback device supplying that filter's far end. A POINTER for the
+    // same reason `aec` is one: apply_audio_reload has to move it when the
+    // OUTPUT endpoint changes, and it is declared long after that lambda.
+    rt::AudioCapture* loopback = nullptr;
 
     // The answer text as it is handed to the speaker, accumulated purely to be
     // LOGGED once the turn ends. It is not the source of what gets spoken --
@@ -559,69 +567,30 @@ void on_text_sink(void* user, const char* /*utf8*/, std::int32_t /*index*/,
 // Runs on the DSP worker, once per 10 ms block. That thread is the SINGLE owner
 // of the SileroVAD instance (the class's threading contract); the UI thread only
 // reads its published atomics.
-// THE SELF-BARGE-IN GUARD, and the reason it is now a MUTE rather than a bar.
+// SELF-BARGE-IN IS ANSWERED IN THE DSP, NOT HERE.
 //
-// The microphone stays open while the assistant talks -- that is the whole
-// point of full duplex, and the echo canceller is what makes it survivable. But
-// the AEC is an ADAPTIVE filter: it converges over a few hundred milliseconds,
-// it never reaches perfect cancellation, and it degrades on a loud speaker in a
-// live room. The residue it leaves is speech-shaped, because it IS speech, and
-// Silero is very good at recognising speech. So the assistant hears itself,
-// scores high, and barges in on its own sentence -- measured as
-// `chunks cancelled` with nobody in the room talking.
+// The loudspeaker feeds the microphone and Silero scores the assistant's own
+// voice as speech -- correctly, because it IS speech. Two guards were tried in
+// this function and both were removed: a raised probability bar (a statistical
+// bound that fails whenever the reference drifts out of alignment) and a hard
+// mute keyed on playback state (deterministic, but it starved a recurrent model
+// of blocks and withheld barge-in without asking).
 //
-// WHAT WAS TRIED FIRST, AND WHY IT DID NOT HOLD. The previous guard raised the
-// bar instead of closing it: while emitting, a barge-in had to clear 0.92 rather
-// than the configured threshold. That is a STATISTICAL argument -- it assumes
-// the residue stays below a number -- and the assumption fails in exactly the
-// conditions that matter. The two devices run on independent WASAPI clocks and
-// drift; every resync re-opens a window in which the canceller is subtracting
-// misaligned audio, and misaligned speech does not attenuate, it doubles. A
-// residue peak crosses 0.92 during that window, and one block is all a barge-in
-// needs. Raising the constant further only moves the failure onto the user's
-// real interruptions.
-//
-// SO THE GUARD IS NOW STATE, NOT LEVEL. While the playback time-lock is set --
-// real audio in flight, plus AudioPlayback::kAcousticTailMs of room -- the score
-// is zero. Not scaled, not thresholded: zero. This is deterministic. It does not
-// depend on how well the canceller converged, on the volume, on the room, or on
-// whether the two clocks happen to be aligned this second, which is precisely
-// the set of things that made the previous guard unreliable.
-//
-// WHAT IT COSTS, STATED PLAINLY. Voice barge-in does not work while the
-// assistant is audible. That is the same capability the old microphone gate cost
-// (recorded as a mistake in tts_runtime.hpp) and it is being paid deliberately
-// this time: self-interruption made long answers unusable, and an assistant that
-// cannot finish a sentence is worse than one that has to be stopped by hand. The
-// cancel control and its hotkey are the way out and are NOT gated -- see
-// cb.on_cancel, which bumps the epoch and calls BargeIn() directly.
+// Both made the DETECTOR lie about what it heard. The answer now lives one layer
+// down, where the problem actually is: the assistant's own voice is SUBTRACTED
+// from the capture stream by the echo canceller, fed a WASAPI loopback reference
+// of what the speaker is really emitting (see the capture tap below). This
+// function does one thing and does it unconditionally.
 struct VadContext {
     blackwell::vad::SileroVAD* vad = nullptr;
-#if defined(VOICE_ASSISTANT_HAS_TTS)
-    rt::TtsRuntime** tts = nullptr;   // indirect: the runtime is built later
-#endif
 };
 
 float vad_score(void* user, const float* block, size_t count) {
     auto* ctx = static_cast<VadContext*>(user);
     if (ctx == nullptr || ctx->vad == nullptr) return 0.0f;
-#if defined(VOICE_ASSISTANT_HAS_TTS)
-    // THE TIME-LOCK, checked BEFORE feed() and returning without it.
-    //
-    // Not feeding the model while masked is deliberate and not an optimisation:
-    // Silero is recurrent, it carries an LSTM state across blocks, and feeding it
-    // our own echo leaves that state primed on the assistant's voice. The first
-    // genuine block after the lock lifts would then be scored in the context of
-    // a sentence the user never spoke.
-    //
-    // The pipeline's own suppressor (speech_pipeline_set_vad_suppressed, pushed
-    // from the capture tap) enforces the same window one level down, so the
-    // guarantee does not rest on this branch alone -- and holds identically on
-    // the RMS fallback path, which never reaches this function at all.
-    if (ctx->tts != nullptr && *ctx->tts != nullptr && (*ctx->tts)->is_playing_tts()) {
-        return 0.0f;
-    }
-#endif
+    // EVERY BLOCK, unconditionally. Silero is recurrent -- it carries an LSTM
+    // state across blocks -- so skipping blocks to suppress a verdict leaves that
+    // state describing a signal the microphone never produced.
     return ctx->vad->feed(block, count);
 }
 #endif
@@ -1183,12 +1152,6 @@ int main(int argc, char** argv) {
                 neural_vad->set_threshold(args.vad_threshold);
                 vad_fn = &vad_score;
                 vad_ctx.vad = neural_vad.get();
-#if defined(VOICE_ASSISTANT_HAS_TTS)
-                // A pointer to the SLOT, not the runtime: TTS is constructed
-                // several hundred lines below this, and the VAD must pick it up
-                // when it appears without this wiring being revisited.
-                vad_ctx.tts = &app_ctx.tts;
-#endif
                 vad_user = &vad_ctx;
                 std::printf("[vad] Silero neural VAD armed (threshold %.2f)\n",
                             args.vad_threshold);
@@ -1282,19 +1245,16 @@ int main(int argc, char** argv) {
             // the TTS stack is up -- this lambda also runs once BEFORE that, so
             // the launch value is applied at construction instead.
             if (app_ctx.aec != nullptr) app_ctx.aec->SetEnabled(s.aec_enabled);
-            // VOLUME GOES TO BOTH, ALWAYS. The playback gain is what the user
-            // hears; the reference gain is what keeps the echo canceller's
-            // learned response valid across the change (audio_playback.h).
-            // Setting one without the other is the bug this comment exists to
-            // stop -- it does not fault, it just quietly costs ERLE until the
-            // filter re-converges.
+            // VOLUME GOES TO THE SPEAKER ONLY. The canceller is no longer told
+            // about it: its reference is a loopback of the endpoint, so the gain
+            // is already baked into what it observes. The pre-gain/post-gain
+            // correction this used to need -- and the re-convergence every time
+            // the slider moved -- went away with the playback tap.
+            //
             // Folded with the dock's mute: a Save while deafened must not turn
             // the sound back on behind the icon, which would leave the UI
             // claiming a state the speaker does not have.
             if (app_ctx.tts != nullptr) app_ctx.tts->SetVolume(effective_tts_volume(s.tts_volume));
-            if (app_ctx.aec != nullptr) {
-                app_ctx.aec->SetReferenceGain(effective_tts_volume(s.tts_volume));
-            }
 #endif
             // The capture-side twin of tts_volume, and live for the same reason:
             // the callback reads it once per block.
@@ -1455,10 +1415,20 @@ int main(int argc, char** argv) {
             // path -- old speaker, old microphone, old latency between them. Left
             // alone it would spend a few hundred milliseconds actively
             // subtracting the wrong signal, which is worse than not cancelling.
-            if (app_ctx.aec != nullptr) {
-                app_ctx.aec->Reset();
-                app_ctx.aec->SetReferenceGain(s.tts_volume);
+            // The loopback reference follows the OUTPUT endpoint, because that
+            // is the speaker whose echo it exists to describe. Moved BEFORE the
+            // filter is reset, so the reset lands on a reference that is already
+            // pointing at the new room.
+            if (app_ctx.loopback != nullptr) {
+                const bool lb_ok = app_ctx.loopback->hot_reload(
+                    rt::CaptureMode::Loopback, s.output_device_name, s.output_device_index);
+                std::printf("[aec] loopback reference hot reload %s -> %s\n",
+                            lb_ok ? "ok" : "FAILED",
+                            app_ctx.loopback->device_name().empty()
+                                ? "(system default output)"
+                                : app_ctx.loopback->device_name().c_str());
             }
+            if (app_ctx.aec != nullptr) app_ctx.aec->Reset();
 #endif
             std::fflush(stdout);
         };
@@ -1470,9 +1440,39 @@ int main(int argc, char** argv) {
         // the same posture already taken for the neural VAD and the audio head.
 #if defined(VOICE_ASSISTANT_HAS_TTS)
         std::optional<rt::TtsRuntime> tts;
-        // DECLARED AFTER `tts`, DELIBERATELY. It holds a reference into the
-        // runtime's far-end ring, so it must be destroyed BEFORE the ring it
-        // points at -- which reverse declaration order is exactly what gives.
+
+        // ---- THE FAR END: a WASAPI loopback of the render endpoint ----------
+        // The canceller's reference is what the SPEAKER emits, taken from the
+        // speaker rather than from us. A second AudioCapture in Loopback mode
+        // taps the output endpoint; miniaudio hands it back at the same 16 kHz
+        // mono f32 the microphone runs at, so there is NO resampler on this path
+        // at all -- the 24 kHz -> 16 kHz conversion the old reference needed is
+        // simply gone.
+        //
+        // WHAT THIS BUYS over tapping PullForPlayback. The reference is
+        // post-mix and post-volume: it already contains the software gain (so
+        // the canceller never has to be told about it, and never re-converges
+        // when the slider moves) and it contains audio THIS PROCESS DID NOT
+        // PRODUCE -- a browser, a notification, anything else on the endpoint --
+        // all of which used to reach the microphone as uncancellable echo.
+        //
+        // WHAT IT DOES NOT BUY, stated so nobody looks for it: the microphone
+        // and the render endpoint are still two devices on two independent
+        // clocks, so reference/mic drift is unchanged and AecCaptureFilter's
+        // backlog policy is still doing that job.
+        //
+        // Loopback runs continuously and returns SILENCE when nothing is
+        // playing, which is exactly what the synchroniser wants -- a reference
+        // stream with no gaps in it.
+        rt::AudioCapture loopback_capture;
+        // The far-end ring the filter reads. ~3 s at 16 kHz: it only ever holds
+        // the drift between the loopback callback and the DSP worker, and the
+        // filter's own ceiling discards anything older than max_lag_ms.
+        blackwell::audio_rt::SpscRing<float> loopback_ref(48000);
+
+        // DECLARED AFTER both, DELIBERATELY. It holds a reference into
+        // `loopback_ref`, so it must be destroyed BEFORE the ring it points at --
+        // which reverse declaration order is exactly what gives.
         // (CLAUDE.md extension pattern #3, applied to a function scope.)
         std::optional<blackwell::audio_rt::AecCaptureFilter> aec;
         if (!settings.tts_ckpt_dir.empty()) {
@@ -1563,29 +1563,89 @@ int main(int argc, char** argv) {
                 // configuration that self-triggers. The two failures are
                 // different and have to say so.
                 try {
+                    // THE LOOPBACK REFERENCE, opened on the OUTPUT endpoint --
+                    // both selectors address the PLAYBACK list in this mode
+                    // (audio_capture.h says so, and it is the trap here: an
+                    // index that looks like a capture index is not one).
+                    //
+                    // Started BEFORE the filter exists so a failure to open is
+                    // reported as "no reference" rather than as a canceller that
+                    // silently subtracts nothing.
+                    loopback_capture.start(rt::CaptureMode::Loopback, settings.output_device_name,
+                                   settings.output_device_index);
+
                     blackwell::audio_rt::AecCaptureFilterConfig acfg;
                     acfg.near_rate = static_cast<int>(cfg.sample_rate);
-                    acfg.far_rate = rt::TtsRuntime::far_sample_rate();
+                    // SAME RATE, so the polyphase resampler degenerates to a
+                    // copy: miniaudio already delivers the loopback stream at the
+                    // capture rate. The old 24 kHz far end needed a 2/3 converter
+                    // and paid its group delay out of the filter's tail budget.
+                    acfg.far_rate = acfg.near_rate;
                     // Clamped, not trusted: this arrives from a hand-editable
                     // settings file, and a tail of zero produces a canceller
                     // that runs and cancels nothing.
                     acfg.aec.filter_tail_samples =
                         static_cast<std::size_t>(std::clamp(settings.aec_tail_ms, 64, 1000)) *
                         static_cast<std::size_t>(acfg.near_rate) / 1000u;
-                    aec.emplace(tts->aec_reference(), acfg);
+                    // ---- the subtractor backend ---------------------------
+                    // AEC3 when the package was found at configure time, the
+                    // built-in partitioned-block filter otherwise. The choice is
+                    // made HERE rather than inside AecCaptureFilter because
+                    // blackwell_audio_rt is dependency-free by construction and
+                    // must not learn the name of a WebRTC type.
+                    //
+                    // A THROW HERE IS NOT FATAL and deliberately falls through
+                    // to the built-in filter: an AEC3 that will not construct is
+                    // a reason to cancel worse, not a reason to have no speech.
+                    std::unique_ptr<blackwell::audio_rt::IEchoCanceller> backend;
+                    const char* backend_name = "built-in block-FDAF";
+#if defined(BLACKWELL_HAVE_AEC3)
+                    try {
+                        blackwell::audio_rt::Aec3Config a3;
+                        a3.sample_rate_hz = acfg.near_rate;
+                        // A loopback reference is tapped at the endpoint, so the
+                        // true speaker->mic delay is the render buffer plus the
+                        // capture buffer -- tens of milliseconds, not a room's
+                        // worth. AEC3 re-estimates regardless; this only saves it
+                        // the first second of searching.
+                        a3.initial_delay_ms = 30;
+                        backend = std::make_unique<blackwell::audio_rt::Aec3EchoCanceller>(a3);
+                        backend_name = "WebRTC AEC3";
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr,
+                                     "[aec] AEC3 unavailable (%s) -- falling back to the "
+                                     "built-in canceller.\n",
+                                     e.what());
+                        backend.reset();
+                    }
+#endif
+                    aec.emplace(loopback_ref, acfg, std::move(backend));
                     aec->SetEnabled(settings.aec_enabled);
-                    // The reference must describe what the SPEAKER emits, and
-                    // the software gain is applied after the reference is
-                    // tapped -- so the canceller is told about it separately.
-                    // See audio_playback.h; apply_live_settings keeps the two in
-                    // step from then on.
-                    aec->SetReferenceGain(settings.tts_volume);
+                    // NO SetReferenceGain. The loopback stream is tapped after
+                    // the mix, so it already carries whatever gain the user set
+                    // -- the correction the playback tap needed (and the
+                    // re-convergence every time the slider moved) is retired.
                     app_ctx.aec = &aec.value();
-                    std::printf("[aec] %s: %d ms tail, %zu-sample capture latency, "
-                                "reference %d Hz -> %d Hz\n",
+                    app_ctx.loopback = &loopback_capture;
+                    std::printf("[aec] %s (%s): %d ms tail, %zu-sample capture latency, "
+                                "far end = WASAPI loopback @ %d Hz on %s\n",
                                 settings.aec_enabled ? "on" : "BYPASSED (diagnostic)",
+                                backend_name,
                                 settings.aec_tail_ms, aec->latency_samples(),
-                                acfg.far_rate, acfg.near_rate);
+                                acfg.far_rate,
+                                loopback_capture.device_name().empty()
+                                    ? "(system default output)"
+                                    : loopback_capture.device_name().c_str());
+                    if (loopback_capture.device_fallback()) {
+                        // THE failure that produces a canceller which subtracts
+                        // the wrong room: the reference must come from the
+                        // endpoint the assistant is SPEAKING through, and a
+                        // silent fallback to a different one is uncancellable.
+                        std::fprintf(stderr,
+                                     "[aec] WARNING: the loopback reference fell back to a "
+                                     "different endpoint than the one speech plays on -- "
+                                     "cancellation will not work until they match.\n");
+                    }
                     if (!settings.aec_enabled) {
                         // Said out loud because it is the difference between a
                         // demo that works and one that talks over itself: with
@@ -1620,49 +1680,56 @@ int main(int argc, char** argv) {
         // block the capture device produces reaches the AEC, the level meter and
         // the ring, exactly as before: the PCM path is untouched, so pre-roll,
         // metering and speculative warming all keep working while the assistant
-        // talks. What the time-lock masks is the VERDICT, one level down, and
-        // nothing else.
-        //
-        // The subtraction stays, and is still the load-bearing part for the case
-        // the lock does not cover -- the 250 ms after it lifts, when the room is
-        // still ringing and the user may already be talking.
+        // talks. There is no state flag anywhere on this path and no verdict is
+        // masked -- what removes the assistant's voice is a SUBTRACTION, and the
+        // thing being subtracted is a loopback of the speaker itself.
         //
         // Runs on the DSP worker, which is this pipeline's single producer, so
-        // the scratch buffer needs no synchronisation. It is sized ONCE here:
-        // RealTimeDSP pops at most 4096 samples per call, so the resize below
-        // never fires again after the first block and the tap stays
+        // the scratch buffers need no synchronisation. They are sized ONCE here:
+        // RealTimeDSP pops at most 4096 samples per call, so the resizes below
+        // never fire again after the first block and the tap stays
         // allocation-free on the path it shares with the capture drain.
 #if defined(VOICE_ASSISTANT_HAS_TTS)
         std::vector<float> aec_out(4096, 0.0f);
-        // Edge-triggered: one atomic store per TRANSITION, not per block. The
-        // setter is a single relaxed-ish store and would be affordable either
-        // way, but the log line below is not -- and the transitions are what a
-        // reader diagnosing a stuck suppressor actually needs to see.
-        bool vad_locked = false;
+        std::vector<float> far_scratch(4096, 0.0f);
 #endif
         realtime.set_pcm_tap(
             [&](const float* s, std::size_t n) {
 #if defined(VOICE_ASSISTANT_HAS_TTS)
-                // THE SUPPRESSOR PUSH. Deliberately here rather than inside
-                // vad_score: this covers the RMS fallback too, and vad_score is
-                // not called at all when Silero failed to load -- which is a
-                // degraded mode, not an excuse for the assistant to interrupt
-                // itself.
-                const bool lock =
-                    app_ctx.tts != nullptr && app_ctx.tts->is_playing_tts();
-                if (lock != vad_locked) {
-                    vad_locked = lock;
-                    (void)speech_pipeline_set_vad_suppressed(speech_mode.pipeline(), lock);
-                }
                 if (app_ctx.aec != nullptr) {
+                    // ---- pump the far end ----------------------------------
+                    // The loopback device writes into its own SampleRing on its
+                    // own callback thread; the filter reads a SpscRing. This
+                    // moves one from the other, and it happens HERE because this
+                    // thread is the filter's only consumer -- so the SpscRing
+                    // ends up written and read by the same thread, which trivially
+                    // satisfies its SPSC contract.
+                    //
+                    // Drained to EMPTY rather than n samples: the two devices
+                    // deliver on independent schedules, and leaving a residue
+                    // would let the reference fall progressively behind the
+                    // microphone -- the one direction of misalignment no causal
+                    // filter can represent (aec_capture_filter.hpp).
+                    for (;;) {
+                        const std::size_t got =
+                            loopback_capture.ring().pop(far_scratch.data(), far_scratch.size());
+                        if (got == 0) break;
+                        // write_or_drop: this is a real-time-ish path and the
+                        // filter's backlog ceiling would discard the excess
+                        // anyway. A ring that is full means the filter is not
+                        // keeping up, which its own resync counter reports.
+                        (void)loopback_ref.write_or_drop(far_scratch.data(), got);
+                        if (got < far_scratch.size()) break;
+                    }
+
                     if (aec_out.size() < n) aec_out.resize(n);
                     app_ctx.aec->Process(s, n, aec_out.data());
                     active->on_pcm_block(aec_out.data(), n);
                     return;
                 }
 #endif
-                // No speech output in this build or this launch: nothing is
-                // playing, so there is nothing to cancel.
+                // No canceller in this build or this launch: pass the microphone
+                // through untouched.
                 active->on_pcm_block(s, n);
             });
         realtime.start();
@@ -1792,17 +1859,13 @@ int main(int argc, char** argv) {
             // what the user is listening to while dragging, and they must not
             // wait behind a device reopen that may not even be needed.
             //
-            // THE EFFECTIVE GAIN is the slider folded with the mute, computed
-            // here and nowhere else. Everything downstream -- playback, and the
-            // AEC reference that has to match it -- is handed the same number,
-            // so a muted assistant cannot leave the canceller chasing a
-            // reference for sound the room never heard.
+            // THE EFFECTIVE GAIN is the slider folded with the mute. It goes to
+            // the speaker and nowhere else: the canceller observes the endpoint
+            // through a loopback, so it sees this change by itself, at the same
+            // instant the room does, with no second setter to keep in step.
             const float effective_volume = effective_tts_volume(settings.tts_volume);
 #if defined(VOICE_ASSISTANT_HAS_TTS)
             if (app_ctx.tts != nullptr) app_ctx.tts->SetVolume(effective_volume);
-            // Both, always -- see apply_live_settings on why splitting these two
-            // silently costs the canceller its accuracy.
-            if (app_ctx.aec != nullptr) app_ctx.aec->SetReferenceGain(effective_volume);
 #endif
             capture.set_input_gain(settings.mic_gain);
 
@@ -2035,14 +2098,14 @@ int main(int argc, char** argv) {
         // screen but said nothing or stopped mid-sentence: every count is a
         // barge-in that killed a chunk.
         //
-        // WHAT A NON-ZERO COUNT MEANS NOW. Under the playback time-lock the VAD
-        // cannot fire while the assistant is audible, so self-barge-in is not a
-        // candidate explanation any more -- the remaining sources are the cancel
-        // control, the cancel hotkey, and speech in the 250 ms after the lock
-        // lifts. If it is non-zero with nobody touching either control, the lock
-        // itself is the thing to doubt: check that playback actually reports
-        // is_playing_tts (a device that failed to open never sets it) before
-        // reaching for the canceller's tuning.
+        // WHAT A NON-ZERO COUNT MEANS. Either somebody interrupted, or the
+        // canceller is not removing enough of the assistant's own voice for
+        // Silero to stop scoring it as speech. There is no state flag to suspect
+        // any more -- the ONLY thing standing between the loudspeaker and a
+        // barge-in is the subtraction. So read it next to the [aec] ERLE line:
+        // a healthy loopback reference and a converged filter give a quiet
+        // microphone, and if the ERLE is low the reference is the thing to
+        // check first (wrong endpoint, or a fallback warned about at startup).
         if (tts.has_value()) {
             std::printf("\n=== speech output summary ===\n");
             std::printf("  chunks spoken          : %llu\n",
@@ -2050,11 +2113,29 @@ int main(int argc, char** argv) {
             std::printf("  chunks cancelled       : %llu%s\n",
                         static_cast<unsigned long long>(tts->chunks_cancelled()),
                         tts->chunks_cancelled() > 0
-                            ? "   <-- barge-in killed these; the time-lock rules out "
-                              "self-trigger, so check the cancel control"
+                            ? "   <-- barge-in killed these; if nobody interrupted, "
+                              "read the ERLE below"
                             : "");
             std::printf("  synthesis errors       : %llu\n",
                         static_cast<unsigned long long>(tts->synthesis_errors()));
+        }
+        // THE NUMBER THAT EXPLAINS THE ONE ABOVE. ERLE is how many dB of the
+        // assistant's own voice the canceller is actually removing; resyncs are
+        // how often the reference had to be discarded to catch up with the
+        // microphone, which is the clock-drift term loopback does NOT fix.
+        // Reference underruns mean the loopback device stopped delivering, which
+        // makes the filter subtract silence and cancel nothing.
+        if (aec.has_value()) {
+            std::printf("  AEC erle               : %.1f dB\n",
+                        static_cast<double>(aec->erle_db()));
+            std::printf("  AEC resyncs            : %llu (reference discarded to catch up)\n",
+                        static_cast<unsigned long long>(aec->resyncs()));
+            std::printf("  AEC ref underruns      : %llu%s\n",
+                        static_cast<unsigned long long>(aec->reference_underruns()),
+                        aec->reference_underruns() > 0
+                            ? "   <-- the loopback reference had gaps; cancellation "
+                              "was blind for those samples"
+                            : "");
         }
 #endif
 

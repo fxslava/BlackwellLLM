@@ -121,33 +121,6 @@ public:
     // The sample rate the device was opened at, so a hot swap can reuse it.
     int sample_rate() const noexcept { return sample_rate_; }
 
-    // ---- the playback time-lock (any thread) --------------------------------
-    // TRUE from the moment real audio reaches the device until the ring has been
-    // dry for kAcousticTailMs. THE authority on "is the assistant audible right
-    // now", and the reason it lives here rather than on the bridge: the bridge's
-    // speaking() reports the RING, and the ring runs dry while WASAPI still holds
-    // one to three buffers of already-committed audio -- so the assistant is
-    // still talking for tens of milliseconds after the ring says it stopped.
-    // Every consumer that has to know whether the room contains our own voice
-    // reads THIS, not the ring.
-    //
-    // THE TAIL IS NOT A FUDGE FACTOR. Sound that has left the speaker is still
-    // in the room: the direct path plus early reflections plus the reverb tail
-    // reach the microphone after the last sample was emitted, and the capture
-    // side adds its own buffering on top. Cancelling the lock at the last sample
-    // re-opens the VAD onto exactly that residue, which is speech-shaped and
-    // scores as speech. 250 ms covers a normal room and the capture buffer with
-    // margin; the cost of it being generous is a quarter second at the end of an
-    // answer in which an interruption has to be a click rather than a word.
-    //
-    // COUNTED ON THE AUDIO CLOCK, not a wall clock: the callback knows exactly
-    // how many frames it has served, and frames are the only measure of elapsed
-    // sound that cannot drift against the device. A steady_clock read on the
-    // real-time thread would also be a syscall on the one thread that must make
-    // none.
-    static constexpr int kAcousticTailMs = 250;
-    bool is_playing_tts() const noexcept;
-
     // ---- volume (any thread, effective on the next callback) ----------------
     // Clamped to [0, 1]. Applied to every sample the callback hands the device.
     // A plain relaxed atomic: the callback reads it once per buffer, and a

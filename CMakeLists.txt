@@ -79,6 +79,15 @@ option(USE_DIRECT_STORAGE "Enable DirectStorage for blazing fast weight loading 
 # so nothing downstream breaks. Declared before the module that reads it.
 option(USE_SILERO_VAD "Enable the Silero neural VAD (fetches ONNXRuntime + silero_vad.onnx)" ON)
 
+# WebRTC AEC3 as the echo-canceller backend, replacing the built-in
+# partitioned-block filter. ON asks for it; whether it is actually available is a
+# separate question the module answers (BLACKWELL_HAVE_WEBRTC_AEC3), because
+# unlike every other dependency here this one is NOT fetched -- it is a prebuilt
+# vcpkg package and a tree without it must still build. See cmake/WebRtcAec3.cmake
+# for why WebRTC cannot join the hash-pinned FetchContent pattern, and for the
+# static-CRT triplet requirement. Declared before the module that reads it.
+option(USE_WEBRTC_AEC3 "Use WebRTC AEC3 for echo cancellation when the package is available" ON)
+
 # Which ONNXRuntime build to fetch. ON pulls the GPU archive (CUDA execution
 # provider); OFF pulls the CPU-only one. Consequences, because this is not just
 # a download-size knob:
@@ -100,6 +109,7 @@ include(cmake/BlackwellHelpers.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/DirectStorage.cmake)
 include(cmake/OnnxRuntime.cmake)
+include(cmake/WebRtcAec3.cmake)
 # Chromium (Edge WebView2) embedding SDK -> blackwell::webview2. Declared here,
 # once, so the two products that host a web UI (poc_overlay's settings window,
 # voice_assistant's whole main view) cannot pin two different SDK versions

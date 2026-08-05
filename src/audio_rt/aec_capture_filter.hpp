@@ -86,7 +86,26 @@ class AecCaptureFilter {
 public:
     // `far_ring` is owned by the caller and must outlive this object. INIT tier:
     // throws std::invalid_argument on a config the canceller cannot honour.
+    //
+    // This overload builds the DEFAULT backend (BlockFdafEchoCanceller) from
+    // cfg.aec.
     AecCaptureFilter(SpscRing<float>& far_ring, const AecCaptureFilterConfig& cfg);
+
+    // BRING YOUR OWN CANCELLER. Everything this class does -- rate conversion,
+    // backlog bounding, alignment -- is backend-independent, so the subtractor
+    // is a caller's choice: WebRTC AEC3 where it is available, the built-in
+    // partitioned-block filter otherwise.
+    //
+    // The choice is INJECTED rather than named by an enum because this target is
+    // dependency-free by construction (see its CMakeLists). An enum would put
+    // WebRTC's include path on every consumer of a header that currently needs
+    // nothing but the STL.
+    //
+    // A null `backend` is the same as the overload above. Note that
+    // divergence_resets() and leak_estimate() describe an NLMS filter's internal
+    // health and report neutral values for any other backend.
+    AecCaptureFilter(SpscRing<float>& far_ring, const AecCaptureFilterConfig& cfg,
+                     std::unique_ptr<IEchoCanceller> backend);
     ~AecCaptureFilter();
 
     AecCaptureFilter(const AecCaptureFilter&) = delete;

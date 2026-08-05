@@ -221,19 +221,6 @@ public:
     float volume() const noexcept { return playback_.volume(); }
 
     // ---- observers -----------------------------------------------------------
-    // THE PLAYBACK TIME-LOCK, and the difference between it and speaking() is
-    // the whole of why self-barge-in survived the echo canceller.
-    //
-    // speaking() is the RING: it goes false the instant the last sample is
-    // handed to WASAPI, while that sample and the one to three buffers queued
-    // behind it have not been emitted yet, and what HAS been emitted is still
-    // travelling across the room. A guard keyed on speaking() therefore re-arms
-    // the VAD onto the loudest part of our own tail.
-    //
-    // is_playing_tts() is the SPEAKER, plus AudioPlayback::kAcousticTailMs of
-    // room. Anything deciding whether the microphone currently contains our own
-    // voice must ask this one. See audio_playback.h.
-    bool is_playing_tts() const noexcept { return playback_.is_playing_tts(); }
     bool speaking() const noexcept { return bridge_.speaking(); }
     // The output endpoint actually opened ("" = system default), and whether a
     // requested one was silently swapped for it.
@@ -293,10 +280,16 @@ private:
 
     static blackwell::tts::DuplexConfig MakeDuplexConfig() {
         blackwell::tts::DuplexConfig d;
-        // Playback tap: the reference must be aligned to what the SPEAKER emits,
-        // not to when synthesis happened -- synthesis runs several times faster
-        // than realtime and would put the reference seconds ahead of the mic.
-        d.aec_tap = blackwell::tts::AecTap::Playback;
+        // NO reference published from here. The canceller's far end is a WASAPI
+        // LOOPBACK capture of the render endpoint (main.cpp), which observes what
+        // the speaker actually emits rather than what this class handed the
+        // device -- post-mix, post-volume, and inclusive of audio this process
+        // never produced.
+        //
+        // The Playback tap it replaces was correct about ALIGNMENT and wrong
+        // about CONTENT: it saw the pre-gain signal, so the canceller had to be
+        // told the volume separately and re-converged whenever it moved.
+        d.aec_tap = blackwell::tts::AecTap::None;
         return d;
     }
 

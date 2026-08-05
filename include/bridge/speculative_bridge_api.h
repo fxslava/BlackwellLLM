@@ -217,35 +217,6 @@ BRIDGE_API BridgeStatus speech_pipeline_set_vad_scorer(SpeechPipelineHandle hand
 BRIDGE_API BridgeStatus speech_pipeline_set_vad_threshold(SpeechPipelineHandle handle,
                                                           float threshold);
 
-/* THE VAD SUPPRESSOR — a hard mask over the speech verdict, for the window in
- * which the microphone is known to contain the application's OWN output.
- *
- * While set, every block is scored as silence: no onset, no sustain, therefore
- * no barge-in and no cancelled generation, regardless of which detector is
- * running. It sits ABOVE both the external scorer and the built-in RMS path, so
- * a caller does not have to own a scorer to get the guarantee — which is the
- * point, because the self-echo problem exists in both configurations.
- *
- * WHY THIS IS NOT set_manual_mode. Manual mode also gates what reaches the
- * ring, so it discards the pre-roll a real interruption needs; and it is owned
- * by the push-to-talk hotkey, so an acoustic guard sharing it would fight the
- * user for the same flag. This masks the VERDICT only: PCM keeps flowing, the
- * level meter keeps moving, and the state machine's own timers are untouched.
- *
- * NOT A SUBSTITUTE FOR ECHO CANCELLATION, and the difference is what the caller
- * gives up. AEC removes our voice and leaves the user's; this removes the
- * verdict and therefore both. A caller that holds it for the whole of its own
- * playback cannot be interrupted BY VOICE during that playback and must offer
- * another way out (a cancel control). Holding it is a product decision, not a
- * DSP one — see docs/TTS_INTEGRATION_AUDIT.md.
- *
- * Lock-free (one atomic store), callable from any thread, effective on the next
- * VAD block. Clearing it re-arms from a clean slate rather than restoring the
- * verdict held when it was set. ADDITIVE ABI: a caller that never touches it
- * keeps today's behaviour exactly. */
-BRIDGE_API BridgeStatus speech_pipeline_set_vad_suppressed(SpeechPipelineHandle handle,
-                                                           bool suppressed);
-
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

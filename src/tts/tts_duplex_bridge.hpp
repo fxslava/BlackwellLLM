@@ -129,6 +129,17 @@ enum class AecTap : std::int32_t {
     // Reference is tapped where PCM is produced. Only correct if something
     // downstream re-aligns it against the playback clock.
     Synthesis = 1,
+    // NO reference is published at all. For callers whose canceller takes its
+    // far end from somewhere this class cannot see -- specifically a WASAPI
+    // LOOPBACK capture of the render endpoint, which observes what the speaker
+    // actually emits (post-mix, post-volume, including audio this process never
+    // produced) rather than what we handed the device.
+    //
+    // Choosing it is not merely skipping a copy on the audio thread, though it
+    // does that: it also retires the pre-gain/post-gain correction the Playback
+    // tap needs (see audio_playback.h on SetReferenceGain), because a loopback
+    // reference is already scaled by whatever the user set.
+    None = 2,
 };
 
 struct DuplexConfig {

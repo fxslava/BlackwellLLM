@@ -19,11 +19,26 @@ constexpr std::size_t kMaxChunk = 4096;
 }  // namespace
 
 struct AecCaptureFilter::Impl {
-    Impl(SpscRing<float>& ring, const AecCaptureFilterConfig& c)
-        : cfg(c),
+    // `backend` may be null, in which case the built-in partitioned-block filter
+    // is constructed from cfg.aec. INJECTED rather than selected by an enum here
+    // because this translation unit must not know the set of backends: naming
+    // AEC3 would put WebRTC's include path on blackwell_audio_rt, whose whole
+    // premise is that it has none (see its CMakeLists).
+    Impl(SpscRing<float>& ring, const AecCaptureFilterConfig& c,
+         std::unique_ptr<IEchoCanceller> backend)
+        : backend_was_injected(backend != nullptr),
+          cfg(c),
           far_ring(ring),
           resampler(c.far_rate, c.near_rate),
-          aec(c.aec) {
+          aec(backend ? std::move(backend)
+                      : std::unique_ptr<IEchoCanceller>(
+                            std::make_unique<BlockFdafEchoCanceller>(c.aec))) {
+        // Only non-null when the DEFAULT backend is in use. The two observers
+        // below describe an NLMS filter's internal health and have no meaning
+        // for a backend that is not one -- so they report a neutral value
+        // rather than inventing a number a caller might act on.
+        fdaf = backend_was_injected ? nullptr
+                                    : static_cast<BlockFdafEchoCanceller*>(aec.get());
         const double sr = static_cast<double>(c.near_rate) / 1000.0;
         target_lag = static_cast<std::size_t>(std::max(0.0, sr * c.target_lag_ms));
         max_lag = static_cast<std::size_t>(std::max(0.0, sr * c.max_lag_ms));
@@ -101,10 +116,14 @@ struct AecCaptureFilter::Impl {
         DropOldest(take);
     }
 
+    const bool backend_was_injected;
     AecCaptureFilterConfig cfg;
     SpscRing<float>& far_ring;
     RationalResampler resampler;
-    BlockFdafEchoCanceller aec;
+    // The canceller, owned through the seam so the backend is a caller's
+    // choice (BlockFdaf by default, AEC3 when the app supplies one).
+    std::unique_ptr<IEchoCanceller> aec;
+    BlockFdafEchoCanceller* fdaf = nullptr;   // non-owning; see the ctor
 
     std::vector<float> raw_far;   // staging, playback rate
     std::vector<float> fifo;      // resampled reference, near-end rate
@@ -127,7 +146,12 @@ struct AecCaptureFilter::Impl {
 
 AecCaptureFilter::AecCaptureFilter(SpscRing<float>& far_ring,
                                    const AecCaptureFilterConfig& cfg)
-    : impl_(std::make_unique<Impl>(far_ring, cfg)) {}
+    : impl_(std::make_unique<Impl>(far_ring, cfg, nullptr)) {}
+
+AecCaptureFilter::AecCaptureFilter(SpscRing<float>& far_ring,
+                                   const AecCaptureFilterConfig& cfg,
+                                   std::unique_ptr<IEchoCanceller> backend)
+    : impl_(std::make_unique<Impl>(far_ring, cfg, std::move(backend))) {}
 
 AecCaptureFilter::~AecCaptureFilter() = default;
 
@@ -141,7 +165,7 @@ void AecCaptureFilter::Process(const float* near_end, std::size_t count,
         const std::size_t chunk = std::min(kMaxChunk, count - done);
         s.TakeReference(chunk);
         if (s.enabled) {
-            s.aec.Process(near_end + done, s.blk.data(), out + done, chunk);
+            s.aec->Process(near_end + done, s.blk.data(), out + done, chunk);
         } else if (out != near_end) {
             std::memcpy(out + done, near_end + done, chunk * sizeof(float));
         }
@@ -156,7 +180,7 @@ void AecCaptureFilter::SetEnabled(bool on) noexcept {
     // the gap and a reference queue that may have been resynced under it. Both
     // are stale; keeping them would mean the first seconds after re-enabling are
     // spent UN-learning rather than learning.
-    if (on) s.aec.Reset();
+    if (on) s.aec->Reset();
     s.enabled = on;
 }
 
@@ -165,7 +189,7 @@ bool AecCaptureFilter::enabled() const noexcept { return impl_->enabled; }
 void AecCaptureFilter::Reset() noexcept {
     // Exactly what re-entering from bypass does above, for exactly the same
     // reason: both cases leave coefficients describing a path that is gone.
-    impl_->aec.Reset();
+    impl_->aec->Reset();
 }
 
 void AecCaptureFilter::SetReferenceGain(float g) noexcept {
@@ -177,10 +201,10 @@ void AecCaptureFilter::SetReferenceGain(float g) noexcept {
 
 float AecCaptureFilter::reference_gain() const noexcept { return impl_->ref_gain; }
 
-float AecCaptureFilter::erle_db() const noexcept { return impl_->aec.erle_db(); }
+float AecCaptureFilter::erle_db() const noexcept { return impl_->aec->erle_db(); }
 
 std::size_t AecCaptureFilter::latency_samples() const noexcept {
-    return impl_->aec.latency_samples();
+    return impl_->aec->latency_samples();
 }
 
 std::uint64_t AecCaptureFilter::resyncs() const noexcept { return impl_->resyncs; }
@@ -190,11 +214,13 @@ std::uint64_t AecCaptureFilter::reference_underruns() const noexcept {
 }
 
 std::uint64_t AecCaptureFilter::divergence_resets() const noexcept {
-    return impl_->aec.divergence_resets();
+    return impl_->fdaf != nullptr ? impl_->fdaf->divergence_resets() : 0;
 }
 
 float AecCaptureFilter::leak_estimate() const noexcept {
-    return impl_->aec.leak_estimate();
+    // 1.0 is the "nothing removed yet" end of the scale, which is the honest
+    // reading for a backend that does not expose a leak estimate at all.
+    return impl_->fdaf != nullptr ? impl_->fdaf->leak_estimate() : 1.0f;
 }
 
 }  // namespace blackwell::audio_rt

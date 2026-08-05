@@ -1,6 +1,61 @@
 {
     "version": 6,
     "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+    "vendor": {
+        "blackwell/notes": {
+            "toolset-must-match-vcpkg": [
+                "The x64-*-aec3 presets link a PREBUILT static WebRTC, and a prebuilt",
+                "library constrains the TOOLSET the same way it constrains the CRT.",
+                "MSVC's separately-compiled STL grows new entry points over time --",
+                "__std_find_first_of_trivial_pos_1, __std_min_element_f,",
+                "__std_max_element_f, __std_minmax_element_f -- so objects compiled by a",
+                "NEWER toolset call into things an OLDER libcpmt.lib has never defined.",
+                "The failure is LNK2001 on symbols nobody in this repo wrote, at the end",
+                "of a very long link.",
+                "",
+                "THE TRAP: vcpkg picks the NEWEST Visual Studio instance on the box, and",
+                "this repo does not -- it pins \"Visual Studio 17 2022\". Install VS 18",
+                "alongside VS 2022 and the two silently diverge (vcpkg -> 14.50 / v145,",
+                "repo -> v143). Nothing warns; the packages build 18/18 clean and the",
+                "mismatch only surfaces at link time.",
+                "",
+                "THE FIX, and it is committed: cmake/vcpkg-triplets/x64-windows-static.cmake",
+                "is an overlay triplet that pins VCPKG_VISUAL_STUDIO_PATH to the VS 2022",
+                "install. Install WebRTC through it -- see cmake/WebRtcAec3.cmake for the",
+                "command -- so the dependency follows the project rather than the box.",
+                "",
+                "SECOND, SMALLER TRAP, on the repo side. Within one VS 2022 install these",
+                "two files can still disagree:",
+                "  VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt       <- vcvars64, hence vcpkg",
+                "  VC/Auxiliary/Build/Microsoft.VCToolsVersion.v143.default.txt  <- MSBuild, hence this repo",
+                "If they do, pin the version vcpkg used (the FIRST file) on both the",
+                "configure AND the build preset:",
+                "  \"environment\": { \"VCToolsVersion\": \"<x.y.z>\" }",
+                "",
+                "NOT \"toolset\": {\"value\": \"version=<x.y.z>\"} -- that is the field which",
+                "looks correct and does not work. CMake accepts it and sets",
+                "CMAKE_GENERATOR_TOOLSET, but emits no <VCToolsVersion> into the",
+                "generated .vcxproj, so MSBuild resolves v143 through the file above and",
+                "compiles with the old toolset anyway. Measured, not assumed. The env var",
+                "works because v143.default.props assigns its value under",
+                "Condition=\"'$(VCToolsVersion)' == ''\", which an env var satisfies.",
+                "It must be on the BUILD preset too: build presets do not inherit the",
+                "configure preset's environment, and the build is where it matters.",
+                "",
+                "That version is a property of the machine, not of the project, so it",
+                "belongs in CMakeUserPresets.json -- exactly like VCPKG_ROOT.",
+                "",
+                "Changing the toolset invalidates the cache in an existing tree: CMake",
+                "refuses to reconfigure when the compiler moves. Delete CMakeCache.txt",
+                "and CMakeFiles/ and reconfigure -- do NOT delete the whole tree. _deps/",
+                "is over 2 GB of fetched ONNXRuntime, DirectStorage and WebView2, it",
+                "survives a cache wipe, and a fresh binaryDir re-downloads all of it.",
+                "Then build with --clean-first: deleting the cache does NOT invalidate",
+                "the per-project .obj files, so an ordinary rebuild relinks stale objects",
+                "from the previous toolset and quietly defeats the whole exercise."
+            ]
+        }
+    },
     "configurePresets": [
         {
             "name": "base",
@@ -48,13 +103,37 @@
             "displayName": "x64 Release (+ remote cloud leg)",
             "inherits": ["cloud", "x64-release"],
             "binaryDir": "${sourceDir}/out/build/x64-Release"
+        },
+        {
+            "name": "aec3",
+            "hidden": true,
+            "description": "Resolves the prebuilt WebRTC package so cmake/WebRtcAec3.cmake finds it. The STATIC triplet is mandatory -- the root pins a static CRT (CMAKE_MSVC_RUNTIME_LIBRARY), and x64-windows builds against the dynamic one; mixing them is LNK2038 at the very end of a very long link. Both triplet roots are listed so this composes with the cloud leg, which resolves libcurl/simdjson from x64-windows. THE TOOLSET MUST ALSO MATCH, and this preset cannot pin it portably -- see the toolset-must-match note in the vendor block below.",
+            "cacheVariables": {
+                "USE_WEBRTC_AEC3": "ON",
+                "CMAKE_PREFIX_PATH": "$env{VCPKG_ROOT}/installed/x64-windows-static;$env{VCPKG_ROOT}/installed/x64-windows"
+            }
+        },
+        {
+            "name": "x64-release-aec3",
+            "displayName": "x64 Release (+ WebRTC AEC3)",
+            "description": "The configuration the live echo-cancellation work is measured in. RELEASE ON PURPOSE: the Debug webrtc.lib is ~650 MB against ~73 MB for Release, and AEC3's filter bank is not something to run unoptimised on the capture thread.",
+            "inherits": ["aec3", "x64-release"],
+            "binaryDir": "${sourceDir}/out/build/x64-Release"
+        },
+        {
+            "name": "x64-debug-aec3",
+            "displayName": "x64 Debug (+ WebRTC AEC3)",
+            "inherits": ["aec3", "x64-debug"],
+            "binaryDir": "${sourceDir}/out/build/x64-Debug"
         }
     ],
     "buildPresets": [
         { "name": "x64-debug",         "configurePreset": "x64-debug",         "configuration": "Debug" },
         { "name": "x64-release",       "configurePreset": "x64-release",       "configuration": "Release" },
         { "name": "x64-debug-cloud",   "configurePreset": "x64-debug-cloud",   "configuration": "Debug" },
-        { "name": "x64-release-cloud", "configurePreset": "x64-release-cloud", "configuration": "Release" }
+        { "name": "x64-release-cloud", "configurePreset": "x64-release-cloud", "configuration": "Release" },
+        { "name": "x64-release-aec3",  "configurePreset": "x64-release-aec3",  "configuration": "Release" },
+        { "name": "x64-debug-aec3",    "configurePreset": "x64-debug-aec3",    "configuration": "Debug" }
     ],
     "testPresets": [
         {

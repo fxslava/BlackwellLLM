@@ -42,18 +42,6 @@ struct AudioPlayback::Impl {
 
     std::atomic<float> volume{1.0f};
 
-    // ---- the playback time-lock (see audio_playback.h) ----------------------
-    // `playing` is what the outside world reads. `silence_frames` is the
-    // callback's own accumulator and is never read from anywhere else, but it is
-    // atomic anyway: hot_reload() swaps the device underneath it, and the joining
-    // callback's last write must not race the reset.
-    std::atomic<bool> playing{false};
-    std::atomic<std::uint32_t> silence_frames{0};
-    // kAcousticTailMs converted to frames at the rate the device was opened at.
-    // Written once in start(), before ma_device_start, so the callback only ever
-    // reads a settled value.
-    std::atomic<std::uint32_t> tail_frames{0};
-
     // Telemetry. All relaxed: these are counters nobody makes a decision on
     // mid-stream, and an acquire/release pair per callback would be ordering
     // work on the one thread that must do none. See audio_playback.h on why
@@ -99,32 +87,6 @@ struct AudioPlayback::Impl {
         // and does not pretend to.
         if (served < frame_count) impl->starved.fetch_add(1, std::memory_order_relaxed);
 
-        // ---- the playback time-lock -----------------------------------------
-        // `served` is the number of REAL samples the pull had, so served > 0 is
-        // the exact statement "the ring was not empty" -- the condition the lock
-        // is specified against, taken from the one place that cannot be wrong
-        // about it.
-        //
-        // RELEASE on the store that RAISES the lock, so a consumer that observes
-        // `playing` also observes everything the callback wrote before it. The
-        // lowering store is relaxed on purpose: it publishes nothing, and it is
-        // the one that runs every callback of an idle device.
-        if (served > 0) {
-            impl->silence_frames.store(0, std::memory_order_relaxed);
-            impl->playing.store(true, std::memory_order_release);
-        } else if (impl->playing.load(std::memory_order_relaxed)) {
-            // Saturating, not wrapping: an idle device sits here forever, and a
-            // counter that wraps past the tail would drop the lock back on for
-            // one callback every few hours. Nothing else re-arms it.
-            const std::uint32_t tail = impl->tail_frames.load(std::memory_order_relaxed);
-            std::uint32_t n = impl->silence_frames.load(std::memory_order_relaxed);
-            if (n < tail) {
-                n = (tail - n > frame_count) ? n + frame_count : tail;
-                impl->silence_frames.store(n, std::memory_order_relaxed);
-            }
-            if (n >= tail) impl->playing.store(false, std::memory_order_relaxed);
-        }
-
         // ---- software volume -------------------------------------------------
         // Read ONCE per buffer, not per sample: re-reading would let the gain
         // change mid-buffer, which is a step discontinuity and therefore a click.
@@ -168,18 +130,6 @@ void AudioPlayback::start(int sample_rate, PlaybackPullFn pull, void* user,
     // half-initialised Impl.
     impl_->pull = pull;
     impl_->user = user;
-
-    // The time-lock's tail, in frames at THIS device's rate. Computed here and
-    // not in the callback because the callback may not divide. A zero tail is
-    // impossible for any sane rate, but the max() makes the lock's contract
-    // ("false only AFTER a tail has elapsed") hold even if one appeared: with
-    // tail_frames == 0 the very first silent callback would drop it.
-    impl_->tail_frames.store(
-        std::max(1u, static_cast<unsigned>(
-                         (static_cast<std::int64_t>(sample_rate) * kAcousticTailMs) / 1000)),
-        std::memory_order_relaxed);
-    impl_->silence_frames.store(0, std::memory_order_relaxed);
-    impl_->playing.store(false, std::memory_order_relaxed);
 
     const auto unwire = [this] {
         impl_->pull = nullptr;
@@ -281,12 +231,6 @@ void AudioPlayback::stop() {
     }
     impl_->pull = nullptr;
     impl_->user = nullptr;
-    // Dropped AFTER the callback is joined, so nothing can raise it again. A
-    // stopped device emits no sound, so leaving the lock set would deafen the
-    // VAD permanently -- the one failure mode of a suppressor is that it never
-    // lifts, and a device swap is exactly when it would happen.
-    impl_->playing.store(false, std::memory_order_release);
-    impl_->silence_frames.store(0, std::memory_order_relaxed);
     running_ = false;
 }
 
@@ -342,11 +286,6 @@ void AudioPlayback::reset_stats() noexcept {
     impl_->starved.store(0, std::memory_order_relaxed);
     impl_->last_requested.store(0, std::memory_order_relaxed);
     impl_->last_available.store(0, std::memory_order_relaxed);
-}
-
-bool AudioPlayback::is_playing_tts() const noexcept {
-    if (impl_ == nullptr) return false;
-    return impl_->playing.load(std::memory_order_acquire);
 }
 
 void AudioPlayback::set_volume(float v) noexcept {

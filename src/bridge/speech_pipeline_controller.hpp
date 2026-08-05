@@ -67,20 +67,6 @@ public:
     void set_vad_scorer(SpeechVadScoreFn fn, void* user) noexcept;
     void set_vad_threshold(float threshold) noexcept;
 
-    // THE VAD SUPPRESSOR. While set, evaluate_block() answers "silence" without
-    // consulting either detector AND vad_on_block drives no transition -- see
-    // speculative_bridge_api.h for the contract and for why this is not manual
-    // mode. Any thread; effective on the next VAD block.
-    void set_vad_suppressed(bool suppressed) noexcept;
-    bool vad_suppressed() const noexcept {
-        return vad_suppressed_.load(std::memory_order_acquire);
-    }
-    bool has_vad_scorer() const noexcept {
-        return vad_scorer_.load(std::memory_order_acquire) != nullptr;
-    }
-    float vad_threshold() const noexcept {
-        return vad_threshold_.load(std::memory_order_relaxed);
-    }
 
     // ---- Engine-thread bookkeeping hooks (called by the IEngineControl impl) -
     // The engine owns the exact token accounting; it publishes it here so the
@@ -155,9 +141,6 @@ private:
     std::atomic<SpeechVadScoreFn> vad_scorer_{nullptr};
     std::atomic<void*> vad_scorer_user_{nullptr};
     std::atomic<float> vad_threshold_{0.5f};   // probability onset threshold
-    // Hard mask over the verdict, above BOTH detectors. Read once per block on
-    // the audio thread, written from whichever thread owns the playback state.
-    std::atomic<bool> vad_suppressed_{false};
     // Hysteresis for the probability path, mirroring vad_release_db on the RMS
     // path: a block sustains speech while it stays above (threshold - kDrop),
     // never below kFloor. Without it a probability hovering at the threshold
