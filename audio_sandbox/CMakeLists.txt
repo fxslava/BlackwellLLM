@@ -283,6 +283,32 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         blackwell_copy_vad_model(voice_assistant)
     endif()
 
+    # whisper.cpp Cascade ASR (Mode C). Additive and optional in exactly the way
+    # the VAD above is: without blackwell::whisper_cpp the target does not exist,
+    # VOICE_ASSISTANT_HAS_WHISPER stays undefined, whisper_asr.cpp is not
+    # compiled, and pipeline_mode="whisper_cascade" is refused at startup with a
+    # message rather than silently running the legacy path.
+    #
+    # whisper_asr.cpp is the ONLY TU that sees <whisper.h>, which is what keeps
+    # the ggml headers quarantined at /external:W0 -- see whisper_asr.hpp.
+    if(TARGET blackwell::whisper_cpp)
+        target_sources(voice_assistant PRIVATE voice_assistant/whisper_asr.cpp)
+        target_link_libraries(voice_assistant PRIVATE blackwell::whisper_cpp)
+        target_compile_definitions(voice_assistant PRIVATE VOICE_ASSISTANT_HAS_WHISPER)
+        # The configure-time model path, as the SECOND step of the app's runtime
+        # resolution order (settings -> this -> next to the exe). Baked in the
+        # same way BLACKWELL_VAD_MODEL_PATH is, and empty is fine: an empty
+        # string fails path_exists and the search moves on.
+        get_target_property(_va_whisper_model blackwell_whisper_cpp BLACKWELL_WHISPER_MODEL_PATH)
+        if(_va_whisper_model)
+            target_compile_definitions(voice_assistant PRIVATE
+                BLACKWELL_WHISPER_MODEL_PATH="${_va_whisper_model}")
+        endif()
+        # No-op when BLACKWELL_WHISPER_MODEL was not configured; the app also
+        # resolves the model from settings and from its own directory at runtime.
+        blackwell_copy_whisper_model(voice_assistant)
+    endif()
+
     # F5-TTS speech output. Additive and optional in exactly the same way as the
     # VAD above: blackwell_tts_f5 exists only when the ONNXRuntime CUDA execution
     # provider was fetched, and without it VOICE_ASSISTANT_HAS_TTS stays

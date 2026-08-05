@@ -185,7 +185,10 @@ private:
     void drain_pending();                     // UI thread: queue -> PostWebMessageAsJson
     void on_web_message(const std::wstring& json);
     void push_settings();                     // seed/refresh the Settings modal
-    void browse_for_folder(const std::string& target);
+    // Native picker for one settings field. FOLDER or FILE is decided from the
+    // target name (see the table in the .cpp): almost every path this app takes
+    // is a checkpoint DIRECTORY, and the GGML Whisper model is the exception.
+    void browse_for_path(const std::string& target);
 
     // Answers the page's "audio.devices.request" with the live endpoint lists,
     // so the settings dropdowns are built from what the machine actually has

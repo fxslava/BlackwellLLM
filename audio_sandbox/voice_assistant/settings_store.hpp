@@ -110,6 +110,57 @@ struct AssistantSettings {
     // this value decides whether long answers get through at all.
     int   max_new_tokens = 256;
 
+    // ---- WHICH SPEECH-TO-TEXT PIPELINE RUNS ---------------------------------
+    // "ultravox_legacy"  the end-to-end multimodal path: mic -> log-mel ->
+    //                    Whisper encoder -> Ultravox projector -> audio
+    //                    soft-tokens spliced into the backbone's KV, decoded on
+    //                    the ephemeral transcription sequence. The proven path.
+    // "whisper_cascade"  mic -> VAD-bounded utterance -> whisper.cpp (GGML) ->
+    //                    UTF-8 -> published as an intent. No audio ever reaches
+    //                    the backbone, and the AUDIO HEAD IS NOT LOADED.
+    //
+    // RESTART TIER, and structurally so: this decides which ISpeechMode object is
+    // constructed AND whether ~2 GB of Ultravox audio tower is allocated at
+    // bring-up. It is not a mode you can flip under a live engine, it is a
+    // different engine configuration.
+    //
+    // THE TWO ARE MUTUALLY EXCLUSIVE ON PURPOSE. They are two answers to one
+    // question ("what did the user say?"), they want the VRAM the other one is
+    // holding, and running both would double the transcription cost of every
+    // utterance to produce a second answer nothing consumes.
+    //
+    // Defaults to the LEGACY path. Cascade is opt-in until it has been validated
+    // in production, which is the whole point of the flag -- and an unknown value
+    // clamps back to legacy rather than to the newer path (see clamp_settings).
+    std::string pipeline_mode = "ultravox_legacy";   // | "whisper_cascade"
+
+    // The GGML Whisper model the cascade transcribes with (e.g. a turbo-class
+    // Whisper-Turbo-Platinum-F16.bin). Empty = fall back to the path CMake
+    // configured at build time, then to a copy sitting next to the exe -- the
+    // same three-step resolution the Silero model uses. Cascade mode refuses to
+    // arm without a model and says so; it never silently degrades to legacy
+    // behaviour on a path typo.
+    std::string whisper_model_path;
+    // The language being spoken, as an ISO-639-1 code ("ru", "en"); "" = let
+    // Whisper identify it. NOT cosmetic, and the reasoning is the same one
+    // speech_language carries below: on a SHORT utterance an acoustically
+    // adjacent language is a live failure mode (Russian heard as Bulgarian and
+    // transcribed accordingly), and nothing downstream can undo a wrong
+    // transcript -- it is what gets committed and answered.
+    std::string whisper_language;
+    // CPU worker threads for the ggml graph. Inert on a CUDA-backend build
+    // except for the ops ggml keeps on the host, so it is worth exactly what it
+    // costs: a small number, not a core count. Ignored entirely when the model
+    // fails to load.
+    int  whisper_threads = 4;
+    // The longest utterance the cascade will transcribe in one piece. It sizes
+    // the audio ring, and the ring FAILS a read whose head it has already
+    // evicted rather than handing back a truncated window -- so this is the
+    // point past which a monologue is dropped with a log line instead of being
+    // transcribed missing its first words. Whisper's own encoder tops out at
+    // 30 s regardless.
+    int  whisper_max_utterance_ms = 15000;
+
     // ---- speech output (F5-TTS) ---------------------------------------------
     // Empty ckpt dir = speech output off. These defaults point at a real layout
     // on the development machine so the feature is discoverable; on any other
@@ -344,6 +395,16 @@ void visit_fields(S& s, Fn&& f) {
     f("temperature",              s.temperature,              Tier::Live);
     f("top_p",                    s.top_p,                    Tier::Live);
     f("max_new_tokens",           s.max_new_tokens,           Tier::Live);
+    // ---- the speech-to-text pipeline selector --------------------------------
+    // All Restart tier: pipeline_mode picks which ISpeechMode is constructed and
+    // whether the Ultravox audio head is allocated; the whisper_* values are read
+    // once when the ASR context is created (a ~1.6 GB model load onto the GPU).
+    // None of them can be a store the next block reads.
+    f("pipeline_mode",            s.pipeline_mode,            Tier::Restart);
+    f("whisper_model_path",       s.whisper_model_path,       Tier::Restart);
+    f("whisper_language",         s.whisper_language,         Tier::Restart);
+    f("whisper_threads",          s.whisper_threads,          Tier::Restart);
+    f("whisper_max_utterance_ms", s.whisper_max_utterance_ms, Tier::Restart);
     // ---- Tab 2 -------------------------------------------------------------
     f("neural_vad",               s.neural_vad,               Tier::Restart);
     f("loopback_capture",         s.loopback_capture,         Tier::Restart);
@@ -473,6 +534,29 @@ inline void clamp_settings(AssistantSettings& s) {
         s.speech_task != "both") {
         s.speech_task = "transcribe";
     }
+    // An unknown pipeline clamps to LEGACY, not to the newer path. A hand-edited
+    // file, an older build's value, or a typo must never be the thing that moves
+    // a user onto an unvalidated pipeline -- the fallback direction is toward the
+    // one that has been in production.
+    if (s.pipeline_mode != "ultravox_legacy" && s.pipeline_mode != "whisper_cascade") {
+        s.pipeline_mode = "ultravox_legacy";
+    }
+    trim(s.whisper_model_path);
+    // Whisper wants a bare ISO-639-1 code; "" and whitespace both mean auto-LID,
+    // for the same reason speech_language treats them alike below. Lowercased
+    // because whisper_lang_id() is case-sensitive and "RU" resolves to nothing --
+    // which whisper reports by falling back to auto, i.e. silently ignoring the
+    // setting the user just typed.
+    trim(s.whisper_language);
+    for (char& c : s.whisper_language) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    s.whisper_threads = clamp_int(s.whisper_threads, 1, 32);
+    // Floor: below ~1 s Whisper's encoder degrades badly (it zero-pads to 30 s
+    // regardless, and a very short window is mostly padding). Ceiling: the
+    // encoder's positional embeddings stop at 30 s, so nothing above that can be
+    // transcribed in one piece no matter how large the ring is made.
+    s.whisper_max_utterance_ms = clamp_int(s.whisper_max_utterance_ms, 1000, 30000);
     // "" means Auto, so whitespace has to mean Auto too: a stray space would
     // otherwise be a non-empty language that reads "The spoken language is  ."
     // to the model, and would keep re-triggering the prefix rebuild diff.

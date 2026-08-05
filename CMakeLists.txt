@@ -158,6 +158,23 @@ option(USE_WEBRTC_AEC3 "Use WebRTC AEC3 for echo cancellation when the package i
 # in the header of cmake/OnnxRuntime.cmake. Declared before that module.
 option(BLACKWELL_ORT_GPU "Fetch the ONNXRuntime GPU build (CUDA execution provider)" ON)
 
+# whisper.cpp as the Cascade ASR front-end: a GGML Whisper model transcribes a
+# VAD-bounded utterance to UTF-8 and the text is routed to the local backbone.
+# It is the ALTERNATIVE to the Ultravox audio head, selected at RUNTIME by
+# voice_assistant's pipeline_mode setting -- not a second audio path running
+# alongside it. OFF drops the fetch entirely and the app is legacy-only.
+# Declared before the module that reads it.
+option(USE_WHISPER_CPP "Enable the whisper.cpp Cascade ASR pipeline (fetches whisper.cpp + ggml)" ON)
+
+# Which ggml backend whisper.cpp is built with. ON by default because Cascade
+# mode exists to lower latency: a turbo-class encode is tens of milliseconds on
+# the GPU against several hundred on the CPU. The costs are a THIRD in-process
+# CUDA context (engine + ONNXRuntime CUDA EP + ggml), ~1.6 GB of VRAM for a turbo
+# F16 model, and a long first build. That VRAM is affordable only because cascade
+# mode does not load the Ultravox audio head -- see cmake/WhisperCpp.cmake.
+# Declared before that module.
+option(BLACKWELL_WHISPER_CUDA "Build whisper.cpp with the ggml CUDA backend" ON)
+
 # 3. Зависимости: pinned FetchContent + опциональный DirectStorage SDK
 # (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls())
 # + ONNXRuntime CPU для нейросетевого VAD (blackwell::onnxruntime +
@@ -167,6 +184,11 @@ include(cmake/BlackwellHelpers.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/DirectStorage.cmake)
 include(cmake/OnnxRuntime.cmake)
+# whisper.cpp (Cascade ASR) -> blackwell::whisper_cpp + blackwell_copy_whisper_model().
+# MUST stay above the /W4 /WX block below: that block is a directory property and
+# would otherwise be inherited by the ggml/whisper targets this creates, which do
+# not compile clean under it. See the WARNINGS section of cmake/WhisperCpp.cmake.
+include(cmake/WhisperCpp.cmake)
 include(cmake/WebRtcAec3.cmake)
 # Chromium (Edge WebView2) embedding SDK -> blackwell::webview2. Declared here,
 # once, so the two products that host a web UI (poc_overlay's settings window,

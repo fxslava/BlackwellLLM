@@ -188,6 +188,59 @@
       <!-- ============================ TAB 1 ============================= -->
       <section class="panel active" data-panel="inference">
         <div class="group">
+          <h3>How speech is understood</h3>
+          <div class="field">
+            <label for="s_pipeline_mode">Pipeline</label>
+            <select id="s_pipeline_mode">
+              <option value="ultravox_legacy">Ultravox (end-to-end audio)</option>
+              <option value="whisper_cascade">Whisper cascade (speech &rarr; text &rarr; model)</option>
+            </select>
+          </div>
+          <p class="hint">
+            <b>Ultravox</b> feeds the audio straight into the language model, which
+            writes down what you said itself. <b>Whisper cascade</b> transcribes you
+            with a separate Whisper model first and only ever sends the model text.
+            The cascade is usually faster and it frees the memory the audio head
+            would hold &mdash; but it hears only words, not tone.
+          </p>
+          <details class="advanced">
+            <summary>Whisper cascade settings</summary>
+            <p class="hint">
+              Used only while the pipeline above is set to the cascade. Without a
+              model file the cascade refuses to start rather than quietly falling
+              back to the other pipeline.
+            </p>
+            <div class="field">
+              <label for="s_whisper_model_path">Whisper model <em>(GGML .bin)</em></label>
+              <div class="row">
+                <input id="s_whisper_model_path"
+                       placeholder="e.g. Whisper-Turbo-Platinum-F16.bin (blank = next to the app)">
+                <button class="ghost" data-browse="whisper_model_path">Browse&hellip;</button>
+              </div>
+            </div>
+            <div class="row two">
+              <div class="field">
+                <label for="s_whisper_language">Spoken language <em>(ISO code)</em></label>
+                <input id="s_whisper_language" placeholder="blank = detect" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="s_whisper_threads">CPU threads</label>
+                <input id="s_whisper_threads" type="number" min="1" max="32" step="1">
+              </div>
+            </div>
+            <div class="field">
+              <label for="s_whisper_max_utterance_ms">Longest sentence (ms)</label>
+              <input id="s_whisper_max_utterance_ms" type="number" min="1000" max="30000" step="500">
+            </div>
+            <p class="hint">
+              Naming the language is worth doing whenever you know it: on a short
+              sentence Whisper can pick a neighbouring language and nothing later
+              can undo a wrong transcript.
+            </p>
+          </details>
+        </div>
+
+        <div class="group">
           <h3>Model</h3>
           <label class="check">
             <input type="checkbox" id="s_simulated">

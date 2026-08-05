@@ -704,7 +704,7 @@ void AssistantWindow::on_web_message(const std::wstring& message_json) {
             return;
         }
         if (type == "browse") {
-            browse_for_folder(j.value("target", std::string("model_dir")));
+            browse_for_path(j.value("target", std::string("model_dir")));
             return;
         }
         if (type == "restart") {
@@ -805,7 +805,7 @@ void AssistantWindow::push_audio_devices() {
     post_event(out.dump());
 }
 
-void AssistantWindow::browse_for_folder(const std::string& target) {
+void AssistantWindow::browse_for_path(const std::string& target) {
     // The native picker, on this UI thread. A checkpoint path typed by hand into
     // a web input is the single most common way to mis-configure this app.
     ComPtr<IFileDialog> dialog;
@@ -813,9 +813,27 @@ void AssistantWindow::browse_for_folder(const std::string& target) {
                                 IID_PPV_ARGS(&dialog)))) {
         return;
     }
+    // FOLDER unless the field names a single file. Everything else this app
+    // browses for is a checkpoint DIRECTORY, so folder is the default and the
+    // exceptions are listed rather than the rule being restated at each site.
+    const bool pick_file = (target == "whisper_model_path");
+
     DWORD options = 0;
     dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST |
+                       (pick_file ? DWORD{0} : DWORD{FOS_PICKFOLDERS}));
+    if (pick_file) {
+        // A GGML model is a .bin, and pointing this at a .safetensors checkpoint
+        // is the predictable mistake -- the filter is what makes it hard to make.
+        // "All files" stays available because the extension is a convention, not
+        // a format requirement (.gguf exists in the wild too).
+        static const COMDLG_FILTERSPEC kGgmlFilters[] = {
+            {L"GGML/GGUF Whisper model", L"*.bin;*.gguf"},
+            {L"All files", L"*.*"},
+        };
+        dialog->SetFileTypes(ARRAYSIZE(kGgmlFilters), kGgmlFilters);
+        dialog->SetFileTypeIndex(1);
+    }
     if (FAILED(dialog->Show(hwnd_))) return;   // cancelled
 
     ComPtr<IShellItem> item;

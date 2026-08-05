@@ -84,6 +84,13 @@
 #include "engine_bootstrap.hpp"         // rt::RealEngineStack, bring_up_real_engine
 #include "simulated_engine_control.hpp" // rt::SimulatedEngineControl
 
+#if defined(VOICE_ASSISTANT_HAS_WHISPER)
+// Mode C, the Cascade. Present only when the build fetched whisper.cpp
+// (-DUSE_WHISPER_CPP=ON, the default); without it pipeline_mode="whisper_cascade"
+// is refused at startup with a message and the app runs the legacy path.
+#include "whisper_cascade_mode.hpp"     // rt::WhisperCascadeMode
+#endif
+
 #include "intent_commit.hpp"          // blackwell::bridge::IntentCommitQueue
 #include "intent_dispatcher.hpp"      // blackwell::cloud::IntentDispatcher
 #include "offline_transport.hpp"      // blackwell::cloud::OfflineTransport
@@ -777,6 +784,51 @@ int main(int argc, char** argv) {
 #endif
     }
 
+    // ---- WHICH SPEECH-TO-TEXT PIPELINE ------------------------------------
+    // Resolved HERE, before anything is loaded, because it decides what gets
+    // ALLOCATED: the Ultravox audio head, the backbone checkpoint, and whether a
+    // ~1.6 GB GGML model is pulled onto the GPU.
+    bool cascade = (settings.pipeline_mode == "whisper_cascade");
+#if !defined(VOICE_ASSISTANT_HAS_WHISPER)
+    if (cascade) {
+        // Refused, LOUDLY, and clamped back to the path that works. A build with
+        // no whisper.cpp cannot honour this setting, and coming up silently on
+        // the legacy pipeline would leave the user believing they were testing
+        // the cascade.
+        std::fprintf(stderr,
+                     "[cascade] pipeline_mode=whisper_cascade, but this build has no "
+                     "whisper.cpp (-DUSE_WHISPER_CPP=OFF) -- running the legacy Ultravox "
+                     "path instead.\n");
+        cascade = false;
+        settings.pipeline_mode = "ultravox_legacy";
+    }
+#endif
+
+    // The GGML model, resolved the same three ways the Silero model is: the
+    // configured path, then whatever CMake baked in, then a copy next to the exe.
+    std::string whisper_model = settings.whisper_model_path;
+#if defined(VOICE_ASSISTANT_HAS_WHISPER)
+    if (whisper_model.empty()) {
+#if defined(BLACKWELL_WHISPER_MODEL_PATH)
+        whisper_model = BLACKWELL_WHISPER_MODEL_PATH;
+#endif
+    }
+    whisper_model = resolve_asset_file(whisper_model, "Whisper-Turbo-Platinum-F16.bin");
+#endif
+
+    // CASCADE'S BACKBONE. With no projector in the graph the backbone width is
+    // free (see kDefaultCascadeModelDir), so an unconfigured cascade brings up
+    // Qwen rather than falling through to the simulated stand-in -- but only if
+    // the checkpoint is actually there. Guessing a path that does not exist would
+    // turn "no model configured" into a startup crash, which is strictly worse
+    // than the GPU-free backend it would have used.
+    if (cascade && settings.model_dir.empty() && path_exists(rt::kDefaultCascadeModelDir)) {
+        settings.model_dir = rt::kDefaultCascadeModelDir;
+        settings.simulated = false;
+        std::printf("[cascade] no backbone configured -- defaulting to %s\n",
+                    rt::kDefaultCascadeModelDir);
+    }
+
     // THE decision. Everything downstream is written against the base type.
     const bool use_real = !settings.simulated && !settings.model_dir.empty();
 
@@ -801,10 +853,21 @@ int main(int argc, char** argv) {
 
     std::printf("=== voice_assistant (Local Router) ===\n");
     std::printf("  commit rule : dispatch IFF the local generation reaches EOS\n");
+    // FIRST, because it is what every line below means something different
+    // under. A reader diagnosing "why is there no [audio] line" needs this one
+    // before the ones that would otherwise look like the failure.
+    std::printf("  pipeline    : %s\n",
+                cascade ? "whisper_cascade (whisper.cpp -> text -> backbone; NO audio head)"
+                        : "ultravox_legacy (audio -> soft-tokens -> backbone)");
+    if (cascade) {
+        std::printf("  whisper     : %s\n",
+                    whisper_model.empty() ? "(NOT CONFIGURED -- cascade will refuse to arm)"
+                                          : whisper_model.c_str());
+    }
     if (use_real) {
         std::printf("  engine      : RealEngineControl (CUDA device %d)\n", settings.device_id);
         std::printf("  model-dir   : %s\n", args.model_dir.c_str());
-        std::printf("  audio-head  : %s\n", args.audio_head.c_str());
+        if (!cascade) std::printf("  audio-head  : %s\n", args.audio_head.c_str());
     } else {
         std::printf("  engine      : SimulatedEngineControl (no GPU, no checkpoint)%s\n",
                     settings.simulated ? "  [Simulated selected]"
@@ -839,12 +902,18 @@ int main(int argc, char** argv) {
     try {
         // ---- audio front-end ------------------------------------------------
         whisper::DspConfig cfg;
-        // On the real path the mel geometry MUST match the projector the audio
-        // head was trained with; 128 (Whisper large-v3-turbo) is the simulated
-        // default. Resolving it here also fails fast on a bad projector path,
-        // before the mic is opened.
-        cfg.n_mels = use_real ? rt::resolve_projector_params(args.projector_path).num_mel_bins
-                              : 128;
+        // On the LEGACY real path the mel geometry MUST match the projector the
+        // audio head was trained with; 128 (Whisper large-v3-turbo) is the
+        // simulated default. Resolving it here also fails fast on a bad projector
+        // path, before the mic is opened.
+        //
+        // Cascade mode takes the default and does not consult the projector at
+        // all: whisper.cpp computes its own log-mel internally from the PCM it is
+        // handed, so this DSP feeds nothing on that path. It is still constructed
+        // because RealTimeDSP is what HOSTS the PCM tap both modes read from.
+        cfg.n_mels = (use_real && !cascade)
+                         ? rt::resolve_projector_params(args.projector_path).num_mel_bins
+                         : 128;
         whisper::WhisperDSP dsp(cfg, args.data_dir + "/mel_filters.bin");
         // The spectrogram no longer has a viewer -- it is kept because
         // RealTimeDSP writes into it unconditionally, and shrinking it is a DSP
@@ -876,18 +945,29 @@ int main(int argc, char** argv) {
             // persona and the conversation inherited the transcript's tag format.
             // Two engine sequences (native CoW branching) is the fix; see
             // RealEngineControl's Session block.
+            // ISOLATED SESSIONS ARE A LEGACY-PATH NEED, not a general one. They
+            // exist because Mode A runs TWO jobs on one engine -- transcribe the
+            // speech, then answer it -- and a shared linear context let the
+            // transcription inherit the assistant persona. A cascade has only
+            // ONE job for the backbone (answer), because whisper.cpp did the
+            // transcribing outside the engine entirely. So there is no second
+            // sequence to isolate, and asking for branching would only inflate
+            // the paged host-mirror pool for a branch nothing forks.
             real_stack = rt::bring_up_real_engine(args, dsp, settings.max_context,
                                                   settings.device_id,
                                                   /*arm_streaming_plan=*/true,
-                                                  /*isolated_sessions=*/true);
+                                                  /*isolated_sessions=*/!cascade,
+                                                  /*load_audio_head=*/!cascade);
             control = real_stack.bridge();
-            // Seed the transcription session's prefix source BEFORE the engine
-            // thread freezes it: prefill_system_prompt lays BOTH prefixes and
-            // reads this one from the control.
-            // Both halves of that prefix: the task text and the forced spoken
-            // language are composed into one system prompt for seq 1.
-            real_stack.control->set_audio_task_prompt(settings.audio_task_prompt);
-            real_stack.control->set_speech_language(settings.speech_language);
+            if (!cascade) {
+                // Seed the transcription session's prefix source BEFORE the engine
+                // thread freezes it: prefill_system_prompt lays BOTH prefixes and
+                // reads this one from the control.
+                // Both halves of that prefix: the task text and the forced spoken
+                // language are composed into one system prompt for seq 1.
+                real_stack.control->set_audio_task_prompt(settings.audio_task_prompt);
+                real_stack.control->set_speech_language(settings.speech_language);
+            }
         } else {
             simulated = std::make_unique<rt::SimulatedEngineControl>();
             control = simulated.get();
@@ -1188,9 +1268,70 @@ int main(int argc, char** argv) {
             prefill = [sc](const std::string& p) { return sc->prefill_system_prompt(p); };
         }
 
-        rt::ConversationalMode speech_mode(control, prefill, vad_fn, vad_user, mcfg, &on_token,
-                                           &on_state, &app_ctx);
-        rt::ISpeechMode* active = &speech_mode;
+        // ONE of the two is constructed, never both -- they are two answers to the
+        // same question and each wants the VRAM the other is holding. `active` is
+        // the only handle the runner, the PCM tap and the shutdown path use; the
+        // typed handles below exist solely for the handful of call sites that
+        // need something the ISpeechMode interface deliberately does not carry.
+        std::unique_ptr<rt::ConversationalMode> conv_mode;
+#if defined(VOICE_ASSISTANT_HAS_WHISPER)
+        std::unique_ptr<rt::WhisperCascadeMode> cascade_mode;
+#endif
+        rt::ISpeechMode* active = nullptr;
+
+#if defined(VOICE_ASSISTANT_HAS_WHISPER)
+        if (cascade) {
+            if (whisper_model.empty() || !path_exists(whisper_model)) {
+                // REFUSED, not degraded. Falling back to the legacy path here
+                // would hand the user a working-looking assistant running a
+                // pipeline they did not select, on a model they did not choose.
+                throw std::runtime_error(
+                    "cascade mode needs a GGML Whisper model, and none was found. Set "
+                    "Settings -> Whisper model (or -DBLACKWELL_WHISPER_MODEL at configure "
+                    "time, or drop the .bin next to the exe). Looked at: '" +
+                    (whisper_model.empty() ? std::string("(nothing configured)") : whisper_model) +
+                    "'");
+            }
+
+            rt::WhisperAsrConfig acfg;
+            acfg.model_path = whisper_model;
+            acfg.language   = settings.whisper_language;
+            acfg.n_threads  = settings.whisper_threads;
+            acfg.use_gpu    = true;   // forced false at compile time on a CPU build
+            acfg.gpu_device = settings.device_id;
+
+            rt::WhisperCascadeMode::Config ccfg;
+            ccfg.sample_rate      = cfg.sample_rate;
+            ccfg.onset_threshold  = settings.vad_threshold;
+            ccfg.hangover_ms      = settings.silence_hangover_ms;
+            ccfg.preroll_ms       = settings.pre_roll_ms;
+            ccfg.max_utterance_ms = settings.whisper_max_utterance_ms;
+            ccfg.system_prompt    = settings.system_prompt;
+
+            // The transcript IS the user's bubble, exactly as Mode A's token
+            // stream is -- so it lands on the same two view calls, in the same
+            // order. The difference is that it arrives whole rather than token by
+            // token, and that the gate's verdict comes with it instead of being
+            // read back off the control (which never ran a decode loop here).
+            auto on_transcript = [&view](const std::string& text, std::uint32_t id,
+                                         bool committed) {
+                if (!text.empty()) view.on_local_token(text.c_str(), id);
+                view.on_local_final(committed
+                                        ? blackwell::bridge::TerminationReason::Eos
+                                        : blackwell::bridge::TerminationReason::None);
+            };
+
+            cascade_mode = std::make_unique<rt::WhisperCascadeMode>(
+                control, prefill, vad_fn, vad_user, acfg, ccfg, &on_state,
+                std::move(on_transcript), &app_ctx);
+            active = cascade_mode.get();
+        }
+#endif
+        if (active == nullptr) {
+            conv_mode = std::make_unique<rt::ConversationalMode>(
+                control, prefill, vad_fn, vad_user, mcfg, &on_token, &on_state, &app_ctx);
+            active = conv_mode.get();
+        }
 
         // Live-tier settings, applied to the RUNNING pipeline. Everything here is
         // an atomic store read at the next VAD block or turn boundary -- no
@@ -1228,12 +1369,15 @@ int main(int argc, char** argv) {
             return tts_muted ? 0.0f : slider;
         };
         auto apply_live_settings = [&](const rt::AssistantSettings& s) {
-            SpeechPipelineHandle pipe = speech_mode.pipeline();
-            (void)speech_pipeline_set_vad_threshold(pipe, s.vad_threshold);
-            (void)speech_pipeline_set_silence_hangover_ms(
-                pipe, static_cast<std::uint32_t>(s.silence_hangover_ms));
-            (void)speech_pipeline_set_warm_prefill_interval_ms(
-                pipe, static_cast<std::uint32_t>(s.warm_prefill_interval_ms));
+            // Through the INTERFACE, not through Mode A's pipeline handle. Each
+            // mode honours the knobs it actually has and ignores the rest (see
+            // ISpeechMode) -- which is the only arrangement that works now that
+            // there are two modes with different sets of them.
+            active->set_vad_threshold(s.vad_threshold);
+            active->set_silence_hangover_ms(
+                static_cast<std::uint32_t>(s.silence_hangover_ms));
+            active->set_warm_prefill_interval_ms(
+                static_cast<std::uint32_t>(s.warm_prefill_interval_ms));
             // The pre-roll goes to the CONTROL, not the pipeline: the flush it
             // sizes happens on the engine thread, which is the only consumer
             // allowed to move the ring's read cursor. It is on the base bridge, so
@@ -1373,8 +1517,15 @@ int main(int argc, char** argv) {
             dispatcher.stop();
             throw std::runtime_error("engine thread failed during startup: " + engine_error);
         }
+        // Not on ISpeechMode: the number is a KV floor, which only means anything
+        // to a caller that already knows which mode laid the prefix down and how
+        // many prefixes it laid. Branching here is cheaper than a virtual that
+        // would have to explain itself.
         std::printf("[system-prefix] frozen %u tokens (KV rewind floor)\n",
-                    speech_mode.frozen_prefix_tokens());
+#if defined(VOICE_ASSISTANT_HAS_WHISPER)
+                    cascade_mode ? cascade_mode->frozen_prefix_tokens() :
+#endif
+                                 conv_mode->frozen_prefix_tokens());
         apply_live_settings(settings);
 
         // ---- audio hot reload -------------------------------------------------
@@ -1756,7 +1907,10 @@ int main(int argc, char** argv) {
             // Manual mode mutes the VAD for ALL transitions while PCM keeps
             // flowing, which is exactly "mic off" without tearing the stream
             // down. No explicit on_speech_start follows, so nothing commits.
-            (void)speech_pipeline_set_manual_mode(speech_mode.pipeline(), !listening);
+            // Through the interface: both modes implement it, with the same
+            // meaning on each (Mode C's WhisperCascadeMode::set_manual_mode says
+            // what it does and does not do).
+            active->set_manual_mode(!listening);
         };
         cb.on_cancel = [&] {
             // The cancel hotkey IS a barge-in, minus the speech: bump the epoch
@@ -2087,6 +2241,33 @@ int main(int argc, char** argv) {
                         : "");
         std::printf("  dropped queue-full     : %llu\n",
                     static_cast<unsigned long long>(commit_queue.dropped_queue_full()));
+
+#if defined(VOICE_ASSISTANT_HAS_WHISPER)
+        // The cascade's own stage, reported separately for the same reason the
+        // speech-output summary below is: it answers a DIFFERENT question. The
+        // gate's numbers say whether transcripts became intents; these say
+        // whether speech became transcripts at all -- and when the assistant
+        // "did not hear" something, this is the block that says which.
+        if (cascade_mode) {
+            std::printf("\n=== cascade ASR summary ===\n");
+            std::printf("  transcripts published  : %llu\n",
+                        static_cast<unsigned long long>(cascade_mode->published()));
+            if (const rt::WhisperAsr* a = cascade_mode->asr(); a != nullptr) {
+                std::printf("  utterances transcribed : %llu\n",
+                            static_cast<unsigned long long>(a->utterances()));
+                std::printf("  encode failures        : %llu%s\n",
+                            static_cast<unsigned long long>(a->failures()),
+                            a->failures() > 0 ? "   <-- VRAM or a bad model" : "");
+                std::printf("  last encode            : %.1f ms (%s)\n",
+                            a->last_encode_ms(), a->gpu() ? "GPU" : "CPU");
+            }
+            std::printf("  dropped (ASR behind)   : %llu%s\n",
+                        static_cast<unsigned long long>(cascade_mode->dropped_overrun()),
+                        cascade_mode->dropped_overrun() > 0
+                            ? "   <-- the encode is slower than the speaker"
+                            : "");
+        }
+#endif
 
 #if defined(VOICE_ASSISTANT_HAS_TTS)
         // A SEPARATE SUMMARY, because these count a different stage and confusing

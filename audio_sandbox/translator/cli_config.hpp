@@ -76,7 +76,23 @@ struct TranslatorArgs {
 
 // Default checkpoint locations, used when neither a CLI flag nor a local
 // config.json provides them (so a bare `audio_translator.exe` just runs).
+//
+// THERE ARE TWO BACKBONE DEFAULTS AND THAT IS NOT AN OVERSIGHT. The Ultravox
+// projector's output width is baked into the checkpoint it was trained against
+// (4096 = Llama-3.1-8B), so the LEGACY path can only ever run on a backbone of
+// that width -- swap the model and validate_dimensions rejects it, correctly.
+// CASCADE mode has no projector in the graph at all, which is precisely what
+// frees the backbone choice, so it takes the one that is cheaper to run:
+//
+//   Qwen2.5-7B  hidden 3584, 4 KV heads   -> 512 KV dims/layer
+//   Llama-3.1-8B hidden 4096, 8 KV heads  -> 1024 KV dims/layer
+//
+// That is HALF the KV cache per token at the same context length, which is the
+// other half of how cascade mode pays for a ~1.6 GB GGML model on the same card.
+// kDefaultModelDir is the legacy default; kDefaultCascadeModelDir is cascade's.
+// A --model-dir flag or a config.json entry overrides either.
 inline constexpr const char* kDefaultModelDir  = "F:/AI/llama-3.1-8B-Instruct-AWQ-INT4";
+inline constexpr const char* kDefaultCascadeModelDir = "F:/AI/Qwen2.5-Coder-7B-Instruct-AWQ";
 inline constexpr const char* kDefaultAudioHead = "F:/AI/ultravox-v0_5-llama-3_1-8b";
 
 // The backbone dimensions the validation and the projector configuration need,

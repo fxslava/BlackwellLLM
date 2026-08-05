@@ -409,6 +409,13 @@ const FIELDS = {
   // Tab 1
   model_dir: "value", audio_head: "value", projector_path: "value", data_dir: "value",
   device_id: "int", max_context: "int", simulated: "check",
+  // Which speech-to-text pipeline runs, and the cascade's own knobs. All
+  // restart-tier on the C++ side (they decide what gets ALLOCATED at bring-up),
+  // so the banner picks them up from `restart_fields` with nothing to add here.
+  // whisper_language stays "value": it is an ISO code the C++ side lowercases
+  // and validates, and coercing it here would only be a second opinion.
+  pipeline_mode: "value", whisper_model_path: "value", whisper_language: "value",
+  whisper_threads: "int", whisper_max_utterance_ms: "int",
   temperature: "float", top_p: "float", max_new_tokens: "int",
   local_inference: "check",
   // The remote leg. All three are plain strings on the C++ side, so "value" --

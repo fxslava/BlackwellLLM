@@ -162,6 +162,25 @@ public:
         return t;
     }
 
+    // ---- LIVE settings: straight through to the C ABI this mode drives -------
+    // Mode A honours ALL FOUR knobs, because the pipeline it wraps is what
+    // implements them. Every one is a single atomic store read by the audio
+    // thread on its next 10 ms block, so these are callable from any thread and
+    // need no marshaling -- the same contract they had when main() called
+    // speech_pipeline_set_*(mode.pipeline(), ...) directly.
+    void set_vad_threshold(float probability) noexcept override {
+        (void)speech_pipeline_set_vad_threshold(pipe_, probability);
+    }
+    void set_silence_hangover_ms(std::uint32_t ms) noexcept override {
+        (void)speech_pipeline_set_silence_hangover_ms(pipe_, ms);
+    }
+    void set_warm_prefill_interval_ms(std::uint32_t ms) noexcept override {
+        (void)speech_pipeline_set_warm_prefill_interval_ms(pipe_, ms);
+    }
+    void set_manual_mode(bool enabled) noexcept override {
+        (void)speech_pipeline_set_manual_mode(pipe_, enabled);
+    }
+
     // Handles the settings panel still needs (it talks to the pipeline directly
     // for hangover / push-to-talk / VAD threshold).
     SpeechPipelineHandle pipeline() const noexcept { return pipe_; }

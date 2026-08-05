@@ -48,6 +48,9 @@ struct RealEngineStack {
     std::unique_ptr<RealEngineControl>     control;    // destroyed FIRST
 
     BackboneConfig  backbone{};
+    // Left at its defaults when the audio head was not requested (cascade mode):
+    // nothing resolved it, so nothing may read it. audio_head_ready is the flag
+    // that says whether it means anything.
     ProjectorParams projector{};
     bool            audio_head_ready = false;
     // Whether the two-sequence topology actually came up (see
@@ -120,10 +123,26 @@ inline void report_vram(const char* stage) {
 // continuous cache to the paged one. Non-fatal: a model that cannot branch
 // (hybrid SSM) or a paged geometry the flash kernel cannot serve degrades to the
 // single-session path with a warning, exactly like the audio head.
+//
+// load_audio_head=false is CASCADE MODE, and it is the reason that flag exists:
+// whisper.cpp answers "what did the user say?" on its own, so the Ultravox
+// encoder + projector are dead weight -- and expensive dead weight, because
+// whisper_encoder.h carries its weights as `const float*` and inflates an fp16
+// checkpoint 2x on upload. Skipping it is what pays for the ~1.6 GB GGML model
+// the cascade loads instead.
+//
+// IT ALSO SKIPS THE PROJECTOR/BACKBONE DIMENSION CHECK, and that is not a
+// shortcut -- it is the point. The projector's output width is fixed by the
+// checkpoint Ultravox was trained against (4096, Llama-3.1-8B), so validating it
+// against a DIFFERENT backbone is validating a tensor nothing will multiply.
+// Cascade mode is precisely what makes a backbone of another width usable here
+// (Qwen2.5-7B is 3584), and running the check anyway would reject it for a
+// mismatch that has no consumer.
 inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper::WhisperDSP& dsp,
                                             int max_context, int device_id,
                                             bool arm_streaming_plan,
-                                            bool isolated_sessions = false) {
+                                            bool isolated_sessions = false,
+                                            bool load_audio_head = true) {
     RealEngineStack st;
 
     select_cuda_device(device_id);
@@ -138,11 +157,19 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
 
     // Validate BEFORE any CUDA allocation: a projector/backbone width mismatch
     // must abort while it is still cheap, not after a 5.3 GB load.
-    st.backbone  = parse_backbone_config(args.model_dir);
-    st.projector = resolve_projector_params(args.projector_path);
-    validate_dimensions(st.projector, st.backbone, args.model_dir);
-    std::printf("[validated] projector.output_dim == backbone.hidden_size (%d)\n",
-                st.backbone.hidden_size);
+    st.backbone = parse_backbone_config(args.model_dir);
+    if (load_audio_head) {
+        st.projector = resolve_projector_params(args.projector_path);
+        validate_dimensions(st.projector, st.backbone, args.model_dir);
+        std::printf("[validated] projector.output_dim == backbone.hidden_size (%d)\n",
+                    st.backbone.hidden_size);
+    } else {
+        // Say it out loud. "The audio head is not loaded" is the single fact that
+        // explains both the missing [audio] lines below and the ~2 GB the [vram]
+        // lines do not show, and someone will otherwise read that gap as a bug.
+        std::printf("[audio] CASCADE mode: the Ultravox audio head is NOT loaded "
+                    "(no encoder, no projector, no dimension check)\n");
+    }
 
     std::printf("[engine] loading tokenizer + backbone from %s ...\n", args.model_dir.c_str());
     std::fflush(stdout);
@@ -216,7 +243,13 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
         std::fflush(stdout);
     }
 
-    // Audio head: NON-FATAL by design (see the header preamble).
+    // Audio head: NON-FATAL by design (see the header preamble), and SKIPPED
+    // ENTIRELY in cascade mode -- where its absence is the plan, not a
+    // degradation, so it must not print the text-only warning below.
+    if (!load_audio_head) {
+        report_vram("cascade (no audio head)");
+        return st;
+    }
     std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
     std::fflush(stdout);
     try {

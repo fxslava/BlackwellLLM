@@ -169,6 +169,28 @@ public:
         utterance_id_ = 0;
     }
 
+    // ---- LIVE retune (OWNER THREAD ONLY -- the caller of on_block) -----------
+    // The two detection knobs a settings panel moves while audio is flowing.
+    // They take effect on the NEXT block and deliberately do not disturb an
+    // utterance already in flight: begin_ is already fixed, and re-deriving the
+    // release threshold mid-utterance is exactly what hysteresis exists to
+    // absorb.
+    //
+    // WHY THESE ARE NOT THREAD-SAFE, AND WHY THAT IS THE RIGHT CALL. Making
+    // cfg_ atomic would put an acquire load on every field this class touches
+    // per 10 ms block, to serve a writer that is a person moving a slider. The
+    // caller marshals instead: it holds the new value in one atomic and applies
+    // it here, from the block loop, on the thread that owns the segmenter. Two
+    // atomics at the edge beats an atomic struct in the middle.
+    void set_onset_threshold(float t) noexcept {
+        cfg_.onset_threshold = t;
+        release_ = std::max(t - cfg_.release_drop, cfg_.release_floor);
+    }
+    void set_hangover_ms(int ms) noexcept {
+        cfg_.hangover_ms = ms;
+        hangover_ = to_samples(ms);
+    }
+
     bool          in_speech() const noexcept { return speaking_; }
     std::uint64_t stream_position() const noexcept { return stream_pos_; }
     std::uint64_t committed_end() const noexcept { return committed_end_; }

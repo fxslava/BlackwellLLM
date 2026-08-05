@@ -9,6 +9,10 @@
 //   Mode B  SIMULTANEOUS    continuous rolling re-translation, no bot voice.
 //                           SpeechSegmenter -> AbsoluteAudioRing ->
 //                           RetranslationSession (docs/CONTINUOUS_STREAMING.md).
+//   Mode C  WHISPER CASCADE listen -> silence -> whisper.cpp transcribes ->
+//                           the TEXT is published as an intent. No audio ever
+//                           reaches the backbone (voice_assistant only; see
+//                           voice_assistant/whisper_cascade_mode.hpp).
 //
 // WHY THE SEAM IS HERE AND NOT AT IEngineControl. The obvious-looking move is to
 // make Mode B another IEngineControl implementation, mapping Partial->warm_prefill
@@ -69,6 +73,29 @@ public:
     virtual void stop() noexcept = 0;
 
     virtual ModeTelemetry telemetry() const noexcept = 0;
+
+    // ---- LIVE settings (any thread; effective on the next VAD block) ---------
+    // The four knobs an app's settings panel retunes on a RUNNING mode. They are
+    // virtual with DEFAULT NO-OP bodies rather than pure, for two reasons:
+    //
+    //   * Not every mode has every knob. A warm-prefill throttle is meaningless
+    //     to a mode that never speculatively prefills, and the honest
+    //     implementation of "retune a knob I do not have" is to ignore it -- not
+    //     to force each mode to write an empty override.
+    //   * They are ADDITIVE to an interface that already has implementors. A
+    //     pure virtual here would break every one of them at once for the
+    //     benefit of no caller.
+    //
+    // Their existence is what lets a settings push say `active->set_...` instead
+    // of reaching through a mode-specific handle (audio_translator still calls
+    // ConversationalMode::pipeline() directly, which stays public and unchanged).
+    // Each mode documents which of these it honours.
+    virtual void set_vad_threshold(float /*probability*/) noexcept {}
+    virtual void set_silence_hangover_ms(std::uint32_t /*ms*/) noexcept {}
+    virtual void set_warm_prefill_interval_ms(std::uint32_t /*ms*/) noexcept {}
+    // Push-to-talk: while enabled, no automatic VAD transition may fire. PCM
+    // keeps flowing either way -- this mutes the DECISIONS, never the stream.
+    virtual void set_manual_mode(bool /*enabled*/) noexcept {}
 };
 
 }  // namespace rt
