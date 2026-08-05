@@ -144,11 +144,99 @@ set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 # make two CUDA contexts not share SMs.
 if(BLACKWELL_WHISPER_CUDA)
     set(GGML_CUDA ON)
+
+    # -----------------------------------------------------------------------
+    # TOOLSET GATE. ggml-cuda includes CCCL (CUB / <cuda/std/...>), and OUR OWN
+    # KERNELS DO NOT -- which is the whole reason this gate lives here and not in
+    # the root. CUDA 13.x's CCCL needs a materially newer MSVC than the rest of
+    # this tree does, and on an old one it fails in two stages:
+    #
+    #   14.34: cccl/cuda/std/__cccl/preprocessor.h(23): fatal error C1189
+    #          (demands /Zc:preprocessor -- which is passed below), and THEN
+    #          cccl/cub/device/device_reduce.cuh(158): error C2653
+    #          'reduce_tuning_t': is not a class or namespace name.
+    #
+    # Both were measured on this tree. 14.43.34808 is measured GOOD (and is the
+    # toolset the repo already verified nvcc 13.2 accepts as a host compiler --
+    # see CMakeUserPresets.json's x64-release-aec3-local note). Versions in
+    # between are untested, so the floor is set where the other toolset gate in
+    # this repo sets it (cmake/WebRtcAec3.cmake) rather than guessed lower.
+    #
+    # FATAL, not a warning, and not a silent downgrade to the CPU backend:
+    # ggml-cuda is a long compile, so a warning buys a twenty-minute build that
+    # then dies, and quietly switching backends would leave a "CUDA" build
+    # transcribing on the CPU at ten times the latency -- exactly the kind of
+    # silent substitution this app refuses everywhere else.
+    if(MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+        set(_bw_w_default_file
+            "${CMAKE_GENERATOR_INSTANCE}/VC/Auxiliary/Build/Microsoft.VCToolsVersion.v143.default.txt")
+        if(BLACKWELL_MSVC_TOOLSET_PIN)
+            set(_bw_w_ts "${BLACKWELL_MSVC_TOOLSET_PIN}")
+            set(_bw_w_origin "BLACKWELL_MSVC_TOOLSET_PIN")
+        else()
+            set(_bw_w_ts "")
+            set(_bw_w_origin "${_bw_w_default_file}")
+            if(EXISTS "${_bw_w_default_file}")
+                file(READ "${_bw_w_default_file}" _bw_w_ts)
+                string(STRIP "${_bw_w_ts}" _bw_w_ts)
+            endif()
+        endif()
+
+        if(_bw_w_ts AND _bw_w_ts VERSION_LESS 14.40)
+            message(FATAL_ERROR
+                "whisper.cpp CUDA backend: MSBuild will build this tree with MSVC ${_bw_w_ts},\n"
+                "             which cannot compile CUDA ${CMAKE_CUDA_COMPILER_VERSION}'s CCCL headers.\n"
+                "             ggml-cuda pulls in CUB; the build dies on\n"
+                "               cub/device/device_reduce.cuh: error C2653 'reduce_tuning_t'.\n"
+                "             Minimum is 14.40 (14.43.34808 is verified with nvcc 13.2).\n"
+                "\n"
+                "             Selected by: ${_bw_w_origin}\n"
+                "             Installing a newer compiler beside it does NOT change that file --\n"
+                "             MSBuild reads it for PlatformToolset v143 regardless.\n"
+                "\n"
+                "             Pin this build tree to an installed toolset (writes\n"
+                "             Directory.Build.props; works from the IDE too):\n"
+                "               -D BLACKWELL_MSVC_TOOLSET_PIN=<x.y.z>\n"
+                "             Or transcribe on the CPU:  -D BLACKWELL_WHISPER_CUDA=OFF\n"
+                "             Or drop Cascade ASR entirely:  -D USE_WHISPER_CPP=OFF")
+        endif()
+        if(_bw_w_ts)
+            message(STATUS "whisper.cpp CUDA: MSBuild toolset ${_bw_w_ts} "
+                           "(>= 14.40 required, via ${_bw_w_origin})")
+        endif()
+        unset(_bw_w_ts)
+        unset(_bw_w_origin)
+        unset(_bw_w_default_file)
+    endif()
     # ggml derives its own arch list when this is unset, and its default is a
-    # broad matrix that would multiply an already-long build. Inherit the
-    # project's pinned matrix instead -- 120-real (Blackwell) today.
-    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES_SAVED "${CMAKE_CUDA_ARCHITECTURES}")
+    # broad matrix that would multiply an already-long build. It inherits the
+    # project's pinned matrix (120-real, Blackwell) because CMAKE_CUDA_ARCHITECTURES
+    # is a directory-scope variable and add_subdirectory carries it in.
+    #
+    # /Zc:preprocessor IS REQUIRED, NOT A PREFERENCE. ggml-cuda includes CCCL
+    # (<cuda/std/...>), and from CUDA 13 those headers hard-#error out under
+    # MSVC's TRADITIONAL preprocessor:
+    #
+    #   cccl/cuda/std/__cccl/preprocessor.h(23): fatal error C1189: #error:
+    #   MSVC/cl.exe with traditional preprocessor is used.
+    #
+    # Our own kernels never hit it -- they do not include CCCL -- which is why
+    # this flag is HERE rather than in the root's CUDA flags: it is scoped to the
+    # subproject that needs it, and /Zc:preprocessor is a real behaviour change we
+    # do not want to impose on first-party TUs as a side effect.
+    #
+    # -Xcompiler, because it has to reach the HOST compiler nvcc drives.
+    #
+    # SAVED AND RESTORED AROUND MakeAvailable, and that is the whole trick. This
+    # file is include()d, so it runs in the ROOT directory's scope -- a bare
+    # set(CMAKE_CUDA_FLAGS ...) here would still be in effect at
+    # add_subdirectory(src) and would silently put /Zc:preprocessor on every
+    # first-party kernel too. add_subdirectory (which FetchContent uses) COPIES
+    # the current scope into the child, so setting it immediately before and
+    # restoring immediately after hands the flag to ggml and to nothing else.
+    if(MSVC)
+        set(_blackwell_saved_cuda_flags "${CMAKE_CUDA_FLAGS}")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
     endif()
     message(STATUS "whisper.cpp: fetching ${BLACKWELL_WHISPER_CPP_TAG} with the ggml CUDA backend "
                    "(arch: ${CMAKE_CUDA_ARCHITECTURES})")
@@ -164,6 +252,13 @@ FetchContent_Declare(whisper_cpp
     GIT_TAG        "${BLACKWELL_WHISPER_CPP_TAG}"
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(whisper_cpp)
+
+# The subproject has its copy of the scope now; put the root's CUDA flags back so
+# nothing below this line inherits ggml's /Zc:preprocessor. See the CUDA block.
+if(DEFINED _blackwell_saved_cuda_flags)
+    set(CMAKE_CUDA_FLAGS "${_blackwell_saved_cuda_flags}")
+    unset(_blackwell_saved_cuda_flags)
+endif()
 
 if(NOT TARGET whisper)
     message(STATUS

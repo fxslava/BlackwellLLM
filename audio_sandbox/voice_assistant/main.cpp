@@ -155,6 +155,9 @@ struct TypedFlags {
     bool output_device_index = false;
     bool input_device_index = false;
     bool tts_volume = false;
+    bool pipeline_mode = false;
+    bool whisper_model = false;
+    bool whisper_language = false;
 };
 
 // voice_assistant's OWN flags, layered over the shared rt::parse_cli. rt::parse_cli
@@ -179,6 +182,14 @@ struct VoiceArgs {
     // --test-llm-tts ["<prompt>"]: the FULL stack, one injected turn, then exit.
     // Empty string = not requested; the flag supplies a default prompt.
     std::string test_llm_tts;
+    // --pipeline <ultravox_legacy|whisper_cascade> and the cascade's two paths.
+    // Restart-tier settings all three, so a flag is the ONLY way to try the
+    // cascade without opening Settings, saving, and being restarted -- which
+    // matters most on exactly the launch where it is being brought up for the
+    // first time. Validated by clamp_settings, not here: one validator.
+    std::string pipeline_mode;
+    std::string whisper_model;
+    std::string whisper_language;
     TypedFlags typed;
 };
 
@@ -229,6 +240,20 @@ VoiceArgs parse_voice_args(int argc, char** argv, std::vector<char*>& passthroug
         } else if (std::strcmp(a, "--tts-volume") == 0 && i + 1 < argc) {
             v.tts_volume = static_cast<float>(std::atof(argv[++i]));
             v.typed.tts_volume = true;
+        } else if (std::strcmp(a, "--pipeline") == 0 && i + 1 < argc) {
+            v.pipeline_mode = argv[++i];
+            v.typed.pipeline_mode = true;
+        } else if (std::strcmp(a, "--cascade") == 0) {
+            // The shorthand, because this is the flag anyone bringing the feature
+            // up will type twenty times in a row.
+            v.pipeline_mode = "whisper_cascade";
+            v.typed.pipeline_mode = true;
+        } else if (std::strcmp(a, "--whisper-model") == 0 && i + 1 < argc) {
+            v.whisper_model = argv[++i];
+            v.typed.whisper_model = true;
+        } else if (std::strcmp(a, "--whisper-language") == 0 && i + 1 < argc) {
+            v.whisper_language = argv[++i];
+            v.typed.whisper_language = true;
         } else {
             // Record what the shared parser is about to consume, then hand it on.
             if (std::strcmp(a, "--model-dir") == 0)      v.typed.model_dir = true;
@@ -748,7 +773,22 @@ int main(int argc, char** argv) {
     if (typed.output_device_index) settings.output_device_index = vargs.output_device_index;
     if (typed.input_device_index)  settings.input_device_index = vargs.input_device_index;
     if (typed.tts_volume)     settings.tts_volume = vargs.tts_volume;
+    // Before clamp_settings, deliberately: an unrecognised --pipeline value has to
+    // hit the SAME validator a hand-edited settings file does, and fall back the
+    // same way (to legacy, never to the newer path).
+    if (typed.pipeline_mode)     settings.pipeline_mode = vargs.pipeline_mode;
+    if (typed.whisper_model)     settings.whisper_model_path = vargs.whisper_model;
+    if (typed.whisper_language)  settings.whisper_language = vargs.whisper_language;
     rt::clamp_settings(settings);
+    // Typed but rejected: clamp_settings silently reverts an unknown value, which
+    // is right for a settings file and wrong for a flag somebody just typed --
+    // launching on the legacy path after asking for the cascade must not be quiet.
+    if (typed.pipeline_mode && settings.pipeline_mode != vargs.pipeline_mode) {
+        std::fprintf(stderr,
+                     "--pipeline '%s' is not a pipeline (expected ultravox_legacy or "
+                     "whisper_cascade) -- using %s\n",
+                     vargs.pipeline_mode.c_str(), settings.pipeline_mode.c_str());
+    }
 
     // After the settings resolve (so it honours a configured output device) but
     // before anything heavy loads: this test needs an audio endpoint and nothing

@@ -224,10 +224,30 @@ public:
             if (const auto seg = segmenter_.on_block(p)) {
                 if (seg->kind == blackwell::vad::SegmentKind::Final) on_final(*seg);
             } else if (segmenter_.in_speech() && !was_speaking_) {
-                // ONSET. The barge-in edge: the user has started talking, so
-                // anything still unspoken is unwanted. Fired as the pipeline
-                // state Mode A fires so the app's existing TTS wiring works here
-                // untouched -- see main.cpp's on_state.
+                // ONSET -- THE BARGE-IN EDGE. Two things have to happen here, and
+                // only one of them is cosmetic.
+                //
+                // 1. ABORT THE IN-FLIGHT GENERATION. An epoch bump is what makes
+                //    the decode loop stop at its next token check. Mode A gets
+                //    this from the speech pipeline; Mode C has no pipeline, so
+                //    without this line the answer to the PREVIOUS turn keeps
+                //    decoding while the user is already talking over it -- the
+                //    speaker goes quiet (the TTS barge-in below) and the GPU does
+                //    not, which is the worst of both.
+                //
+                //    IT IS ALSO THE SM-CONTENTION ANSWER. The one moment the ASR
+                //    encode and the text decode would genuinely overlap is
+                //    exactly this one, and the overlap is with work the user has
+                //    just cancelled by speaking. Killing it here is why the third
+                //    CUDA context does not have to fight the decode loop for SMs.
+                //
+                //    Callable from this thread by design: the epoch bump is an
+                //    O(1) fire-and-forget store, the same one Mode A's VAD makes.
+                //
+                // 2. Announce it as the pipeline state Mode A announces, so the
+                //    app's existing TTS barge-in wiring works here untouched
+                //    (main.cpp's on_state).
+                control_->cancel_generation(control_->active_generation() + 1);
                 emit_state(SPEECH_STATE_PREFILL_SPEAKING);
             }
             was_speaking_ = segmenter_.in_speech();
