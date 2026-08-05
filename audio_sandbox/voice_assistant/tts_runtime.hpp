@@ -33,18 +33,19 @@
 // pauses capture for any reason.
 //
 // What replaced it is acoustic echo cancellation
-// (src/audio_rt/echo_canceller.hpp), fed the far-end reference this class
-// publishes at aec_reference(). The microphone runs continuously; the
+// (src/audio_rt/echo_canceller.hpp). The microphone runs continuously; the
 // assistant's own voice is SUBTRACTED from it rather than the microphone being
 // switched off. A user talking over the assistant reaches the VAD in the same
 // block they would have if nothing were playing.
 //
-// This class's remaining share of that contract is the REFERENCE, and it has
-// exactly one property to protect: it is tapped at PullForPlayback, so it is
-// aligned with what the speaker is emitting rather than with when synthesis
-// happened (see tts_duplex_bridge.hpp -- synthesis runs several times faster
-// than realtime and would put the reference seconds ahead of the microphone).
-// The consumer side -- rate conversion, backlog bounding, cancellation -- is
+// THIS CLASS PUBLISHES NO REFERENCE. It once did -- tapped at PullForPlayback,
+// which was correct about alignment and wrong about content, because the gain is
+// applied downstream of that tap. The far end is now a WASAPI LOOPBACK capture
+// of the render endpoint, opened in main.cpp, which observes what the speaker
+// actually emits: post-mix, post-volume, and including audio this process never
+// produced. See MakeDuplexConfig on why the tap is AecTap::None.
+//
+// The consumer side -- backlog bounding, alignment, cancellation -- is
 // AecCaptureFilter, on the capture thread, where it belongs.
 // -----------------------------------------------------------------------------
 #include <algorithm>
@@ -109,6 +110,11 @@ public:
           // state: this is how long synthesis may stall before the speaker
           // starves, and synthesis runs several times faster than realtime.
           speaker_(48000),
+          // INERT under MakeDuplexConfig()'s AecTap::None -- nothing writes it
+          // and nothing reads it. It exists because the bridge takes the
+          // reference ring by reference and cannot be handed nothing. Sized like
+          // the speaker so that flipping the tap back to Playback is a one-line
+          // change here rather than a silent stream of dropped reference.
           aec_ref_(48000),
           bridge_(synth_, tokenizer_, speaker_, aec_ref_, MakeChunkerConfig(cfg),
                   MakeDuplexConfig()) {
@@ -214,9 +220,10 @@ public:
     }
 
     // ---- volume (any thread) -------------------------------------------------
-    // Effective on the next audio buffer. THE CALLER MUST ALSO give the same
-    // value to AecCaptureFilter::SetReferenceGain(), or the canceller's learned
-    // response goes stale by exactly this ratio -- audio_playback.h says why.
+    // Effective on the next audio buffer. Nothing else has to be told: the
+    // canceller's far end is a loopback of the render endpoint, so it observes
+    // this gain already applied. (The retired Playback tap saw the pre-gain
+    // signal and did need the volume mirrored to it -- see MakeDuplexConfig.)
     void SetVolume(float v) noexcept { playback_.set_volume(v); }
     float volume() const noexcept { return playback_.volume(); }
 
@@ -233,20 +240,6 @@ public:
     // The device-side view of the same question; see AudioPlayback::stats().
     AudioPlayback::PlaybackStats playback_stats() const noexcept { return playback_.stats(); }
     void reset_playback_stats() noexcept { playback_.reset_stats(); }
-
-    // THE far-end reference, consumed by AecCaptureFilter on the capture thread.
-    // Time-aligned with the speaker because it is tapped at playback, and
-    // continuous because PullForPlayback writes every sample it hands the device
-    // including silence -- a gap here would shift the whole stream and the
-    // canceller would be subtracting the wrong milliseconds.
-    //
-    // SINGLE CONSUMER, per the ring's SPSC contract: exactly one AecCaptureFilter
-    // may read it.
-    blackwell::audio_rt::SpscRing<float>& aec_reference() noexcept { return aec_ref_; }
-
-    // The rate that reference is in (F5's output rate). The capture side is at
-    // 16 kHz, so somebody has to convert; this is what tells them by how much.
-    static constexpr int far_sample_rate() noexcept { return blackwell::tts::kF5SampleRate; }
 
     const std::string& reference_text() const noexcept { return cfg_.ref_text; }
 

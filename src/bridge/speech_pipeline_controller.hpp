@@ -67,6 +67,19 @@ public:
     void set_vad_scorer(SpeechVadScoreFn fn, void* user) noexcept;
     void set_vad_threshold(float threshold) noexcept;
 
+    // Which path is answering "is this block speech?" -- true once a scorer is
+    // installed, false on the built-in RMS threshold. The two paths read
+    // different knobs (vad_threshold() vs the dBFS pair in the config), so this
+    // is what tells a caller which of them its setting is going to reach.
+    bool has_vad_scorer() const noexcept {
+        return vad_scorer_.load(std::memory_order_acquire) != nullptr;
+    }
+    // The probability onset threshold the scorer path compares against, AFTER
+    // set_vad_threshold's clamp to [0, 1] -- so a caller that pushed an
+    // out-of-range value can read back what actually took effect.
+    float vad_threshold() const noexcept {
+        return vad_threshold_.load(std::memory_order_acquire);
+    }
 
     // ---- Engine-thread bookkeeping hooks (called by the IEngineControl impl) -
     // The engine owns the exact token accounting; it publishes it here so the

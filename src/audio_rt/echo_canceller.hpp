@@ -114,8 +114,11 @@ struct EchoCancellerConfig {
     float over_subtraction = 1.5f;
 };
 
-// The seam. A capture path holds this type, never the implementation, so a
-// SpeexDSP or AEC3 backend can be dropped in without touching a caller.
+// The seam. A capture path holds this type, never the implementation, so the
+// backend is a build-time choice rather than a rewrite. Both implementations
+// that exist sit behind it: BlockFdafEchoCanceller below, and WebRTC AEC3 in
+// aec3_echo_canceller.hpp, which the voice assistant prefers when the package
+// was found at configure time.
 class IEchoCanceller {
 public:
     virtual ~IEchoCanceller() = default;

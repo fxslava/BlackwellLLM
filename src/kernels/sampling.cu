@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -148,7 +149,12 @@ int sample_top_p(const float* d_logits, size_t vocab_size, float temperature, fl
     cudaMemcpy(h_logits.data(), d_logits, vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // 2. Применяем Температуру и находим максимум (для стабильности Softmax)
-    float max_val = -INFINITY;
+    // NOT -INFINITY: MSVC expands that macro to ((float)(1e+300 * 1e+300)), and
+    // nvcc's frontend reports the double literal as warning #221-D
+    // ("floating-point value does not fit in required floating-point type")
+    // while narrowing it. This spells the same value -- the identity element for
+    // a max reduction -- without routing it through a double that overflows.
+    float max_val = -std::numeric_limits<float>::infinity();
     for (size_t i = 0; i < vocab_size; i++) {
         h_logits[i] /= temperature;
         if (h_logits[i] > max_val) max_val = h_logits[i];
@@ -218,7 +224,12 @@ float compute_log_prob(const float* d_logits, size_t vocab_size, int target_toke
     cudaMemcpy(h_logits.data(), d_logits, vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // 2. Ищем максимум (нужно для математической стабильности экспоненты)
-    float max_val = -INFINITY;
+    // NOT -INFINITY: MSVC expands that macro to ((float)(1e+300 * 1e+300)), and
+    // nvcc's frontend reports the double literal as warning #221-D
+    // ("floating-point value does not fit in required floating-point type")
+    // while narrowing it. This spells the same value -- the identity element for
+    // a max reduction -- without routing it through a double that overflows.
+    float max_val = -std::numeric_limits<float>::infinity();
     for (size_t i = 0; i < vocab_size; i++) {
         if (h_logits[i] > max_val) max_val = h_logits[i];
     }

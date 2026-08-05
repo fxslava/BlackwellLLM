@@ -7,6 +7,18 @@
 // dependency or its compile definitions -- the same containment silero_vad.cpp
 // applies to ONNXRuntime.
 // -----------------------------------------------------------------------------
+// FIRST, before ANY include: WebRTC's headers want these on MSVC before
+// anything pulls <windows.h> in transitively. The vcpkg package carries
+// WEBRTC_WIN itself, but NOMINMAX is ours to set -- several AEC3 headers use
+// std::min/std::max unqualified in templates, and the Win32 macros turn those
+// into syntax errors. Nothing below may move above this block.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include "aec3_echo_canceller.hpp"
 
 #include <algorithm>
@@ -16,17 +28,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-// WebRTC's own headers want these on MSVC before anything else pulls <windows.h>
-// in transitively. The vcpkg package carries WEBRTC_WIN itself, but NOMINMAX is
-// ours to set: several AEC3 headers use std::min/std::max unqualified in
-// templates, and the Win32 macros turn those into syntax errors.
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
 
 // =============================================================================
 // WHY THIS DRIVES AudioProcessing AND NOT EchoControl DIRECTLY
@@ -227,9 +228,9 @@ struct Aec3EchoCanceller::Impl {
     std::vector<float> near_fifo, far_fifo, out_fifo, scratch;
     std::size_t fill = 0;                 // samples staged toward the next frame
     std::uint64_t frames_processed = 0;
-    // Frames APM refused. Nonzero means the near end is passing through
-    // UNCANCELLED, which otherwise looks exactly like a filter that will not
-    // converge -- worth being able to tell apart.
+    // Frames APM refused; read through process_errors(). Nonzero means the near
+    // end is passing through UNCANCELLED, which otherwise looks exactly like a
+    // filter that will not converge -- worth being able to tell apart.
     std::uint64_t process_errors = 0;
 
     float erle_db = 0.0f;
@@ -321,6 +322,10 @@ std::size_t Aec3EchoCanceller::latency_samples() const noexcept {
 
 int Aec3EchoCanceller::estimated_delay_ms() const noexcept {
     return impl_->delay_ms;
+}
+
+std::uint64_t Aec3EchoCanceller::process_errors() const noexcept {
+    return impl_->process_errors;
 }
 
 }  // namespace blackwell::audio_rt

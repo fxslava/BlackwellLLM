@@ -33,6 +33,12 @@
 // an AEC fed from a hardware loopback). Choosing it without that is the bug
 // described above.
 //
+// THE DEFAULT IS NOT WHAT THE VOICE ASSISTANT USES. It selects AecTap::None and
+// feeds its canceller from a WASAPI loopback of the render endpoint instead --
+// post-mix and post-volume, which no tap inside this class can see. Playback
+// remains the default because it is the right answer for a caller that has no
+// loopback; see AecTap::None below.
+//
 // =============================================================================
 // 2. BARGE-IN FLUSHES THE SPEAKER BUT *KEEPS* THE AEC REFERENCE
 // =============================================================================
@@ -137,7 +143,7 @@ enum class AecTap : std::int32_t {
     //
     // Choosing it is not merely skipping a copy on the audio thread, though it
     // does that: it also retires the pre-gain/post-gain correction the Playback
-    // tap needs (see audio_playback.h on SetReferenceGain), because a loopback
+    // tap needs (AecCaptureFilter::SetReferenceGain), because a loopback
     // reference is already scaled by whatever the user set.
     None = 2,
 };

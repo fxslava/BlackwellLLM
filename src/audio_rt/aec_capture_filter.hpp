@@ -36,9 +36,10 @@
 // policy is working.
 //
 // The one thing that would break this is a reference ring the writer does not
-// keep continuously fed. TTSDuplexBridge::PullForPlayback writes EVERY sample it
-// hands the device, silence included, precisely so this stream never has gaps to
-// mis-align on.
+// keep continuously fed. The shipping feeder is a WASAPI loopback capture of the
+// render endpoint, which runs continuously and delivers SILENCE rather than
+// nothing while the speaker is idle -- so the stream has no gaps to mis-align
+// on. Any other writer must hold that property too.
 //
 // =============================================================================
 // WHY THIS IS NOT IN THE BRIDGE, AND NOT IN THE APP
@@ -131,26 +132,31 @@ public:
     // actively subtracts a signal that is not there, which is audibly worse than
     // not cancelling at all until it re-converges.
     //
-    // Costs a few hundred milliseconds of reduced ERLE, during which the
-    // self-barge-in guard in main.cpp's vad_score is doing the load-bearing
-    // work. Safe from any thread; the next Process() sees the cleared state.
+    // Costs a few hundred milliseconds of reduced ERLE. Nothing covers that
+    // window -- the VAD-side guards this replaced are gone and were removed on
+    // purpose (see vad_score in main.cpp), so a device swap while the assistant
+    // is mid-sentence can still self-trigger. It is a rare, user-initiated
+    // moment, which is the trade being made.
+    //
+    // Safe from any thread; the next Process() sees the cleared state.
     void Reset() noexcept;
 
     // Scales the reference to match what the SPEAKER actually emits.
     //
-    // WHY THIS EXISTS. Software volume is applied in the playback callback,
-    // downstream of where the reference is tapped, so the reference describes
-    // the pre-gain signal while the room hears the post-gain one. Left alone,
-    // the canceller absorbs the difference into its learned impulse response --
-    // which works, and then breaks the moment the volume MOVES: the response is
-    // instantly wrong by exactly that ratio, and it spends a few hundred
-    // milliseconds re-converging while the assistant is audibly speaking. That
-    // is precisely the window in which it must not be blind.
+    // NOT NEEDED BY THE SHIPPING PATH, and left here for the ones that are not.
+    // A loopback reference is tapped downstream of the software volume, so it
+    // already carries it and this stays at 1.
     //
-    // Applying the same gain to the reference makes the learned response
-    // invariant to volume: the filter never sees the change at all. The caller
-    // is responsible for keeping this equal to the playback gain (main.cpp sets
-    // both from `tts_volume`); a mismatch does not fault, it just costs ERLE.
+    // WHY IT EXISTS. A reference tapped BEFORE the playback gain (the bridge's
+    // AecTap::Playback) describes the pre-gain signal while the room hears the
+    // post-gain one. Left alone, the canceller absorbs the difference into its
+    // learned impulse response -- which works, and then breaks the moment the
+    // volume MOVES: the response is instantly wrong by exactly that ratio, and
+    // it spends a few hundred milliseconds re-converging while the assistant is
+    // audibly speaking. That is precisely the window in which it must not be
+    // blind. Applying the same gain here makes the learned response invariant to
+    // volume. Such a caller must keep this equal to the playback gain; a
+    // mismatch does not fault, it just costs ERLE.
     //
     // Clamped to [0, 4]. Negative is rejected because inverting the reference
     // would make the canceller ADD the echo rather than remove it.

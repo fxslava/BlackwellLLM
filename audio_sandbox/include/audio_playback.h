@@ -8,38 +8,38 @@
 // docs/TTS_INTEGRATION_AUDIT.md §3.2: duplex would force a rewrite of
 // AudioCapture (shared with audio_realtime and untouched by design) and is
 // incompatible with ma_device_type_loopback, which is half of this app's capture
-// story. The one real argument FOR duplex is that acoustic echo cancellation
-// wants a playback reference sample-aligned to the capture clock -- when AEC
-// lands, that decision has to be revisited, and this comment is the pointer.
+// story. The one real argument FOR duplex was that acoustic echo cancellation
+// wants a playback reference sample-aligned to the capture clock. AEC has since
+// landed and the decision HELD: the reference is a separate loopback capture of
+// the render endpoint, which gives that alignment without duplex -- and gives it
+// post-mix and post-volume, which duplex would not have.
 //
 // THE CALLBACK IS A HARD REAL-TIME CONTEXT. `PlaybackPullFn` runs on the WASAPI
 // thread. It must not allocate, lock, block, or throw: a missed deadline is an
 // audible click, and clicks are the entire perceived quality of a speech
-// feature. TTSDuplexBridge::PullForPlayback satisfies this (lock-free ring read
-// plus one ring write); anything else routed here must too.
+// feature. TTSDuplexBridge::PullForPlayback satisfies this (one lock-free ring
+// read); anything else routed here must too.
 //
 // A raw function pointer + void* rather than std::function, matching the
 // SpeechVadScoreFn seam in the bridge: no indirection through a type-erased
 // heap object on the one thread in this process with a sub-millisecond budget.
 //
 // =============================================================================
-// VOLUME LIVES HERE, AND IT HAS A CONSEQUENCE FOR THE ECHO CANCELLER
+// VOLUME LIVES HERE, AND THE ECHO CANCELLER NO LONGER HAS TO CARE
 // =============================================================================
 // The gain is applied in the device callback, AFTER the pull -- which is the
 // last point before the samples become sound, and the only one where "what the
 // speaker emits" is definitively known.
 //
-// That is downstream of TTSDuplexBridge::PullForPlayback, which is where the AEC
-// reference is tapped. So the reference carries the PRE-gain signal while the
-// room hears the post-gain one, and the canceller would have to absorb the
-// difference into its learned impulse response -- silently re-converging over a
-// few hundred milliseconds every time somebody drags the volume slider, which is
-// exactly the window in which it must not be blind.
+// That used to matter to the AEC. When the reference was tapped at
+// TTSDuplexBridge::PullForPlayback it carried the PRE-gain signal while the room
+// heard the post-gain one, so the canceller had to be handed the same value
+// through AecCaptureFilter::SetReferenceGain() or it would re-converge every
+// time the slider moved.
 //
-// The fix is on the consumer side: AecCaptureFilter::SetReferenceGain() is given
-// the same value, so the canceller sees a reference scaled to match what was
-// actually emitted and its learned response is invariant to volume. Whoever
-// changes one MUST change the other; main.cpp does both from `tts_volume`.
+// That coupling is GONE. The far end is now a WASAPI loopback of the render
+// endpoint, which is downstream of this gain and therefore already carries it.
+// Volume is a local concern of this class again.
 // -----------------------------------------------------------------------------
 #include <atomic>
 #include <cstddef>

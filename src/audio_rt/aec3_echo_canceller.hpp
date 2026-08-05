@@ -55,6 +55,7 @@
 // Not thread-safe; one instance belongs to one capture stream on one thread.
 // -----------------------------------------------------------------------------
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 #include "echo_canceller.hpp"
@@ -105,6 +106,11 @@ public:
     // that is plumbed to the wrong endpoint: a delay that never settles means
     // the two streams are not describing the same sound.
     int estimated_delay_ms() const noexcept;
+
+    // Frames APM refused, which are passed through UNCANCELLED. Nonzero looks
+    // exactly like a filter that will not converge, and the two want different
+    // fixes -- so the counter is readable rather than merely kept.
+    std::uint64_t process_errors() const noexcept;
 
 private:
     struct Impl;                     // hides every WebRTC type
