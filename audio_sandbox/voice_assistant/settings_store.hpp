@@ -58,7 +58,17 @@
 namespace rt {
 
 // Can this change be applied to the running engine? See the header preamble.
-enum class Tier { Live, Restart };
+// AudioHotReload is a THIRD tier and not a flavour of Restart, because the thing
+// it protects is expensive and unrelated: restarting the app to change an audio
+// endpoint would tear down 5.3 GB of AWQ weights, the KV pool and a 1.3 GB ONNX
+// session to swap a headphone jack. An ma_device is a handle over a WASAPI
+// endpoint -- closing and reopening one costs milliseconds and touches no VRAM.
+//
+// It is not Live either: Live means "store an atomic and the next block reads
+// it", and these need a device to be closed and reopened. So they get their own
+// tier, and restart_fields() (which drives the page's banner) deliberately does
+// NOT include them -- changing an endpoint must not tell the user to restart.
+enum class Tier { Live, Restart, AudioHotReload };
 
 // The persisted, user-editable configuration. Defaults here are the ones a fresh
 // install boots with -- deliberately the simulated backend, so the app starts and
@@ -141,6 +151,16 @@ struct AssistantSettings {
         "Это не казалось мне имеющим смысл; конечно это не было справедливым.";
     int  tts_nfe_step = 16;            // solver steps: the latency/quality dial
 
+    // Playback loudness, [0, 1], applied in the audio callback -- so it takes
+    // effect on the next buffer with no restart and no re-synthesis. It is a
+    // SOFTWARE gain on our own stream, deliberately not the Windows endpoint
+    // volume: changing that would turn every other app on the machine down too.
+    //
+    // The echo canceller is told the same number (see audio_playback.h): the
+    // reference has to describe what the speaker actually emits, or the
+    // canceller re-converges every time this moves.
+    float tts_volume = 1.0f;
+
     // ---- chunking (time-to-first-audio vs. prosody continuity) --------------
     // F5 is not streaming: TTFB equals full synthesis time for whatever text it
     // is given, so the only latency lever is giving it less at once. Each split
@@ -150,12 +170,69 @@ struct AssistantSettings {
     int  tts_min_chunk_chars = 20;     // [5, 50]   stops "Да," becoming an utterance
     int  tts_max_chunk_chars = 150;    // [50, 300] forces a split at the next space
 
-    // Gate the mic while the speaker is live. ON by default: there is no echo
-    // canceller in this build, so on open speakers the assistant otherwise hears
-    // itself, scores it as speech, and barges in on its own answer. The cost is
-    // real and is stated in the UI -- barge-in-while-speaking stops working, and
-    // the cancel button becomes the only way to interrupt.
-    bool tts_mic_gate = true;
+    // ---- acoustic echo cancellation -----------------------------------------
+    // ON by default, and the microphone is never muted: the assistant's own
+    // voice is SUBTRACTED from the capture stream (src/audio_rt/echo_canceller.hpp)
+    // rather than the stream being switched off, which is what makes full-duplex
+    // barge-in possible on open speakers. The predecessor of this setting was a
+    // mic gate; it is gone, and with it the reason the user could not interrupt.
+    //
+    // Turning this OFF is a diagnostic, not a mode: capture then carries the
+    // loudspeaker unmodified and the VAD will trigger on the assistant itself
+    // unless you are wearing headphones.
+    bool aec_enabled = true;
+    // How much room the adaptive filter can model, in milliseconds. Must cover
+    // the WHOLE speaker-to-microphone delay -- playback device buffer, flight
+    // time, capture buffer -- plus the reverberation tail; echo arriving later
+    // than this is uncancellable by construction. 256 ms is generous for a
+    // desktop. Raise it for a large or reverberant room; the CPU cost is linear
+    // and the convergence gets slower, so raising it "just in case" is not free.
+    int  aec_tail_ms = 256;
+
+    // ---- audio endpoints ----------------------------------------------------
+    // Endpoint NAMES, not ids: an id is a backend-specific blob that cannot be
+    // written into a settings file by hand, and the name is the only form a user
+    // can recognise. Empty = follow the system default, which is the right
+    // behaviour for a machine whose default changes when a headset is plugged in.
+    //
+    // Matching is case-insensitive and accepts a unique substring, so
+    // "Realtek" resolves if only one endpoint contains it (see
+    // audio_sandbox/src/ma_device_select.h). A name that does not resolve does
+    // NOT stop the app: it warns and falls back to the default. Launch with
+    // --list-audio-devices to print the exact strings.
+    //
+    // With loopback_capture ON, input_device_name names a PLAYBACK endpoint --
+    // loopback taps a speaker, not a microphone.
+    std::string output_device_name;    // "" = system default
+    std::string input_device_name;     // "" = system default
+
+    // The same two endpoints, addressed by the zero-based [N] the startup listing
+    // prints. -1 = not selected by index, which is the default and defers to the
+    // name above it.
+    //
+    // WHY BOTH FORMS EXIST rather than one replacing the other. A name survives a
+    // device being unplugged and re-enumerated; an index does not, because it is
+    // a position in a list the OS reorders. But a name has to be transcribed
+    // exactly out of strings like "Speakers (2- High Definition Audio Device)",
+    // and getting it wrong produces SILENCE -- the one failure mode that gives
+    // the user nothing to go on. An index is two keystrokes off a printed list.
+    // So: index for picking, name for stability, and the app prints the list at
+    // every startup so both stay checkable.
+    //
+    // AN INDEX >= 0 OVERRIDES A NAME. See rt::detail::resolve_device_selection;
+    // the short reason is that a stale name left in this file must not defeat the
+    // index the user just set to get away from it.
+    int output_device_index = -1;
+    int input_device_index  = -1;
+
+    // Capture gain, [0, 1], applied to every captured sample before anything
+    // reads them. UPSTREAM OF EVERYTHING ON PURPOSE: the VAD, the AEC and the
+    // ASR must all see the same signal the user is adjusting, or the meter in
+    // the UI stops predicting whether speech will actually trigger.
+    //
+    // A software gain on OUR stream, not the Windows endpoint level -- same
+    // reasoning as tts_volume, and the reason it can be Live.
+    float mic_gain = 1.0f;
 
     // ---- Tab 2: audio & speculative decoding --------------------------------
     bool neural_vad = true;            // Silero; false = the built-in RMS detector
@@ -287,10 +364,27 @@ void visit_fields(S& s, Fn&& f) {
     f("tts_ref_audio",            s.tts_ref_audio,            Tier::Restart);
     f("tts_ref_text",             s.tts_ref_text,             Tier::Restart);
     f("tts_nfe_step",             s.tts_nfe_step,             Tier::Restart);
+    // Live: the gain is read by the audio callback on every buffer, so a change
+    // is audible on the next one. Nothing is rebuilt and nothing re-synthesised.
+    f("tts_volume",               s.tts_volume,               Tier::Live);
+    // AudioHotReload: the device IS closed and reopened, but only the device --
+    // see the tier's declaration. The AEC's learned response is reset by the
+    // swap (it describes the old speaker), which costs a few hundred ms of
+    // re-convergence and is not a reason to restart a process holding 8 GB.
+    f("output_device_name",       s.output_device_name,       Tier::AudioHotReload);
+    f("input_device_name",        s.input_device_name,        Tier::AudioHotReload);
+    f("output_device_index",      s.output_device_index,      Tier::AudioHotReload);
+    f("input_device_index",       s.input_device_index,       Tier::AudioHotReload);
+    // Live: a plain gain on the capture samples, read per block like tts_volume.
+    f("mic_gain",                 s.mic_gain,                 Tier::Live);
     f("tts_split_on_commas",      s.tts_split_on_commas,      Tier::Restart);
     f("tts_min_chunk_chars",      s.tts_min_chunk_chars,      Tier::Restart);
     f("tts_max_chunk_chars",      s.tts_max_chunk_chars,      Tier::Restart);
-    f("tts_mic_gate",             s.tts_mic_gate,             Tier::Restart);
+    // Live: the filter is bypassable in place (and resets its learned response
+    // on the way back in), so toggling it costs nothing but a re-convergence.
+    // The tail sizes fixed buffers in the constructor, so that one is Restart.
+    f("aec_enabled",              s.aec_enabled,              Tier::Live);
+    f("aec_tail_ms",              s.aec_tail_ms,              Tier::Restart);
     // ---- Tab 3 -------------------------------------------------------------
     f("hotkey_talk",              s.hotkey_talk,              Tier::Live);
     f("hotkey_cancel",            s.hotkey_cancel,            Tier::Live);
@@ -354,6 +448,24 @@ inline void clamp_settings(AssistantSettings& s) {
     s.warm_prefill_interval_ms = clamp_int(s.warm_prefill_interval_ms, 0, 5000);
     if (s.history_budget_tokens < 0) s.history_budget_tokens = 0;
     if (s.device_id < 0) s.device_id = 0;
+    s.aec_tail_ms = clamp_int(s.aec_tail_ms, 64, 1000);
+    // NaN-safe: `!(v >= lo)` is true for NaN where `v < lo` is false, and a NaN
+    // gain would silence the speaker AND poison the canceller's reference.
+    if (!(s.tts_volume >= 0.0f)) s.tts_volume = 0.0f;
+    if (s.tts_volume > 1.0f) s.tts_volume = 1.0f;
+    if (!(s.mic_gain >= 0.0f)) s.mic_gain = 0.0f;   // NaN-safe, as above
+    if (s.mic_gain > 1.0f) s.mic_gain = 1.0f;
+    // Endpoint names are matched literally, so a pasted trailing space is a name
+    // that will not resolve and will fall back to the default with no clue why.
+    trim(s.output_device_name);
+    trim(s.input_device_name);
+    // Only the negative side is normalised, to exactly -1. There is deliberately
+    // NO upper clamp: this header cannot see the device list, and clamping an
+    // index to a count it would have to guess is how "device 9" quietly becomes
+    // "device 2". Out-of-range is caught where the list is actually in hand
+    // (resolve_device_by_index), which warns and takes the system default.
+    if (s.output_device_index < 0) s.output_device_index = -1;
+    if (s.input_device_index < 0)  s.input_device_index  = -1;
     if (s.context_mode != "stateless" && s.context_mode != "bounded") {
         s.context_mode = "bounded";
     }
@@ -439,6 +551,22 @@ inline std::string restart_signature(const AssistantSettings& s) {
 // Does moving from `a` to `b` need a fresh process?
 inline bool requires_restart(const AssistantSettings& a, const AssistantSettings& b) {
     return restart_signature(a) != restart_signature(b);
+}
+
+// The same trick for the hot-reload tier: one comparison answers "does a device
+// have to be reopened?". Separate from requires_restart so a settings save can
+// do the cheap thing when only an endpoint moved -- which is the common case and
+// the one that must never cost a process restart.
+inline std::string audio_signature(const AssistantSettings& s) {
+    nlohmann::json j;
+    visit_fields(s, [&](const char* key, const auto& value, Tier tier) {
+        if (tier == Tier::AudioHotReload) j[key] = value;
+    });
+    return j.dump();
+}
+
+inline bool requires_audio_reload(const AssistantSettings& a, const AssistantSettings& b) {
+    return audio_signature(a) != audio_signature(b);
 }
 
 // Where the file lives: %LOCALAPPDATA%\BlackwellVoiceAssistant\settings.json.

@@ -432,6 +432,53 @@ Mitigations, cheapest first:
    sample-aligned reference signal that §3.2 explicitly gave up. Revisit only if
    barge-in-while-speaking becomes a requirement.
 
+#### 3.5.1 What actually shipped — and why it ended up back at option 1
+
+Written after the fact, because the route taken here is not the one this section
+recommended and the reasons are worth keeping.
+
+**Option 4 was built.** Barge-in-while-speaking *did* become a requirement, so the
+sample-aligned reference §3.2 gave up was reclaimed: `TTSDuplexBridge::PullForPlayback`
+taps the reference at the device callback, and `AecCaptureFilter`
+(`src/audio_rt/aec_capture_filter.hpp`) resamples it, bounds the backlog and drives a
+block-FDAF canceller. Option 1's mic gate was deleted outright. The lab result is good and
+is pinned by `tests/vad/aec_barge_in_test.cpp`: **87% of chunks hot before cancellation,
+0% after**, with the interrupting user still detected on 83% of double-talk chunks at a
+32 ms onset cost.
+
+**And it was not sufficient in the room.** The gap between that number and the product is
+clock drift. The two `ma_device`s run on independent WASAPI clocks; the synchroniser
+bounds the backlog by *discarding* reference samples when it grows past the ceiling, and
+each discard is a resync the filter re-converges from. During those windows the canceller
+subtracts misaligned speech, which does not attenuate — it doubles. A residue peak crosses
+any fixed probability bar, and one block is all a barge-in needs. The intermediate fix (a
+raised bar of 0.92 while speaking, rather than a mute) is a *statistical* bound on a signal
+whose worst case is set by clock drift, and it failed the same way for the same reason.
+
+**So the guard is now state, not level** — option 1's shape, with two corrections that
+address why it was rejected the first time:
+
+- **The authority is the SPEAKER, not the ring.** `AudioPlayback::is_playing_tts()`
+  (`audio_sandbox/include/audio_playback.h`) latches on real frames reaching the device and
+  clears only after the ring has been dry for `kAcousticTailMs` (250 ms), counted on the
+  audio clock. `TTSDuplexBridge::speaking()` — the ring — goes false while WASAPI still
+  holds buffers and the room is still ringing, which is precisely the loudest part of the
+  tail to re-arm a VAD onto. §3.5's "~150 ms tail" was the right instinct and the wrong
+  number and the wrong clock.
+- **It masks the VERDICT, not the microphone.** `speech_pipeline_set_vad_suppressed`
+  short-circuits `evaluate_block` above *both* detectors and freezes every transition in
+  `vad_on_block` — but PCM keeps flowing to the ring, so pre-roll, the level meter and
+  speculative warming all survive, which is what the deleted mic gate broke. Freezing the
+  silence clock (rather than feeding it fabricated silence) is load-bearing: without it a
+  held mask auto-commits an open utterance on evidence that was never gathered. Pinned by
+  `tests/bridge/speech_pipeline_vad_suppressor_test.cpp`.
+
+**The honest cost is the one §3.5 named, and it is now paid deliberately:** voice barge-in
+does not work while the assistant is audible. The cancel control and its hotkey are the way
+out and are not gated. The AEC is *not* redundant — it carries the 250 ms after the lock
+lifts, when the room is still ringing and the user may already be talking, and it is what
+keeps `Loopback` from being the unbounded case in the table above.
+
 ---
 
 ## 4. Application state & UI integration
@@ -620,13 +667,26 @@ Revised once AEC replaced the hard interlock as the barge-in strategy. Each phas
 shippable app; **the interlock stays as a safety net through Phase 4 and is removed in
 Phase 5**, so no build ever ships that can self-trigger.
 
+> **Landed 2026-08 — and NOT the way this section planned it.** Phases 2/3 were skipped
+> rather than deferred: the output path arrived as `AudioPlayback` + `TTSDuplexBridge` on a
+> **separate** playback device, so the "duplex refactor" that Phase 3 describes (rewriting
+> `audio_capture`, replacing `SampleRing`) never happened and is no longer required — the
+> alignment it existed to provide is done on the consumer side by `AecCaptureFilter`
+> instead. Phase 4 shipped an **in-house** canceller rather than SpeexDSP: `blackwell_audio_rt`
+> is dependency-free by construction (see its `CMakeLists.txt`), and vendoring an autotools
+> DSP library to get a 256-point FFT and an NLMS loop was the larger change. The **dual tap**
+> was dropped because the pipeline has ONE PCM feed serving both Silero and Whisper
+> (`speech_pipeline_push_pcm`) — splitting it is a pipeline API change, not an AEC one, and
+> the suppressor is unity-gain whenever nothing is playing, so the ASR path pays nothing in
+> the common case. The mic interlock is **gone**, config and all.
+
 | Phase | Deliverable | Status |
 |---|---|---|
 | **1 — Foundation** | `IPhonemizer` seam + passthrough frontend; `SpscRing<T>`; `TranscriptModel` stable IDs; `blackwell_tts` + `tts_tests`. | **done** |
 | **2 — Output path** | `PcmSink` + playback `ma_device` + test tone + xrun readout; pin miniaudio. | not started |
 | **3 — Duplex refactor** | New `audio_device` (leave `audio_capture` alone for `audio_realtime`); 16 kHz duplex; fixed-block adapter; `SpscRing` replaces `SampleRing`; delay calibration. Loopback stays non-duplex, permanently interlocked. | not started |
-| **4 — AEC** | `IEchoCanceller` seam; SpeexDSP first, AEC3 as the escalation; **dual tap** (aggressive → VAD, linear-only → Whisper); ERLE metering. | not started |
-| **5 — `TtsWorker`** | Worker lifecycle, `speak_epoch`, sentence chunking, ORT `intra_op_num_threads = 2`; **interlock removed, barge-in enabled**. | not started |
+| **4 — AEC** | `IEchoCanceller` seam + an in-house partitioned-block FDAF behind it (`src/audio_rt/echo_canceller.*`), WOLA residual suppressor, `RationalResampler` (24 k → 16 k) and `AecCaptureFilter` (far-end alignment); ERLE metering. | **done** (2026-08) |
+| **5 — `TtsWorker`** | Worker lifecycle, `speak_epoch`, sentence chunking, ORT `intra_op_num_threads = 2`; **interlock removed, barge-in enabled**. | **interlock removed** (2026-08); worker lifecycle landed with `TtsRuntime` |
 | **6 — Mode policy & UI** | `TtsPolicy` on `ISpeechMode`; per-utterance `[▶]`; voice/auto-speak panel. | not started |
 
 **Still blocking:** the licensing question in §1.2. Phase 1 was deliberately built so that it
@@ -675,6 +735,19 @@ to the capture clock — which in turn means revisiting the separate-device deci
 favor of duplex, and duplex is incompatible with the loopback capture path. That chain is the
 actual risk in this feature, and it is worth deciding deliberately now rather than
 discovering it at T5.
+
+**RESOLVED 2026-08, and the feared chain did not materialise.** The prediction above was that
+buying back barge-in would force the separate-device decision (§3.2) over to duplex, and that
+duplex would break loopback capture. It did not, because the premise was wrong: what an AEC
+needs is not a reference on the same *device clock*, it is a reference whose BACKLOG relative
+to the microphone is bounded and never negative. `TTSDuplexBridge::PullForPlayback` supplies
+the first half by tapping the reference where samples are handed to the device (so it leads
+the microphone rather than trailing it), and `AecCaptureFilter` supplies the second by
+draining that ring aggressively and discarding the oldest reference whenever the backlog
+passes a ceiling. A reference running slightly *ahead* is just a longer impulse response,
+which is exactly what an adaptive FIR is for. The separate-device architecture stands, the
+loopback path is untouched, and the fix turned out to be additive after all — it lives in the
+mode's PCM tap and nowhere else. The mic gate it replaced is deleted.
 
 **Runner-up: the phonemizer (§1.2).** Higher raw effort, and possibly weeks of it — but the
 effort is *contained* behind one interface, and the decision is a licensing question with a

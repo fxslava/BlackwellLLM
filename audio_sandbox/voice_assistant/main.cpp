@@ -56,6 +56,7 @@
 #include <objbase.h>   // CoInitializeEx / COINIT_APARTMENTTHREADED (WIN32_LEAN_AND_MEAN
                        // drops <ole2.h> from <windows.h>, so pull it in explicitly)
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -70,6 +71,7 @@
 #include <vector>
 
 #include "audio_capture.h"
+#include "audio_devices.h"
 #include "audio_recorder.h"   // realtime_dsp.h only forward-declares AudioRecorder
 #include "realtime_dsp.h"
 #include "whisper_dsp.h"
@@ -111,6 +113,10 @@
 // blackwell::onnxruntime, which blackwell_tts_f5 links PRIVATE, so it never
 // reaches here and the whole integration silently vanishes from the binary.
 #include "tts_runtime.hpp"
+// The capture-side half of full duplex. Gated with the TTS because it is the
+// loudspeaker that creates the problem it solves: with no speech output there is
+// no echo, and no far-end reference to cancel one with.
+#include "aec_capture_filter.hpp"
 #define VOICE_ASSISTANT_HAS_TTS 1
 #endif
 
@@ -133,6 +139,11 @@ struct TypedFlags {
     bool no_neural_vad = false;
     bool context_mode = false;
     bool history_budget = false;
+    bool output_device = false;
+    bool input_device = false;
+    bool output_device_index = false;
+    bool input_device_index = false;
+    bool tts_volume = false;
 };
 
 // voice_assistant's OWN flags, layered over the shared rt::parse_cli. rt::parse_cli
@@ -140,6 +151,23 @@ struct TypedFlags {
 // silently ignored), so the flags that exist only here are removed before it runs.
 struct VoiceArgs {
     int device_id = 0;   // --device <id>
+    // Audio ENDPOINTS -- unrelated to device_id above, which is a CUDA device.
+    // The names are deliberately unambiguous (--audio-output / --audio-input)
+    // because "--device" already means something else here.
+    std::string output_device;
+    std::string input_device;
+    // The index form of the same two endpoints, -1 = unset. Kept separate from
+    // the names rather than overloading one flag with "a number means an index":
+    // an endpoint genuinely called "2" would then be unaddressable by name.
+    int output_device_index = -1;
+    int input_device_index = -1;
+    float tts_volume = 1.0f;
+    bool list_audio_devices = false;   // print the endpoints and exit
+    bool check_volume = false;         // measure the software gain and exit
+    std::string say;                   // --say "<text>": speak it and exit
+    // --test-llm-tts ["<prompt>"]: the FULL stack, one injected turn, then exit.
+    // Empty string = not requested; the flag supplies a default prompt.
+    std::string test_llm_tts;
     TypedFlags typed;
 };
 
@@ -160,6 +188,36 @@ VoiceArgs parse_voice_args(int argc, char** argv, std::vector<char*>& passthroug
             // Opt into parse_cli's resolved default checkpoint without naming a
             // path. Ours alone -- it would be rejected downstream.
             v.typed.real = true;
+        } else if (std::strcmp(a, "--list-audio-devices") == 0) {
+            v.list_audio_devices = true;
+        } else if (std::strcmp(a, "--check-volume") == 0) {
+            v.check_volume = true;
+        } else if (std::strcmp(a, "--say") == 0 && i + 1 < argc) {
+            v.say = argv[++i];
+        } else if (std::strcmp(a, "--test-llm-tts") == 0) {
+            // Optional argument: the next token is the prompt only if it is not
+            // itself a flag, so `--test-llm-tts --real` does not silently
+            // swallow --real and then generate a reply to the word "--real".
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                v.test_llm_tts = argv[++i];
+            } else {
+                v.test_llm_tts = "Привет! Как дела?";
+            }
+        } else if (std::strcmp(a, "--audio-output") == 0 && i + 1 < argc) {
+            v.output_device = argv[++i];
+            v.typed.output_device = true;
+        } else if (std::strcmp(a, "--audio-input") == 0 && i + 1 < argc) {
+            v.input_device = argv[++i];
+            v.typed.input_device = true;
+        } else if (std::strcmp(a, "--audio-output-index") == 0 && i + 1 < argc) {
+            v.output_device_index = std::atoi(argv[++i]);
+            v.typed.output_device_index = true;
+        } else if (std::strcmp(a, "--audio-input-index") == 0 && i + 1 < argc) {
+            v.input_device_index = std::atoi(argv[++i]);
+            v.typed.input_device_index = true;
+        } else if (std::strcmp(a, "--tts-volume") == 0 && i + 1 < argc) {
+            v.tts_volume = static_cast<float>(std::atof(argv[++i]));
+            v.typed.tts_volume = true;
         } else {
             // Record what the shared parser is about to consume, then hand it on.
             if (std::strcmp(a, "--model-dir") == 0)      v.typed.model_dir = true;
@@ -177,6 +235,209 @@ VoiceArgs parse_voice_args(int argc, char** argv, std::vector<char*>& passthroug
     return v;
 }
 
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+// ---- --check-volume: does the volume setting actually change the loudness? ---
+//
+// A self-test rather than a claim. Software volume is one multiply in an audio
+// callback, which is exactly the kind of code that is "obviously correct" and
+// silently does nothing -- the gain never reaching the callback, or reaching it
+// once and never updating, both look identical from the outside and neither
+// shows up in a build log.
+//
+// So this MEASURES it, through the production path and nothing else: the real
+// AudioPlayback on the configured endpoint, with WASAPI loopback recording that
+// same endpoint's output. It plays a tone at full gain, changes the volume WHILE
+// PLAYING (which is the part that must work without a restart), and reports the
+// measured ratio of the two.
+//
+// It makes an audible sound, which is why it is opt-in and brief.
+struct ToneState {
+    double phase = 0.0;
+    double step = 0.0;
+};
+
+// A generator can never starve, so every frame it returns is a real one.
+std::size_t tone_pull(void* user, float* dst, std::size_t frames) {
+    auto* t = static_cast<ToneState*>(user);
+    for (std::size_t i = 0; i < frames; ++i) {
+        dst[i] = static_cast<float>(0.2 * std::sin(t->phase));
+        t->phase += t->step;
+        if (t->phase > 6.283185307179586) t->phase -= 6.283185307179586;
+    }
+    return frames;
+}
+
+// Measures the amplitude of the 1 kHz TONE specifically, by Goertzel, rather
+// than the broadband RMS of everything the endpoint is playing.
+//
+// This is not fussiness. Loopback captures the whole system mix, so a broadband
+// measurement adds a noise floor `n` in quadrature to both readings: at unity it
+// is invisible (sqrt(A^2 + n^2) ~ A), but at a quarter gain it dominates
+// sqrt((A/4)^2 + n^2) and inflates the ratio. Measured that way this test
+// reported 0.302 for a gain of exactly 0.250 -- correct hardware, misleading
+// number, and the one thing a volume self-test must never do is make working
+// volume look broken. A single-bin DFT at the tone's own frequency rejects
+// everything else in the mix.
+//
+// Drains first: the ring holds audio produced at the PREVIOUS gain, and
+// averaging across the change would report the mean of two answers.
+double measure_tone(rt::AudioCapture& cap, int ms) {
+    // Capture is fixed at 16 kHz (audio_capture.h), regardless of the rate the
+    // tone was synthesised at.
+    constexpr double kCaptureRate = 16000.0;
+    constexpr double kToneHz = 1000.0;
+    const double coeff = 2.0 * std::cos(6.283185307179586 * kToneHz / kCaptureRate);
+
+    std::vector<float> buf(4096);
+    while (cap.ring().pop(buf.data(), buf.size()) != 0) {}
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+
+    double s1 = 0.0, s2 = 0.0;
+    std::size_t n = 0;
+    for (;;) {
+        const std::size_t got = cap.ring().pop(buf.data(), buf.size());
+        if (got == 0) break;
+        for (std::size_t i = 0; i < got; ++i) {
+            const double s = static_cast<double>(buf[i]) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        n += got;
+    }
+    if (n == 0) return 0.0;
+    const double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+    return 2.0 * std::sqrt(power < 0.0 ? 0.0 : power) / static_cast<double>(n);
+}
+
+int run_volume_check(const rt::AssistantSettings& settings) {
+    std::printf("=== volume self-test (a 1 kHz tone will play for ~3 seconds) ===\n");
+    try {
+        rt::AudioPlayback playback;
+        ToneState tone;
+        tone.step = 6.283185307179586 * 1000.0 /
+                    static_cast<double>(blackwell::tts::kF5SampleRate);
+        playback.set_volume(1.0f);
+        playback.start(blackwell::tts::kF5SampleRate, &tone_pull, &tone,
+                       settings.output_device_name, settings.output_device_index);
+        std::printf("  output   : %s\n", playback.device_name().empty()
+                                             ? "(system default)"
+                                             : playback.device_name().c_str());
+
+        // Loopback on the SAME endpoint -- measuring a different speaker would
+        // measure nothing. In loopback mode both selectors refer to a PLAYBACK
+        // device, which is why the OUTPUT name and index are the ones passed
+        // here; the input_* settings would name the wrong list entirely.
+        rt::AudioCapture cap;
+        cap.start(rt::CaptureMode::Loopback, settings.output_device_name,
+                  settings.output_device_index);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));   // device settle
+        const double full = measure_tone(cap, 700);
+
+        // THE POINT OF THE TEST: changed while the device is running, with no
+        // restart and no re-synthesis.
+        constexpr float kQuiet = 0.25f;
+        playback.set_volume(kQuiet);
+        // Longer than the endpoint's buffer: samples already handed to WASAPI
+        // carry the OLD gain and are still going to be emitted.
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const double quiet = measure_tone(cap, 700);
+
+        cap.stop();
+        playback.stop();
+
+        std::printf("  1 kHz level at 100%%: %.5f\n  1 kHz level at  25%%: %.5f\n", full,
+                    quiet);
+        if (full < 1e-5) {
+            std::printf("  INCONCLUSIVE: nothing was captured. The endpoint may not "
+                        "support loopback, or it is muted at the OS level.\n");
+            return 1;
+        }
+        const double ratio = quiet / full;
+        std::printf("  measured ratio: %.3f (expected %.3f)\n", ratio,
+                    static_cast<double>(kQuiet));
+        // Still a physical measurement through a shared endpoint, so the band is
+        // wider than the instrument: the question is "does the gain apply, live",
+        // not "is it accurate to a percent".
+        const bool ok = ratio > 0.18 && ratio < 0.33;
+        std::printf("  %s\n", ok ? "PASS -- the volume setting takes effect immediately."
+                                 : "FAIL -- the gain did not track the setting.");
+        return ok ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  volume self-test could not run: %s\n", e.what());
+        return 1;
+    }
+}
+
+// --say "<text>": drive the SPEECH HALF of a turn with no LLM and no microphone.
+//
+// WHAT IT PROVES, AND WHAT IT DOES NOT. It pushes text through exactly the calls
+// the dispatcher's answer stream makes -- Resume(), PushToken(), EndOfTurn() --
+// so everything downstream of "the answer exists as text" is under test:
+// chunker, F5 tokenizer, CUDA synthesis, the speaker ring, the device.
+//
+// It does NOT test the LLM -> dispatcher -> here wiring, because it stands in
+// for the LLM. That half has no headless entry point: a real turn needs a
+// microphone or the typed box in the UI. So a PASS here plus a
+// "[answer->tts] pushed ... (N chars)" line in a live run is what covers the
+// whole path; this alone covers the half where the failure usually is, and is
+// the only half that can be checked without a person talking.
+int run_say_check(const rt::AssistantSettings& settings, const std::string& text) {
+    std::printf("=== speech self-test: synthesising %zu chars ===\n", text.size());
+    try {
+        rt::TtsRuntimeConfig tcfg;
+        tcfg.ckpt_dir            = settings.tts_ckpt_dir;
+        tcfg.vocab_path          = settings.tts_vocab_path;
+        tcfg.ref_audio           = settings.tts_ref_audio;
+        tcfg.ref_text            = settings.tts_ref_text;
+        tcfg.nfe_step            = settings.tts_nfe_step;
+        tcfg.split_on_commas     = settings.tts_split_on_commas;
+        tcfg.min_chunk_chars     = settings.tts_min_chunk_chars;
+        tcfg.max_chunk_chars     = settings.tts_max_chunk_chars;
+        tcfg.output_device       = settings.output_device_name;
+        tcfg.output_device_index = settings.output_device_index;
+        tcfg.volume              = settings.tts_volume;
+
+        rt::TtsRuntime tts(tcfg);
+        std::printf("  output   : %s\n", tts.output_device().empty()
+                                             ? "(system default)"
+                                             : tts.output_device().c_str());
+
+        // The dispatcher's exact call sequence. Resume() first for the same
+        // reason it is on the dispatch-start edge: without it a barge-in latch
+        // left set from a previous turn silently eats every token.
+        tts.Resume();
+        tts.PushToken(text);
+        tts.EndOfTurn();
+
+        // Wait for the worker to drain, bounded. Synthesis runs several times
+        // faster than realtime, so anything past this is a hang, not slowness.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (tts.chunks_spoken() > 0 && !tts.speaking()) break;
+            if (tts.synthesis_errors() > 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        // Let the tail actually reach the speaker before the dtor stops the
+        // device -- otherwise a PASS would be reported for audio nobody heard.
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+        const bool ok = tts.chunks_spoken() > 0 && tts.synthesis_errors() == 0;
+        std::printf("  chunks spoken: %llu | cancelled: %llu | errors: %llu\n",
+                    static_cast<unsigned long long>(tts.chunks_spoken()),
+                    static_cast<unsigned long long>(tts.chunks_cancelled()),
+                    static_cast<unsigned long long>(tts.synthesis_errors()));
+        std::printf("  %s\n", ok ? "PASS -- text handed to the TTS was synthesised and played."
+                                 : "FAIL -- nothing reached the speaker; see the [tts-worker] "
+                                   "lines above for where it stopped.");
+        return ok ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  speech self-test could not run: %s\n", e.what());
+        return 1;
+    }
+}
+#endif  // VOICE_ASSISTANT_HAS_TTS
+
 // ---- speech-pipeline callbacks (engine / VAD threads) -----------------------
 // They may only hand results to the thread-safe view -- never a window, COM,
 // CUDA, or a re-entrant pipeline call.
@@ -189,6 +450,28 @@ struct AppContext {
     // Every use below is guarded, because "the assistant cannot speak" must
     // never become "the assistant cannot answer".
     rt::TtsRuntime* tts = nullptr;
+    // The echo canceller sitting in the capture path. Null exactly when `tts` is
+    // null: with no loudspeaker there is no echo and no reference to cancel it
+    // with. It is a POINTER here rather than being reached through `tts` because
+    // it belongs to the capture side -- the settings handler and the PCM tap
+    // touch it, and neither of them has any business in the TTS stack.
+    blackwell::audio_rt::AecCaptureFilter* aec = nullptr;
+
+    // The answer text as it is handed to the speaker, accumulated purely to be
+    // LOGGED once the turn ends. It is not the source of what gets spoken --
+    // PushToken already streamed every fragment as it arrived, which is what
+    // gives time-to-first-audio; re-pushing this at the end would say everything
+    // twice.
+    //
+    // THREADING. on_text runs on the ENGINE thread for the local leg and the
+    // DISPATCHER thread for the remote one, and on_complete on the dispatcher
+    // thread either way. For the local leg the dispatcher is parked inside
+    // send() for the whole generation, so the two never actually overlap -- but
+    // "never overlaps" here is a property of another header's blocking
+    // behaviour, and a mutex costs nothing on a per-token path that already
+    // takes one inside PushToken.
+    std::mutex answer_mu;
+    std::string answer_text;
 #endif
 };
 
@@ -276,8 +559,70 @@ void on_text_sink(void* user, const char* /*utf8*/, std::int32_t /*index*/,
 // Runs on the DSP worker, once per 10 ms block. That thread is the SINGLE owner
 // of the SileroVAD instance (the class's threading contract); the UI thread only
 // reads its published atomics.
+// THE SELF-BARGE-IN GUARD, and the reason it is now a MUTE rather than a bar.
+//
+// The microphone stays open while the assistant talks -- that is the whole
+// point of full duplex, and the echo canceller is what makes it survivable. But
+// the AEC is an ADAPTIVE filter: it converges over a few hundred milliseconds,
+// it never reaches perfect cancellation, and it degrades on a loud speaker in a
+// live room. The residue it leaves is speech-shaped, because it IS speech, and
+// Silero is very good at recognising speech. So the assistant hears itself,
+// scores high, and barges in on its own sentence -- measured as
+// `chunks cancelled` with nobody in the room talking.
+//
+// WHAT WAS TRIED FIRST, AND WHY IT DID NOT HOLD. The previous guard raised the
+// bar instead of closing it: while emitting, a barge-in had to clear 0.92 rather
+// than the configured threshold. That is a STATISTICAL argument -- it assumes
+// the residue stays below a number -- and the assumption fails in exactly the
+// conditions that matter. The two devices run on independent WASAPI clocks and
+// drift; every resync re-opens a window in which the canceller is subtracting
+// misaligned audio, and misaligned speech does not attenuate, it doubles. A
+// residue peak crosses 0.92 during that window, and one block is all a barge-in
+// needs. Raising the constant further only moves the failure onto the user's
+// real interruptions.
+//
+// SO THE GUARD IS NOW STATE, NOT LEVEL. While the playback time-lock is set --
+// real audio in flight, plus AudioPlayback::kAcousticTailMs of room -- the score
+// is zero. Not scaled, not thresholded: zero. This is deterministic. It does not
+// depend on how well the canceller converged, on the volume, on the room, or on
+// whether the two clocks happen to be aligned this second, which is precisely
+// the set of things that made the previous guard unreliable.
+//
+// WHAT IT COSTS, STATED PLAINLY. Voice barge-in does not work while the
+// assistant is audible. That is the same capability the old microphone gate cost
+// (recorded as a mistake in tts_runtime.hpp) and it is being paid deliberately
+// this time: self-interruption made long answers unusable, and an assistant that
+// cannot finish a sentence is worse than one that has to be stopped by hand. The
+// cancel control and its hotkey are the way out and are NOT gated -- see
+// cb.on_cancel, which bumps the epoch and calls BargeIn() directly.
+struct VadContext {
+    blackwell::vad::SileroVAD* vad = nullptr;
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+    rt::TtsRuntime** tts = nullptr;   // indirect: the runtime is built later
+#endif
+};
+
 float vad_score(void* user, const float* block, size_t count) {
-    return static_cast<blackwell::vad::SileroVAD*>(user)->feed(block, count);
+    auto* ctx = static_cast<VadContext*>(user);
+    if (ctx == nullptr || ctx->vad == nullptr) return 0.0f;
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+    // THE TIME-LOCK, checked BEFORE feed() and returning without it.
+    //
+    // Not feeding the model while masked is deliberate and not an optimisation:
+    // Silero is recurrent, it carries an LSTM state across blocks, and feeding it
+    // our own echo leaves that state primed on the assistant's voice. The first
+    // genuine block after the lock lifts would then be scored in the context of
+    // a sentence the user never spoke.
+    //
+    // The pipeline's own suppressor (speech_pipeline_set_vad_suppressed, pushed
+    // from the capture tap) enforces the same window one level down, so the
+    // guarantee does not rest on this branch alone -- and holds identically on
+    // the RMS fallback path, which never reaches this function at all.
+    if (ctx->tts != nullptr && *ctx->tts != nullptr && (*ctx->tts)->is_playing_tts()) {
+        return 0.0f;
+    }
+#endif
+    return ctx->vad->feed(block, count);
 }
 #endif
 
@@ -392,6 +737,17 @@ int main(int argc, char** argv) {
     rt::TranslatorArgs args;
     std::vector<char*> shared_argv;
     const VoiceArgs vargs = parse_voice_args(argc, argv, shared_argv);
+
+    // Answered BEFORE anything else is parsed, loaded or opened: this is the
+    // flag someone reaches for precisely because the app will not start, or
+    // because it started on the wrong speaker. Requiring a valid checkpoint to
+    // find out what the audio endpoints are called would defeat it.
+    if (vargs.list_audio_devices) {
+        rt::print_audio_devices();
+        CoUninitialize();
+        return 0;
+    }
+
     try {
         args = rt::parse_cli(static_cast<int>(shared_argv.size()), shared_argv.data());
     } catch (const std::exception& e) {
@@ -411,7 +767,46 @@ int main(int argc, char** argv) {
     if (typed.no_neural_vad)  settings.neural_vad = false;
     if (typed.context_mode)   settings.context_mode = args.context_mode;
     if (typed.history_budget) settings.history_budget_tokens = args.history_budget_tokens;
+    if (typed.output_device)  settings.output_device_name = vargs.output_device;
+    if (typed.input_device)   settings.input_device_name = vargs.input_device;
+    if (typed.output_device_index) settings.output_device_index = vargs.output_device_index;
+    if (typed.input_device_index)  settings.input_device_index = vargs.input_device_index;
+    if (typed.tts_volume)     settings.tts_volume = vargs.tts_volume;
     rt::clamp_settings(settings);
+
+    // After the settings resolve (so it honours a configured output device) but
+    // before anything heavy loads: this test needs an audio endpoint and nothing
+    // else -- no checkpoint, no GPU, no window.
+    if (vargs.check_volume) {
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+        const int rc = run_volume_check(settings);
+        CoUninitialize();
+        return rc;
+#else
+        std::fprintf(stderr,
+                     "--check-volume needs the speech-output stack, which this build "
+                     "does not have (blackwell_tts_f5 absent).\n");
+        CoUninitialize();
+        return 2;
+#endif
+    }
+
+    // Same placement and the same reasoning as --check-volume, one tier heavier:
+    // this one loads the F5 graphs onto the GPU, but still no checkpoint, no
+    // engine and no window.
+    if (!vargs.say.empty()) {
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+        const int rc = run_say_check(settings, vargs.say);
+        CoUninitialize();
+        return rc;
+#else
+        std::fprintf(stderr,
+                     "--say needs the speech-output stack, which this build does not "
+                     "have (blackwell_tts_f5 absent).\n");
+        CoUninitialize();
+        return 2;
+#endif
+    }
 
     // THE decision. Everything downstream is written against the base type.
     const bool use_real = !settings.simulated && !settings.model_dir.empty();
@@ -446,7 +841,31 @@ int main(int argc, char** argv) {
                     settings.simulated ? "  [Simulated selected]"
                                        : "  [no model directory configured]");
     }
+    // Reports the selector that will actually be CONSULTED, applying the same
+    // index-beats-name precedence resolve_device_selection does. Printing both
+    // when both are set would be honest about the config and misleading about
+    // the behaviour -- and this line exists to predict the behaviour.
+    const auto endpoint_desc = [](const std::string& name, int index) {
+        if (index >= 0) return "index " + std::to_string(index);
+        return name.empty() ? std::string("(system default)") : name;
+    };
+    std::printf("  audio in    : %s\n",
+                endpoint_desc(settings.input_device_name, settings.input_device_index).c_str());
+    std::printf("  audio out   : %s  @ %.0f%% volume\n",
+                endpoint_desc(settings.output_device_name, settings.output_device_index).c_str(),
+                static_cast<double>(settings.tts_volume) * 100.0);
     std::printf("  settings    : %s\n", rt::settings_path().c_str());
+
+    // The endpoint list, at launch, every launch. It is a few lines on a typical
+    // box and it is the difference between "the assistant is silent" being a
+    // ten-second fix and an evening: the [N] printed here is EXACTLY what
+    // output_device_index / input_device_index select with, and the names are
+    // EXACTLY the strings output_device_name / input_device_name accept.
+    //
+    // AFTER the two lines above, deliberately. Those say which endpoint is
+    // configured; this says what the endpoints are. Read in that order, a
+    // mismatch is visible on one screen without scrolling back.
+    rt::print_audio_devices();
 
     try {
         // ---- audio front-end ------------------------------------------------
@@ -466,8 +885,12 @@ int main(int argc, char** argv) {
 
         rt::AudioCapture capture;
         capture.start(settings.loopback_capture ? rt::CaptureMode::Loopback
-                                                : rt::CaptureMode::Microphone);
-        std::printf("capture started (%s, 16 kHz mono f32)\n", capture.backend_name().c_str());
+                                                : rt::CaptureMode::Microphone,
+                      settings.input_device_name, settings.input_device_index);
+        std::printf("capture started (%s, 16 kHz mono f32) on %s\n",
+                    capture.backend_name().c_str(),
+                    capture.device_name().empty() ? "the system default device"
+                                                  : capture.device_name().c_str());
         rt::RealTimeDSP realtime(dsp, capture.ring(), spectrogram, &recorder);
 
         // ---- the control plane ----------------------------------------------
@@ -679,6 +1102,10 @@ int main(int argc, char** argv) {
             // which is why it is here and not on a pipeline state -- the
             // pipeline's DECODE state belongs to the transcription pass.
             if (app_ctx.tts != nullptr) app_ctx.tts->Resume();
+            {
+                const std::lock_guard<std::mutex> lk(app_ctx.answer_mu);
+                app_ctx.answer_text.clear();
+            }
 #endif
         });
         dispatcher.set_on_text([&view, &app_ctx](std::string_view s) {
@@ -689,6 +1116,10 @@ int main(int argc, char** argv) {
             // and returns, so neither is blocked and all synthesis stays on the
             // TTS worker.
             if (app_ctx.tts != nullptr) app_ctx.tts->PushToken(s);
+            {
+                const std::lock_guard<std::mutex> lk(app_ctx.answer_mu);
+                app_ctx.answer_text.append(s);
+            }
 #endif
         });
         dispatcher.set_on_complete(
@@ -705,6 +1136,34 @@ int main(int argc, char** argv) {
                 // streamed a partial sentence, and leaving it buffered would
                 // splice it onto the FRONT of the next reply.
                 if (app_ctx.tts != nullptr) app_ctx.tts->EndOfTurn();
+
+                // THE HANDOFF LINE. This is the seam people go looking for when
+                // the assistant answers on screen but says nothing, so it prints
+                // the text that reached the speaker and how much of it there was.
+                //
+                // It is logged HERE, on the answer stream's completion, and not
+                // at the commit gate. The gate sits one stage EARLIER and on the
+                // other sequence: it decides whether the user's TRANSCRIPT
+                // becomes an intent worth dispatching. Its "EOS -> DISPATCHED (N
+                // tokens)" line counts transcript tokens, and the answer that
+                // follows deliberately never re-enters it -- see the block above
+                // on_token(), and generate_local_reply(), which calls
+                // finalize_turn() and pointedly not publish_turn().
+                //
+                // A 0-char line here means the LLM emitted nothing (look up at
+                // [Decode Stop]); a non-zero line with no [tts-worker] line
+                // after it means the text died between the chunker and the
+                // synthesiser, which is the next place to look.
+                std::string spoken;
+                {
+                    const std::lock_guard<std::mutex> lk(app_ctx.answer_mu);
+                    spoken.swap(app_ctx.answer_text);
+                }
+                if (app_ctx.tts != nullptr) {
+                    std::printf("[answer->tts] pushed LLM response to TTS (%zu chars): \"%s\"\n",
+                                spoken.size(), spoken.c_str());
+                    std::fflush(stdout);
+                }
 #endif
             });
         dispatcher.start();
@@ -712,6 +1171,8 @@ int main(int argc, char** argv) {
         // ---- optional Silero neural VAD --------------------------------------
         // Constructed BEFORE the mode and outliving it: the ORT session is a
         // startup-cost resource. Non-fatal, like the audio head.
+        // Outlives the pipeline that reads it through vad_user; see vad_score.
+        VadContext vad_ctx;
         SpeechVadScoreFn vad_fn = nullptr;
         void* vad_user = nullptr;
 #if defined(VOICE_ASSISTANT_HAS_SILERO)
@@ -721,7 +1182,14 @@ int main(int argc, char** argv) {
                 neural_vad = std::make_unique<blackwell::vad::SileroVAD>(args.vad_model);
                 neural_vad->set_threshold(args.vad_threshold);
                 vad_fn = &vad_score;
-                vad_user = neural_vad.get();
+                vad_ctx.vad = neural_vad.get();
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                // A pointer to the SLOT, not the runtime: TTS is constructed
+                // several hundred lines below this, and the VAD must pick it up
+                // when it appears without this wiring being revisited.
+                vad_ctx.tts = &app_ctx.tts;
+#endif
+                vad_user = &vad_ctx;
                 std::printf("[vad] Silero neural VAD armed (threshold %.2f)\n",
                             args.vad_threshold);
             } catch (const std::exception& e) {
@@ -780,6 +1248,22 @@ int main(int argc, char** argv) {
         std::string applied_audio_task = settings.audio_task_prompt;
         std::string applied_speech_language = settings.speech_language;
         bool audio_prefix_dirty = false;
+
+        // THE SPEAKER MUTE, and the reason it is a local rather than a field of
+        // `settings`: it must not be persisted (an app that starts up silent
+        // because of a tap three days ago reads as broken), and settings.save
+        // physically cannot reach a variable that is not in the struct.
+        //
+        // It folds with tts_volume at every application site -- the two are never
+        // applied independently, because the AEC reference has to describe what
+        // the speaker actually emitted and a muted speaker emits nothing.
+        //
+        // UI-thread only: both writers are window callbacks, which the message
+        // loop serialises.
+        bool tts_muted = false;
+        const auto effective_tts_volume = [&](float slider) noexcept {
+            return tts_muted ? 0.0f : slider;
+        };
         auto apply_live_settings = [&](const rt::AssistantSettings& s) {
             SpeechPipelineHandle pipe = speech_mode.pipeline();
             (void)speech_pipeline_set_vad_threshold(pipe, s.vad_threshold);
@@ -792,6 +1276,29 @@ int main(int argc, char** argv) {
             // allowed to move the ring's read cursor. It is on the base bridge, so
             // it applies to whichever backend is live without a branch.
             control->set_pre_roll_ms(s.pre_roll_ms);
+
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            // Live-toggleable because the filter bypasses in place. Null until
+            // the TTS stack is up -- this lambda also runs once BEFORE that, so
+            // the launch value is applied at construction instead.
+            if (app_ctx.aec != nullptr) app_ctx.aec->SetEnabled(s.aec_enabled);
+            // VOLUME GOES TO BOTH, ALWAYS. The playback gain is what the user
+            // hears; the reference gain is what keeps the echo canceller's
+            // learned response valid across the change (audio_playback.h).
+            // Setting one without the other is the bug this comment exists to
+            // stop -- it does not fault, it just quietly costs ERLE until the
+            // filter re-converges.
+            // Folded with the dock's mute: a Save while deafened must not turn
+            // the sound back on behind the icon, which would leave the UI
+            // claiming a state the speaker does not have.
+            if (app_ctx.tts != nullptr) app_ctx.tts->SetVolume(effective_tts_volume(s.tts_volume));
+            if (app_ctx.aec != nullptr) {
+                app_ctx.aec->SetReferenceGain(effective_tts_volume(s.tts_volume));
+            }
+#endif
+            // The capture-side twin of tts_volume, and live for the same reason:
+            // the callback reads it once per block.
+            capture.set_input_gain(s.mic_gain);
 
             // The sampling knobs and the reply ceiling exist on BOTH controls (the
             // simulated one honours the ceiling and stores the rest), so they are
@@ -910,6 +1417,52 @@ int main(int argc, char** argv) {
                     speech_mode.frozen_prefix_tokens());
         apply_live_settings(settings);
 
+        // ---- audio hot reload -------------------------------------------------
+        // Moves the two ma_devices to whatever endpoints the settings now name,
+        // and NOTHING else. Declared here because it needs `capture` (above) and
+        // `app_ctx.tts` (below, via the pointer), and is called from the settings
+        // handler at the bottom.
+        //
+        // ORDER: playback first, then capture, then the AEC reset. Playback is
+        // what the canceller's reference describes, so resetting the filter
+        // before the new speaker exists would just make it converge on the old
+        // one for another few hundred milliseconds.
+        auto apply_audio_reload = [&](const rt::AssistantSettings& s) {
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            if (app_ctx.tts != nullptr) {
+                const bool ok = app_ctx.tts->HotReloadOutput(s.output_device_name,
+                                                             s.output_device_index);
+                std::printf("[audio] output hot reload %s -> %s\n", ok ? "ok" : "FAILED",
+                            app_ctx.tts->output_device().empty()
+                                ? "(system default)"
+                                : app_ctx.tts->output_device().c_str());
+            }
+#endif
+            // Loopback capture taps a PLAYBACK endpoint, so it follows the OUTPUT
+            // selection -- the same trap the name form has always had, restated
+            // here because getting it wrong yields MA_NO_DEVICE with no hint.
+            const bool loopback = s.loopback_capture;
+            const bool cap_ok = capture.hot_reload(
+                loopback ? rt::CaptureMode::Loopback : rt::CaptureMode::Microphone,
+                loopback ? s.output_device_name : s.input_device_name,
+                loopback ? s.output_device_index : s.input_device_index);
+            std::printf("[audio] input hot reload %s -> %s\n", cap_ok ? "ok" : "FAILED",
+                        capture.device_name().empty() ? "(system default)"
+                                                      : capture.device_name().c_str());
+            capture.set_input_gain(s.mic_gain);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            // THE canceller's learned impulse response describes the OLD room
+            // path -- old speaker, old microphone, old latency between them. Left
+            // alone it would spend a few hundred milliseconds actively
+            // subtracting the wrong signal, which is worse than not cancelling.
+            if (app_ctx.aec != nullptr) {
+                app_ctx.aec->Reset();
+                app_ctx.aec->SetReferenceGain(s.tts_volume);
+            }
+#endif
+            std::fflush(stdout);
+        };
+
         // ---- speech output ---------------------------------------------------
         // Built AFTER the engine so a TTS failure cannot delay the thing the app
         // is actually for, and BEFORE the UI so the first reply can be spoken.
@@ -917,6 +1470,11 @@ int main(int argc, char** argv) {
         // the same posture already taken for the neural VAD and the audio head.
 #if defined(VOICE_ASSISTANT_HAS_TTS)
         std::optional<rt::TtsRuntime> tts;
+        // DECLARED AFTER `tts`, DELIBERATELY. It holds a reference into the
+        // runtime's far-end ring, so it must be destroyed BEFORE the ring it
+        // points at -- which reverse declaration order is exactly what gives.
+        // (CLAUDE.md extension pattern #3, applied to a function scope.)
+        std::optional<blackwell::audio_rt::AecCaptureFilter> aec;
         if (!settings.tts_ckpt_dir.empty()) {
             rt::TtsRuntimeConfig tcfg;
             tcfg.ckpt_dir   = settings.tts_ckpt_dir;
@@ -928,7 +1486,9 @@ int main(int argc, char** argv) {
             tcfg.split_on_commas  = settings.tts_split_on_commas;
             tcfg.min_chunk_chars  = settings.tts_min_chunk_chars;
             tcfg.max_chunk_chars  = settings.tts_max_chunk_chars;
-            tcfg.mic_gate_enabled = settings.tts_mic_gate;
+            tcfg.output_device       = settings.output_device_name;
+            tcfg.output_device_index = settings.output_device_index;
+            tcfg.volume           = settings.tts_volume;
 
             // THE PAIR MUST MATCH. F5 treats generation as infilling against
             // (reference audio, reference text), so a transcript that is not
@@ -960,30 +1520,91 @@ int main(int argc, char** argv) {
             try {
                 tts.emplace(tcfg);
                 app_ctx.tts = &tts.value();
-                std::printf("[tts] ready: %s (nfe=%d, mic gate %s)\n",
+                std::printf("[tts] ready: %s (nfe=%d, volume %.0f%%) on %s\n",
                             tcfg.ckpt_dir.c_str(), tcfg.nfe_step,
-                            tcfg.mic_gate_enabled ? "ON -- barge-in disabled" : "off");
+                            static_cast<double>(tts->volume()) * 100.0,
+                            tts->output_device().empty() ? "the system default device"
+                                                         : tts->output_device().c_str());
                 // The last GPU consumer to load, so this line is the WHOLE
                 // budget: if it says OVER BUDGET, the box is already paging and
                 // every latency number after it is meaningless.
                 //
-                // MEASURED HEADROOM, so nobody re-litigates it from guesses:
-                // the F5 arena is bounded by F5TtsConfig::gpu_mem_limit_mb, and
-                // sweeping it showed 2048 MiB costs 2219 MiB committed, 1792
-                // costs the SAME 2219 (the arena never grows into the slack),
-                // and 1536 fails to initialize outright because the 1.31 GB of
-                // fp32 DiT weights are allocated THROUGH the arena, not beside
-                // it. There is no headroom left on this knob; the remaining
-                // reducible items are max_context and the fp32 audio head.
+                // MEASURED, so nobody re-litigates it from guesses: the 1.31 GB
+                // of fp32 DiT weights are allocated THROUGH the CUDA EP arena,
+                // not beside it. A sweep of the old gpu_mem_limit_mb cap showed
+                // 2048 MiB costing 2219 MiB committed, 1792 costing the same
+                // 2219, and 1536 failing to initialise outright.
+                //
+                // That sweep is why the cap is now 0 (unbounded) by default. It
+                // only ever measured the WEIGHTS -- a cap of 2048 leaves the
+                // graph ~700 MiB for its attention intermediates, which is
+                // enough to load and enough to synthesise a SHORT utterance, so
+                // the sweep read as "no headroom left" rather than as what it
+                // was: a ceiling one long sentence away from failing inside
+                // Softmax. Confirmed since -- a 335-token utterance asks one
+                // attention node for 385 MB and dies against the cap, and
+                // succeeds without it. See F5TtsConfig::gpu_mem_limit_mb.
+                //
+                // So this line is the WHOLE budget in a stronger sense than
+                // before: nothing bounds F5 but the box. The reducible items are
+                // max_context, the fp32 audio head, and F5's max_frames.
                 if (use_real) rt::report_vram("+ TTS (full stack)");
-                if (!tcfg.mic_gate_enabled) {
-                    // Said out loud because it is the difference between a demo
-                    // that works and one that talks over itself: there is no AEC
-                    // in this build, so on OPEN SPEAKERS the assistant's own
-                    // voice reaches the mic, Silero scores it as speech, and the
-                    // pipeline barges in on the answer it is currently giving.
-                    std::printf("[tts] NOTE: no echo canceller in this build. Use HEADPHONES, "
-                                "or enable the mic gate (costs barge-in-while-speaking).\n");
+
+                // ---- the capture-side half of full duplex --------------------
+                // Built here and not earlier because it needs the far-end ring,
+                // which only exists once the runtime does. It is the SOLE
+                // consumer of that ring, per its SPSC contract.
+                //
+                // ITS OWN try/catch, and that is not tidiness. Speech output is
+                // already live and app_ctx.tts is already published by this
+                // point, so letting a throw fall into the handler below would
+                // print "[tts] disabled" about a TTS stack that is running --
+                // and would leave it running with no canceller, which is the one
+                // configuration that self-triggers. The two failures are
+                // different and have to say so.
+                try {
+                    blackwell::audio_rt::AecCaptureFilterConfig acfg;
+                    acfg.near_rate = static_cast<int>(cfg.sample_rate);
+                    acfg.far_rate = rt::TtsRuntime::far_sample_rate();
+                    // Clamped, not trusted: this arrives from a hand-editable
+                    // settings file, and a tail of zero produces a canceller
+                    // that runs and cancels nothing.
+                    acfg.aec.filter_tail_samples =
+                        static_cast<std::size_t>(std::clamp(settings.aec_tail_ms, 64, 1000)) *
+                        static_cast<std::size_t>(acfg.near_rate) / 1000u;
+                    aec.emplace(tts->aec_reference(), acfg);
+                    aec->SetEnabled(settings.aec_enabled);
+                    // The reference must describe what the SPEAKER emits, and
+                    // the software gain is applied after the reference is
+                    // tapped -- so the canceller is told about it separately.
+                    // See audio_playback.h; apply_live_settings keeps the two in
+                    // step from then on.
+                    aec->SetReferenceGain(settings.tts_volume);
+                    app_ctx.aec = &aec.value();
+                    std::printf("[aec] %s: %d ms tail, %zu-sample capture latency, "
+                                "reference %d Hz -> %d Hz\n",
+                                settings.aec_enabled ? "on" : "BYPASSED (diagnostic)",
+                                settings.aec_tail_ms, aec->latency_samples(),
+                                acfg.far_rate, acfg.near_rate);
+                    if (!settings.aec_enabled) {
+                        // Said out loud because it is the difference between a
+                        // demo that works and one that talks over itself: with
+                        // the canceller bypassed, the assistant's own voice
+                        // reaches the mic on open speakers, Silero scores it as
+                        // speech, and the pipeline barges in on the answer it is
+                        // currently giving.
+                        std::fprintf(stderr,
+                                     "[aec] WARNING: echo cancellation is OFF. Use "
+                                     "HEADPHONES, or the assistant will interrupt itself.\n");
+                    }
+                } catch (const std::exception& e) {
+                    // Speech still works; what is lost is the ability to survive
+                    // hearing it. Degrade loudly rather than silently.
+                    std::fprintf(stderr,
+                                 "[aec] DISABLED: %s\n"
+                                 "[aec] The assistant will hear its own voice and may "
+                                 "interrupt itself. Use HEADPHONES.\n",
+                                 e.what());
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[tts] disabled: %s\n", e.what());
@@ -993,22 +1614,55 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        // THE CAPTURE TAP -- and the whole of what full duplex means here.
+        //
+        // The microphone is still NEVER muted, gated, zeroed or paused. Every
+        // block the capture device produces reaches the AEC, the level meter and
+        // the ring, exactly as before: the PCM path is untouched, so pre-roll,
+        // metering and speculative warming all keep working while the assistant
+        // talks. What the time-lock masks is the VERDICT, one level down, and
+        // nothing else.
+        //
+        // The subtraction stays, and is still the load-bearing part for the case
+        // the lock does not cover -- the 250 ms after it lifts, when the room is
+        // still ringing and the user may already be talking.
+        //
+        // Runs on the DSP worker, which is this pipeline's single producer, so
+        // the scratch buffer needs no synchronisation. It is sized ONCE here:
+        // RealTimeDSP pops at most 4096 samples per call, so the resize below
+        // never fires again after the first block and the tap stays
+        // allocation-free on the path it shares with the capture drain.
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+        std::vector<float> aec_out(4096, 0.0f);
+        // Edge-triggered: one atomic store per TRANSITION, not per block. The
+        // setter is a single relaxed-ish store and would be affordable either
+        // way, but the log line below is not -- and the transitions are what a
+        // reader diagnosing a stuck suppressor actually needs to see.
+        bool vad_locked = false;
+#endif
         realtime.set_pcm_tap(
             [&](const float* s, std::size_t n) {
 #if defined(VOICE_ASSISTANT_HAS_TTS)
-                // THE MIC INTERLOCK. While the speaker is live (plus a reverb
-                // tail) the mic carries our own voice, so feed the pipeline
-                // SILENCE rather than dropping the block: the VAD and the mel
-                // front-end are stateful and a gap would shift every subsequent
-                // frame. Off by default -- see tts_runtime.hpp for what enabling
-                // it costs.
-                if (app_ctx.tts != nullptr && app_ctx.tts->MicShouldBeGated()) {
-                    static thread_local std::vector<float> hush;
-                    hush.assign(n, 0.0f);
-                    active->on_pcm_block(hush.data(), n);
+                // THE SUPPRESSOR PUSH. Deliberately here rather than inside
+                // vad_score: this covers the RMS fallback too, and vad_score is
+                // not called at all when Silero failed to load -- which is a
+                // degraded mode, not an excuse for the assistant to interrupt
+                // itself.
+                const bool lock =
+                    app_ctx.tts != nullptr && app_ctx.tts->is_playing_tts();
+                if (lock != vad_locked) {
+                    vad_locked = lock;
+                    (void)speech_pipeline_set_vad_suppressed(speech_mode.pipeline(), lock);
+                }
+                if (app_ctx.aec != nullptr) {
+                    if (aec_out.size() < n) aec_out.resize(n);
+                    app_ctx.aec->Process(s, n, aec_out.data());
+                    active->on_pcm_block(aec_out.data(), n);
                     return;
                 }
 #endif
+                // No speech output in this build or this launch: nothing is
+                // playing, so there is nothing to cancel.
                 active->on_pcm_block(s, n);
             });
         realtime.start();
@@ -1051,6 +1705,15 @@ int main(int argc, char** argv) {
 #endif
         };
         cb.on_settings_apply = [&](const rt::AssistantSettings& next, bool live_only) {
+            // THE HOT-RELOAD CHECK, before `settings` is overwritten -- it is a
+            // comparison against the values currently in force, so it has to run
+            // while those are still readable.
+            //
+            // Reopening two ma_devices takes tens of milliseconds and touches no
+            // VRAM: the engine keeps its 5.3 GB of weights, the KV pool stays
+            // allocated and the F5 ONNX session is not reloaded. That is the
+            // entire reason these settings are their own tier.
+            const bool audio_moved = rt::requires_audio_reload(settings, next);
             settings = next;
             if (!rt::save_settings(settings)) {
                 std::fprintf(stderr, "[settings] WARN: could not write %s\n",
@@ -1061,6 +1724,7 @@ int main(int argc, char** argv) {
             // changed would be a worse answer than doing what can be done now.
             // `live_only` decides whether the app also restarts, nothing else.
             apply_live_settings(settings);
+            if (audio_moved) apply_audio_reload(settings);
             (void)live_only;
             // Restart-tier changes are persisted here and picked up by the next
             // process; the app keeps running on the OLD engine until then, which
@@ -1101,6 +1765,80 @@ int main(int argc, char** argv) {
                               "but not applied. Restart to load it.");
             }
         };
+        cb.on_audio_hot_update = [&](const rt::AudioHotUpdate& u) {
+            // Merge into the live settings. ONLY these fields are touched, so
+            // whatever the settings modal is holding cannot be dragged along --
+            // which is exactly the bug this path exists to remove.
+            if (u.output_device_index != rt::AudioHotUpdate::kNoIndex) {
+                settings.output_device_index = u.output_device_index;
+            }
+            if (u.input_device_index != rt::AudioHotUpdate::kNoIndex) {
+                settings.input_device_index = u.input_device_index;
+            }
+            if (u.has_output_name) settings.output_device_name = u.output_device_name;
+            if (u.has_input_name)  settings.input_device_name  = u.input_device_name;
+            if (u.tts_volume >= 0.0f) settings.tts_volume = u.tts_volume;
+            if (u.mic_gain   >= 0.0f) settings.mic_gain   = u.mic_gain;
+            // Mute is session state and is deliberately NOT merged into
+            // `settings` -- see AudioHotUpdate::tts_muted on why it must not
+            // survive a restart. It lives in this one bool, which the save
+            // below therefore cannot reach.
+            if (u.tts_muted != rt::AudioHotUpdate::Tri::Absent) {
+                tts_muted = (u.tts_muted == rt::AudioHotUpdate::Tri::On);
+            }
+            rt::clamp_settings(settings);
+
+            // Gains first, and unconditionally: they are atomic stores, they are
+            // what the user is listening to while dragging, and they must not
+            // wait behind a device reopen that may not even be needed.
+            //
+            // THE EFFECTIVE GAIN is the slider folded with the mute, computed
+            // here and nowhere else. Everything downstream -- playback, and the
+            // AEC reference that has to match it -- is handed the same number,
+            // so a muted assistant cannot leave the canceller chasing a
+            // reference for sound the room never heard.
+            const float effective_volume = effective_tts_volume(settings.tts_volume);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            if (app_ctx.tts != nullptr) app_ctx.tts->SetVolume(effective_volume);
+            // Both, always -- see apply_live_settings on why splitting these two
+            // silently costs the canceller its accuracy.
+            if (app_ctx.aec != nullptr) app_ctx.aec->SetReferenceGain(effective_volume);
+#endif
+            capture.set_input_gain(settings.mic_gain);
+
+            // The device reopen happens ONLY when an endpoint actually moved. A
+            // slider drag arrives as dozens of messages; reopening WASAPI on each
+            // would turn a volume change into an audible stutter.
+            if (u.needs_device_reload()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                apply_audio_reload(settings);
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - t0).count();
+                // The line that proves the claim: a device swap, timed, with no
+                // engine or arena activity between the two timestamps.
+                std::printf("[audio-hot-reload] Swapped WASAPI device in %lld ms "
+                            "(engine untouched, VRAM unchanged)\n",
+                            static_cast<long long>(ms));
+                std::fflush(stdout);
+            }
+
+            // Persisted so the choice survives a restart -- but note the
+            // ordering: the device is ALREADY live by here. A failed write costs
+            // the user the setting next launch, not the sound they just fixed.
+            if (!rt::save_settings(settings)) {
+                std::fprintf(stderr, "[settings] WARN: could not persist audio settings\n");
+            }
+        };
+        cb.on_test_tone = [&] {
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+            // Through the live TTS pipeline, not a second private device: the
+            // point of the button is to prove the endpoint the ASSISTANT speaks
+            // through makes sound. A tone on its own device could pass while
+            // speech stayed silent, which is exactly the confusion it exists to
+            // end.
+            if (app_ctx.tts != nullptr) app_ctx.tts->PlayTestTone();
+#endif
+        };
         cb.on_restart = [&] {
             restart_requested.store(true, std::memory_order_release);
             if (window.hwnd() != nullptr) PostMessageW(window.hwnd(), WM_CLOSE, 0, 0);
@@ -1123,18 +1861,147 @@ int main(int argc, char** argv) {
             // An exception escaping a std::thread is std::terminate. A telemetry
             // poller is the last thing that should be allowed to take the app
             // down, so it swallows and keeps going.
+            // The gate counters move at conversation pace; the mic meter has to
+            // move at speech pace or it reads as broken. So the loop runs at the
+            // METER's rate and the counters are published every Nth pass.
+            constexpr int kMeterMs = 80;              // ~12 fps, smooth enough
+            constexpr int kStatsEvery = 1000 / kMeterMs;
+            int tick = 0;
             while (running.load(std::memory_order_acquire)) {
                 try {
-                    view.publish_stats(commit_queue);
+                    if (tick % kStatsEvery == 0) view.publish_stats(commit_queue);
+                    window.post_audio_level(capture.input_level());
                 } catch (...) {
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                ++tick;
+                std::this_thread::sleep_for(std::chrono::milliseconds(kMeterMs));
             }
         });
+
+        // ---- --test-llm-tts: one injected turn on the COMPLETE stack ----------
+        // Everything is already constructed at this point -- engine, arena, audio
+        // head, Silero, AEC, F5 -- so this measures the loaded machine, which is
+        // the entire point. It exists because --say does NOT: --say stands in for
+        // the LLM, so it runs F5 on an otherwise idle GPU and therefore cannot
+        // reproduce anything caused by decode and synthesis sharing the device.
+        //
+        // The prompt goes in through submit_text, the SAME entry the typed box
+        // uses and therefore the same ring, gate, dispatcher and answer stream a
+        // spoken turn takes. Reaching into generate_local_reply() directly would
+        // have been fewer lines and would have tested a path no user can take.
+        std::thread test_thread;
+        if (!vargs.test_llm_tts.empty()) {
+            test_thread = std::thread([&] {
+                try {
+                    const std::string prompt = vargs.test_llm_tts;
+                    std::printf("\n=== full-stack LLM+TTS test ===\n  prompt: \"%s\"\n",
+                                prompt.c_str());
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                    if (tts.has_value()) tts->reset_playback_stats();
+#endif
+                    // Let the device settle so the first buffers are not counted
+                    // as starvation from before there was anything to play.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                    view.on_user_text(prompt);
+                    if (control->submit_text(prompt, text_sink) !=
+                        blackwell::EngineStatus::Success) {
+                        std::printf("  FAIL -- submit_text was refused (command ring full).\n");
+                    } else {
+                        // Sample WHILE the turn runs: a summary printed after the
+                        // fact cannot show whether the ring ran dry during decode,
+                        // which is the whole question.
+                        const auto deadline =
+                            std::chrono::steady_clock::now() + std::chrono::seconds(120);
+                        bool spoke = false;
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                            if (!tts.has_value()) break;
+                            const auto ps = tts->playback_stats();
+                            std::printf("[audio-playback] WASAPI requested %u frames | "
+                                        "RingBuffer available: %u frames | starved %llu/%llu "
+                                        "callbacks | ring underruns %llu | chunks %llu\n",
+                                        ps.last_requested, ps.last_available,
+                                        static_cast<unsigned long long>(ps.starved_callbacks),
+                                        static_cast<unsigned long long>(ps.callbacks),
+                                        static_cast<unsigned long long>(tts->speaker_underruns()),
+                                        static_cast<unsigned long long>(tts->chunks_spoken()));
+                            std::fflush(stdout);
+                            if (tts->chunks_spoken() > 0) spoke = true;
+                            // Done when the speaker has drained after speaking.
+                            if (spoke && !tts->speaking()) break;
+#else
+                            break;
+#endif
+                        }
+                    }
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    if (tts.has_value()) {
+                        const auto ps = tts->playback_stats();
+                        std::printf("\n  --- playback under load ---\n");
+                        std::printf("  callbacks              : %llu\n",
+                                    static_cast<unsigned long long>(ps.callbacks));
+                        std::printf("  frames requested/served: %llu / %llu\n",
+                                    static_cast<unsigned long long>(ps.frames_requested),
+                                    static_cast<unsigned long long>(ps.frames_served));
+                        std::printf("  starved callbacks      : %llu\n",
+                                    static_cast<unsigned long long>(ps.starved_callbacks));
+                        std::printf("  speaker-ring underruns : %llu\n",
+                                    static_cast<unsigned long long>(tts->speaker_underruns()));
+                        std::printf("  chunks spoken/cancelled: %llu / %llu   errors %llu\n",
+                                    static_cast<unsigned long long>(tts->chunks_spoken()),
+                                    static_cast<unsigned long long>(tts->chunks_cancelled()),
+                                    static_cast<unsigned long long>(tts->synthesis_errors()));
+                        std::printf("  %s\n",
+                                    tts->chunks_spoken() > 0 && tts->synthesis_errors() == 0
+                                        ? "PASS -- audio was synthesised and played while the "
+                                          "model was decoding."
+                                        : "FAIL -- nothing reached the speaker during the turn.");
+                    }
+#endif
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                    // ---- hot swap, on the loaded stack -----------------------
+                    // The acceptance test for the AudioHotReload tier: move the
+                    // endpoint with 8 GB of weights resident and show that the
+                    // VRAM figure does not move. A reload would be unmissable
+                    // here -- the arena alone is gigabytes.
+                    if (tts.has_value()) {
+                        std::printf("\n  --- audio hot swap (no model reload) ---\n");
+                        if (use_real) rt::report_vram("  before swap");
+                        rt::AssistantSettings swapped = settings;
+                        // Deliberately to a DIFFERENT endpoint than the one in
+                        // use, so a no-op cannot pass as a success.
+                        swapped.output_device_index =
+                            (settings.output_device_index == 4) ? 0 : 4;
+                        swapped.output_device_name.clear();
+                        apply_audio_reload(swapped);
+                        std::printf("  now on: %s\n", tts->output_device().empty()
+                                                          ? "(system default)"
+                                                          : tts->output_device().c_str());
+                        if (use_real) rt::report_vram("  after swap ");
+                        // Prove the NEW device actually carries audio, through
+                        // the same pipeline speech uses.
+                        tts->PlayTestTone();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+                        std::printf("  test tone on the new device: %s\n",
+                                    tts->chunks_spoken() > 0 ? "published" : "NOT published");
+                    }
+#endif
+                    std::fflush(stdout);
+                } catch (...) {
+                    std::printf("  FAIL -- the test threw.\n");
+                }
+                // Close the window so the process exits and the summaries print.
+                if (window.hwnd() != nullptr) PostMessageW(window.hwnd(), WM_CLOSE, 0, 0);
+            });
+        }
 
         std::printf("running... speak, then pause. Interrupt mid-answer to test barge-in.\n");
         std::fflush(stdout);
         window.run_message_loop();
+        if (test_thread.joinable()) test_thread.join();
 
         // ---- shutdown (reverse dependency order) -----------------------------
         realtime.stop();
@@ -1157,6 +2024,39 @@ int main(int argc, char** argv) {
                         : "");
         std::printf("  dropped queue-full     : %llu\n",
                     static_cast<unsigned long long>(commit_queue.dropped_queue_full()));
+
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+        // A SEPARATE SUMMARY, because these count a different stage and confusing
+        // the two is what makes "it went silent" hard to place. The gate's
+        // numbers are about the user's TRANSCRIPT becoming an intent; these are
+        // about the ANSWER becoming sound, which happens after and independently.
+        //
+        // `cancelled` is the one to read first when the assistant answered on
+        // screen but said nothing or stopped mid-sentence: every count is a
+        // barge-in that killed a chunk.
+        //
+        // WHAT A NON-ZERO COUNT MEANS NOW. Under the playback time-lock the VAD
+        // cannot fire while the assistant is audible, so self-barge-in is not a
+        // candidate explanation any more -- the remaining sources are the cancel
+        // control, the cancel hotkey, and speech in the 250 ms after the lock
+        // lifts. If it is non-zero with nobody touching either control, the lock
+        // itself is the thing to doubt: check that playback actually reports
+        // is_playing_tts (a device that failed to open never sets it) before
+        // reaching for the canceller's tuning.
+        if (tts.has_value()) {
+            std::printf("\n=== speech output summary ===\n");
+            std::printf("  chunks spoken          : %llu\n",
+                        static_cast<unsigned long long>(tts->chunks_spoken()));
+            std::printf("  chunks cancelled       : %llu%s\n",
+                        static_cast<unsigned long long>(tts->chunks_cancelled()),
+                        tts->chunks_cancelled() > 0
+                            ? "   <-- barge-in killed these; the time-lock rules out "
+                              "self-trigger, so check the cancel control"
+                            : "");
+            std::printf("  synthesis errors       : %llu\n",
+                        static_cast<unsigned long long>(tts->synthesis_errors()));
+        }
+#endif
 
         // Relaunched LAST, after this process has released the CUDA context, the
         // capture device and the WebView2 user-data folder -- starting the new

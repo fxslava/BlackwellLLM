@@ -654,7 +654,10 @@ input.hotkey.recording {
 }
 .save-msg { flex: 1; font-size: 12.5px; color: var(--text-faint); }
 
-button.primary, button.ghost {
+/* .secondary shares this shell: it was previously styled nowhere at all, so both
+   "Check sound" buttons rendered as raw user-agent controls -- a white system
+   button on a dark panel, which read as an unfinished part of the page. */
+button.primary, button.ghost, button.secondary {
   padding: 8px 16px;
   border-radius: var(--radius-sm);
   font: 13.5px var(--sans);
@@ -662,9 +665,13 @@ button.primary, button.ghost {
   border: 1px solid var(--line);
   background: var(--bg-elev);
   color: var(--text);
-  transition: background .12s, border-color .12s;
+  transition: background .12s, border-color .12s, opacity .12s;
 }
-button.ghost:hover { border-color: var(--text-faint); }
+button.ghost:hover, button.secondary:hover:not(:disabled) {
+  border-color: var(--text-faint);
+}
+button.secondary { padding: 6px 12px; font-size: 12.5px; }
+button.secondary:disabled { cursor: default; opacity: .5; }
 button.primary {
   background: var(--accent);
   border-color: transparent;
@@ -677,3 +684,180 @@ button.primary:hover { filter: brightness(1.08); }
   .bubble { max-width: 88%; }
   .chat { padding: 14px 12px 6px; }
 }
+
+/* ---- audio settings: Output / Input sections --------------------------------
+   Section headings inside the modal, so the panel reads as two groups (what you
+   hear, what hears you) rather than one list of eight controls. */
+.audio-head {
+  margin: 22px 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.audio-head:first-of-type { margin-top: 8px; }
+
+.check-sound-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.hint.inline { margin: 0; }
+
+/* The mic meter. A plain width transition rather than an animation loop: the app
+   pushes a level several times a second and the easing carries the bar between
+   samples, so it looks continuous without the page running a timer. */
+.meter {
+  margin-top: 10px;
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, .25);
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 4px;
+  /* Green through amber to red: the top of the bar is where clipping lives, and
+     a meter that reads the same at 0.4 and 0.98 is not telling you anything. */
+  background: linear-gradient(90deg, #3ba55d 0%, #3ba55d 55%, #faa81a 78%, #ed4245 100%);
+  transition: width .08s linear;
+}
+
+/* ---- audio dock -------------------------------------------------------------
+   Speaker (with its volume rail) and gear, sharing one positioning context so
+   the popover can anchor to the whole group.
+
+   `align-items: center` rather than the default stretch: the rail is a
+   different height from the 40px buttons, and stretching it would make the
+   dock's own baseline move when it expands. */
+.audio-dock {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.audio-btn.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---- speaker toggle ---------------------------------------------------------
+   Unlike the mic, this SWAPS the glyph instead of striking it through: a speaker
+   with a slash and a speaker with an x are both instantly readable, and stacking
+   the generic slash on top of the muted glyph would draw both. */
+.audio-btn .ico-muted { display: none; }
+.audio-btn[data-on="false"] .ico-speaker { display: none; }
+.audio-btn[data-on="false"] .ico-muted { display: block; }
+.audio-btn[data-on="false"] { color: var(--err); border-color: var(--err); opacity: 1; }
+/* Cancels the .mic-btn strike-through this button would otherwise inherit. */
+.audio-btn[data-on="false"]::after { content: none; }
+
+/* ---- the volume rail --------------------------------------------------------
+   Collapsed to zero width and revealed on hover, focus-within or a click on the
+   speaker (.open). Width, not display or visibility: those cannot be
+   transitioned, and a control that appears instantly under a moving cursor is
+   how you end up dragging a slider you did not mean to touch.
+
+   focus-within is what keeps it keyboard-reachable -- tabbing to the range input
+   opens the rail that contains it. */
+.volume-dock { position: relative; display: flex; align-items: center; }
+
+.volume-rail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 0;
+  overflow: hidden;
+  opacity: 0;
+  /* Nothing to grab while collapsed: a 0-width slider still answers clicks that
+     land on its padding, and it would answer them with a volume change. */
+  pointer-events: none;
+  transition: width .16s ease, opacity .16s ease, margin-left .16s ease;
+}
+.volume-dock:hover .volume-rail,
+.volume-dock:focus-within .volume-rail,
+.volume-dock.open .volume-rail {
+  width: 116px;
+  margin-left: 8px;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.volume-rail input[type="range"] {
+  width: 72px;
+  /* The rail is a hover target; a slider that reserves a full row of vertical
+     space would make the dock taller than the composer's other controls. */
+  margin: 0;
+}
+.rail-readout {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  min-width: 30px;
+}
+/* Muted: the rail still shows the value it will return to, greyed rather than
+   zeroed. Zeroing it would destroy the number the user chose -- the same
+   mistake the C++ side avoids by keeping mute orthogonal to volume. */
+.volume-dock.muted .volume-rail { opacity: .55; }
+
+.audio-popover {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  z-index: 40;
+  width: 300px;
+  padding: 14px;
+  border-radius: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  color: var(--text);
+  /* The elevation that makes it read as floating rather than inset. --shadow is
+     already defined per theme; the previous hard-coded black drop shadow was
+     invisible in dark mode and far too heavy on the light background. */
+  box-shadow: var(--shadow);
+}
+.audio-popover.hidden { display: none; }
+
+.audio-popover select,
+.audio-popover input[type="range"] { width: 100%; }
+/* The selects inherited the UA's default control colours, which is why they read
+   as light-grey chips on the dark panel regardless of theme. */
+.audio-popover select {
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-elev-2);
+  color: var(--text);
+  font: inherit;
+}
+
+.pop-section {
+  margin: 12px 0 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.pop-section:first-child { margin-top: 0; }
+
+.pop-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 10px 0 4px;
+  font-size: 13px;
+}
+.pop-row .readout { font-variant-numeric: tabular-nums; color: var(--text-dim); }
+
+.pop-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.pop-msg { font-size: 11px; color: var(--text-dim); }

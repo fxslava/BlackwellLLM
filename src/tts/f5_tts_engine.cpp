@@ -304,13 +304,15 @@ struct F5TtsEngine::Impl {
         std::vector<const char*> values;
         keys.push_back("device_id");                 values.push_back(device_id.c_str());
 
-        // kSameAsRequested, NOT the kNextPowerOfTwo default. The default doubles
-        // its reservation on growth, which on a box already holding ~5.3 GB of
-        // AWQ weights plus a ~1.05 GB KV pool is how synthesis makes the ENGINE
-        // fail to allocate. Our shapes are known and bounded (allocate_buffers
-        // takes them all at max_frames up front), so there is nothing for a
-        // growth heuristic to win here.
-        keys.push_back("arena_extend_strategy");     values.push_back("kSameAsRequested");
+        // kNextPowerOfTwo by default — ORT's own default, restored from a
+        // previous kSameAsRequested pin. NOT the fix for the BFCArena failure
+        // that prompted the change: a measured 2x2 (see
+        // F5TtsConfig::arena_extend_strategy) shows both strategies failing
+        // under a cap and both succeeding without one. gpu_mem_limit_mb is the
+        // knob that mattered.
+        keys.push_back("arena_extend_strategy");
+        values.push_back(config.arena_extend_strategy == 1 ? "kSameAsRequested"
+                                                           : "kNextPowerOfTwo");
 
         // HEURISTIC, not EXHAUSTIVE. Exhaustive benchmarks every cuDNN algorithm
         // on the first call with a new shape — seconds of stall and a VRAM spike,
@@ -324,6 +326,10 @@ struct F5TtsEngine::Impl {
         // — which is precisely the guarantee the interrupt check leans on.
         keys.push_back("do_copy_in_default_stream"); values.push_back("1");
 
+        // Omitted entirely at 0, which is the default — an absent gpu_mem_limit
+        // lets the arena grow against physical VRAM, which is the only budget
+        // that means anything once the attention intermediates are in play.
+        // Passing a cap here is opt-in and deliberately rare; see the field.
         if (config.gpu_mem_limit_mb > 0) {
             keys.push_back("gpu_mem_limit");         values.push_back(mem_limit.c_str());
         }

@@ -6,6 +6,7 @@
 #include "tts_duplex_bridge.hpp"
 
 #include <algorithm>
+#include <cstdio>    // printf (the worker-side handoff diagnostics)
 #include <cstring>
 #include <thread>
 
@@ -80,8 +81,27 @@ TtsStatus TTSDuplexBridge::PumpOnce(std::size_t* out_samples) {
 
     std::size_t unknown = 0;
     std::vector<std::int32_t> ids32 = tokenizer_.Tokenize(chunk, &unknown);
-    if (ids32.empty()) return TtsStatus::EmptyResult;
+    if (ids32.empty()) {
+        // A SILENT FAILURE THAT USED TO LOOK LIKE NOTHING HAPPENING. Text
+        // arrived, was chunked, and then tokenised to nothing -- which is what a
+        // vocab that does not cover the script produces, and the only visible
+        // symptom is silence. Say so.
+        std::printf("[tts-worker] DROPPED %zu chars: vocabulary produced no tokens "
+                    "(wrong vocab.txt for this language?)\n",
+                    chunk.size());
+        std::fflush(stdout);
+        return TtsStatus::EmptyResult;
+    }
     ids_scratch_.assign(ids32.begin(), ids32.end());
+
+    // The line that proves synthesis actually STARTED, as opposed to text having
+    // been pushed at a bridge that never got to it. `unknown` is on it because a
+    // chunk that tokenises mostly to the unknown id still synthesises -- it just
+    // produces confident gibberish or near-silence, and the count is the only
+    // way to tell that from a bad reference clip.
+    std::printf("[tts-worker] F5-TTS synthesizing %zu chars on CUDA (%zu tokens, %zu unknown)...\n",
+                chunk.size(), ids_scratch_.size(), unknown);
+    std::fflush(stdout);
 
     const TtsStatus st = synth_.Synthesize(ids_scratch_, cancel_, pcm_scratch_);
 
@@ -97,6 +117,13 @@ TtsStatus TTSDuplexBridge::PumpOnce(std::size_t* out_samples) {
         if (st != TtsStatus::EmptyResult) {
             synthesis_errors_.fetch_add(1, std::memory_order_relaxed);
         }
+        // Counted before this existed, but only visible in the exit summary --
+        // which is no help while a user is standing there asking why it went
+        // quiet. The status distinguishes an ORT/CUDA fault from a graph that
+        // returned nothing.
+        std::printf("[tts-worker] synthesis FAILED (%s) for %zu chars\n", to_string(st),
+                    chunk.size());
+        std::fflush(stdout);
         return st;
     }
     if (pcm_scratch_.empty()) return TtsStatus::EmptyResult;
@@ -107,6 +134,14 @@ TtsStatus TTSDuplexBridge::PumpOnce(std::size_t* out_samples) {
     chunks_spoken_.fetch_add(1, std::memory_order_relaxed);
     if (out_samples != nullptr) *out_samples = pcm_scratch_.size();
     return TtsStatus::Success;
+}
+
+TtsStatus TTSDuplexBridge::PushPcm(const std::vector<float>& pcm) {
+    if (pcm.empty()) return TtsStatus::EmptyResult;
+    if (CancelRequested()) return TtsStatus::Interrupted;
+    const TtsStatus st = Publish(pcm);
+    if (st == TtsStatus::Success) chunks_spoken_.fetch_add(1, std::memory_order_relaxed);
+    return st;
 }
 
 TtsStatus TTSDuplexBridge::Publish(const std::vector<float>& pcm) {

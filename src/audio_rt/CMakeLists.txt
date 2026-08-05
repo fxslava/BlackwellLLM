@@ -1,24 +1,37 @@
 # =============================================================================
-# blackwell_audio_rt -- header-only real-time audio primitives.
+# blackwell_audio_rt -- real-time audio primitives.
 #
-# The lock-free structures that sit ON the audio callback: SpscRing today, the
-# playback sink and the echo-canceller seam as the TTS/AEC work lands. Kept in
-# its OWN target rather than inside blackwell_tts because its consumers are not
-# all TTS: the capture path and the echo canceller use the same ring, and a
-# capture-side include of a "tts" target would be a layering lie.
+# The lock-free structures that sit ON the audio callback plus the echo
+# canceller that sits BESIDE it: SpscRing, the AEC seam and its
+# partitioned-block implementation, and the rate converter the AEC needs to put
+# its two streams on one clock. Kept in its OWN target rather than inside
+# blackwell_tts because its consumers are not all TTS: the capture path holds
+# the canceller and the reference ring, and a capture-side include of a "tts"
+# target would be a layering lie.
 #
 # DEPENDENCY-FREE BY CONSTRUCTION -- STL only. No CUDA, no ONNXRuntime, no
-# miniaudio, no engine headers. That is what lets it be linked from the audio
-# sandbox (which must stay CUDA-free in its standalone configuration) and from
-# the engine-linked targets alike, and it is why this target is NOT gated on
-# anything: there is nothing here that can fail to be available.
+# miniaudio, no engine headers, and no fetched third-party include paths. That
+# is what lets it be linked from the audio sandbox (which must stay CUDA-free in
+# its standalone configuration) and from the engine-linked targets alike, and it
+# is why this target is NOT gated on anything: there is nothing here that can
+# fail to be available.
 #
-# INTERFACE (no sources yet). It becomes STATIC the moment a primitive here needs
-# a TU of its own; consumers link the same name either way.
+# THE FFT IS THE ONE PLACE THAT COSTS SOMETHING. echo_canceller.cpp carries its
+# own 256-point radix-2 transform rather than reaching for pocketfft through
+# blackwell::sandbox_headers, which would put a fetched dependency on this
+# target's otherwise empty link line. Same trade, same reason, as
+# src/tts/f5_mel_extractor.cpp.
+#
+# STATIC as of the AEC landing: it was INTERFACE while SpscRing was the only
+# thing here, and the comment then said it would become STATIC the moment a
+# primitive needed a TU of its own. Consumers link the same name either way.
 # =============================================================================
-add_library(blackwell_audio_rt INTERFACE)
+add_library(blackwell_audio_rt STATIC
+    echo_canceller.cpp
+    rational_resampler.cpp
+    aec_capture_filter.cpp)
 add_library(blackwell::audio_rt ALIAS blackwell_audio_rt)
 
 # NOT SYSTEM: this is first-party code and is held to the root's /W4 /WX budget
 # in every target that includes it (see the compiler-hygiene skill).
-target_include_directories(blackwell_audio_rt INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(blackwell_audio_rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

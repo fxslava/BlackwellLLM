@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "audio_devices.h"   // enumerate_audio_devices, for GET /api/audio-devices
+
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 using nlohmann::json;
@@ -162,6 +164,64 @@ std::wstring assets_dir() {
 bool file_exists(const std::wstring& path) {
     const DWORD attr = GetFileAttributesW(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// =============================================================================
+// The audio-device list the settings dropdowns are built from.
+// =============================================================================
+// DELIVERED OVER THE postMessage CHANNEL, not as a fetch endpoint, and that is
+// forced rather than chosen. There is no HTTP server in this process: the UI is
+// a WebView2 document on a VIRTUAL host mapped to <exe dir>\web, and requests
+// the mapping satisfies are served off disk WITHOUT raising
+// WebResourceRequested -- measured, see the handler in create_webview(). So a
+// same-origin `fetch("/api/audio-devices")` is precisely the request shape that
+// cannot be intercepted; it would 404 against the folder.
+//
+// The alternative that would have preserved a fetch() call site is an unmapped
+// hostname, which DOES raise the event. Rejected: it means inventing a domain
+// we do not own and relying on interception to stop a real DNS lookup from
+// leaving the machine. A request-id round trip over the channel the app already
+// uses for settings, mic and browse costs one message type and leaks nothing.
+//
+// The shape the page consumes, and it is deliberately NOT the C++ struct:
+//
+//   { "outputs": ["(system default)", "Speakers (...)", ...],
+//     "inputs":  ["(system default)", "Microphone (...)", ...] }
+//
+// Entry 0 of each list is the SYNTHETIC "(system default)" row, so a select's
+// option positions are `device index + 1` and the sentinel -1 lands at position
+// 0. Building that offset into the payload rather than the page keeps the two
+// definitions of "which row means default" from drifting: the page never does
+// arithmetic on a device index it did not receive.
+//
+// NAMES TRAVEL VERBATIM, with no "* default" decoration folded in. The page
+// saves the string it was given straight back as output_device_name, so any
+// decoration would have to be stripped client-side by pattern -- and a device
+// genuinely named like the pattern would then be unsaveable. Which endpoint
+// Windows currently prefers is already expressed by row 0 meaning "follow it",
+// and the startup console listing still marks it for diagnostics.
+json audio_devices_payload() {
+    const auto build = [](AudioDeviceKind kind) {
+        json list = json::array();
+        list.push_back("(system default)");
+        for (const AudioDeviceInfo& d : enumerate_audio_devices(kind)) {
+            list.push_back(d.name);
+        }
+        return list;
+    };
+    json out;
+    out["outputs"] = build(AudioDeviceKind::Playback);
+    out["inputs"]  = build(AudioDeviceKind::Capture);
+    // One line per serve, and it earns its place: "the dropdown is empty" has
+    // two very different causes -- the page never asked (a transport problem)
+    // and the machine reported nothing (a backend problem) -- and they are
+    // indistinguishable from the UI. A missing line means the former; a line
+    // reading 0/0 means the latter. The counts exclude the synthetic
+    // "(system default)" row so they match what the startup listing printed.
+    std::printf("[webview] audio.devices -> page (%zu playback, %zu capture)\n",
+                out["outputs"].size() - 1, out["inputs"].size() - 1);
+    std::fflush(stdout);
+    return out;
 }
 
 }  // namespace
@@ -318,30 +378,41 @@ void AssistantWindow::create_webview() {
                                     .Get(),
                                 &token);
 
-                            // ---- always revalidate the app's own assets -------
+                            // ---- revalidation for the REMOTE assets -----------
                             // The build REDEPLOYS web/ next to the exe on every
                             // compile, but the WebView keeps a persistent HTTP
-                            // cache in its user-data folder -- so a rebuilt
-                            // style.css or app.js can lose to the copy cached by
-                            // the previous run. The failure is badly misleading:
-                            // a NEW index.html paired with a CACHED stylesheet
-                            // renders every settings panel at once, because the
-                            // markup has `.panel` sections the old CSS has no
-                            // display:none rule for. It reads as "the tabs
-                            // overlap and the modal is unstyled", not as a stale
-                            // file, and it survives restarts.
+                            // cache -- so a rebuilt style.css could lose to the
+                            // copy cached by the previous run, rendering a NEW
+                            // index.html against an OLD stylesheet.
                             //
-                            // Forcing revalidation costs nothing here (the assets
-                            // are on local disk, a few KB) and makes what the app
-                            // renders always the code that was last built.
+                            // THIS HANDLER DOES NOT ACTUALLY COVER THAT CASE, and
+                            // the comment used to claim it did. Measured
+                            // 2026-08-04 by logging every URI that reaches here:
+                            // the ONLY requests raised are the external ones
+                            // (cdn.jsdelivr.net for marked/highlight.js).
+                            // index.html, app.js and style.css never appear --
+                            // requests satisfied by SetVirtualHostNameToFolderMapping
+                            // are served straight off disk and do not raise
+                            // WebResourceRequested at all.
+                            //
+                            // Which also means it cannot host an /api/... route:
+                            // a same-origin fetch to the virtual host is exactly
+                            // the kind of request that never gets here. That is
+                            // why the audio-device list travels over the
+                            // postMessage channel instead (see on_web_message).
+                            //
+                            // Kept because the CDN assets are genuinely cached and
+                            // genuinely worth revalidating. If local-asset
+                            // staleness ever bites, the fix is a cache-busting
+                            // query string in index.html, not this handler.
                             ComPtr<ICoreWebView2> wv = impl_->webview;
                             wv->AddWebResourceRequestedFilter(
                                 L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
                             EventRegistrationToken res_token{};
                             wv->add_WebResourceRequested(
                                 Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-                                    [](ICoreWebView2*,
-                                       ICoreWebView2WebResourceRequestedEventArgs* args)
+                                    [this](ICoreWebView2*,
+                                           ICoreWebView2WebResourceRequestedEventArgs* args)
                                         -> HRESULT {
                                         if (args == nullptr) return S_OK;
                                         ComPtr<ICoreWebView2WebResourceRequest> req;
@@ -575,6 +646,52 @@ void AssistantWindow::on_web_message(const std::wstring& message_json) {
             push_settings();
             return;
         }
+        // Deliberately NOT also pushed on "ready": the page asks for itself, at
+        // load and on every settings open. One trigger means one enumeration per
+        // request and a page-side watchdog that is always armed -- pushing here
+        // too would enumerate twice at startup and leave the unsolicited copy
+        // unaccounted for by that watchdog.
+        if (type == "audio.devices.request") {
+            push_audio_devices();
+            return;
+        }
+        if (type == "audio.test_tone") {
+            if (cb_.on_test_tone) cb_.on_test_tone();
+            return;
+        }
+        // THE HOT PATH. Note what is absent: no AssistantSettings is built, no
+        // requires_restart() is consulted, and control never reaches the
+        // settings.save branch below. A message that cannot express a
+        // restart-tier field cannot cause a restart.
+        if (type == "audio.hot_update") {
+            AudioHotUpdate u;
+            if (j.contains("output_device_index") && j["output_device_index"].is_number()) {
+                u.output_device_index = j["output_device_index"].get<int>();
+            }
+            if (j.contains("input_device_index") && j["input_device_index"].is_number()) {
+                u.input_device_index = j["input_device_index"].get<int>();
+            }
+            if (j.contains("output_device_name") && j["output_device_name"].is_string()) {
+                u.output_device_name = j["output_device_name"].get<std::string>();
+                u.has_output_name = true;
+            }
+            if (j.contains("input_device_name") && j["input_device_name"].is_string()) {
+                u.input_device_name = j["input_device_name"].get<std::string>();
+                u.has_input_name = true;
+            }
+            if (j.contains("tts_volume") && j["tts_volume"].is_number()) {
+                u.tts_volume = j["tts_volume"].get<float>();
+            }
+            if (j.contains("mic_gain") && j["mic_gain"].is_number()) {
+                u.mic_gain = j["mic_gain"].get<float>();
+            }
+            if (j.contains("tts_muted") && j["tts_muted"].is_boolean()) {
+                u.tts_muted = j["tts_muted"].get<bool>() ? rt::AudioHotUpdate::Tri::On
+                                                         : rt::AudioHotUpdate::Tri::Off;
+            }
+            if (cb_.on_audio_hot_update) cb_.on_audio_hot_update(u);
+            return;
+        }
         if (type == "send") {
             const std::string text = j.value("text", std::string());
             if (!text.empty() && cb_.on_send_text) cb_.on_send_text(text);
@@ -665,6 +782,27 @@ void AssistantWindow::push_settings() {
     mic["type"] = "mic";
     mic["on"] = listening_;
     post_event(mic.dump());
+}
+
+void AssistantWindow::post_audio_level(float level) {
+    // Dropped, not queued, when the page is not ready: a meter reading is only
+    // interesting while it is current, and a backlog of stale amplitudes would
+    // animate the bar through history the moment the modal opened.
+    if (!page_ready_) return;
+    json j;
+    j["type"] = "audio.level";
+    j["level"] = level;
+    post_event(j.dump());
+}
+
+void AssistantWindow::push_audio_devices() {
+    // ENUMERATION RUNS HERE, ON THE UI THREAD, and that is deliberate: it opens
+    // a fresh ma_context per call (~tens of ms on WASAPI), so the list reflects
+    // hardware plugged in since launch rather than a snapshot taken at startup.
+    // The cost is paid when the page asks -- page load and every settings open.
+    json out = audio_devices_payload();
+    out["type"] = "audio.devices";
+    post_event(out.dump());
 }
 
 void AssistantWindow::browse_for_folder(const std::string& target) {

@@ -129,6 +129,7 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/mock_vad_streaming_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_manual_mode_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_vad_scorer_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/speech_pipeline_vad_suppressor_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/kv_ledger_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/continuous_streaming_config_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/retranslation_session_test.cpp"
@@ -293,7 +294,12 @@ if(TARGET blackwell_vad)
     # the policy layer over whatever produced the probabilities.
     add_executable(vad_tests
         "${CMAKE_CURRENT_SOURCE_DIR}/vad/silero_vad_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vad/speech_segmenter_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/vad/speech_segmenter_test.cpp"
+        # The functional check for full-duplex barge-in. It belongs HERE and not
+        # with the canceller's own tests because what it asserts is a VAD
+        # verdict, not a signal-to-noise ratio -- it needs the real Silero model,
+        # which is exactly what this suite is gated on.
+        "${CMAKE_CURRENT_SOURCE_DIR}/vad/aec_barge_in_test.cpp")
     # audio_test_wav.hpp: the reference speech clip's path + WAV reader + the
     # documented silence-valley geometry (header-only, STL-only, no CUDA).
     target_include_directories(vad_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/integration")
@@ -301,6 +307,7 @@ if(TARGET blackwell_vad)
         GTest::gtest
         GTest::gtest_main
         blackwell_vad
+        blackwell::audio_rt   # the echo canceller under functional test
         psapi)  # GetProcessMemoryInfo (working-set smoke check)
     get_target_property(_vad_model blackwell_onnxruntime BLACKWELL_VAD_MODEL_PATH)
     target_compile_definitions(vad_tests PRIVATE BLACKWELL_VAD_MODEL_PATH="${_vad_model}")
@@ -328,7 +335,12 @@ add_executable(tts_tests
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/spsc_ring_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/phonemizer_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/transcript_model_test.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tts/test_duplex_pipeline.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/test_duplex_pipeline.cpp"
+    # The AEC lives in blackwell::audio_rt, not in blackwell_tts, but it is
+    # tested here for the same reason SpscRing is: this is the suite that already
+    # runs the duplex path CPU-only, and the canceller's whole purpose is to make
+    # that path survive its own loudspeaker.
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/echo_canceller_test.cpp")
 
 # transcript_model.hpp is app-side UI storage (header-only, STL-only), so it is
 # consumed by PATH rather than by linking audio_sandbox -- which would drag in
@@ -341,7 +353,7 @@ target_link_libraries(tts_tests PRIVATE
     GTest::gtest
     GTest::gtest_main
     blackwell_tts          # IPhonemizer + PassthroughPhonemizer + TtsVoice
-    blackwell::audio_rt)   # SpscRing (header-only INTERFACE target)
+    blackwell::audio_rt)   # SpscRing + the echo canceller
 
 if(MSVC)
     # REQUIRED: phonemizer_test.cpp asserts on Cyrillic UTF-8 literals -- the

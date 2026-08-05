@@ -74,7 +74,8 @@ struct Args {
     int   device = 0;
     std::size_t max_frames = 3000;
     int   opt_level = 3;   // ORT graph optimization; see F5TtsConfig
-    std::size_t gpu_mem_limit_mb = 2048;   // ORT CUDA arena ceiling; see F5TtsConfig
+    std::size_t gpu_mem_limit_mb = 0;      // ORT CUDA arena ceiling; 0 = none. See F5TtsConfig
+    int arena_extend_strategy = 0;         // 0 = kNextPowerOfTwo, 1 = kSameAsRequested
     // Debug seam: writes the ref+gen id sequences as raw int32 so they can be
     // diffed against f5_tts' own list_str_to_idx. Character ids are LINE INDICES
     // into vocab.txt, so an off-by-one or a mis-parsed vocab yields fluent
@@ -102,9 +103,17 @@ void usage() {
         "  --speed F         speech rate           (default: 1.0)\n"
         "  --max-frames N    frame-axis cap        (default: 3000)\n"
         "  --device N        CUDA device           (default: 0)\n"
-        "  --gpu-mem-limit N ORT CUDA arena ceiling, MiB (default: 2048, 0 = none).\n"
+        "  --gpu-mem-limit N ORT CUDA arena ceiling, MiB (default: 0 = none).\n"
         "                    Bounds the ARENA ONLY -- weights are allocated outside\n"
-        "                    it, so total VRAM is ~1.3 GB + what this permits.\n"
+        "                    it, so total VRAM is ~1.3 GB + what this permits. A cap\n"
+        "                    does NOT shrink the DiT's attention intermediates; it\n"
+        "                    only decides whether the arena can serve them, so too\n"
+        "                    low a value fails mid-solve in Softmax/MatMul rather\n"
+        "                    than saving anything. Use --max-frames to cut demand.\n"
+        "  --arena-extend N  arena growth: 0=next-power-of-two (default) 1=exact.\n"
+        "                    Measured to make NO difference to the failure above:\n"
+        "                    both values fail under a cap and both succeed without\n"
+        "                    one. Kept for profiling, not for fixing OOMs.\n"
         "  --opt-level N     ORT graph opt level    (default: 3)\n"
         "                    0=off 1=basic 2=extended 3=all. Bisect this when an\n"
         "                    fp16 DiT yields silence: a fused fp16 kernel can be\n"
@@ -135,6 +144,8 @@ Args parse_args(const std::vector<std::string>& argv) {
         else if (k == "--opt-level")         a.opt_level = std::stoi(next("--opt-level"));
         else if (k == "--gpu-mem-limit")     a.gpu_mem_limit_mb =
                                                  static_cast<std::size_t>(std::stoul(next("--gpu-mem-limit")));
+        else if (k == "--arena-extend")      a.arena_extend_strategy =
+                                                 std::stoi(next("--arena-extend"));
         else if (k == "--dump-ids")          a.dump_ids = next("--dump-ids");
         else die("unknown argument: " + k);
     }
@@ -329,7 +340,8 @@ int run(const std::vector<std::string>& argv_utf8) {
     cfg.speed              = args.speed;
     cfg.max_frames         = args.max_frames;
     cfg.graph_opt_level    = args.opt_level;
-    cfg.gpu_mem_limit_mb   = args.gpu_mem_limit_mb;
+    cfg.gpu_mem_limit_mb      = args.gpu_mem_limit_mb;
+    cfg.arena_extend_strategy = args.arena_extend_strategy;
     apply_contract(args.ckpt_dir + "/f5_tts_contract.json", cfg);
 
     // ---- reference audio -> mel -------------------------------------------

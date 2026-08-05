@@ -18,33 +18,34 @@
 // assistant from being an assistant.
 //
 // =============================================================================
-// THE SELF-TRIGGER PROBLEM, STATED HONESTLY
+// THE SELF-TRIGGER PROBLEM, AND WHAT NOW SOLVES IT
 // =============================================================================
 // The loudspeaker feeds the microphone. Silero scores the assistant's own voice
 // as speech -- correctly, because it IS speech -- which fires speech-onset,
 // which is barge-in, which cancels the generation currently being spoken. The
 // system's own correctness works against it.
 //
-// There are exactly two mitigations and they are mutually exclusive today:
+// This used to be answered by GATING THE MICROPHONE while the speaker was live.
+// That worked and it cost the whole feature: during exactly the window in which
+// a user would interrupt, the assistant was deaf, so barge-in-while-speaking
+// could not happen at all and the cancel button was the only way out. The gate
+// is GONE -- config, state and interlock -- and nothing here mutes, zeroes or
+// pauses capture for any reason.
 //
-//   AEC (real fix)   subtract the far-end reference from the mic. The bridge
-//                    already produces a correctly time-aligned reference at
-//                    aec_reference(). NOTHING CONSUMES IT YET -- there is no
-//                    echo canceller in this repo (docs/TTS_INTEGRATION_AUDIT.md
-//                    Phase 4, not started). The tap is wired and correct so that
-//                    landing an AEC is a connection, not a redesign.
+// What replaced it is acoustic echo cancellation
+// (src/audio_rt/echo_canceller.hpp), fed the far-end reference this class
+// publishes at aec_reference(). The microphone runs continuously; the
+// assistant's own voice is SUBTRACTED from it rather than the microphone being
+// switched off. A user talking over the assistant reaches the VAD in the same
+// block they would have if nothing were playing.
 //
-//   Mic gating (V1)  drop mic blocks while the speaker is active plus a reverb
-//                    tail. Cheap and effective, and it COSTS BARGE-IN: the user
-//                    cannot interrupt by talking over the assistant, only with
-//                    the cancel button. That is a real regression against the
-//                    Conversational mode's design intent.
-//
-// mic_gate_enabled defaults to FALSE, so barge-in-while-speaking works as the
-// pipeline intends. The consequence you are accepting is that on OPEN SPEAKERS
-// the assistant can hear itself and cut itself off. Use headphones, or set the
-// gate. There is no third option until AEC lands, and pretending otherwise in a
-// comment would be worse than saying it here.
+// This class's remaining share of that contract is the REFERENCE, and it has
+// exactly one property to protect: it is tapped at PullForPlayback, so it is
+// aligned with what the speaker is emitting rather than with when synthesis
+// happened (see tts_duplex_bridge.hpp -- synthesis runs several times faster
+// than realtime and would put the reference seconds ahead of the microphone).
+// The consumer side -- rate conversion, backlog bounding, cancellation -- is
+// AecCaptureFilter, on the capture thread, where it belongs.
 // -----------------------------------------------------------------------------
 #include <algorithm>
 #include <atomic>
@@ -87,8 +88,13 @@ struct TtsRuntimeConfig {
     int  min_chunk_chars = 20;    // clamped to [5, 50]
     int  max_chunk_chars = 150;   // clamped to [50, 300]
 
-    bool mic_gate_enabled = true;   // see the header block before disabling
-    std::uint32_t mic_gate_tail_ms = 200;   // reverb tail after the last sample
+    // Output endpoint: name (empty = system default) and zero-based index
+    // (-1 = not selected by index, and the index wins when both are set).
+    // Both are forwarded verbatim to AudioPlayback::start, which owns the
+    // precedence rule and the fallback behaviour. See audio_playback.h.
+    std::string output_device;
+    int output_device_index = -1;
+    float volume = 1.0f;          // initial playback gain, [0, 1]
 };
 
 class TtsRuntime {
@@ -110,9 +116,14 @@ public:
 
         bridge_.SetCancelSignal(&cancel_);
 
+        // Volume BEFORE the device starts, so the very first buffer is already
+        // at the configured level rather than briefly at full scale.
+        playback_.set_volume(cfg.volume);
+
         // Playback LAST: once the device is running its callback is live, and it
         // must never observe a half-built bridge.
-        playback_.start(blackwell::tts::kF5SampleRate, &PullThunk, this);
+        playback_.start(blackwell::tts::kF5SampleRate, &PullThunk, this, cfg.output_device,
+                        cfg.output_device_index);
 
         worker_ = std::thread([this] { WorkerLoop(); });
     }
@@ -143,7 +154,57 @@ public:
     void BargeIn() {
         cancel_.store(true, std::memory_order_release);
         bridge_.Cancel();
-        gate_until_ = std::chrono::steady_clock::now();   // release the mic at once
+    }
+
+    // ---- audio hot swap (settings thread) -----------------------------------
+    // Moves speech output to a different endpoint WITHOUT touching the F5
+    // session, the arena or anything else on the GPU. The synthesiser, its ONNX
+    // graphs and the worker thread all keep running; only the ma_device is
+    // closed and reopened underneath the same speaker ring.
+    //
+    // The AEC reference needs NO rebinding across this, and that is a property
+    // of where it is tapped rather than luck: PullForPlayback writes the
+    // reference as it hands samples to the device, so it describes "what we are
+    // emitting" independently of which endpoint emits it. What the swap DOES
+    // invalidate is the canceller's learned impulse response, which belongs to
+    // the old speaker -- the caller resets the filter (main.cpp does).
+    bool HotReloadOutput(const std::string& device_name, int device_index) {
+        return playback_.hot_reload(device_name, device_index);
+    }
+
+    // ---- "Check sound" (any thread) -----------------------------------------
+    // A short tone straight into the speaker ring, bypassing the synthesiser
+    // entirely. THROUGH THE REAL PIPELINE ON PURPOSE: it goes out the configured
+    // endpoint, at the configured volume, and is tapped into the AEC reference
+    // exactly like speech -- so it tests the path that was actually silent,
+    // rather than a second path that might work when the first does not.
+    //
+    // Short and gentle: 0.35 s of 660 Hz at -18 dBFS with raised-cosine edges,
+    // because a hard-edged tone at full scale is what makes test buttons
+    // unpleasant to press twice.
+    void PlayTestTone() {
+        constexpr int kRate = blackwell::tts::kF5SampleRate;
+        constexpr std::size_t kSamples = static_cast<std::size_t>(kRate * 0.35);
+        constexpr double kFreq = 660.0;
+        constexpr std::size_t kFade = kRate / 100;   // 10 ms in and out
+
+        std::vector<float> pcm(kSamples);
+        for (std::size_t i = 0; i < kSamples; ++i) {
+            const double t = static_cast<double>(i) / kRate;
+            double env = 0.125;                       // -18 dBFS
+            if (i < kFade) {
+                env *= 0.5 * (1.0 - std::cos(3.14159265358979 * static_cast<double>(i) / kFade));
+            } else if (i + kFade > kSamples) {
+                const std::size_t k = kSamples - i;
+                env *= 0.5 * (1.0 - std::cos(3.14159265358979 * static_cast<double>(k) / kFade));
+            }
+            pcm[i] = static_cast<float>(env * std::sin(6.283185307179586 * kFreq * t));
+        }
+        // Resume first: a barge-in latch left set from an earlier turn would
+        // otherwise swallow the tone, and "the test button does nothing" is the
+        // worst possible outcome for a button whose job is to prove sound works.
+        Resume();
+        bridge_.PushPcm(pcm);
     }
 
     // The user's turn ended; speak again on the next reply.
@@ -152,24 +213,53 @@ public:
         bridge_.Resume();
     }
 
-    // ---- mic interlock (DSP worker) -----------------------------------------
-    // True while the speaker is active, plus a reverb tail. Only meaningful when
-    // mic_gate_enabled -- see the header for what enabling it costs.
-    bool MicShouldBeGated() const noexcept {
-        if (!cfg_.mic_gate_enabled) return false;
-        return std::chrono::steady_clock::now() < gate_until_;
-    }
+    // ---- volume (any thread) -------------------------------------------------
+    // Effective on the next audio buffer. THE CALLER MUST ALSO give the same
+    // value to AecCaptureFilter::SetReferenceGain(), or the canceller's learned
+    // response goes stale by exactly this ratio -- audio_playback.h says why.
+    void SetVolume(float v) noexcept { playback_.set_volume(v); }
+    float volume() const noexcept { return playback_.volume(); }
 
     // ---- observers -----------------------------------------------------------
+    // THE PLAYBACK TIME-LOCK, and the difference between it and speaking() is
+    // the whole of why self-barge-in survived the echo canceller.
+    //
+    // speaking() is the RING: it goes false the instant the last sample is
+    // handed to WASAPI, while that sample and the one to three buffers queued
+    // behind it have not been emitted yet, and what HAS been emitted is still
+    // travelling across the room. A guard keyed on speaking() therefore re-arms
+    // the VAD onto the loudest part of our own tail.
+    //
+    // is_playing_tts() is the SPEAKER, plus AudioPlayback::kAcousticTailMs of
+    // room. Anything deciding whether the microphone currently contains our own
+    // voice must ask this one. See audio_playback.h.
+    bool is_playing_tts() const noexcept { return playback_.is_playing_tts(); }
     bool speaking() const noexcept { return bridge_.speaking(); }
+    // The output endpoint actually opened ("" = system default), and whether a
+    // requested one was silently swapped for it.
+    const std::string& output_device() const noexcept { return playback_.device_name(); }
+    bool output_device_fallback() const noexcept { return playback_.device_fallback(); }
     std::uint64_t chunks_spoken() const noexcept { return bridge_.chunks_spoken(); }
     std::uint64_t chunks_cancelled() const noexcept { return bridge_.chunks_cancelled(); }
     std::uint64_t synthesis_errors() const noexcept { return bridge_.synthesis_errors(); }
+    std::uint64_t speaker_underruns() const noexcept { return bridge_.speaker_underruns(); }
+    // The device-side view of the same question; see AudioPlayback::stats().
+    AudioPlayback::PlaybackStats playback_stats() const noexcept { return playback_.stats(); }
+    void reset_playback_stats() noexcept { playback_.reset_stats(); }
 
-    // The far-end reference for a future echo canceller. Correctly time-aligned
-    // with the speaker (tapped at playback), and currently UNCONSUMED -- see the
-    // header block.
+    // THE far-end reference, consumed by AecCaptureFilter on the capture thread.
+    // Time-aligned with the speaker because it is tapped at playback, and
+    // continuous because PullForPlayback writes every sample it hands the device
+    // including silence -- a gap here would shift the whole stream and the
+    // canceller would be subtracting the wrong milliseconds.
+    //
+    // SINGLE CONSUMER, per the ring's SPSC contract: exactly one AecCaptureFilter
+    // may read it.
     blackwell::audio_rt::SpscRing<float>& aec_reference() noexcept { return aec_ref_; }
+
+    // The rate that reference is in (F5's output rate). The capture side is at
+    // 16 kHz, so somebody has to convert; this is what tells them by how much.
+    static constexpr int far_sample_rate() noexcept { return blackwell::tts::kF5SampleRate; }
 
     const std::string& reference_text() const noexcept { return cfg_.ref_text; }
 
@@ -282,20 +372,19 @@ private:
         }
     }
 
-    static void PullThunk(void* user, float* dst, std::size_t frames) {
-        static_cast<TtsRuntime*>(user)->OnPull(dst, frames);
+    static std::size_t PullThunk(void* user, float* dst, std::size_t frames) {
+        return static_cast<TtsRuntime*>(user)->OnPull(dst, frames);
     }
 
     // THE audio callback. Lock-free and allocation-free, per audio_playback.h.
-    void OnPull(float* dst, std::size_t frames) noexcept {
-        const std::size_t real = bridge_.PullForPlayback(dst, frames);
-        if (real != 0) {
-            // Hold the mic gate open while sound is actually going out, plus a
-            // tail for the room. steady_clock::now() on the audio thread is a
-            // vDSO/QPC read -- no lock, no syscall.
-            gate_until_ = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(cfg_.mic_gate_tail_ms);
-        }
+    // PullForPlayback does the reference tap itself; there is nothing else for
+    // this to do, and nothing here may touch the microphone.
+    //
+    // Its return value -- real frames as opposed to padding -- is now forwarded
+    // rather than discarded, because that is the number the starvation counters
+    // are built from.
+    std::size_t OnPull(float* dst, std::size_t frames) noexcept {
+        return bridge_.PullForPlayback(dst, frames);
     }
 
     TtsRuntimeConfig cfg_;
@@ -318,11 +407,6 @@ private:
     std::thread       worker_;
     std::atomic<bool> running_{true};
     std::atomic<bool> cancel_{false};
-
-    // Written by the audio callback, read by the DSP worker. Not atomic because
-    // a time_point is not lock-free everywhere; a torn read costs one 10 ms
-    // block of gating either way, which is below the tail it is guarding.
-    std::chrono::steady_clock::time_point gate_until_{};
 };
 
 }  // namespace rt

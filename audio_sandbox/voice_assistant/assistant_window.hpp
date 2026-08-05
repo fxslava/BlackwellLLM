@@ -39,6 +39,57 @@
 
 namespace rt {
 
+// THE HOT AUDIO SET, as its own type rather than a subset of AssistantSettings.
+//
+// The separation is enforced by the TYPE, not by discipline: there is no field
+// here that a restart could depend on, so no code path that takes one of these
+// can decide to restart the engine even by mistake. That is the whole design --
+// the previous arrangement passed a full AssistantSettings and relied on every
+// caller remembering that audio changes are cheap.
+//
+// Each member is optional-by-sentinel so a slider drag sends one field rather
+// than a snapshot of five: -2 means "index not present in this message" (-1 is
+// already taken, and means "follow the system default"), and a negative gain
+// means "gain not present". A message that carries only what moved cannot
+// clobber a device the user selected a moment earlier from a stale copy.
+struct AudioHotUpdate {
+    static constexpr int kNoIndex = -2;
+
+    int output_device_index = kNoIndex;
+    int input_device_index = kNoIndex;
+    bool has_output_name = false;
+    bool has_input_name = false;
+    std::string output_device_name;
+    std::string input_device_name;
+    float tts_volume = -1.0f;   // <0 = absent
+    float mic_gain = -1.0f;     // <0 = absent
+
+    // SPEAKER MUTE (the dock's "deafen"), tri-state for the same reason the
+    // gains are sentinel-encoded: a message carrying only what moved cannot
+    // clobber the other fields.
+    //
+    // SEPARATE FROM tts_volume ON PURPOSE. Muting by writing volume 0 destroys
+    // the value being muted, so unmuting has to guess -- and the obvious guess
+    // (restore to 1.0) silently promotes everyone who listens at 30% to full
+    // scale the first time they tap the speaker icon. Keeping mute orthogonal
+    // means the slider still shows, and still holds, what the user chose.
+    //
+    // NOT PERSISTED, unlike every other field here: a mute is a statement about
+    // the next few minutes, and an app that starts up silent because of a tap
+    // three days ago reads as broken. main.cpp applies it and does not save it.
+    enum class Tri { Absent, Off, On };
+    Tri tts_muted = Tri::Absent;
+
+    // True when anything requiring a DEVICE reopen is present. The gains alone
+    // are atomics and must not cost a device close/open -- dragging a volume
+    // slider through 40 values would otherwise reopen WASAPI 40 times. Mute is
+    // on the gain side of that line: it is one atomic store, not a reopen.
+    bool needs_device_reload() const noexcept {
+        return output_device_index != kNoIndex || input_device_index != kNoIndex ||
+               has_output_name || has_input_name;
+    }
+};
+
 // What the page can ask the app to do. All invoked on the UI thread, from inside
 // the message loop -- so an implementation may touch the settings/producer edges
 // freely, but must NOT call into the engine (single-thread doctrine): marshal.
@@ -58,6 +109,26 @@ struct AssistantWindowCallbacks {
     std::function<void(const AssistantSettings& next, bool live_only)> on_settings_apply;
     // The user asked to restart the app so restart-tier settings can take effect.
     std::function<void()> on_restart;
+
+    // "Check sound": play a short tone through the LIVE output pipeline, so the
+    // thing being tested is the thing that speaks. Fired from the settings
+    // panel; runs on the UI thread and must not block it for long.
+    std::function<void()> on_test_tone;
+
+    // THE HOT AUDIO PATH, and the reason it is a separate callback from
+    // on_settings_apply rather than a flag on it.
+    //
+    // on_settings_apply receives the WHOLE form and asks requires_restart()
+    // whether the engine has to come back. That is correct for the settings
+    // modal and catastrophic for a volume slider: the payload carries every
+    // restart-tier field too, so one blank model path -- a modal that was never
+    // opened, a tab never seeded -- differs from what is running and restarts a
+    // process holding 8 GB of weights because somebody dragged a slider.
+    //
+    // This callback carries ONLY the audio fields. It cannot compute a restart
+    // because it is not given anything a restart could depend on, which is a
+    // stronger guarantee than remembering not to ask.
+    std::function<void(const AudioHotUpdate&)> on_audio_hot_update;
     // The system prompt changed and must be re-frozen: tokenize, prefill, and
     // republish the KV rewind floor. This is ENGINE work and is therefore
     // asynchronous by nature -- the implementation marshals it onto the engine
@@ -95,6 +166,11 @@ public:
     // nothing.
     void post_system_prompt_applied(bool ok, unsigned tokens, const std::string& detail);
 
+    // Microphone amplitude for the settings meter, [0, 1]. Posted several times
+    // a second from the telemetry thread; it is a display value, so it is
+    // dropped rather than queued when the page is not up.
+    void post_audio_level(float level);
+
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
 
 private:
@@ -110,6 +186,12 @@ private:
     void on_web_message(const std::wstring& json);
     void push_settings();                     // seed/refresh the Settings modal
     void browse_for_folder(const std::string& target);
+
+    // Answers the page's "audio.devices.request" with the live endpoint lists,
+    // so the settings dropdowns are built from what the machine actually has
+    // rather than from a number the user read off the console. Re-enumerates on
+    // every call; see the .cpp for why it is not a fetch endpoint.
+    void push_audio_devices();
 
     // ---- hotkeys (UI thread) -------------------------------------------------
     void register_hotkeys();      // (re)register all three from settings_

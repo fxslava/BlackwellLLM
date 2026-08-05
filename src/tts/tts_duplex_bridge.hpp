@@ -189,6 +189,16 @@ public:
     // user's turn has ended, after the caller has cleared its cancel signal.
     void Resume();
 
+    // Publishes ready-made PCM (24 kHz mono f32) as if it had been synthesised:
+    // same ring, same barge-in checks, same AEC reference tap. For UI sounds --
+    // the "check sound" tone -- which must travel the REAL output path or they
+    // do not test it.
+    //
+    // Any thread EXCEPT the audio callback. It can block briefly while the ring
+    // drains, exactly as a synthesised chunk does, which is why the callback is
+    // excluded rather than merely discouraged.
+    TtsStatus PushPcm(const std::vector<float>& pcm);
+
     bool cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
     std::uint64_t speak_epoch() const noexcept {
         return speak_epoch_.load(std::memory_order_acquire);
@@ -211,8 +221,23 @@ public:
     std::uint64_t synthesis_errors() const noexcept { return synthesis_errors_.load(std::memory_order_relaxed); }
     std::uint64_t samples_published() const noexcept { return samples_published_.load(std::memory_order_relaxed); }
     std::uint64_t samples_discarded() const noexcept { return samples_discarded_.load(std::memory_order_relaxed); }
+
+    // Samples of silence the speaker ring had to invent because the synthesiser
+    // had not produced them yet. THE number that decides whether "no sound"
+    // means "nothing was synthesised" or "synthesis could not keep up with the
+    // device" -- the second is what GPU contention with a decoding LLM would
+    // look like, and it is invisible in every other counter here.
+    //
+    // Safe from any thread (SpscRing's observers are), though it is only
+    // meaningful next to chunks_spoken: an idle stream pads every buffer and is
+    // not starving.
+    std::uint64_t speaker_underruns() const noexcept { return speaker_.underruns(); }
     // True between the first sample of a chunk being queued and the speaker ring
-    // running dry. The mic-gating interlock reads this.
+    // running dry. OBSERVATION ONLY -- it used to drive a mic-gating interlock,
+    // and that interlock is gone: the microphone is never gated on whether we
+    // are speaking, because that is precisely when a user might interrupt. What
+    // removes our voice from the capture stream is the echo canceller, which
+    // works off the reference samples rather than off this flag.
     bool speaking() const noexcept;
 
 private:

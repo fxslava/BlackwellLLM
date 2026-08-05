@@ -6,8 +6,9 @@
      app -> page   phase | local.delta | local.final | user.text | remote.start
                    | remote.delta | remote.final | transport | backend | stats
                    | settings | settings.saved | system_prompt.applied | mic
-                   | browsed
+                   | browsed | audio.devices
      page -> app   ready | send | mic | browse | settings.save | restart
+                   | audio.devices.request
 
    MIC STATE IS THE APP'S, not this page's: the talk hotkey is global and can
    flip it while the window is hidden, so the button RENDERS `mic` events and
@@ -371,10 +372,24 @@ function submit() {
   send({ type: "send", text });
 }
 
+/* MIC MUTE. Routed through `mic`, NOT audio.hot_update, and that is deliberate:
+   the same message is what the talk hotkey sends, so the button and the hotkey
+   arrive at one handler and cannot disagree about the state. It is not a
+   settings path either -- the app answers it with set_manual_mode, one atomic
+   store, no engine work and nothing written to disk.
+
+   aria-pressed is kept in step with data-on because the visual state is a CSS
+   strike-through, which a screen reader cannot see. */
+function paintMic(on) {
+  micBtn.dataset.on = String(on);
+  micBtn.setAttribute("aria-pressed", String(!on));
+  micBtn.title = micBtn.ariaLabel = on ? "Mute the microphone" : "Unmute the microphone";
+  if (!on) micBtn.classList.remove("hearing");
+}
+
 micBtn.addEventListener("click", () => {
   const on = micBtn.dataset.on !== "true";
-  micBtn.dataset.on = String(on);
-  if (!on) micBtn.classList.remove("hearing");
+  paintMic(on);
   send({ type: "mic", on });
 });
 
@@ -410,7 +425,15 @@ const FIELDS = {
   tts_ckpt_dir: "value", tts_vocab_path: "value", tts_ref_audio: "value",
   tts_ref_text: "value", tts_nfe_step: "int",
   tts_split_on_commas: "check", tts_min_chunk_chars: "int",
-  tts_max_chunk_chars: "int", tts_mic_gate: "check",
+  tts_max_chunk_chars: "int",
+  // "float" (not "int") is load-bearing: tts_volume arriving as an integer would
+  // be 0 or 1 and nothing between, i.e. a mute switch wearing a slider.
+  tts_volume: "float", mic_gain: "float",
+  // The four audio-endpoint settings (output/input x name/index) are NOT here.
+  // They are driven by two <select>s whose options come from
+  // GET /api/audio-devices, and one dropdown writes two settings, which the
+  // one-id-one-field table above cannot express. See readDevices/writeDevices.
+  aec_enabled: "check", aec_tail_ms: "int",
   // Tab 3
   hotkey_talk: "value", hotkey_cancel: "value", hotkey_show: "value",
   hotkey_push_to_talk: "check",
@@ -433,9 +456,17 @@ const READOUTS = {
   warm_prefill_interval_ms: ["#warmValue",     v => Number(v) === 0 ? "off" : Number(v) + " ms"],
   // Chunk sizes read as characters, not an abstract scale -- the whole point of
   // the two knobs is "how much text before it starts talking".
+  mic_gain:                 ["#micGainValue",  v => Math.round(Number(v) * 100) + "%"],
   tts_nfe_step:             ["#nfeValue",      v => Number(v) + " steps"],
   tts_min_chunk_chars:      ["#minChunkValue", v => Number(v) + " chars"],
-  tts_max_chunk_chars:      ["#maxChunkValue", v => Number(v) + " chars"]
+  tts_max_chunk_chars:      ["#maxChunkValue", v => Number(v) + " chars"],
+  // Milliseconds of room, not an abstract scale: it is a physical length the
+  // canceller can model, and reading it as one is what makes it settable.
+  aec_tail_ms:              ["#aecTailValue",  v => Number(v) + " ms"],
+  // Percent, not the raw 0-1 gain: nobody sets loudness in linear amplitude.
+  tts_volume:               ["#volumeValue",   v => Number(v) === 0
+                                                    ? "muted"
+                                                    : Math.round(Number(v) * 100) + "%"]
 };
 
 // Must match settings_store.hpp's defaults -- "Restore defaults" that restored
@@ -450,6 +481,491 @@ let seeded = false;          // has the form ever been filled from `current`?
 
 function el(k) { return $("#s_" + k); }
 
+/* ---------------------------- audio endpoints -----------------------------
+   Two <select>s, populated from GET /api/audio-devices, replacing what used to
+   be four hand-typed fields (a name and an index, per direction).
+
+   ONE DROPDOWN WRITES TWO SETTINGS, which is why these are handled here instead
+   of in the FIELDS table. What it writes, and why:
+
+     "(system default)"  -> name "", index -1.
+     a device            -> name = the exact enumerated string, index -1.
+     a DUPLICATE name    -> name = the string, index = its real position.
+
+   Preferring the NAME is the whole point of having picked from a list: the
+   string is now exact, so the substring matching that made hand-typed names
+   risky never comes into play, and a name keeps pointing at the right hardware
+   after the OS reorders its endpoints. An index does not survive that.
+
+   The duplicate case is the exception because it has to be. Two identical USB
+   headsets enumerate under one name, and an exact-name match that hits both is
+   treated as NO match by the resolver (deliberately -- see ma_device_select.h).
+   Only the position can separate them, so there the index is pinned and the
+   ordering fragility is accepted: a wrong-but-plausible device beats a silent
+   fallback to the default. */
+const DEVICE_SELECTS = {
+  output: { el: "s_output_device", name: "output_device_name", index: "output_device_index" },
+  input:  { el: "s_input_device",  name: "input_device_name",  index: "input_device_index"  }
+};
+
+// null until the fetch resolves. Kept so writeDevices() can re-select the right
+// option when settings arrive after the list (or before it -- either order
+// happens, and both have to end up showing the same thing).
+let deviceLists = null;
+
+function optionLabel(list, i) {
+  // A duplicate name is disambiguated IN THE UI too, not just in what gets
+  // saved: two identical rows would otherwise be an unexplained coin flip.
+  if (i === 0) return list[0];
+  return list.indexOf(list[i]) === i && list.lastIndexOf(list[i]) === i
+    ? list[i]
+    : list[i] + "  [" + (i - 1) + "]";
+}
+
+function fillSelect(sel, list) {
+  sel.textContent = "";
+  list.forEach((nameStr, i) => {
+    const o = document.createElement("option");
+    // value is the DEVICE index (row 0 -> -1, the system-default sentinel).
+    o.value = String(i - 1);
+    o.textContent = optionLabel(list, i);
+    sel.appendChild(o);
+  });
+  sel.disabled = false;
+}
+
+// Captured before anything can overwrite it, so a failure that is later
+// RECOVERED (the app answers a retry, a backend comes back) puts the real
+// explanatory text back instead of leaving a stale error under a working list.
+const OUTPUT_HINT_HTML = $("#outputDeviceHint") ? $("#outputDeviceHint").innerHTML : "";
+
+function markDevicesUnavailable(why) {
+  for (const k in DEVICE_SELECTS) {
+    const sel = $("#" + DEVICE_SELECTS[k].el);
+    if (!sel) continue;
+    sel.textContent = "";
+    const o = document.createElement("option");
+    o.value = "-1";
+    o.textContent = "(system default)";
+    sel.appendChild(o);
+    // Disabled rather than empty: an empty dropdown reads as "this machine has
+    // no audio devices", which is a hardware diagnosis the page has not earned.
+    sel.disabled = true;
+  }
+  const hint = $("#outputDeviceHint");
+  if (hint) hint.innerHTML = "<b>Could not read the device list</b> (" + why +
+    "). The assistant will use the system default. The console prints the same " +
+    "list at launch.";
+}
+
+// Asks the app for the list. The reply arrives asynchronously as an
+// "audio.devices" message (see onMessage) rather than as the return value here
+// -- the app↔page transport is one-way postMessage, not request/response.
+//
+// NOT a fetch, though it started as one: a same-origin fetch to the virtual
+// asset host is served straight off disk and never reaches the C++ side, so
+// there is no way for the app to answer it. The full reasoning is in
+// assistant_window.cpp above audio_devices_payload().
+//
+// The watchdog exists because a message that is never answered leaves no trace:
+// the dropdown would sit empty forever with nothing on screen saying why. An app
+// that is alive answers this in microseconds, so 4 s only ever fires when
+// something is genuinely wrong.
+let deviceRequestTimer = null;
+function loadAudioDevices() {
+  if (!host) {                       // opened outside the app shell
+    markDevicesUnavailable("not running inside the assistant");
+    return;
+  }
+  clearTimeout(deviceRequestTimer);
+  deviceRequestTimer = setTimeout(() => {
+    if (!deviceLists) markDevicesUnavailable("the app did not answer");
+  }, 4000);
+  send({ type: "audio.devices.request" });
+}
+
+// Applies a payload of the shape { outputs: [...], inputs: [...] }.
+function applyAudioDevices(j) {
+  clearTimeout(deviceRequestTimer);
+  if (!j || !Array.isArray(j.outputs) || !Array.isArray(j.inputs)) {
+    deviceLists = null;
+    markDevicesUnavailable("the device list was malformed");
+    return;
+  }
+  deviceLists = { output: j.outputs, input: j.inputs };
+  fillSelect($("#" + DEVICE_SELECTS.output.el), j.outputs);
+  fillSelect($("#" + DEVICE_SELECTS.input.el), j.inputs);
+  const hint = $("#outputDeviceHint");
+  if (hint) hint.innerHTML = OUTPUT_HINT_HTML;
+  // Settings usually land first, but not always -- re-select from whatever the
+  // app last told us, so either arrival order ends at the same selection.
+  if (seeded) writeDevices(current);
+  // The popover mirrors these options, so it has to be refilled whenever they
+  // change -- otherwise it keeps showing the list from the previous open.
+  syncPopoverFromForm();
+}
+
+function readDevices(out) {
+  for (const k in DEVICE_SELECTS) {
+    const spec = DEVICE_SELECTS[k];
+    const sel = $("#" + spec.el);
+    // Untouched when the list never loaded: writing "" + -1 from a disabled
+    // dropdown would silently WIPE a working configured device on the next save.
+    if (!sel || sel.disabled || !deviceLists) continue;
+    const list = deviceLists[k];
+    const idx = parseInt(sel.value, 10);
+    if (Number.isNaN(idx) || idx < 0) {
+      out[spec.name] = "";
+      out[spec.index] = -1;
+      continue;
+    }
+    const nameStr = list[idx + 1];
+    const dup = list.indexOf(nameStr) !== list.lastIndexOf(nameStr);
+    out[spec.name] = nameStr;
+    out[spec.index] = dup ? idx : -1;
+  }
+  return out;
+}
+
+function writeDevices(s) {
+  if (!deviceLists) return;
+  for (const k in DEVICE_SELECTS) {
+    const spec = DEVICE_SELECTS[k];
+    const sel = $("#" + spec.el);
+    if (!sel) continue;
+    const list = deviceLists[k];
+    const savedIdx = typeof s[spec.index] === "number" ? s[spec.index] : -1;
+    const savedName = s[spec.name] || "";
+    // Same precedence the C++ resolver applies (index beats name), so what the
+    // dropdown shows is what the app will actually open -- including for a
+    // settings.json edited by hand into a state the UI cannot produce.
+    let pick = -1;
+    if (savedIdx >= 0 && savedIdx < list.length - 1) {
+      pick = savedIdx;
+    } else if (savedName) {
+      const at = list.indexOf(savedName);
+      if (at > 0) pick = at - 1;
+    }
+    // A configured device that is not in the list (unplugged, or renamed) leaves
+    // the dropdown on "(system default)" -- which is what the app will fall back
+    // to anyway, so the UI agrees with the behaviour rather than showing a
+    // selection that no longer exists.
+    sel.value = String(pick);
+  }
+}
+
+/* ------------------------- live audio application -------------------------
+   The audio controls do NOT wait for Save. Every other setting in this panel is
+   a considered change you might abandon with Cancel; an output device and a
+   volume are things you adjust BY HEARING THE RESULT, and a slider you have to
+   confirm cannot be adjusted that way at all.
+
+   They are safe to apply immediately because of what they cost on the C++ side:
+   the gains are an atomic each, and a device change closes and reopens two
+   ma_device handles. Nothing here reloads a model, and the app does not restart
+   -- which is exactly why these fields were moved off the restart tier. */
+
+/* NEVER settings.save. That route carries the WHOLE form, and the app has to ask
+   requires_restart() of it -- so a blank model path in a tab the user never
+   opened turns a volume drag into an engine restart. That is not hypothetical;
+   it is what this replaced.
+
+   audio.hot_update carries ONLY the fields named below. The C++ side cannot
+   compute a restart from it because it is not given anything a restart could
+   depend on. */
+function sendAudioHot(patch) {
+  send(Object.assign({ type: "audio.hot_update" }, patch));
+}
+
+// Devices reopen a WASAPI handle, so they go immediately and unthrottled -- a
+// select fires once, on commit.
+function sendDeviceChange(which) {
+  const spec = DEVICE_SELECTS[which];
+  const sel = $("#" + spec.el);
+  if (!sel || sel.disabled || !deviceLists) return;
+  const list = deviceLists[which];
+  const idx = parseInt(sel.value, 10);
+  const patch = {};
+  if (Number.isNaN(idx) || idx < 0) {
+    patch[spec.name] = "";
+    patch[spec.index] = -1;
+  } else {
+    const nameStr = list[idx + 1];
+    const dup = list.indexOf(nameStr) !== list.lastIndexOf(nameStr);
+    patch[spec.name] = nameStr;
+    patch[spec.index] = dup ? idx : -1;
+  }
+  sendAudioHot(patch);
+}
+
+// Gains are atomic stores on the C++ side, so they can go at drag rate -- but
+// each is still a JSON round trip, so 60 ms keeps the wire quiet while staying
+// well below the point where the slider stops feeling attached to the sound.
+//
+// COALESCED, NOT DROPPED: the pending patch accumulates fields, so a drag that
+// also flips the mute (the rail's unmute-on-drag) delivers both in one message
+// and the app can never apply half of the pair.
+let gainTimer = null;
+let pendingGains = {};
+function sendGainPatch(patch) {
+  Object.assign(pendingGains, patch);
+  clearTimeout(gainTimer);
+  gainTimer = setTimeout(() => {
+    sendAudioHot(pendingGains);
+    pendingGains = {};
+  }, 60);
+}
+function sendGainChange(field, value) {
+  sendGainPatch({ [field]: value });
+}
+
+function wireAudioLiveControls() {
+  for (const k in DEVICE_SELECTS) {
+    const sel = $("#" + DEVICE_SELECTS[k].el);
+    if (sel) sel.addEventListener("change", () => sendDeviceChange(k));
+  }
+  const gains = { s_tts_volume: "tts_volume", s_mic_gain: "mic_gain" };
+  for (const id in gains) {
+    const e = $("#" + id);
+    if (!e) continue;
+    e.addEventListener("input", () => {
+      // Mirror into the readout immediately, before the round trip: the number
+      // beside the slider must track the thumb, not the app's acknowledgement.
+      refreshReadouts();
+      // ...and into the dock rail, which shows the same value on the main
+      // screen. Three controls, one number: whichever one moves, the other two
+      // follow, because a user who drags the modal slider and then glances at
+      // the dock must not see two different volumes.
+      if (id === "s_tts_volume") syncDockVolumeFromForm();
+      sendGainChange(gains[id], parseFloat(e.value) || 0);
+    });
+  }
+  wireCheckSound("#checkSoundBtn", "#checkSoundMsg");
+}
+
+function wireCheckSound(btnSel, msgSel) {
+  const btn = $(btnSel);
+  const msg = $(msgSel);
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    // Flush any pending gain BEFORE the tone, so the button tests the value on
+    // screen rather than the one from before the drag. Still no settings.save.
+    clearTimeout(gainTimer);
+    if (Object.keys(pendingGains).length) {
+      sendAudioHot(pendingGains);
+      pendingGains = {};
+    }
+    send({ type: "audio.test_tone" });
+    btn.disabled = true;
+    if (msg) msg.textContent = "Playing…";
+    setTimeout(() => {
+      btn.disabled = false;
+      if (msg) msg.textContent = "Heard nothing? Try another output device.";
+    }, 700);
+  });
+}
+
+/* ------------------------- the speaker + volume rail ------------------------
+   MUTE IS NOT VOLUME 0, and the whole design of this control follows from that.
+   Sending volume 0 on mute destroys the value being muted, so unmute has to
+   guess -- and the only available guess promotes everyone who listens at 30% to
+   full scale on their first tap. So the icon sends `tts_muted` and the slider
+   sends `tts_volume`, they are independent fields of the same hot update, and
+   the C++ side folds them (see AudioHotUpdate::tts_muted).
+
+   The slider therefore keeps SHOWING the stored volume while muted, greyed. It
+   is what you will get back, and hiding it would make unmute feel like a gamble.
+
+   NOT PERSISTED. The app applies the mute and pointedly does not save it: an
+   assistant that starts up silent because of a tap three days ago reads as
+   broken, so the page does not seed this from settings either. */
+let speakerOn = true;
+
+function paintSpeaker() {
+  const btn = $("#speakerBtn"), dock = $("#volumeDock");
+  if (!btn) return;
+  btn.dataset.on = String(speakerOn);
+  btn.setAttribute("aria-pressed", String(!speakerOn));
+  btn.title = btn.ariaLabel =
+    speakerOn ? "Mute the assistant" : "Unmute the assistant";
+  if (dock) dock.classList.toggle("muted", !speakerOn);
+}
+
+function wireSpeakerDock() {
+  const btn = $("#speakerBtn"), dock = $("#volumeDock"), rail = $("#dock_tts_volume");
+  if (!btn || !dock) return;
+
+  btn.addEventListener("click", e => {
+    // The rail opens on hover, but a click has to work on a touchpad and on
+    // touch, where there is no hover at all -- .open latches what :hover would
+    // otherwise be the only way to reach.
+    e.stopPropagation();
+    speakerOn = !speakerOn;
+    paintSpeaker();
+    dock.classList.add("open");
+    sendAudioHot({ tts_muted: !speakerOn });
+  });
+
+  if (rail) {
+    rail.addEventListener("input", () => {
+      // Mirror into the OTHER view of the same number before the round trip: the
+      // readout must track the thumb, not the app's acknowledgement.
+      const f = $("#s_tts_volume");
+      if (f) f.value = rail.value;
+      refreshDockVolume();
+      refreshReadouts();
+      // Moving the slider while muted is an unmute: the user is reaching for a
+      // volume, and leaving them dragging a control that produces no sound is
+      // the kind of dead end that gets reported as "the slider does nothing".
+      // Sent as ONE patch with the volume, so the app cannot briefly apply a new
+      // volume to a still-muted speaker (or the reverse).
+      const patch = { tts_volume: parseFloat(rail.value) || 0 };
+      if (!speakerOn) {
+        speakerOn = true;
+        paintSpeaker();
+        patch.tts_muted = false;
+      }
+      sendGainPatch(patch);
+    });
+  }
+
+  // Click-away only unlatches the click-opened state; hover still governs the
+  // rest, so this cannot fight the CSS.
+  document.addEventListener("click", () => dock.classList.remove("open"));
+  dock.addEventListener("click", e => e.stopPropagation());
+  paintSpeaker();
+  // Reconcile the readout with the thumb BEFORE the app's first settings push.
+  // A range input with no value attribute lands at the midpoint, so the markup's
+  // placeholder "100%" would sit next to a thumb at 50% for however long the
+  // engine takes to come up -- which on a cold 8 GB load is seconds of the dock
+  // stating a volume that is not the one in force.
+  refreshDockVolume();
+}
+
+// The dock rail follows whatever the app last told us the volume is.
+function refreshDockVolume() {
+  const rail = $("#dock_tts_volume"), out = $("#dockVolValue");
+  if (!rail) return;
+  if (out) out.textContent = Math.round(Number(rail.value) * 100) + "%";
+}
+
+function syncDockVolumeFromForm() {
+  const f = $("#s_tts_volume"), rail = $("#dock_tts_volume");
+  if (f && rail) rail.value = f.value;
+  refreshDockVolume();
+}
+
+/* --------------------------- the gear popover ------------------------------
+   Quick settings: the two device dropdowns, the microphone gain with its level
+   meter, and the tone button -- reachable without opening the settings modal,
+   because changing output device is something you do while listening, and
+   burying it three clicks deep in a modal that also holds checkpoint paths is
+   what made it feel like a dangerous operation.
+
+   SPEECH VOLUME IS NOT IN HERE any more: it lives on the dock rail next to the
+   speaker icon, where it can be adjusted while the assistant is talking. A
+   volume inside a popover is a volume you cannot hear yourself setting, because
+   the popover is what your cursor is busy holding open.
+
+   It mirrors rather than duplicates: the popover's controls write through the
+   same sendDeviceChange/sendGainChange, and both views are re-synced from the
+   app's own state, so they cannot disagree about what is selected. */
+function syncPopoverFromForm() {
+  for (const k in DEVICE_SELECTS) {
+    const src = $("#" + DEVICE_SELECTS[k].el);
+    const dst = $("#pop_" + k + "_device");
+    if (!src || !dst) continue;
+    dst.textContent = "";
+    for (const o of src.options) {
+      const c = document.createElement("option");
+      c.value = o.value;
+      c.textContent = o.textContent;
+      dst.appendChild(c);
+    }
+    dst.value = src.value;
+    dst.disabled = src.disabled;
+  }
+  const g = $("#s_mic_gain"), pg = $("#pop_mic_gain");
+  if (g && pg) pg.value = g.value;
+  refreshPopoverReadouts();
+  syncDockVolumeFromForm();
+}
+
+function refreshPopoverReadouts() {
+  const pg = $("#pop_mic_gain"), pgo = $("#popGainValue");
+  if (pg && pgo) pgo.textContent = Math.round(Number(pg.value) * 100) + "%";
+}
+
+function wireAudioPopover() {
+  const btn = $("#audioDockBtn");
+  const pop = $("#audioPopover");
+  if (!btn || !pop) return;
+
+  const close = () => {
+    pop.classList.add("hidden");
+    btn.classList.remove("active");
+    btn.setAttribute("aria-expanded", "false");
+  };
+  btn.addEventListener("click", e => {
+    e.stopPropagation();
+    const opening = pop.classList.contains("hidden");
+    if (opening) {
+      // Re-enumerate on open, exactly like the settings panel: a headset plugged
+      // in since launch is the single most common reason to open this.
+      loadAudioDevices();
+      syncPopoverFromForm();
+      pop.classList.remove("hidden");
+      btn.classList.add("active");
+      btn.setAttribute("aria-expanded", "true");
+    } else {
+      close();
+    }
+  });
+  // Click-away and Escape, the two things every popover is expected to honour.
+  pop.addEventListener("click", e => e.stopPropagation());
+  document.addEventListener("click", () => { if (!pop.classList.contains("hidden")) close(); });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && !pop.classList.contains("hidden")) close();
+  });
+
+  for (const k in DEVICE_SELECTS) {
+    const dst = $("#pop_" + k + "_device");
+    if (!dst) continue;
+    dst.addEventListener("change", () => {
+      // Write through the MODAL's control, then reuse its sender -- so the two
+      // views cannot drift, and there is exactly one place that knows how a
+      // selection becomes a name plus an index.
+      const src = $("#" + DEVICE_SELECTS[k].el);
+      if (src) src.value = dst.value;
+      sendDeviceChange(k);
+    });
+  }
+  const pg = $("#pop_mic_gain");
+  if (pg) {
+    pg.addEventListener("input", () => {
+      const f = $("#s_mic_gain");
+      if (f) f.value = pg.value;
+      refreshPopoverReadouts();
+      refreshReadouts();
+      sendGainChange("mic_gain", parseFloat(pg.value) || 0);
+    });
+  }
+  wireCheckSound("#popCheckSoundBtn", "#popCheckSoundMsg");
+}
+
+// Live microphone amplitude, pushed by the app several times a second.
+function setMicLevel(level) {
+  const v = Math.max(0, Math.min(1, Number(level) || 0));
+  // sqrt, not the raw amplitude: speech peaks sit low in a linear scale and a
+  // linear bar barely twitches on normal talking, which reads as a broken
+  // meter. This is the same reason level meters are not linear in volts.
+  const w = (Math.sqrt(v) * 100).toFixed(1) + "%";
+  for (const id of ["#micMeterFill", "#popMicMeterFill"]) {
+    const fill = $(id);
+    if (fill) fill.style.width = w;
+  }
+}
+
 function readForm() {
   const out = {};
   for (const k in FIELDS) {
@@ -461,7 +977,7 @@ function readForm() {
            : kind === "float" ? (parseFloat(e.value) || 0)
            : e.value;
   }
-  return out;
+  return readDevices(out);
 }
 
 function writeForm(s) {
@@ -471,7 +987,13 @@ function writeForm(s) {
     if (FIELDS[k] === "check") e.checked = !!s[k];
     else e.value = s[k];
   }
+  writeDevices(s);
   refreshReadouts();
+  // The dock rail is a third view onto tts_volume and is NOT inside the form, so
+  // it does not get filled by the loop above. Without this it would sit at the
+  // markup default until the user touched it -- showing 100% next to a speaker
+  // playing at 40%.
+  syncDockVolumeFromForm();
   refreshPromptCount();
   // Only a REAL payload counts as seeded. Opening the modal before the app's
   // first push writes an empty form, and marking that as seeded would lock the
@@ -646,6 +1168,12 @@ function openSettings() {
   saveMsg.textContent = "";
   maskKey();   // a key left revealed from last time must not survive a reopen
   overlay.classList.remove("hidden");
+  // RE-ENUMERATED ON EVERY OPEN, not just at startup. Plugging in a headset is
+  // the single most common reason to open this panel at all, so a list cached
+  // from launch would be stale exactly when it is being looked at. It resolves
+  // asynchronously and re-selects the saved device when it lands (see
+  // loadAudioDevices), so the panel is usable before the fetch returns.
+  loadAudioDevices();
 }
 function closeSettings() {
   maskKey();
@@ -767,8 +1295,7 @@ function onMessage(msg) {
     case "mic":
       // The app owns mic state: the talk hotkey flips it while this window may
       // not even be visible. Painted only -- echoing it back would ping-pong.
-      micBtn.dataset.on = String(!!msg.on);
-      if (!msg.on) micBtn.classList.remove("hearing");
+      paintMic(!!msg.on);
       break;
 
     case "settings":
@@ -780,6 +1307,18 @@ function onMessage(msg) {
       // an empty form the user could Save would silently blank every setting.
       if (overlay.classList.contains("hidden") || !seeded) writeForm(current);
       else refreshRestartBanner();
+      break;
+
+    case "audio.level":
+      setMicLevel(msg.level);
+      break;
+
+    case "audio.devices":
+      // Unconditional, unlike "settings" above: repopulating the dropdowns
+      // cannot destroy typed input the way refilling the whole form can, and a
+      // list arriving while the modal is open is exactly the headset-just-
+      // plugged-in case this is for.
+      applyAudioDevices(msg);
       break;
 
     case "settings.saved":
@@ -845,4 +1384,11 @@ setPhase("idle");
 refreshSend();
 autoGrow();
 send({ type: "ready" });
+// At load as well as on every settings open: the dropdowns must already hold
+// real options the first time the panel is shown, or the initial writeForm()
+// would have nothing to select the saved device from.
+loadAudioDevices();
+wireAudioLiveControls();
+wireSpeakerDock();
+wireAudioPopover();
 input.focus();

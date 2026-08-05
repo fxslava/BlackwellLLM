@@ -239,6 +239,13 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
 
     target_link_libraries(voice_assistant PRIVATE
         whisper_dsp blackwell::sandbox_headers
+        # Acoustic echo cancellation in the capture path (AecCaptureFilter). It
+        # arrives transitively through blackwell_tts_f5 as well, but this app
+        # includes its header directly, so it declares the dependency directly:
+        # the TTS link is CONDITIONAL, and inheriting an include path from a
+        # target that may not exist is how a build breaks for an unrelated
+        # reason. STL-only leaf -- no CUDA, no ORT.
+        blackwell::audio_rt
         # Win32 + COM + the shell folder picker the Settings modal calls into.
         user32 gdi32 ole32 shell32
         blackwell::webview2   # Chromium UI: headers + static loader + version.lib

@@ -25,11 +25,14 @@
 //     product measures. Synthesis of an already-emitted utterance now competes
 //     with the generation of the next one. This is a genuine regression against
 //     the CPU design and it is the thing to profile first.
-//   * VRAM. Bounded and small — see the arithmetic on max_frames below (~5 MB of
-//     latents) — but the WEIGHTS are ~1.3 GB in fp16, on top of the ~5.3 GB AWQ
-//     backbone and the ~1.05 GB KV pool. Set gpu_mem_limit_mb deliberately; the
-//     arena is pinned to kSameAsRequested precisely so ORT cannot quietly grab a
-//     multi-gigabyte reservation the engine then fails to allocate around.
+//   * VRAM. Our OWN buffers are bounded and small — see the arithmetic on
+//     max_frames below (~5 MB of latents) — but the WEIGHTS are ~1.3 GB in fp16,
+//     on top of the ~5.3 GB AWQ backbone and the ~1.05 GB KV pool, and the DiT's
+//     attention intermediates are NOT bounded by anything we allocate. They are
+//     sized by ORT from the frame count, per node, per step. gpu_mem_limit_mb
+//     defaults to 0 (unbounded) because capping that arena does not make the
+//     intermediates smaller — it only converts a VRAM shortage into a mid-solve
+//     BFCArena failure. See the field's comment for the failure mode in full.
 //   * A SECOND CUDA RUNTIME IN-PROCESS, and a 434 MB ORT-GPU archive instead of
 //     the 75 MB CPU one. cmake/OnnxRuntime.cmake fetches CPU-only today; this
 //     class does not build until that is addressed.
@@ -276,10 +279,67 @@ struct F5TtsConfig {
     //   (= 32 s) rather than something larger.
     std::size_t max_frames = 3000;
 
-    // Ceiling handed to the CUDA EP arena, in MiB. Bounds what ORT may reserve
-    // so a synthesis burst cannot starve the backbone's allocations. 0 = no
-    // limit, which on a box also hosting 5.3 GB of AWQ weights is a bad idea.
-    std::size_t gpu_mem_limit_mb = 2048;
+    // Ceiling handed to the CUDA EP arena, in MiB. 0 = NO LIMIT, and that is the
+    // default. This used to be 2048, and the change is a bug fix, not a tuning
+    // preference — record why so nobody "restores" it.
+    //
+    // THE FAILURE IT CAUSED. Only the tensors allocate_buffers() takes are
+    // bounded by max_frames. Everything the DiT needs *inside* a step — the
+    // attention score matrix, the softmax scratch, the MatMul workspaces — is
+    // allocated by ORT, sized from the actual frame count, and freed per node.
+    // Attention is quadratic in T, so those are the LARGEST allocations in the
+    // graph and the ones that grow fastest with utterance length. A cap does not
+    // shrink them; it only decides whether the arena can serve them. Once the
+    // arena had extended to 2 GiB, a long utterance produced exactly:
+    //     BFCArena::AllocateRawInternal: Available memory of 31 MB is
+    //     smaller than requested bytes of 44 MB
+    // at Softmax and MatMul — mid-solve, after the graph had loaded and reported
+    // healthy, on nothing but a longer sentence. Reproduced on demand: a
+    // 335-token utterance (2453 frames) asks a single attention node for 385 MB
+    // and dies against the cap; the same utterance uncapped yields 21.7 s of
+    // audio at 4.6x realtime. Length is the trigger, which is why short test
+    // sentences hid this for as long as they did.
+    //
+    // WHY THE CAP DOES NOT BUY WHAT IT LOOKS LIKE IT BUYS. The intent was to
+    // stop synthesis starving the backbone. But the arena is not what makes the
+    // demand — the graph is — so capping it does not return VRAM to the engine,
+    // it relocates the out-of-memory from a place that can handle it (the
+    // engine's own allocator, which reports OutOfVram through the status tier)
+    // to a place that cannot (an ORT node, which throws from inside Run). If
+    // total VRAM is genuinely short, the levers that WORK are max_frames and the
+    // chunker, both of which make the intermediates smaller.
+    //
+    // Set this non-zero only to deliberately fence ORT off from a fixed budget,
+    // and only with a number that covers peak attention at max_frames — which is
+    // several GB, not two.
+    std::size_t gpu_mem_limit_mb = 0;
+
+    // How the CUDA EP's BFC arena grows when it cannot serve a request from what
+    // it already holds. Mirrors ORT's `arena_extend_strategy`:
+    //     0 = kNextPowerOfTwo   (ORT's default, and ours)
+    //     1 = kSameAsRequested
+    //
+    // THIS KNOB DID NOT CAUSE THE BUG ABOVE AND DOES NOT FIX IT. Recorded
+    // explicitly because the opposite is the natural guess — "exact-fit
+    // extension fragments, fragmentation explains a failed allocation" is a
+    // plausible story, and it is wrong here. The 2x2 was measured on one
+    // 335-token utterance (2453 frames):
+    //
+    //     limit 2048 + kSameAsRequested  -> fails, 262 MB avail / 385 MB asked
+    //     limit 2048 + kNextPowerOfTwo   -> fails,   0 MB avail / 385 MB asked
+    //     limit 0    + kSameAsRequested  -> 21.7 s of audio
+    //     limit 0    + kNextPowerOfTwo   -> 21.7 s of audio
+    //
+    // The cap is the whole story: both strategies fail under it and both succeed
+    // without it. A single attention intermediate wants 385 MB, which no growth
+    // policy can conjure out of a 2 GiB arena already holding 1.31 GB of
+    // weights.
+    //
+    // So the default is kNextPowerOfTwo only because it is ORT's default and
+    // therefore the better-tested path, NOT because it rescued anything. Reach
+    // for kSameAsRequested if a profile ever shows the power-of-two slack itself
+    // costing real VRAM; on the evidence above, expect that to change nothing.
+    int arena_extend_strategy = 0;
 
     // Seed for the initial noise x_0. FIXED BY DEFAULT, deliberately: flow
     // matching is stochastic in its initial condition, so an unpinned seed makes

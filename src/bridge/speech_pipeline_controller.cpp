@@ -162,6 +162,23 @@ void SpeechPipelineController::push_pcm(const float* samples, size_t count) noex
 // VadDecision and cannot tell which produced it.
 SpeechPipelineController::VadDecision SpeechPipelineController::evaluate_block(
     const float* block, uint32_t count, float db) noexcept {
+    // THE SUPPRESSOR, checked before either detector and short-circuiting both.
+    //
+    // It clears last_decision_ rather than merely returning a silent verdict:
+    // that field is what the scorer path holds when a score says "no opinion",
+    // so leaving a stale `sustain` in it would let the first ambiguous block
+    // after the mask lifts resurrect a verdict formed before it was set. Coming
+    // out of suppression means starting from silence, which is the honest state
+    // -- the pipeline genuinely did not observe the room while masked.
+    //
+    // The scorer is deliberately NOT called while masked. It is stateful (Silero
+    // carries an LSTM across blocks), and feeding it our own echo trains its
+    // context on audio the verdict is going to discard anyway.
+    if (vad_suppressed_.load(std::memory_order_acquire)) {
+        last_decision_ = VadDecision{};
+        return last_decision_;
+    }
+
     const SpeechVadScoreFn fn = vad_scorer_.load(std::memory_order_acquire);
     if (fn != nullptr) {
         void* user = vad_scorer_user_.load(std::memory_order_acquire);
@@ -189,20 +206,35 @@ void SpeechPipelineController::vad_on_block(VadDecision decision) noexcept {
     // the explicit on_speech_start/on_silence_timeout key events, so a
     // background VAD trigger can never race a hotkey mid-utterance. Speculative
     // warming below is NOT a transition and stays active during a PTT hold.
-    const bool manual = manual_mode_.load(std::memory_order_acquire);
+    //
+    // THE SUPPRESSOR JOINS IT HERE, and specifically here rather than only in
+    // evaluate_block, because masking the VERDICT is not the same as masking the
+    // TRANSITIONS. A masked block scores as silence, and silence is what the
+    // auto-commit clock counts — so a mask held over an open utterance would
+    // have committed it early, on evidence the pipeline never actually
+    // gathered. Freezing the clock is the honest behaviour: while masked we did
+    // not observe the room, so no observation may accumulate.
+    //
+    // This is the identical shape to manual mode and shares its guard for that
+    // reason, but the two are NOT the same flag: manual is the user's hotkey and
+    // also gates the ring, while this is an acoustic guard that must leave PCM
+    // flowing (pre-roll, meter, warming). They compose — either one alone mutes
+    // the transitions.
+    const bool muted = manual_mode_.load(std::memory_order_acquire) ||
+                       vad_suppressed_.load(std::memory_order_acquire);
 
     switch (s) {
         case SPEECH_STATE_IDLE:
-            if (!manual && decision.onset) on_speech_start();  // onset
+            if (!muted && decision.onset) on_speech_start();  // onset
             break;
 
         case SPEECH_STATE_PREFILL_SPEAKING: {
             // The hangover is runtime-retunable (UI slider): one relaxed load per
-            // 10 ms block. 0 = auto-commit disabled. In manual mode the silence
-            // clock does not even accumulate (a later mode flip must not fire an
+            // 10 ms block. 0 = auto-commit disabled. While muted the silence
+            // clock does not even accumulate (a later unmute must not fire an
             // instant commit off stale silence).
             const uint32_t hangover = hangover_samples_.load(std::memory_order_relaxed);
-            if (!manual) {
+            if (!muted) {
                 if (decision.sustain) {
                     silence_samples_.store(0, std::memory_order_relaxed);  // still speaking
                 } else {
@@ -235,7 +267,7 @@ void SpeechPipelineController::vad_on_block(VadDecision decision) noexcept {
         }
 
         case SPEECH_STATE_DECODE_TRANSLATING:
-            if (!manual && decision.onset) on_speech_start();  // barge-in mid-translation
+            if (!muted && decision.onset) on_speech_start();  // barge-in mid-translation
             break;
 
         case SPEECH_STATE_INTERRUPTION_REWIND:
@@ -264,6 +296,16 @@ void SpeechPipelineController::set_manual_mode(bool enabled) noexcept {
     // A mode flip mid-utterance must not inherit the other mode's silence
     // accounting: the auto-commit clock restarts from the flip (belt-and-braces
     // with the !manual accumulation gate in vad_on_block).
+    silence_samples_.store(0, std::memory_order_relaxed);
+}
+
+void SpeechPipelineController::set_vad_suppressed(bool suppressed) noexcept {
+    vad_suppressed_.store(suppressed, std::memory_order_release);
+    // Same reasoning as set_manual_mode, and it is the reason this is not an
+    // inline setter: lifting the mask must not fire an instant auto-commit off
+    // silence that accumulated before it was set. The clock restarts from the
+    // transition in BOTH directions -- the assistant beginning to speak is as
+    // much a discontinuity in what the microphone means as it finishing.
     silence_samples_.store(0, std::memory_order_relaxed);
 }
 
@@ -434,6 +476,13 @@ BRIDGE_API BridgeStatus speech_pipeline_set_vad_threshold(SpeechPipelineHandle h
                                                           float threshold) {
     if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
     to_ctrl(handle)->set_vad_threshold(threshold);
+    return BRIDGE_OK;
+}
+
+BRIDGE_API BridgeStatus speech_pipeline_set_vad_suppressed(SpeechPipelineHandle handle,
+                                                           bool suppressed) {
+    if (handle == nullptr) return BRIDGE_ERR_INVALID_HANDLE;
+    to_ctrl(handle)->set_vad_suppressed(suppressed);
     return BRIDGE_OK;
 }
 
