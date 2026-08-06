@@ -27,10 +27,24 @@
 //   that makes the offline path a real rehearsal of the GPU path rather than a
 //   parallel implementation of it.
 //
-// TEXT AND VOICE ARE THE SAME PATH. A typed message goes through
-// EngineControlBridge::submit_text -> the SAME command ring -> the SAME decode
-// loop -> the SAME IntentCommitQueue under the SAME EOS rule. There is no second
-// route to a billed cloud call.
+// TEXT AND VOICE ARE THE SAME PATH, and as of this release that is true of the
+// ROUTING as well as the gate. A typed message is an intent: it is offered to
+// the SAME IntentCommitQueue a transcript is, drained by the SAME dispatcher,
+// and answered by whichever leg RoutedTransport picks -- so "use the local
+// model" means the same thing for something typed as for something said. It
+// used to mean nothing at all here: typed input ran a local decode
+// unconditionally and offered THAT as the intent. See submit_typed_turn.
+//
+// ONE ANSWER, TWO AUDIENCES. Whichever leg replies, it replies in two tagged
+// blocks -- a short <voice> summary and the full <ui> answer -- which are split
+// as they stream (reply_split.hpp) and sent to the speaker and the screen
+// respectively. The instruction asking for that shape is appended to the
+// persona by compose_system_prompt, so both legs and both speech modes are
+// asked for it in exactly one place.
+//
+// STOPPING. A generation can be interrupted from the composer's Stop button or
+// the cancel hotkey; both land on cancel_in_flight, which halts the local decode
+// (epoch bump), the network transfer (RoutedTransport::abort) and the speaker.
 //
 // CONFIGURATION PRECEDENCE. persisted settings < CLI flags. A flag typed on this
 // launch wins and is not written back (see settings_store.hpp).
@@ -77,6 +91,7 @@
 #include "whisper_dsp.h"
 
 #include "assistant_view.hpp"           // rt::AssistantView (JSON model, no widgets)
+#include "reply_split.hpp"              // rt::ReplySplitter, compose_system_prompt
 #include "assistant_window.hpp"         // rt::AssistantWindow (Chromium host)
 #include "settings_store.hpp"           // rt::AssistantSettings, load/save
 #include "cli_config.hpp"               // rt::TranslatorArgs, rt::parse_cli
@@ -91,6 +106,8 @@
 #include "whisper_cascade_mode.hpp"     // rt::WhisperCascadeMode
 #endif
 
+#include "chat_history.hpp"           // blackwell::cloud::ChatHistory (remote-leg memory)
+#include "session_store.hpp"          // blackwell::cloud::SessionStore (the durable log)
 #include "intent_commit.hpp"          // blackwell::bridge::IntentCommitQueue
 #include "intent_dispatcher.hpp"      // blackwell::cloud::IntentDispatcher
 #include "offline_transport.hpp"      // blackwell::cloud::OfflineTransport
@@ -481,6 +498,25 @@ struct AppContext {
     rt::AssistantView* view = nullptr;
     // The BASE type: this is what makes the callbacks backend-agnostic.
     blackwell::bridge::EngineControlBridge* control = nullptr;
+
+    // THE SPEAKER MUTE (the dock's speaker icon), and the one piece of state
+    // here that is NOT inside the TTS guard: the volume fold that reads it is
+    // compiled in both builds, and a flag whose home moves with a build option
+    // is a flag someone will read from the wrong side of an #if.
+    //
+    // Session state, deliberately absent from `settings`: an app that starts up
+    // silent because of a tap three days ago reads as broken, and save_settings
+    // physically cannot reach a variable that is not in the struct.
+    //
+    // ATOMIC because the writer and the readers are different threads: the UI
+    // thread sets it from the audio hot-update, while the answer stream reads it
+    // on the ENGINE thread (local leg) or the DISPATCHER thread (remote leg).
+    //
+    // MUTED MEANS NOT SYNTHESISED, not synthesised-at-zero-gain. The gate is on
+    // the three answer-stream edges below (Resume / PushToken / EndOfTurn), so a
+    // muted turn costs no solver steps at all; the zero volume it also produces
+    // is the backstop, not the mechanism.
+    std::atomic<bool> tts_muted{false};
 #if defined(VOICE_ASSISTANT_HAS_TTS)
     // Null when speech output is unavailable (no models, no GPU, ctor threw).
     // Every use below is guarded, because "the assistant cannot speak" must
@@ -584,16 +620,13 @@ void on_state(void* user, SpeechPipelineState /*prev*/, SpeechPipelineState next
     }
 }
 
-// TYPED-TURN sink. A typed message is already on screen as the user's bubble, so
-// the local model's per-token output is NOT painted -- what the UI needs from
-// this path is the single is_final edge carrying the gate's verdict, which is
-// what decides whether the message was actually sent anywhere.
-void on_text_sink(void* user, const char* /*utf8*/, std::int32_t /*index*/,
-                  std::int32_t is_final, BridgeStatus /*status*/) {
-    auto* ctx = static_cast<AppContext*>(user);
-    if (ctx == nullptr || ctx->view == nullptr || is_final == 0) return;
-    ctx->view->on_local_final(ctx->control->last_reason());
-}
+// THE TYPED-TURN SINK IS GONE, and its absence is the shape of the routing fix.
+// It existed to carry the gate's verdict back from the LOCAL decode that every
+// typed message used to trigger -- a decode that happened whichever leg the user
+// had selected. A typed message is now offered to the commit gate as an intent
+// and answered by the routed transport, exactly as a transcript is (see
+// submit_typed_turn), so its verdict arrives on the answer stream with
+// everyone else's and there is no second decode to report on.
 
 #if defined(VOICE_ASSISTANT_HAS_SILERO)
 // Runs on the DSP worker, once per 10 ms block. That thread is the SINGLE owner
@@ -1148,10 +1181,163 @@ int main(int argc, char** argv) {
         // (no lock-free store exists for one), the reader runs once per cloud
         // call, and the writer is a person clicking Save.
         std::mutex prompt_mu;
-        std::string system_prompt = settings.system_prompt;
+        // THE PERSONA PLUS THE OUTPUT CONTRACT, composed once here and never
+        // again. `settings.system_prompt` is what the user wrote and what the
+        // Settings modal shows; what a MODEL is told is always this. Composing
+        // at the point the persona enters the pipeline -- rather than at each of
+        // the four places it is read -- is what keeps the two legs and the two
+        // speech modes from drifting into asking for different reply shapes.
+        std::string system_prompt = rt::compose_system_prompt(settings.system_prompt);
+
+        // ---- the remote leg's memory ----------------------------------------
+        // /chat/completions is stateless, so without this the cloud model forgets
+        // the user's name the moment the turn ends. The local leg needs nothing
+        // equivalent: its memory IS the KV cache above the system-prefix floor.
+        //
+        // BOTH of these must outlive the dispatcher, hence their position here --
+        // the store because its callbacks fire from the dispatcher and engine
+        // threads, the scratch buffer because RequestContext::history is a SPAN
+        // over it and the body is built from that span (chat_history.hpp).
+        //
+        // `history_scratch` needs no lock: the context provider is the only thing
+        // that touches it, and it runs on the dispatcher thread alone.
+        blackwell::cloud::ChatHistory chat_history;
+        std::vector<blackwell::cloud::ChatTurn> history_scratch;
+
+        // ---- the DURABLE half: sessions.json, next to settings.json -----------
+        // THE ONE RULE, and every branch below is a reading of it: the disk holds
+        // what the CLOUD leg was told and answered. Nothing else.
+        //
+        // The local leg is ephemeral BY CONSTRUCTION and stays that way. Its
+        // memory is the KV cache above the system-prefix floor -- VRAM this
+        // process frees on the way out -- so a local conversation has no durable
+        // form and is deliberately not given one. Concretely that is two
+        // omissions, not one: nothing is loaded at startup when Local is
+        // selected, and no locally-answered turn is ever appended (see
+        // on_complete, which keys off which leg actually ran).
+        //
+        // Multi-session at the data layer, one id in the UI: the store is a
+        // collection keyed by session id, and this app names exactly one of them
+        // until a picker exists (session_store.hpp's preamble on why that split
+        // is worth its keep).
+        blackwell::cloud::SessionStore session_store(rt::sessions_path());
+
+        // WHICH conversation is being written into. Mutable since the sidebar
+        // landed, and therefore guarded: the UI thread writes it (a click in the
+        // drawer) while the dispatcher thread reads it at the top of every turn.
+        // A std::string has no atomic form, and the read is once per turn on a
+        // path that then blocks on a network round trip, so a mutex is not a
+        // compromise here -- it is the whole cost.
+        std::mutex  session_mu;
+        std::string active_session_id{blackwell::cloud::SessionStore::kDefaultSessionId};
+        const auto current_session_id = [&session_mu, &active_session_id] {
+            const std::lock_guard<std::mutex> lk(session_mu);
+            return active_session_id;
+        };
+        // THE SESSION LATCH, and the same argument as RoutedTransport's leg latch:
+        // a turn belongs to the conversation it was ASKED IN. The user can open
+        // another session while an answer streams, and filing that answer under
+        // whichever session happens to be active when it lands would drop a reply
+        // into a conversation it has nothing to do with. Written at dispatch
+        // start and read at completion -- both on the dispatcher thread, with one
+        // intent in flight (intent_dispatcher.hpp), so it needs no lock of its own.
+        std::string dispatch_session_id{active_session_id};
+
+        // Loaded UNCONDITIONALLY, local mode included -- the sidebar has to be
+        // able to list what is on disk, and READING the file is not the same act
+        // as seeding a conversation from it. What local mode suppresses is the
+        // seed below, which is what the acceptance criterion is actually about.
+        const bool store_loaded = session_store.load();
+
+        // THE STARTUP SEED, gated on the leg the app BOOTS on. `local_inference`
+        // is a live toggle, but this decision is not re-taken when it flips:
+        // splicing a conversation from three days ago into one already on screen
+        // would be a worse answer than starting the cloud leg cold, and the user
+        // never asked for it. Flipping to Local mid-session likewise leaves the
+        // in-memory window alone -- what the user sees on screen stays one
+        // conversation; it is the DISK that never learns about the local turns.
+        if (!settings.local_inference) {
+            if (store_loaded) {
+                // The TAIL of the log, not the log: sessions.json keeps ~200
+                // turns, the window keeps 4, and the wire carries 3 (see
+                // docs/LOCAL_ROUTER.md's table). Restoring the whole log into the
+                // window would defeat both of the caps below it.
+                const std::vector<blackwell::cloud::ChatTurn> saved =
+                    session_store.turns(active_session_id);
+                chat_history.restore(saved);
+                std::printf("[history] restored %zu turn(s) from %s (session \"%s\")\n",
+                            saved.size(), session_store.path().c_str(),
+                            active_session_id.c_str());
+            } else {
+                std::printf("[history] no persisted session at %s -- starting cold\n",
+                            session_store.path().c_str());
+            }
+        } else {
+            // Said out loud, because "the assistant forgot everything" is the
+            // first thing a user reports and this is the reason.
+            std::printf("[history] local inference selected -- ephemeral session, "
+                        "nothing loaded and nothing will be saved\n");
+        }
+        std::fflush(stdout);
+
+        // ---- ONE answer, TWO audiences ---------------------------------------
+        // The reply arrives as one stream carrying two tagged blocks -- a short
+        // <voice> summary and the full <ui> answer -- and this is what pulls
+        // them apart as they stream. See reply_split.hpp for the contract, the
+        // fail-open behaviour when the model ignores it, and why the parser
+        // lives next to the instruction that asks for the tags.
+        //
+        // THE SINKS ARE WHERE THE SPLIT BECOMES REAL: everything that used to
+        // happen to the whole reply now happens to the half it belongs to. The
+        // screen, the transcript and the durable log take the <ui> text; the
+        // speaker takes the <voice> text and nothing else.
+        //
+        // GUARDED, because on_text fires on the ENGINE thread for the local leg
+        // and the DISPATCHER thread for the remote one. The two never actually
+        // overlap (the dispatcher is parked inside LocalEngineTransport::send
+        // for the whole local generation) -- but that is a property of another
+        // header's blocking behaviour, and the same argument that put a mutex on
+        // app_ctx.answer_text applies here for the same price.
+        std::mutex reply_mu;
+        rt::ReplySplitter reply_split(
+            // -> the screen and the remote leg's memory
+            [&view, &chat_history](std::string_view s) {
+                view.on_remote_token(s);
+                // UNCONDITIONAL, unlike the voice sink below: that one is
+                // compiled out with speech output, whereas the remote leg's
+                // memory must not depend on whether this build can speak.
+                // Clamped and bounded inside the store.
+                chat_history.append_reply(s);
+            },
+            // -> the speaker
+            [&app_ctx](std::string_view s) {
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                // PushToken appends under a short mutex and returns, so neither
+                // producer thread is blocked and all synthesis stays on the TTS
+                // worker.
+                //
+                // Muted: the text is not handed over at all. Redundant with the
+                // cancel latch left set at dispatch-start -- and kept anyway,
+                // because this is the edge a mute that lands MID-answer has to
+                // stop, and it must not depend on the reader agreeing that the
+                // bridge drops post-cancel pushes.
+                if (app_ctx.tts != nullptr &&
+                    !app_ctx.tts_muted.load(std::memory_order_acquire)) {
+                    app_ctx.tts->PushToken(s);
+                }
+                {
+                    const std::lock_guard<std::mutex> lk(app_ctx.answer_mu);
+                    app_ctx.answer_text.append(s);
+                }
+#else
+                (void)app_ctx;
+                (void)s;
+#endif
+            });
+
         blackwell::cloud::IntentDispatcher dispatcher(
             commit_queue, *transport,
-            [&prompt_mu, &system_prompt] {
+            [&prompt_mu, &system_prompt, &chat_history, &history_scratch] {
                 blackwell::cloud::RequestContext c;
                 // FROZEN BETWEEN EDITS. Nothing volatile may appear here: a
                 // timestamp or a session id in this string drives the prompt-cache
@@ -1165,6 +1351,12 @@ int main(int argc, char** argv) {
                 }
                 c.glossary = "This is a spoken-language voice assistant session.";
                 c.committed_prefix = "";
+                // Only FINISHED turns: the one being dispatched right now is
+                // still pending in the store and arrives separately as
+                // `c.intent`, so it cannot appear twice. Re-taken per attempt,
+                // which is free -- a retry replays the identical window.
+                chat_history.snapshot(history_scratch);
+                c.history = history_scratch;
                 return c;
             });
         // ---------------------------------------------------------------------
@@ -1182,49 +1374,159 @@ int main(int argc, char** argv) {
         // RoutedTransport picks the leg, and neither branch is visible from
         // here (local_transport.hpp's whole argument).
         // ---------------------------------------------------------------------
-        dispatcher.set_on_dispatch_start([&view, &app_ctx](const blackwell::bridge::IntentRecord& r) {
+        dispatcher.set_on_dispatch_start([&view, &app_ctx, &chat_history, &dispatch_session_id,
+                                          &current_session_id, &reply_mu, &reply_split](
+                                             const blackwell::bridge::IntentRecord& r) {
             view.on_dispatch_start(r.sequence);
+            // A new answer: drop every scrap of the previous one. A held partial
+            // tag surviving into this turn would splice half a "</ui>" onto the
+            // front of it.
+            {
+                const std::lock_guard<std::mutex> lk(reply_mu);
+                reply_split.reset();
+            }
+            // The session this turn belongs to, frozen for its whole lifetime.
+            // See the latch's declaration for why it is taken here and not read
+            // again at completion.
+            dispatch_session_id = current_session_id();
+            // Opens the turn HERE and not at the commit gate: an intent the gate
+            // accepted but the dispatcher never sent is not part of the
+            // conversation, and the gate runs one stage earlier on the other
+            // sequence (see the block below).
+            chat_history.begin_turn(r.payload);
 #if defined(VOICE_ASSISTANT_HAS_TTS)
             // A new answer is starting: clear the cancelled latch that the
             // barge-in edge set when the user began speaking, so the tokens
             // about to arrive are actually spoken. This is the ANSWER's start,
             // which is why it is here and not on a pipeline state -- the
             // pipeline's DECODE state belongs to the transcription pass.
-            if (app_ctx.tts != nullptr) app_ctx.tts->Resume();
+            //
+            // UNLESS THE SPEAKER IS MUTED, and this is the arm point that makes
+            // the mute mean something: leaving the latch SET is what turns the
+            // bridge's PushToken/EndOfStream into no-ops for the whole turn (see
+            // TTSDuplexBridge::PushToken), so no chunk is ever handed to the
+            // solver and nothing can survive in the chunker to be spliced onto
+            // the front of a later, unmuted reply.
+            if (app_ctx.tts != nullptr &&
+                !app_ctx.tts_muted.load(std::memory_order_acquire)) {
+                app_ctx.tts->Resume();
+            }
             {
                 const std::lock_guard<std::mutex> lk(app_ctx.answer_mu);
                 app_ctx.answer_text.clear();
             }
 #endif
         });
-        dispatcher.set_on_text([&view, &app_ctx](std::string_view s) {
-            view.on_remote_token(s);
-#if defined(VOICE_ASSISTANT_HAS_TTS)
-            // Runs on the ENGINE thread for the local leg and the dispatcher
-            // thread for the remote one; PushToken appends under a short mutex
-            // and returns, so neither is blocked and all synthesis stays on the
-            // TTS worker.
-            if (app_ctx.tts != nullptr) app_ctx.tts->PushToken(s);
-            {
-                const std::lock_guard<std::mutex> lk(app_ctx.answer_mu);
-                app_ctx.answer_text.append(s);
-            }
-#endif
+        // THE ONE PRODUCER OF THE ASSISTANT'S TEXT, and now it produces two
+        // streams from it. Nothing here knows which leg is answering -- the
+        // splitter sits above RoutedTransport's choice, so a local reply and a
+        // billed one are divided by the same code (local_transport.hpp's whole
+        // argument, extended one layer).
+        dispatcher.set_on_text([&reply_mu, &reply_split](std::string_view s) {
+            const std::lock_guard<std::mutex> lk(reply_mu);
+            reply_split.push(s);
         });
         dispatcher.set_on_complete(
-            [&view, &app_ctx](const blackwell::bridge::IntentRecord&,
-                              const blackwell::cloud::Result& r) {
+            [&view, &app_ctx, &chat_history, &session_store, &dispatch_session_id,
+             &current_session_id, &router, &reply_mu,
+             &reply_split](const blackwell::bridge::IntentRecord&,
+                           const blackwell::cloud::Result& r) {
+                // FIRST, before anything seals or flushes. finish() surrenders
+                // the bytes still held against a possible tag and, when the
+                // model ignored the contract, hands the written answer to the
+                // speaker -- so it must run before chat_history seals the turn
+                // (which is what the UI half feeds) and before the TTS flush
+                // below (which is what the voice half feeds).
+                {
+                    const std::lock_guard<std::mutex> lk(reply_mu);
+                    reply_split.finish();
+                }
+                // THE USER PRESSED STOP. Not a failure, and it must not be
+                // painted as one: an answer the user cut off themselves needs no
+                // red note explaining what went wrong. The local leg reports it
+                // as a barge-in (its decode loop was superseded by the epoch
+                // bump), the remote leg as Cancelled -- two mechanisms, one
+                // outcome, and the UI is told the outcome.
+                const bool cancelled =
+                    r.status == blackwell::cloud::Status::Cancelled || r.stop_reason == "barge_in";
                 view.on_remote_final(r.status == blackwell::cloud::Status::Ok,
                                      r.error_detail.empty()
                                          ? std::string(blackwell::cloud::to_string(r.status))
-                                         : r.error_detail);
+                                         : r.error_detail,
+                                     cancelled);
+                // Seals the turn, or drops it whole. Only a completed exchange
+                // becomes memory: a failed request, a refusal or a barge-in
+                // would otherwise enter the window as an assistant message the
+                // user never heard -- and a barged-in half-sentence replayed as
+                // an accepted answer is worse than no memory at all. commit_turn
+                // also refuses a pair with an empty half, so the alternation the
+                // API requires holds by construction.
+                blackwell::cloud::ChatTurn sealed;
+                const bool committed =
+                    r.status == blackwell::cloud::Status::Ok && chat_history.commit_turn(&sealed);
+                if (r.status != blackwell::cloud::Status::Ok) chat_history.abandon_turn();
+
+                // ---- THE PERSISTENCE EDGE ------------------------------------
+                // Gated on which leg ACTUALLY RAN this intent, not on the toggle's
+                // current position: the user can flip the switch while an answer
+                // streams, and asking the router "are you local?" here would
+                // occasionally write a local conversation to disk (which the
+                // local leg promises never happens) or drop a turn the cloud was
+                // paid for. RoutedTransport latches the leg at the top of send()
+                // for exactly this reader -- see last_send_was_local().
+                //
+                // The SEALED turn is what is written, not the raw payload: the
+                // window's clamps and its UTF-8 repair have already run, and the
+                // log must agree with the window about what was said or the two
+                // diverge in a way that only appears after a restart.
+                //
+                // Flushed per turn rather than at shutdown. This process holds
+                // ~8 GB of GPU state and is killed rather than closed often
+                // enough that a shutdown-only flush is a history that mostly does
+                // not survive; a few KB of JSON on a path that just waited out a
+                // network round trip is not a cost worth optimising against that.
+                // Filed under the LATCHED session, not the active one: if the
+                // user opened another conversation while this answer streamed,
+                // the answer still belongs to the one they asked in.
+                if (committed && !router.last_send_was_local()) {
+                    if (session_store.append_turn(dispatch_session_id, sealed) &&
+                        !session_store.save()) {
+                        // Non-fatal and deliberately quiet-ish: the in-memory
+                        // window is unaffected, so this session keeps its memory
+                        // and only the NEXT launch is poorer for it.
+                        std::fprintf(stderr, "[history] could not persist to %s\n",
+                                     session_store.path().c_str());
+                    }
+                    // The sidebar shows a preview and an ordering, and BOTH just
+                    // changed -- a conversation that was never persisted before
+                    // has only now become a row at all. Pushed from the dispatcher
+                    // thread, which is safe by the same route every other producer
+                    // takes: the view serialises and the window's post_event
+                    // marshals (assistant_view.hpp's threading note).
+                    view.set_sessions(session_store.list_summaries(), current_session_id(),
+                                      router.use_local());
+                }
 #if defined(VOICE_ASSISTANT_HAS_TTS)
                 // EOS / stop / error -- whichever ended the generation, the turn
                 // is over. Flush so a tail shorter than min_chunk_chars is still
                 // spoken. Unconditional on status: a failed answer may still have
                 // streamed a partial sentence, and leaving it buffered would
                 // splice it onto the FRONT of the next reply.
-                if (app_ctx.tts != nullptr) app_ctx.tts->EndOfTurn();
+                //
+                // MUTED TURNS END WITH A CANCEL, NOT A FLUSH, and the difference
+                // is the next reply rather than this one: the flush exists to
+                // speak a tail, which is precisely what must not happen here,
+                // while the buffer it would have flushed still has to be emptied
+                // before the next Resume() can reach it. Cancel does both and is
+                // idempotent with the mute edge that already fired.
+                const bool muted = app_ctx.tts_muted.load(std::memory_order_acquire);
+                if (app_ctx.tts != nullptr) {
+                    if (muted) {
+                        app_ctx.tts->BargeIn();
+                    } else {
+                        app_ctx.tts->EndOfTurn();
+                    }
+                }
 
                 // THE HANDOFF LINE. This is the seam people go looking for when
                 // the assistant answers on screen but says nothing, so it prints
@@ -1249,7 +1551,14 @@ int main(int argc, char** argv) {
                     spoken.swap(app_ctx.answer_text);
                 }
                 if (app_ctx.tts != nullptr) {
-                    std::printf("[answer->tts] pushed LLM response to TTS (%zu chars): \"%s\"\n",
+                    // The muted wording is not cosmetic: this line is the seam
+                    // people check when the assistant answers on screen and says
+                    // nothing, and "pushed N chars" next to a silent speaker is
+                    // exactly the wrong thing to tell them when the reason is a
+                    // muted icon rather than a broken synthesiser.
+                    std::printf(muted
+                                    ? "[answer->tts] MUTED -- not synthesised (%zu chars): \"%s\"\n"
+                                    : "[answer->tts] pushed LLM response to TTS (%zu chars): \"%s\"\n",
                                 spoken.size(), spoken.c_str());
                     std::fflush(stdout);
                 }
@@ -1293,7 +1602,7 @@ int main(int argc, char** argv) {
         mcfg.warm_prefill_interval_ms =
             static_cast<std::uint32_t>(settings.warm_prefill_interval_ms);
         mcfg.pre_roll_ms = settings.pre_roll_ms;
-        mcfg.system_prompt = settings.system_prompt;
+        mcfg.system_prompt = rt::compose_system_prompt(settings.system_prompt);
 
         // prefill_system_prompt lives on the CONCRETE control, not the bridge
         // (how a frozen prefix is laid down genuinely differs per backend), so it
@@ -1346,7 +1655,9 @@ int main(int argc, char** argv) {
             ccfg.hangover_ms      = settings.silence_hangover_ms;
             ccfg.preroll_ms       = settings.pre_roll_ms;
             ccfg.max_utterance_ms = settings.whisper_max_utterance_ms;
-            ccfg.system_prompt    = settings.system_prompt;
+            // Composed, like Mode A's above: this mode's ONE frozen prefix is the
+            // persona, so it is also where the output contract has to land.
+            ccfg.system_prompt    = rt::compose_system_prompt(settings.system_prompt);
 
             // The transcript IS the user's bubble, exactly as Mode A's token
             // stream is -- so it lands on the same two view calls, in the same
@@ -1401,20 +1712,20 @@ int main(int argc, char** argv) {
         std::string applied_speech_language = settings.speech_language;
         bool audio_prefix_dirty = false;
 
-        // THE SPEAKER MUTE, and the reason it is a local rather than a field of
-        // `settings`: it must not be persisted (an app that starts up silent
-        // because of a tap three days ago reads as broken), and settings.save
-        // physically cannot reach a variable that is not in the struct.
+        // THE SPEAKER MUTE lives on app_ctx (see AppContext::tts_muted for why it
+        // is neither a persisted setting nor a plain local): the answer-stream
+        // callbacks are the ones that have to obey it, and they reach state
+        // through that handle.
         //
-        // It folds with tts_volume at every application site -- the two are never
-        // applied independently, because the AEC reference has to describe what
-        // the speaker actually emitted and a muted speaker emits nothing.
-        //
-        // UI-thread only: both writers are window callbacks, which the message
-        // loop serialises.
-        bool tts_muted = false;
+        // What stays here is the FOLD with tts_volume, because the two are never
+        // applied independently -- the AEC reference has to describe what the
+        // speaker actually emitted, and a muted speaker emits nothing. Note this
+        // is now the BACKSTOP: the answer never reaches the synthesiser while
+        // muted, so there is no audio for this gain to zero. It still matters for
+        // everything that bypasses the answer path (the test tone) and for the
+        // instant between the mute edge and the barge-in drain.
         const auto effective_tts_volume = [&](float slider) noexcept {
-            return tts_muted ? 0.0f : slider;
+            return app_ctx.tts_muted.load(std::memory_order_acquire) ? 0.0f : slider;
         };
         auto apply_live_settings = [&](const rt::AssistantSettings& s) {
             // Through the INTERFACE, not through Mode A's pipeline handle. Each
@@ -1940,17 +2251,79 @@ int main(int argc, char** argv) {
         view.set_sink([&window](std::string json) { window.post_event(std::move(json)); });
         window.set_settings(settings);
 
-        const blackwell::bridge::TokenSink text_sink{&on_text_sink, &app_ctx};
         std::atomic<bool> restart_requested{false};
 
-        rt::AssistantWindowCallbacks cb;
-        cb.on_send_text = [&](const std::string& text) {
-            // Same ring, same decode loop, same gate as a spoken turn.
+        // ---- THE TYPED TURN, ROUTED LIKE A SPOKEN ONE -------------------------
+        // A typed message is an INTENT, exactly like a transcript, and it enters
+        // the pipeline at exactly the same point one does: offered to the commit
+        // gate, drained by the dispatcher, answered by whichever leg
+        // RoutedTransport picks. Nothing below is new machinery: the routing,
+        // the leg latch, the session latch and the persistence rule all already
+        // existed and applied to every spoken turn. This path was the one thing
+        // bypassing them, so the fix is to stop bypassing.
+        //
+        // WHAT IT USED TO DO, AND WHY THAT WAS WRONG. It called submit_text(),
+        // which runs a full LOCAL decode of an answer and then offers THAT
+        // ANSWER to the gate as the intent. So with the cloud leg selected, the
+        // GPU generated a reply nobody displayed and the remote model was asked
+        // to respond to it -- the toggle was, in effect, ignored for typed
+        // input, and paid for twice over.
+        //
+        // OFFERED ON THE ENGINE THREAD, via post_engine_task. IntentCommitQueue
+        // is single-producer and its producer is defined to be the engine thread
+        // (intent_commit.hpp); the UI thread offering directly would break that
+        // contract for the convenience of saving a marshal on a path a human
+        // drives at single-digit events per minute. Mode C's transcript takes
+        // the identical route for the identical reason.
+        //
+        // Eos, and it is not a fiction: the commit rule asks whether the thought
+        // finished on its own, and a message the user pressed Enter on is the
+        // most finished a thought gets. The reasons the gate rejects (barge-in,
+        // a token cap, a fault) are properties of a decode loop that does not
+        // run on this path at all.
+        const auto submit_typed_turn = [&view, &control, &commit_queue](const std::string& text) {
+            if (text.empty()) return;
+            // THE BUBBLE FIRST, THEN THE OFFER -- program order, and it is the
+            // whole message-ordering guarantee. offer() wakes the dispatcher
+            // thread, whose first act is on_dispatch_start -> "remote.start" ->
+            // the page creates the assistant's bubble. Both land in the SAME
+            // FIFO UI queue, so whichever is enqueued first is the bubble drawn
+            // first; offering first put the answer above the question every time
+            // the dispatcher won the race. Do not merge these.
             view.on_user_text(text);
-            if (control->submit_text(text, text_sink) != blackwell::EngineStatus::Success) {
+            // Captured EXPLICITLY, never by [&]: this task outlives the call that
+            // queued it, and `text` is a parameter of the enclosing lambda -- a
+            // blanket reference capture would compile and dangle.
+            const bool queued = control->post_engine_task([&view, &commit_queue, &control, text] {
+                if (commit_queue.offer(blackwell::bridge::TerminationReason::Eos,
+                                       control->active_generation(), std::string(text),
+                                       // token_count counts LOCAL DECODE tokens,
+                                       // which is what makes dropped_token_cap()
+                                       // diagnostic. Nothing is tokenized here, so
+                                       // a plausible-looking byte count would put a
+                                       // wrong number where a reader expects that
+                                       // meaning.
+                                       /*token_count=*/0u)) {
+                    return;
+                }
+                // The only way an Eos fails to commit is a full queue: an earlier
+                // answer is still streaming. SAID TO THE USER, not just to
+                // stderr -- nothing else will speak for this turn, and a message
+                // that vanished with the composer still showing Stop is the
+                // worst of the available failures.
+                std::fprintf(stderr,
+                             "[typed] NOT dispatched (the commit queue is full -- an "
+                             "earlier answer is still streaming)\n");
+                view.on_remote_final(false,
+                                     "The assistant is still answering — try again in a moment.");
+            });
+            if (!queued) {
                 view.on_remote_final(false, "The assistant is busy — try again in a moment.");
             }
         };
+
+        rt::AssistantWindowCallbacks cb;
+        cb.on_send_text = submit_typed_turn;
         cb.on_mic_toggle = [&](bool listening) {
             // Manual mode mutes the VAD for ALL transitions while PCM keeps
             // flowing, which is exactly "mic off" without tearing the stream
@@ -1960,18 +2333,177 @@ int main(int argc, char** argv) {
             // what it does and does not do).
             active->set_manual_mode(!listening);
         };
-        cb.on_cancel = [&] {
-            // The cancel hotkey IS a barge-in, minus the speech: bump the epoch
-            // and the in-flight decode loop aborts at its next token check. Same
+        // Stop whatever is generating -- decode, NETWORK and sound. Its own lambda
+        // because three unrelated gestures mean it (the cancel hotkey, the Stop
+        // button in the composer, and opening another conversation), and they must
+        // not drift apart: a session switch that halted the decode but let the
+        // speaker finish the old conversation's sentence would reintroduce exactly
+        // the bug the BargeIn below fixed.
+        //
+        // ALL THREE LEGS, UNCONDITIONALLY, and this is the same argument
+        // RoutedTransport::abort() makes one layer down: this is not routing a
+        // turn, it is stopping whatever is running. Asking which leg is live
+        // would mean a Stop pressed just after the user flipped the toggle
+        // cancels the idle one. Each is a no-op when there is nothing to stop.
+        const auto cancel_in_flight = [&] {
+            // 1. THE LOCAL DECODE. A barge-in, minus the speech: bump the epoch
+            // and the in-flight loop aborts at its next token check. Same
             // mechanism the VAD uses, so a cancelled turn lands as BargeIn and is
-            // correctly NOT dispatched.
+            // correctly NOT re-dispatched.
             control->cancel_generation(control->active_generation() + 1);
+            // 2. THE NETWORK. The epoch above cannot reach a transfer -- the
+            // dispatcher thread is blocked inside send() and has never had a way
+            // to be interrupted by a barge-in (docs/LOCAL_ROUTER.md's "one honest
+            // residual"). This is that way, and it is deliberately narrow: it
+            // aborts the transfer IN FLIGHT and leaves the transport armed for
+            // the next turn, so it is not the shutdown() next to it.
+            //
+            // What it saves is OUTPUT tokens, which bill as they stream. The
+            // input and prefill were paid at acceptance and no cancellation can
+            // recover them -- which is exactly why the gate upstream is what
+            // stops unfinished thoughts from being sent at all, and why this
+            // button is not, and must not become, a substitute for it.
+            router.abort();
 #if defined(VOICE_ASSISTANT_HAS_TTS)
-            // The button must also stop the SOUND, not just the decode. Without
-            // this the engine halts while the speaker keeps playing everything
-            // already synthesised -- which reads as the button not working.
+            // 3. THE SOUND. Without this the engine halts and the network drops
+            // while the speaker keeps playing everything already synthesised --
+            // which reads as the button not working.
             if (app_ctx.tts != nullptr) app_ctx.tts->BargeIn();
 #endif
+        };
+
+        cb.on_cancel = [&] { cancel_in_flight(); };
+
+        // ---- the session sidebar --------------------------------------------
+        // All UI-thread. The engine work each of these implies is marshaled, and
+        // the disk work is not on any hot path -- a person clicking a row is not
+        // a rate.
+
+        // Publishes the drawer's contents. `ephemeral` comes from the ROUTER, not
+        // from `settings.local_inference`: the router's flag is atomic (so this is
+        // also callable from the dispatcher thread, which on_complete does) and it
+        // is the same bit that will actually decide whether the next turn is
+        // written. A "not being saved" banner derived from a second copy of that
+        // fact is a banner that will eventually disagree with the behaviour.
+        const auto push_session_list = [&] {
+            view.set_sessions(session_store.list_summaries(), current_session_id(),
+                              router.use_local());
+        };
+
+        // THE SWITCH. Everything a conversation change has to touch, in the order
+        // it has to happen:
+        //
+        //   1. stop the turn in flight   -- it belongs to the session being left
+        //   2. swap the active id        -- so the next dispatch latches the new one
+        //   3. reload the remote window  -- from disk, tail-first (chat_history)
+        //   4. rewind the LOCAL KV       -- see below; this is the easy one to forget
+        //   5. repaint                   -- transcript, then the drawer
+        //
+        // STEP 4 IS NOT OPTIONAL and is the one that has no visible symptom until
+        // it bites. The local leg's memory is its KV above the system-prefix
+        // floor, and it survives a session switch by default -- so without a
+        // rewind the on-device model answers the newly-opened conversation using
+        // the context of the one just closed. rebuild_system_prompt() is exactly
+        // that rewind (it re-freezes the prefix and drops everything above it),
+        // which is why the persona path already calls it.
+        const auto switch_to_session = [&](std::string id, bool restore_from_disk) {
+            cancel_in_flight();
+            {
+                const std::lock_guard<std::mutex> lk(session_mu);
+                active_session_id = id;
+            }
+
+            std::vector<blackwell::cloud::ChatTurn> turns;
+            if (restore_from_disk) turns = session_store.turns(id);
+            // Even when empty: restore() also drops any pending turn, which is
+            // what stops a half-recorded exchange from the previous conversation
+            // sealing itself into this one.
+            chat_history.restore(turns);
+
+            // Marshaled, like every other engine touch on this thread. A failure
+            // to queue is reported and NOT fatal: the transcript still switches,
+            // and the consequence is confined to the local leg carrying stale
+            // context until the next rebuild.
+            std::string prompt;
+            {
+                const std::lock_guard<std::mutex> lk(prompt_mu);
+                prompt = system_prompt;
+            }
+            // Captured EXPLICITLY, not by [&]. This task outlives the call that
+            // queued it, and `id` / `restore_from_disk` are parameters of the
+            // enclosing lambda -- a blanket reference capture would compile and
+            // dangle the moment anyone added a line using one of them.
+            const bool queued =
+                control->post_engine_task([&real_stack, &simulated, prompt] {
+                    try {
+                        if (real_stack.control) {
+                            (void)real_stack.control->rebuild_system_prompt(prompt);
+                        } else {
+                            (void)simulated->rebuild_system_prompt(prompt);
+                        }
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "[session] local context reset failed: %s\n",
+                                     e.what());
+                    }
+                });
+            if (!queued) {
+                std::fprintf(stderr,
+                             "[session] could not reach the engine thread -- the local "
+                             "model keeps the previous conversation's context\n");
+            }
+
+            view.on_session_restored(id, turns);
+            push_session_list();
+            std::printf("[session] opened \"%s\" (%zu turn(s) restored)\n", id.c_str(),
+                        turns.size());
+            std::fflush(stdout);
+        };
+
+        cb.on_session_list_request = [&] { push_session_list(); };
+
+        cb.on_session_select = [&](const std::string& id) {
+            // Clicking the conversation already open is a no-op, not a reload:
+            // rebuilding the prefix and repainting the transcript would throw
+            // away a warm KV and make the sidebar feel like it lost the user's
+            // place. The page suppresses this too; both, because the list it
+            // clicks from can be a moment stale.
+            if (id == current_session_id()) return;
+            if (!session_store.contains(id)) {
+                // A row that was deleted in another window, or a stale click. Do
+                // not create it: an id the store has never heard of is not a
+                // conversation, and silently opening an empty one under that name
+                // would be indistinguishable from the click having worked.
+                push_session_list();
+                return;
+            }
+            switch_to_session(id, /*restore_from_disk=*/true);
+        };
+
+        cb.on_session_new = [&] {
+            // NOT written to disk here. A new conversation becomes a row when its
+            // first turn is answered (on_complete appends), so opening five and
+            // talking in none leaves nothing behind -- and the drawer does not
+            // fill up with empty rows the user cannot tell apart.
+            switch_to_session(blackwell::cloud::make_session_id(),
+                              /*restore_from_disk=*/false);
+        };
+
+        cb.on_session_delete = [&](const std::string& id) {
+            if (!session_store.erase(id)) {
+                push_session_list();   // already gone; just re-sync the drawer
+                return;
+            }
+            (void)session_store.save();
+            // Deleting the conversation you are IN is legal, and lands you in a
+            // fresh empty one. Refusing would make the same button mean different
+            // things on different rows, and leaving the user in a session that no
+            // longer exists would quietly recreate it on the next answered turn.
+            if (id == current_session_id()) {
+                switch_to_session(blackwell::cloud::make_session_id(),
+                                  /*restore_from_disk=*/false);
+            } else {
+                push_session_list();
+            }
         };
         cb.on_settings_apply = [&](const rt::AssistantSettings& next, bool live_only) {
             // THE HOT-RELOAD CHECK, before `settings` is overwritten -- it is a
@@ -1999,13 +2531,48 @@ int main(int argc, char** argv) {
             // process; the app keeps running on the OLD engine until then, which
             // is the honest state and is what the modal's banner says.
         };
-        cb.on_system_prompt_apply = [&](const std::string& prompt) {
+        cb.on_system_prompt_apply = [&](const std::string& persona) {
+            // COMPOSED ONCE, HERE, and used by both branches below. The user
+            // edited the persona; what every model is told is the persona plus
+            // the output contract, and deriving that twice (once for the cloud
+            // string, once for the KV rebuild) is how the two legs would end up
+            // being asked for different reply shapes after a settings edit.
+            const std::string prompt = rt::compose_system_prompt(persona);
             // The cloud side first, because it is a plain string swap and must not
             // be left describing the old prompt if the GPU rebuild fails.
             {
                 std::lock_guard<std::mutex> lk(prompt_mu);
                 system_prompt = prompt;
             }
+            // The rebuild below rewinds the LOCAL KV to the system-prefix floor,
+            // i.e. the local leg forgets the conversation. Dropping the remote
+            // window too keeps the two legs answering as ONE assistant; leaving
+            // it would make the same question get a context-aware answer from the
+            // cloud and a blank-slate one from the local model.
+            chat_history.clear();
+            // AND THE PERSISTED LOG WITH IT -- this is a data-destroying line, so
+            // it states its case. The transcript on disk was produced by a
+            // DIFFERENT assistant; restoring it into a session running the new
+            // persona reproduces precisely the incoherence the clear() above
+            // exists to prevent, just delayed by one launch. Keeping the file
+            // would also mean a restart silently resurrects what the user's edit
+            // just discarded, which is the worse of the two failures.
+            //
+            // Only fires on a REAL change: the window callback gates this on
+            // `prompt_changed`, so saving the modal with the prompt untouched
+            // costs nothing. The right long-term answer is a new session id per
+            // persona rather than a wipe, which is why the store is keyed by id
+            // (session_store.hpp) even though the app names only one today.
+            //
+            // ONLY THE ACTIVE SESSION. The other conversations in the store were
+            // also produced by the old persona, but they are not on screen and
+            // not in the window -- wiping them would be a settings edit deleting
+            // data the user was not looking at, which is a different and much
+            // worse thing than resetting the conversation in front of them.
+            session_store.clear_session(current_session_id());
+            (void)session_store.save();
+            view.set_sessions(session_store.list_summaries(), current_session_id(),
+                              router.use_local());
             // THE marshal. This runs on the UI thread; prefill is CUDA work on a
             // 5.3 GB weight set and belongs to the engine thread alone (CLAUDE.md).
             // post_engine_task runs it at the next command-batch boundary -- after
@@ -2050,10 +2617,33 @@ int main(int argc, char** argv) {
             if (u.mic_gain   >= 0.0f) settings.mic_gain   = u.mic_gain;
             // Mute is session state and is deliberately NOT merged into
             // `settings` -- see AudioHotUpdate::tts_muted on why it must not
-            // survive a restart. It lives in this one bool, which the save
-            // below therefore cannot reach.
+            // survive a restart. It lives on app_ctx, which the save below
+            // therefore cannot reach.
             if (u.tts_muted != rt::AudioHotUpdate::Tri::Absent) {
-                tts_muted = (u.tts_muted == rt::AudioHotUpdate::Tri::On);
+                const bool now_muted = (u.tts_muted == rt::AudioHotUpdate::Tri::On);
+                const bool was_muted =
+                    app_ctx.tts_muted.exchange(now_muted, std::memory_order_acq_rel);
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+                // THE MUTE EDGE. Everything above stops speech that has not
+                // STARTED yet; a mute tapped mid-sentence has to stop the
+                // sentence in the air, and only barge-in can -- it aborts the
+                // solver mid-step, drops the buffered text, and bumps the speak
+                // epoch so the device drops the queued audio on its next pull
+                // instead of finishing the phrase at zero gain.
+                //
+                // On the EDGE, not on every muted update: a volume drag arrives
+                // as dozens of messages, and re-cancelling on each is only
+                // harmless because Cancel is idempotent -- which is not a reason
+                // to do it. Unmuting is deliberately NOT the mirror image: the
+                // answer that was cancelled is gone, and speech re-arms at the
+                // next turn's dispatch-start rather than resurrecting a reply
+                // from the middle of a word.
+                if (now_muted && !was_muted && app_ctx.tts != nullptr) {
+                    app_ctx.tts->BargeIn();
+                }
+#else
+                (void)was_muted;
+#endif
             }
             rt::clamp_settings(settings);
 
@@ -2119,6 +2709,29 @@ int main(int argc, char** argv) {
                          use_real ? args.model_dir : std::string("no checkpoint loaded"),
                          use_real && real_stack.audio_head_ready);
 
+        // ---- THE STARTUP REPAINT --------------------------------------------
+        // The window's context was seeded from disk long before this point (the
+        // dispatcher needed it), but the page did not exist to be told. Emitting
+        // it here closes that gap: a restored conversation arrives as visible
+        // BUBBLES rather than as invisible context the assistant merely happens
+        // to remember, which is the difference between the feature working and
+        // the feature looking broken.
+        //
+        // Safe to emit before the page has loaded: post_event queues, and the
+        // window flushes everything on NavigationCompleted.
+        //
+        // The turns come from the WINDOW and not from the store, so what is drawn
+        // is exactly what the model will be told -- if the tail was clamped to
+        // four pairs, four pairs is what the user sees. Painting the full log next
+        // to a model that only knows its tail would be a more elaborate lie than
+        // painting nothing.
+        {
+            std::vector<blackwell::cloud::ChatTurn> seeded;
+            chat_history.snapshot(seeded);
+            view.on_session_restored(current_session_id(), seeded);
+            push_session_list();
+        }
+
         // Diagnostics poller: the gate counters, once a second, into the Settings
         // panel. Deliberately its own thread and deliberately NOT on the chat
         // screen -- see the file preamble.
@@ -2150,10 +2763,12 @@ int main(int argc, char** argv) {
         // the LLM, so it runs F5 on an otherwise idle GPU and therefore cannot
         // reproduce anything caused by decode and synthesis sharing the device.
         //
-        // The prompt goes in through submit_text, the SAME entry the typed box
-        // uses and therefore the same ring, gate, dispatcher and answer stream a
-        // spoken turn takes. Reaching into generate_local_reply() directly would
-        // have been fewer lines and would have tested a path no user can take.
+        // The prompt goes in through submit_typed_turn, the SAME entry the typed
+        // box uses and therefore the same gate, dispatcher, routing and answer
+        // stream a spoken turn takes. Reaching into generate_local_reply()
+        // directly would have been fewer lines and would have tested a path no
+        // user can take -- and would have pinned the test to the local leg,
+        // which is precisely the coupling this release removed.
         std::thread test_thread;
         if (!vargs.test_llm_tts.empty()) {
             test_thread = std::thread([&] {
@@ -2168,11 +2783,8 @@ int main(int argc, char** argv) {
                     // as starvation from before there was anything to play.
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-                    view.on_user_text(prompt);
-                    if (control->submit_text(prompt, text_sink) !=
-                        blackwell::EngineStatus::Success) {
-                        std::printf("  FAIL -- submit_text was refused (command ring full).\n");
-                    } else {
+                    submit_typed_turn(prompt);
+                    {
                         // Sample WHILE the turn runs: a summary printed after the
                         // fact cannot show whether the ring ran dry during decode,
                         // which is the whole question.

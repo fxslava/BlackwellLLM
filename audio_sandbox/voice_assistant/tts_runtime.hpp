@@ -283,6 +283,25 @@ private:
         // about CONTENT: it saw the pre-gain signal, so the canceller had to be
         // told the volume separately and re-converged whenever it moved.
         d.aec_tap = blackwell::tts::AecTap::None;
+
+        // TEXT CLEANUP, applied per chunk on the way to the tokenizer. The
+        // defaults are what this app wants and each is a decision:
+        //
+        //   strip_markdown         the model is asked to keep Markdown out of
+        //                          the spoken half (reply_split.hpp) and an 8B
+        //                          backbone does not always oblige. Asterisks
+        //                          read aloud are a bug the user hears.
+        //   stress = Strip         THE SAFE DIRECTION, and the asymmetry is the
+        //                          reason: on a checkpoint that was not trained
+        //                          on stress marks, a mark reaching the vocab
+        //                          maps to the UNKNOWN id -- which in F5 is the
+        //                          SPACE character -- so it becomes a pause in
+        //                          the middle of a word. Getting it wrong the
+        //                          other way merely flattens the intonation.
+        //                          A voice pack fine-tuned WITH stress should
+        //                          set Combining or Plus to match its vocab.
+        d.text.stress = blackwell::tts::StressPolicy::Strip;
+        d.text.strip_markdown = true;
         return d;
     }
 

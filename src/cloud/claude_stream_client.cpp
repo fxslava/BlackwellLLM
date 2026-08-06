@@ -113,4 +113,6 @@ Result ClaudeStreamClient::prewarm(const std::string& prewarm_body) noexcept {
 
 void ClaudeStreamClient::shutdown() noexcept { impl_->core.shutdown(); }
 
+void ClaudeStreamClient::abort() noexcept { impl_->core.abort_current(); }
+
 }  // namespace blackwell::cloud

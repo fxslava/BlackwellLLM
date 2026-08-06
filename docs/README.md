@@ -58,3 +58,6 @@ matching code:
 - [REACT_1STEP_ASSESSMENT.md](REACT_1STEP_ASSESSMENT.md) — strict 1-step ReAct assessment.
 - [TTS_INTEGRATION_AUDIT.md](TTS_INTEGRATION_AUDIT.md) — **proposal, not landed**: on-demand
   speech synthesis for `audio_translator` over the existing ONNXRuntime CPU provider.
+- [VOICE_ASSISTANT.md](VOICE_ASSISTANT.md) — technical review of the `voice_assistant` app:
+  threads, the two engine backends, the pipeline modes, full duplex, and a risk assessment.
+  Read alongside [LOCAL_ROUTER.md](LOCAL_ROUTER.md), which owns the commit/routing semantics.

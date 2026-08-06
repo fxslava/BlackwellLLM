@@ -21,6 +21,13 @@ namespace blackwell::cloud {
 enum class Status : uint32_t {
     Ok = 0,
     ShuttingDown,     // aborted by shutdown(); not an error
+    // THE USER PRESSED STOP. Distinct from ShuttingDown, and the distinction is
+    // load-bearing in both directions: shutdown() latches (the client is dead
+    // for the rest of the process), whereas a cancel must leave the transport
+    // usable for the very next turn. It is also what lets the UI say "stopped"
+    // instead of painting a red failure note on an answer the user themselves
+    // cut off.
+    Cancelled,
     ConnectTimeout,
     TtftTimeout,      // no first body byte within budget
     StallTimeout,     // inter-byte gap exceeded budget
@@ -35,6 +42,7 @@ enum class Status : uint32_t {
     switch (s) {
         case Status::Ok:              return "Ok";
         case Status::ShuttingDown:    return "ShuttingDown";
+        case Status::Cancelled:       return "Cancelled";
         case Status::ConnectTimeout:  return "ConnectTimeout";
         case Status::TtftTimeout:     return "TtftTimeout";
         case Status::StallTimeout:    return "StallTimeout";
@@ -61,9 +69,12 @@ enum class Status : uint32_t {
         case Status::HttpError:
             return http == 408 || http == 409 || http == 429 || http >= 500;
         default:
-            // Ok / ShuttingDown / Refusal / MalformedStream: a byte-identical
-            // retry produces a byte-identical outcome. Refusal in particular is
-            // deterministic -- that is what the `fallbacks` parameter is for.
+            // Ok / ShuttingDown / Cancelled / Refusal / MalformedStream: a
+            // byte-identical retry produces a byte-identical outcome. Refusal in
+            // particular is deterministic -- that is what the `fallbacks`
+            // parameter is for. Cancelled is the one that would be actively
+            // harmful to retry: re-sending an intent the user just stopped would
+            // bill them a second time for the answer they interrupted.
             return false;
     }
 }

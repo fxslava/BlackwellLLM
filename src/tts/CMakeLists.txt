@@ -29,6 +29,7 @@ add_library(blackwell_tts STATIC
     f5_mel_extractor.cpp
     f5_tokenizer.cpp
     text_chunker.cpp
+    speech_text.cpp
     tts_duplex_bridge.cpp)
 
 # blackwell::audio_rt is a HEADER-ONLY INTERFACE target (SpscRing) -- no objects,

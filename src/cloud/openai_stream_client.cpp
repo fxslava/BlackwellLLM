@@ -123,6 +123,8 @@ Result OpenAiStreamClient::send(const std::string& body, const Callbacks& cb) no
 
 void OpenAiStreamClient::shutdown() noexcept { impl_->core.shutdown(); }
 
+void OpenAiStreamClient::abort() noexcept { impl_->core.abort_current(); }
+
 const std::string& OpenAiStreamClient::endpoint() const noexcept { return impl_->endpoint; }
 
 }  // namespace blackwell::cloud

@@ -81,6 +81,12 @@ public:
     // immediately. This is teardown only -- it is NOT a barge-in mechanism.
     void shutdown() noexcept;
 
+    // Stop the request in flight RIGHT NOW and leave the client armed -- the
+    // user's Stop button. Any thread; a call with nothing in flight does
+    // nothing. See ClaudeStreamClient::abort() for why this exists despite
+    // cancellation being explicitly out of scope for the commit-gate design.
+    void abort() noexcept;
+
     // The full endpoint this client POSTs to, for the startup log line. Useful
     // enough to be worth exposing: a wrong base URL is the single most likely
     // misconfiguration, and it otherwise only shows up as a 404 at first use.

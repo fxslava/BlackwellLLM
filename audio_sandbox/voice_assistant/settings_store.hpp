@@ -653,14 +653,34 @@ inline bool requires_audio_reload(const AssistantSettings& a, const AssistantSet
     return audio_signature(a) != audio_signature(b);
 }
 
-// Where the file lives: %LOCALAPPDATA%\BlackwellVoiceAssistant\settings.json.
-// Falls back to a CWD-relative file when the variable is missing (a service
-// account, a stripped environment) rather than failing to persist at all.
-inline std::string settings_path() {
+// THE app-data layout, in one function. Everything the app persists lives in
+// %LOCALAPPDATA%\BlackwellVoiceAssistant\, and falls back to a CWD-relative file
+// when the variable is missing (a service account, a stripped environment)
+// rather than failing to persist at all.
+//
+// `leaf` is the name inside that directory; `fallback` is the flat name used
+// when there is no directory to put it in -- deliberately a separate string,
+// because a bare "sessions.json" dropped in whatever the CWD happens to be is a
+// worse neighbour than a prefixed one.
+inline std::string app_data_file(const char* leaf, const char* fallback) {
     if (const char* local = std::getenv("LOCALAPPDATA"); local != nullptr && *local != '\0') {
-        return std::string(local) + "\\BlackwellVoiceAssistant\\settings.json";
+        return std::string(local) + "\\BlackwellVoiceAssistant\\" + leaf;
     }
-    return "voice_assistant_settings.json";
+    return fallback;
+}
+
+inline std::string settings_path() {
+    return app_data_file("settings.json", "voice_assistant_settings.json");
+}
+
+// The persisted conversation log (src/cloud/session_store.hpp). Deliberately a
+// SEPARATE file from settings.json and not a key inside it: the two have
+// different writers (a person clicking Save vs. the dispatcher thread, once per
+// answered turn), different sizes, and different consequences when corrupt --
+// and a per-turn rewrite of the settings file would eventually lose settings to
+// a crash mid-write.
+inline std::string sessions_path() {
+    return app_data_file("sessions.json", "voice_assistant_sessions.json");
 }
 
 // Best-effort load. A missing or corrupt file is NOT an error: the user gets the

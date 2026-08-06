@@ -47,11 +47,12 @@ public:
     [[nodiscard]] Result send(const TransportRequest& req, const Callbacks& cb) noexcept override {
         Result r;
         shutting_down_.store(false, std::memory_order_release);
+        // Latched, never cleared -- see abort(). Everything below compares
+        // against this snapshot, so a Stop pressed between two turns lands ahead
+        // of the next one instead of killing it.
+        entry_epoch_ = cancel_epoch_.load(std::memory_order_acquire);
 
-        if (!sleep_interruptibly(cfg_.latency_ms)) {
-            r.status = Status::ShuttingDown;
-            return r;
-        }
+        if (!sleep_interruptibly(cfg_.latency_ms)) return stopped();
 
         std::string reply = "[Offline Assistant]: Received user intent: \"";
         reply.append(req.intent);
@@ -59,17 +60,11 @@ public:
 
         // Stream it in pieces, exactly as an SSE text_delta sequence would.
         for (size_t i = 0; i < reply.size();) {
-            if (shutting_down_.load(std::memory_order_acquire)) {
-                r.status = Status::ShuttingDown;
-                return r;
-            }
+            if (shutting_down_.load(std::memory_order_acquire) || cancelled()) return stopped();
             const size_t n = chunk_len(reply, i, static_cast<size_t>(cfg_.chunk_chars));
             if (cb.on_text) cb.on_text(std::string_view(reply).substr(i, n));
             i += n;
-            if (i < reply.size() && !sleep_interruptibly(cfg_.chunk_delay_ms)) {
-                r.status = Status::ShuttingDown;
-                return r;
-            }
+            if (i < reply.size() && !sleep_interruptibly(cfg_.chunk_delay_ms)) return stopped();
         }
 
         if (cfg_.simulate_usage) {
@@ -92,7 +87,25 @@ public:
 
     void shutdown() noexcept override { shutting_down_.store(true, std::memory_order_release); }
 
+    // The simulated leg is interruptible too, and that is not a courtesy: the
+    // Stop button has to be exercisable on a laptop with no GPU, no key and no
+    // network, or the only way to test it is to spend money.
+    void abort() noexcept override { cancel_epoch_.fetch_add(1, std::memory_order_acq_rel); }
+
 private:
+    // Which of the two ended the exchange. Cancelled outranks ShuttingDown when
+    // both are set: a user who pressed Stop and then closed the window asked for
+    // the first thing, and the second is what always happens afterwards.
+    [[nodiscard]] Result stopped() const noexcept {
+        Result r;
+        r.status = cancelled() ? Status::Cancelled : Status::ShuttingDown;
+        return r;
+    }
+
+    [[nodiscard]] bool cancelled() const noexcept {
+        return cancel_epoch_.load(std::memory_order_acquire) != entry_epoch_;
+    }
+
     // How many bytes to take from `s` at `pos`, aiming for `want` but never
     // stopping INSIDE a UTF-8 sequence.
     //
@@ -123,18 +136,26 @@ private:
         return n;
     }
 
-    // Sliced so shutdown() is not held up for a whole simulated round trip.
+    // Sliced so shutdown() -- and now Stop -- is not held up for a whole
+    // simulated round trip. Waiting out a 1 s fake latency after the user asked
+    // to stop would make the button feel broken on precisely the configuration
+    // most people first try it on.
     [[nodiscard]] bool sleep_interruptibly(int ms) noexcept {
         constexpr int kSlice = 20;
         for (int e = 0; e < ms; e += kSlice) {
-            if (shutting_down_.load(std::memory_order_acquire)) return false;
+            if (shutting_down_.load(std::memory_order_acquire) || cancelled()) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(kSlice));
         }
-        return !shutting_down_.load(std::memory_order_acquire);
+        return !shutting_down_.load(std::memory_order_acquire) && !cancelled();
     }
 
     Config cfg_;
     std::atomic<bool> shutting_down_{false};
+    // Bumped by abort() from any thread; `entry_epoch_` is touched only by
+    // send(), which the dispatcher calls from one thread with one exchange in
+    // flight (intent_dispatcher.hpp) -- so it needs no atomicity of its own.
+    std::atomic<uint64_t> cancel_epoch_{0};
+    uint64_t              entry_epoch_ = 0;
 };
 
 }  // namespace blackwell::cloud

@@ -94,6 +94,18 @@ public:
     // immediately. This is teardown only -- it is NOT a barge-in mechanism.
     void shutdown() noexcept;
 
+    // Stop the request in flight RIGHT NOW and leave the client armed. Callable
+    // from any thread; a call with nothing in flight does nothing.
+    //
+    // This is the user's Stop button, and it is the ONE thing docs/LOCAL_ROUTER.md
+    // records as deliberately absent -- because cancellation cannot save the
+    // input/prefill tokens, which are billed at acceptance. It is here for the
+    // OUTPUT half, which bills as it streams: an answer the user stopped reading
+    // three tokens in should not keep being paid for to the end. The gate's
+    // argument is untouched by this -- nothing unfinished is ever SENT; this only
+    // ends a send that the user, having seen the start of it, no longer wants.
+    void abort() noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

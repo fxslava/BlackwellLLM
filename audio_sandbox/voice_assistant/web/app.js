@@ -7,20 +7,28 @@
                    | remote.delta | remote.final | transport | backend | stats
                    | settings | settings.saved | system_prompt.applied | mic
                    | browsed | audio.devices
-     page -> app   ready | send | mic | browse | settings.save | restart
-                   | audio.devices.request
+     page -> app   ready | send | interrupt_generation | mic | browse
+                   | settings.save | restart | audio.devices.request
 
    MIC STATE IS THE APP'S, not this page's: the talk hotkey is global and can
    flip it while the window is hidden, so the button RENDERS `mic` events and
    only ever sends one in response to a click. Settings are the same shape --
    the page never decides what is restart-tier, it renders the list the app
-   pushes (see restartKeys).
+   pushes (see restartKeys). GENERATION STATE follows the identical rule (see
+   `generating`): the page asks to stop and waits to be told the turn ended.
 
    WHO IS WHO IN THE BUBBLES. The LOCAL model transcribes what you said and
    decides whether it was a finished thought; the REMOTE model answers it. So
    local output is the USER's bubble (your words, appearing as you speak) and
    remote output is the ASSISTANT's. A typed message skips the local stage and
    lands as a user bubble immediately.
+
+   ONE ANSWER, TWO AUDIENCES. The reply the model produces is tagged
+   <voice>…</voice><ui>…</ui> and split BEFORE it reaches this page: the
+   remote.delta stream carries the <ui> half only, and the <voice> half goes to
+   the speaker. So nothing here parses tags, and a reply that arrives untagged
+   (a model ignoring the contract) is displayed in full exactly as before --
+   see reply_split.hpp for the contract and its fail-open behaviour.
 
    RENDERING is ported from agent_playground: marked + highlight.js with the
    same renderer overrides, and the same rule that model-emitted HTML is escaped
@@ -365,6 +373,170 @@ function showTyping(handle) {
   handle.md.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
 }
 
+/* ============================== session drawer ============================
+   The app owns which conversation is active; this panel only asks. Nothing here
+   mutates the transcript directly -- a click sends `session.select` and the
+   REPAINT arrives back as `session.restore`, exactly like the composer paints
+   nothing and waits for `user.text`. One source of truth for what is on screen,
+   on every path.                                                            */
+
+const drawer = $("#drawer");
+const drawerScrim = $("#drawerScrim");
+const sessionList = $("#sessionList");
+const drawerEphemeral = $("#drawerEphemeral");
+let activeSession = null;
+let sessions = [];
+
+function openDrawer() {
+  drawer.classList.remove("hidden");
+  drawerScrim.classList.remove("hidden");
+  $("#drawerBtn").setAttribute("aria-expanded", "true");
+  // Re-asked on every open, not cached: previews and ordering change with every
+  // answered turn, and a drawer that shows yesterday's ordering is worse than
+  // one that takes a frame to fill.
+  send({ type: "session.list_request" });
+}
+function closeDrawer() {
+  drawer.classList.add("hidden");
+  drawerScrim.classList.add("hidden");
+  $("#drawerBtn").setAttribute("aria-expanded", "false");
+}
+function toggleDrawer() {
+  if (drawer.classList.contains("hidden")) openDrawer(); else closeDrawer();
+}
+
+$("#drawerBtn").addEventListener("click", toggleDrawer);
+$("#drawerClose").addEventListener("click", closeDrawer);
+drawerScrim.addEventListener("click", closeDrawer);
+document.addEventListener("keydown", e => {
+  // Escape closes the drawer, but never out from under the settings modal --
+  // that dialog has its own handler and its own idea of what Escape means.
+  if (e.key === "Escape" && !drawer.classList.contains("hidden") &&
+      overlay.classList.contains("hidden")) {
+    closeDrawer();
+  }
+});
+
+$("#newChatBtn").addEventListener("click", () => {
+  send({ type: "session.new" });
+  closeDrawer();
+});
+
+// "14:32" today, "Mar 4" this year, "Mar 4, 2025" beyond it. Absolute rather
+// than "3 hours ago": relative times need a ticking re-render to stay true, and
+// this list is drawn once per open.
+function sessionWhen(epochSeconds) {
+  if (!epochSeconds) return "";
+  const d = new Date(epochSeconds * 1000);
+  if (isNaN(d.getTime())) return "";
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const opts = { month: "short", day: "numeric" };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString([], opts);
+}
+
+function sessionLabel(s) {
+  // The preview is the name. Falling back to the id is deliberate and not a
+  // placeholder: an id like "chat-1770384750-0" is ugly but it is UNIQUE, which
+  // is the one property a row must have to be clickable at all.
+  return (s.preview && s.preview.trim()) || s.id;
+}
+
+function renderSessions() {
+  sessionList.textContent = "";
+
+  // The active conversation always has a row, even before it has been persisted
+  // -- a new chat is not written to disk until its first turn is answered, and a
+  // sidebar that could not show where you ARE would be lying by omission.
+  const rows = sessions.slice();
+  if (activeSession && !rows.some(s => s.id === activeSession)) {
+    rows.unshift({ id: activeSession, preview: "", turns: 0, updated_at: 0, pending: true });
+  }
+
+  if (!rows.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "No saved conversations yet.";
+    sessionList.appendChild(empty);
+    return;
+  }
+
+  for (const s of rows) {
+    const row = document.createElement("button");
+    row.className = "session-row" + (s.id === activeSession ? " active" : "") +
+                    (s.pending ? " pending" : "");
+    row.type = "button";
+    row.setAttribute("role", "listitem");
+
+    const name = document.createElement("span");
+    name.className = "session-name";
+    name.textContent = s.pending ? "New chat" : sessionLabel(s);
+    row.appendChild(name);
+
+    const meta = document.createElement("span");
+    meta.className = "session-meta";
+    const when = sessionWhen(s.updated_at);
+    const count = s.turns ? s.turns + (s.turns === 1 ? " message" : " messages") : "Empty";
+    meta.textContent = when ? count + " · " + when : count;
+    row.appendChild(meta);
+
+    row.addEventListener("click", () => {
+      if (s.id !== activeSession) send({ type: "session.select", id: s.id });
+      closeDrawer();
+    });
+
+    // A pending session has nothing on disk to delete, so it gets no button --
+    // the row would otherwise offer to remove something that does not exist.
+    if (!s.pending) {
+      const del = document.createElement("button");
+      del.className = "session-del";
+      del.type = "button";
+      del.title = del.ariaLabel = "Delete this conversation";
+      del.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">' +
+        '<path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2M6 9h12l-1 12H7L6 9Z"/></svg>';
+      // stopPropagation, or the click also opens the conversation being deleted.
+      del.addEventListener("click", e => {
+        e.stopPropagation();
+        send({ type: "session.delete", id: s.id });
+      });
+      row.appendChild(del);
+    }
+
+    sessionList.appendChild(row);
+  }
+}
+
+/* Rebuilds the whole transcript from a session's stored turns.
+
+   REPLACES rather than appends, and clears every live handle with it: the
+   bubbles those handles pointed at are about to be removed from the DOM, so a
+   delta arriving mid-switch must not find one of them still bound. */
+function restoreTranscript(turns) {
+  liveUser = null;
+  lastUser = null;
+  liveAssistant = null;
+  orphanAssistant = null;
+  chat.textContent = "";
+
+  if (!turns || !turns.length) {
+    // Put the welcome panel back. addBubble() detaches it rather than deleting
+    // it, so the same node is reusable -- and an empty new chat that showed a
+    // blank void instead would read as a broken window.
+    if (emptyState) chat.appendChild(emptyState);
+    return;
+  }
+  for (const t of turns) {
+    if (t.user) freeze(addBubble("user", t.user, false));
+    if (t.assistant) freeze(addBubble("assistant", t.assistant, false));
+  }
+  // The restored transcript is history, so it opens where a conversation is
+  // resumed: at the end.
+  scrollDown(true);
+}
+
 /* ============================== status ==================================== */
 
 const statusEl = $("#status"), statusText = $("#statusText"), micBtn = $("#micBtn");
@@ -388,6 +560,34 @@ function setPhase(phase) {
 
 const input = $("#input"), sendBtn = $("#sendBtn");
 
+/* IS A REPLY BEING GENERATED RIGHT NOW?
+
+   The composer's send button becomes a Stop button while this is true, which is
+   the only interrupt a mouse user has -- the cancel gesture was a global hotkey
+   and nothing else.
+
+   THE APP OWNS THIS FLAG'S TRUTH, not the page. It is raised by the two events
+   that mean a turn has started (`user.text` for a typed one, `remote.start` for
+   the answer stream) and lowered by the one event that means it has finished
+   (`remote.final`) -- no timers, no optimistic clearing when Stop is clicked.
+   Clearing it on the click would be the tempting version and it is wrong: the
+   stop may land after the last token, the transport may already be draining,
+   and a button that says "sent" while audio is still playing is a lie the user
+   can hear. `remote.final` arrives on every one of those paths, including the
+   cancelled one.
+
+   `local.final` with dispatched=false lowers it too: that is the gate refusing
+   an utterance, so no answer stream is coming and nothing would ever clear it. */
+let generating = false;
+
+function setGenerating(on) {
+  if (generating === on) return;
+  generating = on;
+  sendBtn.dataset.mode = on ? "stop" : "send";
+  sendBtn.title = sendBtn.ariaLabel = on ? "Stop generating" : "Send";
+  refreshSend();
+}
+
 // Collapse to 0 before measuring, NOT to "auto": the textarea is a flex item, so
 // `auto` resolves against the stretched box on the very first call and reports a
 // scrollHeight several lines tall -- which is how the composer opened three rows
@@ -397,13 +597,18 @@ function autoGrow() {
   input.style.height = Math.min(input.scrollHeight, 140) + "px";
 }
 function refreshSend() {
-  sendBtn.disabled = input.value.trim().length === 0;
+  // Stop is ALWAYS enabled: an empty composer is the normal state while an
+  // answer streams, and that is exactly when the button has to be clickable.
+  sendBtn.disabled = !generating && input.value.trim().length === 0;
 }
 input.addEventListener("input", () => { autoGrow(); refreshSend(); });
 input.addEventListener("keydown", e => {
+  // Enter still SENDS while generating -- it does not stop. A key that means
+  // "go" must not silently start meaning "abort" depending on timing; stopping
+  // is a deliberate gesture and it has a deliberate target.
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
 });
-sendBtn.addEventListener("click", submit);
+sendBtn.addEventListener("click", () => { if (generating) interrupt(); else submit(); });
 
 function submit() {
   const text = input.value.trim();
@@ -416,6 +621,13 @@ function submit() {
   // -- and that echo is a PostMessage on a thread already inside the message
   // loop, so it lands on the next pump, not perceptibly later.
   send({ type: "send", text });
+}
+
+/* Stop the decode, the network transfer and the speaker. Fire-and-forget: the
+   button's state is NOT flipped back here -- see `generating` on why the app's
+   `remote.final` is the only thing allowed to do that. */
+function interrupt() {
+  send({ type: "interrupt_generation" });
 }
 
 /* MIC MUTE. Routed through `mic`, NOT audio.hot_update, and that is deliberate:
@@ -1295,6 +1507,9 @@ function onMessage(msg) {
                 msg.reason === "BargeIn" ? "Interrupted — not sent"
                                          : "Cut off before it finished — not sent",
                 "warn");
+        // The gate refused this utterance, so no answer stream is coming and no
+        // `remote.final` will ever arrive to clear the button.
+        setGenerating(false);
       }
       setPhase(msg.phase);
       break;
@@ -1304,6 +1519,10 @@ function onMessage(msg) {
       freeze(liveUser);
       liveUser = null;
       addBubble("user", msg.text, false);
+      // The turn has begun: the message is in the gate and the dispatcher is
+      // about to pick it up. Stopping is meaningful from this instant, which is
+      // before there is any answer to stop.
+      setGenerating(true);
       if (msg.phase) setPhase(msg.phase);
       break;
 
@@ -1311,6 +1530,9 @@ function onMessage(msg) {
       freeze(liveAssistant);
       liveAssistant = addBubble("assistant", "", true);
       showTyping(liveAssistant);
+      // Also raised here, not only on `user.text`: a SPOKEN turn never sends
+      // one, and it needs the Stop button just as much.
+      setGenerating(true);
       break;
 
     case "remote.delta":
@@ -1326,13 +1548,45 @@ function onMessage(msg) {
           setText(liveAssistant, msg.ok ? "_(no reply)_" : "");
         }
         freeze(liveAssistant);
-        if (!msg.ok) addNote(liveAssistant, msg.detail || "The reply failed.", "err");
+        // STOPPED IS NOT FAILED. The user cut this answer off themselves and a
+        // red note explaining what went wrong would be describing their own
+        // click back at them. The words already on screen are kept -- they were
+        // generated, and in the cloud case they were paid for.
+        if (msg.cancelled) addNote(liveAssistant, "Stopped", "muted");
+        else if (!msg.ok) addNote(liveAssistant, msg.detail || "The reply failed.", "err");
         liveAssistant = null;
       }
       // The turn is over: a question that has not arrived by now is not coming,
       // and letting the anchor outlive its reply is what would let it capture
       // the NEXT turn's user bubble.
       orphanAssistant = null;
+      // THE ONE PLACE the composer returns to Send. Reached on every ending --
+      // success, failure, refusal, cancellation -- which is why nothing else
+      // needs to guess at when a turn is over.
+      setGenerating(false);
+      break;
+
+    case "session.list":
+      sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
+      if (typeof msg.active === "string") activeSession = msg.active;
+      drawerEphemeral.classList.toggle("hidden", !msg.ephemeral);
+      renderSessions();
+      break;
+
+    case "session.restore":
+      // The app has switched conversations (or just finished restoring one at
+      // startup). Repaint from what it sent -- the page never reconstructs a
+      // transcript from its own memory, so what is on screen is always what the
+      // model was actually given.
+      if (typeof msg.id === "string") activeSession = msg.id;
+      restoreTranscript(msg.turns);
+      // Switching conversations cancels the turn in flight (the app does this
+      // before it repaints -- see switch_to_session), so the composer must not
+      // be left offering to stop a turn that belongs to a conversation no longer
+      // on screen.
+      setGenerating(false);
+      if (msg.phase) setPhase(msg.phase);
+      renderSessions();   // the active row moved
       break;
 
     case "transport": {

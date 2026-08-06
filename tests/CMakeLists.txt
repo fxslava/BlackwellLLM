@@ -136,8 +136,11 @@ if(TARGET blackwell_bridge)
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/absolute_audio_ring_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/conversational_mode_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/intent_commit_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/chat_history_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/session_store_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/bridge/utf8_stream_test.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/local_transport_test.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/local_transport_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bridge/reply_split_test.cpp")
     target_include_directories(bridge_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/include      # blackwell/*.h, bridge/*.h
         ${CMAKE_SOURCE_DIR}/src          # common.h
@@ -159,15 +162,24 @@ if(TARGET blackwell_bridge)
                                                        # simulated_engine_control.hpp (the
                                                        # app-level classes under test)
         ${CMAKE_SOURCE_DIR}/audio_sandbox/voice_assistant)  # local_transport.hpp — the
-                                                       # fully-local routing leg (header-only,
-                                                       # no WebView2/Win32: it depends on the
-                                                       # transport seam and the bridge only)
+                                                       # fully-local routing leg — and
+                                                       # reply_split.hpp, the <voice>/<ui>
+                                                       # contract. Both header-only and free
+                                                       # of WebView2/Win32: they depend on the
+                                                       # transport seam and the bridge only.
     target_link_libraries(bridge_tests PRIVATE
         GTest::gtest
         GTest::gtest_main
         blackwell_bridge
         blackwell_kernels
-        blackwell_core_obj)
+        blackwell_core_obj
+        # session_store.hpp persists sessions.json with nlohmann, the same way
+        # the app persists settings.json next to it. Header-only INTERFACE
+        # target, so this adds an include path and no link step -- and it does
+        # NOT compromise the BUILD_CLOUD_CLIENT=OFF property this suite is built
+        # around, since nlohmann is unconditional (cmake/Dependencies.cmake)
+        # while libcurl/simdjson are not.
+        nlohmann_json::nlohmann_json)
     # /utf-8 for the same reason audio_sandbox has it: SimulatedEngineControl's
     # canned utterances and the UTF-8 streaming tests carry Cyrillic literals, and
     # without this MSVC reads them in the system ANSI codepage. The app already
@@ -335,6 +347,7 @@ add_executable(tts_tests
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/phonemizer_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/transcript_model_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/test_duplex_pipeline.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/speech_text_test.cpp"
     # The AEC lives in blackwell::audio_rt, not in blackwell_tts, but it is
     # tested here for the same reason SpscRing is: this is the suite that already
     # runs the duplex path CPU-only, and the canceller's whole purpose is to make

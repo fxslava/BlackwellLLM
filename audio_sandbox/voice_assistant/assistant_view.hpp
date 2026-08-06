@@ -36,11 +36,13 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "bridge/speculative_bridge_api.h"  // SpeechPipelineState
 #include "intent_commit.hpp"                // TerminationReason, IntentCommitQueue
+#include "session_store.hpp"                // SessionSummary + ChatTurn (the sidebar's data)
 #include "utf8_stream.hpp"                  // Utf8StreamAssembler (remote chunk splits)
 
 namespace rt {
@@ -196,7 +198,14 @@ public:
     }
 
     // Dispatcher thread: the remote exchange finished.
-    void on_remote_final(bool ok, const std::string& detail) {
+    //
+    // `cancelled` separates "this went wrong" from "you stopped it". They arrive
+    // through the same non-Ok status and must not be drawn the same way: a red
+    // failure note on an answer the user themselves interrupted reads as a bug
+    // in the app, and it is the one outcome the user already knows about.
+    // Defaulted, because every producer other than the dispatcher's completion
+    // edge is reporting a genuine failure.
+    void on_remote_final(bool ok, const std::string& detail, bool cancelled = false) {
         std::string tail;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -217,6 +226,7 @@ public:
         j["type"] = "remote.final";
         j["ok"] = ok;
         j["detail"] = detail;
+        j["cancelled"] = cancelled;
         emit(j);
     }
 
@@ -228,6 +238,77 @@ public:
         j["type"] = "transport";
         j["name"] = name != nullptr ? name : "";
         j["live"] = live;
+        emit(j);
+    }
+
+    // ---- sessions (UI thread) -----------------------------------------------
+    // Both of these are APP-level producers, like set_transport/set_backend
+    // below: the pipeline has no concept of a session, and neither of these is
+    // reachable from the audio, engine or dispatcher threads.
+
+    // The sidebar's contents. Newest first (SessionStore::list_summaries orders
+    // it), with `active` naming the conversation the app is currently writing
+    // into -- which may legitimately be absent from the list: a brand-new chat is
+    // not persisted until its first turn is answered, exactly like every other
+    // messenger. The page draws that case as a pending row rather than showing
+    // nothing selected.
+    //
+    // `ephemeral` is true when the local leg is answering, i.e. nothing said from
+    // now on will be written to disk. It is pushed rather than inferred in the
+    // page because the page would have to derive it from a settings field, and a
+    // "your conversation is not being saved" banner must not be one stale copy
+    // away from lying.
+    void set_sessions(const std::vector<blackwell::cloud::SessionSummary>& list,
+                      const std::string& active, bool ephemeral) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const blackwell::cloud::SessionSummary& s : list) {
+            nlohmann::json e;
+            e["id"] = s.id;
+            e["updated_at"] = s.updated_at;
+            e["turns"] = s.turn_count;
+            e["preview"] = s.preview;
+            arr.push_back(std::move(e));
+        }
+        nlohmann::json j;
+        j["type"] = "session.list";
+        j["sessions"] = std::move(arr);
+        j["active"] = active;
+        j["ephemeral"] = ephemeral;
+        emit(j);
+    }
+
+    // REPAINT THE TRANSCRIPT. Sent when a session is opened -- at startup for the
+    // restored default, and on every click in the sidebar.
+    //
+    // The whole transcript in ONE event, not a replay of user.text/remote.delta
+    // per turn. Those producers advance the phase, freeze live bubbles and drive
+    // the typing indicator; replaying them would animate a conversation that
+    // already happened and would leave the status line describing a turn that is
+    // not running. This event says "the transcript IS this" and the page rebuilds
+    // from scratch, which is also the only shape that can render an EMPTY session
+    // (a new chat) without a special case.
+    void on_session_restored(const std::string& id,
+                             const std::vector<blackwell::cloud::ChatTurn>& turns) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const blackwell::cloud::ChatTurn& t : turns) {
+            arr.push_back({{"user", t.user}, {"assistant", t.assistant}});
+        }
+        {
+            // A restore ends whatever the view thought was in flight: the bubbles
+            // those producers were filling have just been deleted, so a delta
+            // arriving afterwards must not be appended to a handle the page no
+            // longer has. Resetting the assembler is the same reasoning as
+            // on_dispatch_start -- no fragment may survive into a new transcript.
+            std::lock_guard<std::mutex> lk(mu_);
+            phase_ = Phase::Idle;
+            remote_utf8_.reset();
+            local_gen_ = ~0ull;
+        }
+        nlohmann::json j;
+        j["type"] = "session.restore";
+        j["id"] = id;
+        j["turns"] = std::move(arr);
+        j["phase"] = phase_label(phase());
         emit(j);
     }
 

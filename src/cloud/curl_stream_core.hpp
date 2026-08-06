@@ -36,6 +36,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -104,6 +105,20 @@ struct Transfer {
     Clock::time_point last_byte{};
     char              err_buf[CURL_ERROR_SIZE]{};
     std::atomic<bool>* shutting_down = nullptr;
+    // THE CANCEL EPOCH, latched at the top of run(). A monotone counter rather
+    // than a flag, for the same reason the engine's barge-in is one: a flag has
+    // to be cleared, and whoever clears it races the next abort() -- a stop
+    // pressed in the gap between two transfers would either be lost or would
+    // kill the following request. Comparing against a latched value has neither
+    // failure: an abort raised before this transfer started is simply already
+    // ahead of it.
+    const std::atomic<uint64_t>* cancel_epoch = nullptr;
+    uint64_t                     entry_epoch = 0;
+
+    [[nodiscard]] bool cancelled() const noexcept {
+        return cancel_epoch != nullptr &&
+               cancel_epoch->load(std::memory_order_acquire) != entry_epoch;
+    }
 };
 
 template <class Protocol>
@@ -149,6 +164,8 @@ public:
         Transfer<Protocol> t;
         t.target.cb = cb;
         t.shutting_down = &shutting_down_;
+        t.cancel_epoch = &cancel_epoch_;
+        t.entry_epoch = cancel_epoch_.load(std::memory_order_acquire);
         t.started = t.last_byte = Clock::now();
 
         configure(body, t);
@@ -191,6 +208,14 @@ public:
                 // not a symptom of anything.
                 timeout_status = Status::ShuttingDown;
                 timeout_detail = "aborted at teardown";
+                break;
+            }
+            if (t.cancelled()) {
+                // The user pressed Stop. Also not a watchdog, and NOT teardown:
+                // the next intent must be sendable on this same handle, which is
+                // why the epoch is compared rather than a flag being latched.
+                timeout_status = Status::Cancelled;
+                timeout_detail = "stopped by the user";
                 break;
             }
 
@@ -253,6 +278,17 @@ public:
     // Abort an in-flight run() so the process can exit. Any thread; idempotent.
     void shutdown() noexcept { shutting_down_.store(true, std::memory_order_release); }
 
+    // Abort the transfer that is in flight RIGHT NOW, and only that one. Any
+    // thread. This is the user's Stop button, and it is deliberately not
+    // shutdown(): the client stays armed, so the next thing the user says is
+    // sent on the same pooled connection.
+    //
+    // Racing with the end of a transfer is harmless in both directions -- the
+    // bump either lands inside a live run() (which sees it and aborts) or after
+    // it (which the next run() latches past). What it cannot do is leak into a
+    // request the user never asked to stop.
+    void abort_current() noexcept { cancel_epoch_.fetch_add(1, std::memory_order_acq_rel); }
+
 private:
     // The ONLY place response body bytes are touched.
     static size_t on_write(char* ptr, size_t size, size_t nmemb, void* ud) {
@@ -267,6 +303,14 @@ private:
         if (t->shutting_down->load(std::memory_order_acquire)) {
             t->target.result.status = Status::ShuttingDown;
             return 0;  // != n -> CURLE_WRITE_ERROR, aborts the transfer
+        }
+        // Barge-in DOES reach here, unlike shutdown's neighbour above: a stop
+        // pressed mid-answer has to land within one delta rather than at the
+        // next 100 ms poll tick, because the deltas are what the user is
+        // watching and hearing.
+        if (t->cancelled()) {
+            t->target.result.status = Status::Cancelled;
+            return 0;
         }
         if (!t->decoder.feed(ptr, n)) {
             t->target.result.status = Status::MalformedStream;
@@ -330,7 +374,8 @@ private:
     CURL*         easy_ = nullptr;    // reused: this is what keeps the connection pooled
     curl_slist*   headers_ = nullptr; // built once; must outlive every transfer
 
-    std::atomic<bool> shutting_down_{false};
+    std::atomic<bool>     shutting_down_{false};
+    std::atomic<uint64_t> cancel_epoch_{0};
 };
 
 }  // namespace blackwell::cloud::detail

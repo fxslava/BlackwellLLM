@@ -659,6 +659,29 @@ void AssistantWindow::on_web_message(const std::wstring& message_json) {
             if (cb_.on_test_tone) cb_.on_test_tone();
             return;
         }
+        // ---- the session sidebar --------------------------------------------
+        // Pure routing: this class does not own the store, so every one of these
+        // is forwarded and answered asynchronously by the app (see the callback
+        // declarations). Note there is no "session.rename" -- a conversation is
+        // identified by how it opened, which needs no UI to maintain.
+        if (type == "session.list_request") {
+            if (cb_.on_session_list_request) cb_.on_session_list_request();
+            return;
+        }
+        if (type == "session.select") {
+            const std::string id = j.value("id", std::string());
+            if (!id.empty() && cb_.on_session_select) cb_.on_session_select(id);
+            return;
+        }
+        if (type == "session.new") {
+            if (cb_.on_session_new) cb_.on_session_new();
+            return;
+        }
+        if (type == "session.delete") {
+            const std::string id = j.value("id", std::string());
+            if (!id.empty() && cb_.on_session_delete) cb_.on_session_delete(id);
+            return;
+        }
         // THE HOT PATH. Note what is absent: no AssistantSettings is built, no
         // requires_restart() is consulted, and control never reaches the
         // settings.save branch below. A message that cannot express a
@@ -695,6 +718,16 @@ void AssistantWindow::on_web_message(const std::wstring& message_json) {
         if (type == "send") {
             const std::string text = j.value("text", std::string());
             if (!text.empty() && cb_.on_send_text) cb_.on_send_text(text);
+            return;
+        }
+        // The Stop button in the composer. Routed to the SAME callback the cancel
+        // hotkey raises -- see AssistantWindowCallbacks::on_cancel. The page is
+        // told nothing back: it returns to its Send state when the answer stream
+        // ends (remote.final), which is the app's word for "this turn is over"
+        // and is what arrives whether the stop was honoured, raced, or landed
+        // after the last token.
+        if (type == "interrupt_generation") {
+            if (cb_.on_cancel) cb_.on_cancel();
             return;
         }
         if (type == "mic") {

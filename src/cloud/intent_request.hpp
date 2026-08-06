@@ -38,6 +38,7 @@
 //   instruction, measurably makes leakage worse.
 // =============================================================================
 #include <cstdio>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -73,6 +74,16 @@ inline void append_json_string(std::string& out, std::string_view s) {
     out.push_back('"');
 }
 
+// One FINISHED exchange. Owning strings, unlike everything in RequestContext
+// below, because the store they come from (chat_history.hpp) is mutated by
+// another thread between requests -- a view into its ring would be a race, not
+// a borrow. A snapshot is a handful of copies once per turn, on a path that then
+// blocks on a network round trip.
+struct ChatTurn {
+    std::string user;
+    std::string assistant;
+};
+
 // The stable/volatile split, made explicit in the type so a caller cannot put
 // a timestamp in the "frozen" slot without noticing what they are doing.
 //
@@ -90,6 +101,20 @@ struct RequestContext {
     std::string_view intent;            // THE committed, EOS-terminated payload
     std::string_view model = "claude-opus-5";
     int              max_tokens = 2048;
+    // Finished turns preceding `intent`, OLDEST FIRST, without it. A span, so
+    // the same borrowing rule as the views above applies -- point it at storage
+    // that outlives the send (ChatHistory::snapshot fills a caller-owned buffer
+    // for exactly this reason). Empty is the correct value for a first turn and
+    // for any caller that does not keep a history.
+    //
+    // WHY THE DEFAULT (ANTHROPIC) RENDERING BELOW IGNORES IT. This body's whole
+    // layout is built around two cache breakpoints whose value depends on the
+    // prefix staying byte-identical between turns (see the preamble); splicing a
+    // growing message list in ahead of the last breakpoint would invalidate the
+    // cache on EVERY turn, which costs more than the memory is worth on the leg
+    // that has prompt caching. The OpenAI-compatible renderer, which has no
+    // breakpoints to protect, does replay it -- see openai_request.hpp.
+    std::span<const ChatTurn> history;
 };
 
 namespace detail {

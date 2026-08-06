@@ -175,6 +175,20 @@ public:
         // per-request handle has to be tracked here.
     }
 
+    // DELIBERATELY EMPTY, and it is not a gap. The local leg's cancellation
+    // already exists and is the barge-in epoch: cancel_generation() bumps it and
+    // the decode loop reads it before every token, which is a far tighter
+    // interrupt than anything this class could add from the outside. Aborting
+    // the WAIT here instead would leave the engine thread decoding 200 more
+    // tokens into a sink nobody is reading, spending exactly the GPU time the
+    // Stop button was pressed to save.
+    //
+    // The generation that then ends as BargeIn is reported below as
+    // ShuttingDown/"barge_in", which the dispatcher does not retry -- so a
+    // stopped local turn behaves like a stopped remote one without this method
+    // doing anything at all.
+    void abort() noexcept override {}
+
 private:
     struct State {
         std::mutex              mu;
@@ -221,6 +235,27 @@ public:
         return use_local_.load(std::memory_order_acquire) && local_ != nullptr;
     }
 
+    // Which leg actually ran the intent that just finished -- NOT which leg the
+    // toggle points at now.
+    //
+    // The difference is the whole reason this exists. use_local() is a live
+    // reading, and the user may flip the switch while an answer streams; a caller
+    // that asks it in on_complete can therefore be told "local" about a turn the
+    // cloud was paid for, or the reverse. That is fatal for the one caller there
+    // is: persistence keys off it (main.cpp), and getting it backwards either
+    // writes a local conversation to disk -- which the local leg promises never
+    // happens -- or silently drops a cloud turn from the log.
+    //
+    // Latched at the top of send(), read after it returns. Both happen on the
+    // dispatcher thread with exactly one intent in flight (intent_dispatcher.hpp
+    // does not pop the next until send() returns), so this is ordered by
+    // construction; the atomic is for the UI thread's benefit, not for a race
+    // with the reader. On a retried intent it holds the leg of the LAST attempt,
+    // which is the attempt that produced the Result.
+    [[nodiscard]] bool last_send_was_local() const noexcept {
+        return last_was_local_.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] const char* name() const noexcept override {
         return use_local() ? local_->name() : remote_->name();
     }
@@ -254,8 +289,12 @@ public:
     [[nodiscard]] blackwell::cloud::Result send(
         const blackwell::cloud::TransportRequest& req,
         const blackwell::cloud::Callbacks& cb) noexcept override {
-        // Resolved ONCE, here -- see the header block.
-        return use_local() ? local_->send(req, cb) : remote_->send(req, cb);
+        // Resolved ONCE, here -- see the header block. The latch is written from
+        // the SAME read, so `last_send_was_local()` can never disagree with the
+        // leg that was actually entered.
+        const bool local = use_local();
+        last_was_local_.store(local, std::memory_order_release);
+        return local ? local_->send(req, cb) : remote_->send(req, cb);
     }
 
     [[nodiscard]] blackwell::cloud::Result prewarm(const std::string& body) noexcept override {
@@ -272,10 +311,24 @@ public:
         if (remote_ != nullptr) remote_->shutdown();
     }
 
+    // BOTH, and for the same reason shutdown() does both rather than the reason
+    // send() picks one: this is not routing a turn, it is stopping whatever is
+    // running. Reading the toggle here would mean a Stop pressed after the user
+    // flipped the switch mid-answer aborts the leg that is idle and leaves the
+    // one actually streaming to finish -- the exact failure last_send_was_local()
+    // exists to prevent one layer up. Both legs are no-ops when idle.
+    void abort() noexcept override {
+        if (local_ != nullptr) local_->abort();
+        if (remote_ != nullptr) remote_->abort();
+    }
+
 private:
     blackwell::cloud::IIntentTransport* local_ = nullptr;    // borrowed
     blackwell::cloud::IIntentTransport* remote_ = nullptr;   // borrowed
     std::atomic<bool> use_local_{false};
+    // Defaults to FALSE (remote) so a read taken before any send has happened
+    // reports the leg the app boots on rather than a leg it may never use.
+    std::atomic<bool> last_was_local_{false};
 };
 
 }  // namespace rt

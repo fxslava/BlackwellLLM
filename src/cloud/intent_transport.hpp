@@ -95,6 +95,21 @@ public:
 
     // Abort an in-flight send() at teardown. Any thread; idempotent.
     virtual void shutdown() noexcept {}
+
+    // Stop the exchange in flight RIGHT NOW, and leave this transport usable.
+    // Any thread; a call with nothing in flight does nothing.
+    //
+    // NOT shutdown(), and the difference is the whole reason there are two: a
+    // shutdown latches (the transport is finished for the life of the process),
+    // whereas the user pressing Stop must leave the very next turn sendable.
+    // An aborted send reports Status::Cancelled, which is_retryable() refuses --
+    // re-issuing an intent the user just stopped would bill them twice for an
+    // answer they did not want the first time.
+    //
+    // The default is a NO-OP, and that is the right default rather than a gap:
+    // a transport with no cancellation simply finishes the exchange it is in,
+    // which is what every one of them did before this method existed.
+    virtual void abort() noexcept {}
 };
 
 }  // namespace blackwell::cloud

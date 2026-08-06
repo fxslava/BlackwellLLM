@@ -38,6 +38,8 @@ public:
 
     void shutdown() noexcept override { client_.shutdown(); }
 
+    void abort() noexcept override { client_.abort(); }
+
 private:
     ClaudeStreamClient& client_;
 };

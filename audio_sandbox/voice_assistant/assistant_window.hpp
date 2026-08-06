@@ -101,8 +101,15 @@ struct AssistantWindowCallbacks {
     // callback, so a hotkey is not a second, differently-behaved path to the
     // microphone.
     std::function<void(bool listening)> on_mic_toggle;
-    // Interrupt whatever is generating right now (the cancel hotkey). Equivalent
-    // to a barge-in, minus the speech.
+    // Interrupt whatever is generating right now. Equivalent to a barge-in,
+    // minus the speech: the local decode's epoch is bumped, the in-flight
+    // network transfer is aborted, and the speaker drops what it has queued.
+    //
+    // TWO GESTURES, ONE CALLBACK: the cancel hotkey and the Stop button the
+    // composer turns into while a reply is streaming ("interrupt_generation").
+    // Deliberately not two, for the same reason the mic button and the talk
+    // hotkey share on_mic_toggle -- a second entry point is a second thing to
+    // keep in step with the first, and the first is the one that gets fixed.
     std::function<void()> on_cancel;
     // Settings were saved. `live_only` is true when nothing restart-tier changed,
     // in which case the app applies them to the running engine and stays up.
@@ -129,6 +136,31 @@ struct AssistantWindowCallbacks {
     // because it is not given anything a restart could depend on, which is a
     // stronger guarantee than remembering not to ask.
     std::function<void(const AudioHotUpdate&)> on_audio_hot_update;
+    // ---- the session sidebar ------------------------------------------------
+    // All four run on the UI thread and all four are ROUTED, not handled here:
+    // the window does not own the SessionStore (main.cpp does), so unlike the
+    // audio-device list -- which the window enumerates itself -- these cannot be
+    // answered from inside this class. The app replies by pushing a
+    // `session.list` / `session.restore` event back through the view.
+    //
+    // The page asks for the list: on load, and on every open of the drawer. Same
+    // request/response shape as audio.devices.request, and for the same reason --
+    // one trigger, one answer, and a page-side watchdog that is always armed.
+    std::function<void()> on_session_list_request;
+    // Open an existing conversation. The app switches the active session, reloads
+    // the window from disk, resets the LOCAL model's context, and repaints the
+    // transcript. An unknown id is the app's problem to ignore, not the page's to
+    // prevent -- the list it was clicked from can be a moment stale.
+    std::function<void(const std::string& id)> on_session_select;
+    // Start a fresh conversation. The new session is NOT written to disk until
+    // its first turn is answered, so a user who opens five and talks in none
+    // leaves nothing behind.
+    std::function<void()> on_session_new;
+    // Forget a conversation, transcript and all. Deleting the ACTIVE one is legal
+    // and lands the user in a new empty chat -- the alternative (refusing) would
+    // make the delete button mean different things on different rows.
+    std::function<void(const std::string& id)> on_session_delete;
+
     // The system prompt changed and must be re-frozen: tokenize, prefill, and
     // republish the KV rewind floor. This is ENGINE work and is therefore
     // asynchronous by nature -- the implementation marshals it onto the engine

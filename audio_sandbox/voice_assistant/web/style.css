@@ -198,6 +198,10 @@ body {
 }
 .note.warn { color: var(--warn); }
 .note.err  { color: var(--err); }
+/* "Stopped." The user did this on purpose and already knows; it needs to be
+   legible, not alarming. Colouring it like a failure would teach them that the
+   button they just pressed broke something. */
+.note.muted { color: var(--text-faint); }
 
 /* streaming caret */
 .bubble.streaming .md > :last-child::after {
@@ -387,6 +391,168 @@ details.think .think-body {
 
 .send-btn:not(:disabled) { background: var(--accent); color: #fff; border-color: transparent; }
 .send-btn:disabled { cursor: default; opacity: .45; }
+
+/* SEND <-> STOP. Both glyphs are always in the DOM and `data-mode` chooses; the
+   button never rewrites its own contents, so it keeps focus and the swap can be
+   animated. `display` rather than opacity, or the hidden glyph would still take
+   pointer events in the grid cell it shares with the visible one.
+
+   Stop is NOT red. It is the neutral surface: red is this palette's error
+   colour, and stopping your own answer is a normal thing to do -- see the
+   `cancelled` note styling below, which makes the same argument for the text. */
+.send-btn .ic-stop { display: none; }
+.send-btn[data-mode="stop"] .ic-send { display: none; }
+.send-btn[data-mode="stop"] .ic-stop { display: block; }
+.send-btn[data-mode="stop"]:not(:disabled) {
+  background: var(--bg-elev-2);
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+/* Stop is live even with an empty composer -- the whole point is that there is
+   nothing to send and something to stop. refreshSend() enforces this too; the
+   rule is here so the two cannot disagree during a repaint. */
+.send-btn[data-mode="stop"] { opacity: 1; cursor: pointer; }
+
+/* ---------- session drawer ------------------------------------------------
+   A slide-over, not a layout column. `transform` is what animates -- never
+   `width` or `left` -- so the browser can composite the slide on the GPU
+   without laying the page out 60 times on the way in. The chat underneath is
+   untouched in both states, which is the acceptance criterion ("uncluttered
+   when closed") satisfied structurally rather than by tuning a width to 0.
+
+   z-index sits BELOW the settings overlay (50): if both are somehow open, the
+   modal is the one holding a form the user is typing into.                  */
+
+.drawer {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  z-index: 40;
+  width: min(290px, 82vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 10px;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--line);
+  box-shadow: 2px 0 18px rgba(0, 0, 0, .35);
+  transform: translateX(0);
+  transition: transform .18s ease;
+  user-select: none;
+}
+/* `.hidden` here means "slid out", not `display: none` -- a display toggle
+   cannot transition, and this is the one panel in the app whose motion is the
+   affordance that says where it came from. It is pulled a further 4px so the
+   border and shadow clear the edge instead of hairlining along it. */
+.drawer.hidden { transform: translateX(calc(-100% - 4px)); }
+
+.drawer-scrim {
+  position: fixed; inset: 0; z-index: 39;
+  background: rgba(8, 9, 12, .45);
+  opacity: 1; transition: opacity .18s ease;
+}
+/* The scrim DOES leave the layout when closed: unlike the drawer it has no
+   motion to preserve, and a full-screen invisible element left over the chat
+   would swallow every click. */
+.drawer-scrim.hidden { display: none; }
+
+.drawer-head {
+  display: flex; align-items: center;
+  padding: 0 4px 0 8px;
+}
+.drawer-title {
+  flex: 1;
+  font-size: 12px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-faint);
+}
+.drawer-close { width: 30px; height: 30px; }
+
+.new-chat {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg-elev-2); color: var(--text);
+  font: inherit; font-size: 14px; font-weight: 500;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.new-chat:hover { background: var(--accent-soft); border-color: var(--accent); }
+
+.session-list {
+  flex: 1 1 auto;
+  min-height: 0;              /* or the list refuses to scroll inside the flex column */
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex; flex-direction: column; gap: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.session-list::-webkit-scrollbar { width: 8px; }
+.session-list::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 8px; border: 2px solid var(--bg-elev);
+}
+
+.session-row {
+  position: relative;
+  display: block; width: 100%;
+  padding: 8px 30px 8px 11px;   /* right padding reserves the delete button's lane */
+  border: 0; border-radius: 9px;
+  background: transparent; color: var(--text);
+  font: inherit; text-align: left;
+  cursor: pointer;
+  transition: background .12s;
+}
+.session-row:hover { background: var(--bg-elev-2); }
+.session-row.active { background: var(--accent-soft); }
+
+/* ONE LINE, CLIPPED. A preview that wrapped would make rows different heights
+   and turn the list into a wall of text -- the row is a handle for finding a
+   conversation, not a summary of it. */
+.session-name {
+  display: block;
+  font-size: 13.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session-meta {
+  display: block;
+  margin-top: 1px;
+  font-size: 11px; color: var(--text-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* An unsaved conversation still gets a row, so the user can see where they are
+   -- but it is drawn as provisional rather than as an equal of the rest. */
+.session-row.pending .session-name { color: var(--text-dim); font-style: italic; }
+
+/* REVEALED ON HOVER (and on keyboard focus, which is why :focus-visible is in
+   the selector -- an opacity-0 button is unreachable by tab otherwise). */
+.session-del {
+  position: absolute; top: 50%; right: 4px;
+  transform: translateY(-50%);
+  display: grid; place-items: center;
+  width: 24px; height: 24px;
+  border: 0; border-radius: 7px;
+  background: transparent; color: var(--text-faint);
+  cursor: pointer; opacity: 0;
+  transition: opacity .12s, background .12s, color .12s;
+}
+.session-row:hover .session-del,
+.session-del:focus-visible { opacity: 1; }
+.session-del:hover { background: var(--bg-elev); color: var(--err); }
+
+.drawer-note {
+  flex: none;
+  padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 9px;
+  background: var(--bg);
+  font-size: 11.5px; line-height: 1.45; color: var(--text-dim);
+}
+.drawer-note.hidden { display: none; }
+
+.session-empty {
+  padding: 14px 11px;
+  font-size: 12.5px; color: var(--text-faint);
+}
 
 /* ---------- settings modal ------------------------------------------------ */
 

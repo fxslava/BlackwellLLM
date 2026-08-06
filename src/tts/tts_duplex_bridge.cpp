@@ -79,6 +79,17 @@ TtsStatus TTSDuplexBridge::PumpOnce(std::size_t* out_samples) {
     }
     if (chunk.empty()) return TtsStatus::EmptyResult;
 
+    // THE LAST THING THAT TOUCHES THE TEXT. Markdown the model was asked not to
+    // put in the spoken half but did, and stress marks in whichever of the two
+    // notations it happened to use -- both would otherwise reach a character-level
+    // tokenizer that maps what it does not know to the SPACE id, i.e. as pauses
+    // inside words rather than as an error (speech_text.hpp).
+    //
+    // Here and not in PushToken because a normaliser needs whole constructs, and
+    // a token stream splits "**" down the middle. See DuplexConfig::text.
+    chunk = NormalizeForSpeech(chunk, cfg_.text);
+    if (chunk.empty()) return TtsStatus::EmptyResult;   // decoration only, no words
+
     std::size_t unknown = 0;
     std::vector<std::int32_t> ids32 = tokenizer_.Tokenize(chunk, &unknown);
     if (ids32.empty()) {

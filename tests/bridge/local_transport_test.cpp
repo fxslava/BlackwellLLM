@@ -245,6 +245,54 @@ TEST(RoutedTransport, SendsToWhicheverLegIsSelected) {
     EXPECT_EQ(local_leg.sent.load(), 1);
 }
 
+// THE LEG LATCH, and the reason it is not just `use_local()` read later.
+//
+// Persistence keys off this (voice_assistant/main.cpp): a cloud-answered turn is
+// appended to sessions.json, a locally-answered one never touches a disk. The
+// toggle is LIVE, so a user can flip it while an answer streams -- and a reader
+// that asked "are you local now?" after the fact would then either write a local
+// conversation to disk, which the local leg promises never happens, or silently
+// drop a turn the cloud was paid for.
+TEST(RoutedTransport, LatchesTheLegThatActuallyRanTheIntent) {
+    RecordingTransport local_leg("local");
+    local_leg.live = false;
+    RecordingTransport remote_leg("remote");
+    RoutedTransport router(&local_leg, &remote_leg);
+
+    // Before anything is sent: reports remote, the leg the app boots on.
+    EXPECT_FALSE(router.last_send_was_local());
+
+    router.set_use_local(true);
+    EXPECT_EQ(run_send(router, "answered locally", nullptr).status,
+              blackwell::cloud::Status::Ok);
+    EXPECT_TRUE(router.last_send_was_local());
+
+    // FLIPPED AFTER THE SEND, which is the case that matters: the latch still
+    // describes the turn that ran, not the switch's new position.
+    router.set_use_local(false);
+    EXPECT_TRUE(router.last_send_was_local());
+    EXPECT_FALSE(router.use_local());
+
+    // ...and the next send updates it.
+    EXPECT_EQ(run_send(router, "answered remotely", nullptr).status,
+              blackwell::cloud::Status::Ok);
+    EXPECT_FALSE(router.last_send_was_local());
+}
+
+// A null local leg means use_local() is false however the toggle is set, so the
+// latch must agree -- otherwise a build without a local engine would suppress
+// persistence for every turn it actually sent to the cloud.
+TEST(RoutedTransport, LatchFollowsTheRealLegWhenLocalIsAbsent) {
+    RecordingTransport remote_leg("remote");
+    RoutedTransport router(nullptr, &remote_leg);
+
+    router.set_use_local(true);
+    EXPECT_EQ(run_send(router, "nowhere else to go", nullptr).status,
+              blackwell::cloud::Status::Ok);
+    EXPECT_EQ(remote_leg.sent.load(), 1);
+    EXPECT_FALSE(router.last_send_was_local());
+}
+
 // The cost badge is driven by is_live(), so it has to follow the routing -- a
 // user who switched to local must not keep seeing "billed".
 TEST(RoutedTransport, NameAndLivenessFollowTheSelectedLeg) {

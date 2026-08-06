@@ -13,13 +13,16 @@
 // =============================================================================
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "openai_request.hpp"
 
 namespace {
 
 using blackwell::cloud::build_openai_request;
+using blackwell::cloud::ChatTurn;
 using blackwell::cloud::join_url;
 using blackwell::cloud::OpenAiRequestOptions;
 using blackwell::cloud::RequestContext;
@@ -91,6 +94,113 @@ TEST(OpenAiRequest, EmptyHalvesProduceNoSeparator) {
     const std::string b = build_openai_request(c);
     EXPECT_TRUE(contains(b, R"("content":"S")"));
     EXPECT_TRUE(contains(b, R"("content":"U")"));
+}
+
+// ---- the bounded history window ---------------------------------------------
+// The remote endpoint is stateless, so these messages ARE the model's memory --
+// and they are also the thing that silently multiplies the bill, which is why
+// both the ordering and the cap are asserted rather than assumed.
+
+std::vector<ChatTurn> turns(int n) {
+    std::vector<ChatTurn> v;
+    for (int i = 1; i <= n; ++i) {
+        v.push_back(ChatTurn{"u" + std::to_string(i), "a" + std::to_string(i)});
+    }
+    return v;
+}
+
+// Position matters as much as presence: history AFTER the system message and
+// BEFORE the current turn is the only order in which the model reads the live
+// utterance as the thing to answer.
+TEST(OpenAiRequestHistory, SitsBetweenTheSystemMessageAndTheCurrentTurn) {
+    const std::vector<ChatTurn> h = turns(1);
+    RequestContext c = basic_ctx();
+    c.history = h;
+    const std::string b = build_openai_request(c);
+
+    const auto sys = b.find(R"("role":"system")");
+    const auto past_u = b.find(R"("content":"u1")");
+    const auto past_a = b.find(R"("content":"a1")");
+    const auto now = b.find(R"("content":"What is the capital of France?")");
+    ASSERT_NE(now, std::string::npos);
+    EXPECT_LT(sys, past_u);
+    EXPECT_LT(past_u, past_a);
+    EXPECT_LT(past_a, now);
+    EXPECT_TRUE(contains(b, R"({"role":"assistant","content":"a1"})"));
+}
+
+// Two consecutive `user` messages are a 400 on the stricter gateways, so the
+// pairing is structural: every history entry emits BOTH roles, in order.
+TEST(OpenAiRequestHistory, AlternatesStrictlyAndEndsOnTheUserTurn) {
+    const std::vector<ChatTurn> h = turns(2);
+    RequestContext c = basic_ctx();
+    c.history = h;
+    const std::string b = build_openai_request(c);
+    EXPECT_TRUE(contains(b, R"("role":"user","content":"u1"},{"role":"assistant","content":"a1")"));
+    EXPECT_TRUE(contains(b, R"("role":"user","content":"u2"},{"role":"assistant","content":"a2")"));
+    EXPECT_TRUE(contains(b, R"(,{"role":"user","content":"What is the capital of France?"}])"));
+}
+
+// THE COST BOUND. A store deeper than the cap must lose its FRONT: the recent
+// turn is the one the current utterance refers back to.
+TEST(OpenAiRequestHistory, KeepsOnlyTheLastNPairsAndDropsTheOldest) {
+    const std::vector<ChatTurn> h = turns(6);
+    RequestContext c = basic_ctx();
+    c.history = h;
+    OpenAiRequestOptions o;
+    o.max_history_pairs = 3;
+    const std::string b = build_openai_request(c, o);
+
+    EXPECT_FALSE(contains(b, R"("content":"u1")"));
+    EXPECT_FALSE(contains(b, R"("content":"u2")"));
+    EXPECT_FALSE(contains(b, R"("content":"u3")"));
+    EXPECT_TRUE(contains(b, R"("content":"u4")"));
+    EXPECT_TRUE(contains(b, R"("content":"u6")"));
+    // 1 system + 3 pairs + 1 current = 8 messages, and not one more.
+    std::size_t roles = 0;
+    for (std::size_t p = b.find(R"("role":)"); p != std::string::npos;
+         p = b.find(R"("role":)", p + 1)) {
+        ++roles;
+    }
+    EXPECT_EQ(roles, 8u);
+}
+
+// The escape hatch back to the previous, memoryless behaviour -- and the
+// no-history case, which is every first turn of every session.
+TEST(OpenAiRequestHistory, ZeroPairsAndAnEmptyWindowBothSendNoHistory) {
+    const std::vector<ChatTurn> h = turns(3);
+    RequestContext c = basic_ctx();
+    c.history = h;
+    OpenAiRequestOptions o;
+    o.max_history_pairs = 0;
+    EXPECT_FALSE(contains(build_openai_request(c, o), R"("role":"assistant")"));
+    EXPECT_FALSE(contains(build_openai_request(basic_ctx()), R"("role":"assistant")"));
+}
+
+// Belt and braces for the alternation invariant: even if a store were to hand
+// over a half-formed pair, the wire must not carry two `user` messages in a row.
+TEST(OpenAiRequestHistory, SkipsAHalfFormedPairRatherThanBreakingAlternation) {
+    std::vector<ChatTurn> h;
+    h.push_back(ChatTurn{"orphan", ""});
+    h.push_back(ChatTurn{"u2", "a2"});
+    RequestContext c = basic_ctx();
+    c.history = h;
+    const std::string b = build_openai_request(c);
+    EXPECT_FALSE(contains(b, "orphan"));
+    EXPECT_TRUE(contains(b, R"("content":"u2")"));
+}
+
+// History is user speech and model output, so it meets the same escaping path
+// the live intent does -- and a broken escape here breaks EVERY later turn, not
+// just the one that produced it.
+TEST(OpenAiRequestHistory, EscapesReplayedTurns) {
+    std::vector<ChatTurn> h;
+    h.push_back(ChatTurn{"my name is \"Ann\"", "Hi,\nAnn"});
+    RequestContext c = basic_ctx();
+    c.history = h;
+    const std::string b = build_openai_request(c);
+    EXPECT_TRUE(contains(b, R"(my name is \"Ann\")"));
+    EXPECT_TRUE(contains(b, R"(Hi,\nAnn)"));
 }
 
 // ---- optional fields --------------------------------------------------------

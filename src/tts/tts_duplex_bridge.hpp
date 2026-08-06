@@ -102,6 +102,7 @@
 #include <vector>
 
 #include "f5_tokenizer.hpp"
+#include "speech_text.hpp"
 #include "spsc_ring.hpp"
 #include "text_chunker.hpp"
 #include "tts_status.hpp"
@@ -150,6 +151,16 @@ enum class AecTap : std::int32_t {
 
 struct DuplexConfig {
     AecTap aec_tap = AecTap::Playback;
+
+    // How a chunk is cleaned up on its way to the tokenizer: Markdown removal,
+    // stress-mark convention, symbol filtering (speech_text.hpp).
+    //
+    // APPLIED PER CHUNK, NOT PER TOKEN, and that is the reason it lives here
+    // rather than at PushToken: an LLM stream splits wherever its tokenizer
+    // decided, so "**" routinely arrives as two tokens and a link's "](" as
+    // three. A normaliser fed those fragments cannot see the constructs it is
+    // supposed to remove. By the time the chunker emits, the span is a clause.
+    SpeechTextOptions text;
 
     // How long PumpOnce will spin trying to hand a finished chunk to a full
     // speaker ring before giving up and reporting back-pressure. The producer
