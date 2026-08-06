@@ -110,14 +110,24 @@ public:
 
     using PrefillSystemPromptFn = std::function<std::uint32_t(const std::string&)>;
 
-    // ENGINE THREAD. Called with the finished transcript and whether it was
-    // accepted by the commit gate. `utterance_id` is the epoch the UI keys its
-    // live bubble on -- the same role gen_id plays for Mode A's token stream.
+    // ENGINE THREAD. TWO edges, and the split is load-bearing -- see publish().
     //
-    // A callback rather than a direct AssistantView dependency because this
+    //   on_text    the words themselves. Fires BEFORE the transcript is offered
+    //              to the commit gate, so the user's bubble is on screen before
+    //              anything can announce a reply to it.
+    //   on_verdict whether the gate took it. Necessarily after the offer, and
+    //              carries no text: it only closes the bubble on_text opened.
+    //
+    // `utterance_id` is the epoch the UI keys its live bubble on -- the same
+    // role gen_id plays for Mode A's token stream -- and both edges carry it so
+    // the second cannot be attached to the wrong turn.
+    //
+    // Callbacks rather than a direct AssistantView dependency because this
     // header must stay drivable from a test with no UI, no WebView2 and no COM.
-    using TranscriptCallback =
-        std::function<void(const std::string& utf8, std::uint32_t utterance_id, bool committed)>;
+    struct TranscriptCallbacks {
+        std::function<void(const std::string& utf8, std::uint32_t utterance_id)> on_text;
+        std::function<void(std::uint32_t utterance_id, bool committed)>          on_verdict;
+    };
 
     // `control` and `vad_user` are BORROWED and must outlive this object.
     //
@@ -137,7 +147,7 @@ public:
                        const WhisperAsrConfig& asr_cfg,
                        const Config& cfg,
                        SpeechStateCallback state_cb,
-                       TranscriptCallback transcript_cb,
+                       TranscriptCallbacks transcript_cb,
                        void* callback_user)
         : control_(control), prefill_(std::move(prefill)),
           vad_fn_(vad_fn), vad_user_(vad_user), cfg_(cfg),
@@ -534,9 +544,28 @@ private:
 
     // Hand the transcript to the engine thread. Everything downstream of this
     // point -- the commit gate, the dispatcher, the UI -- runs there.
+    //
+    // THE ORDER OF THE TWO CALLBACK EDGES BELOW IS THE WHOLE MESSAGE ORDERING
+    // GUARANTEE, and it is not obvious enough to leave implicit.
+    //
+    // offer() does not merely record the intent: it wakes the dispatcher thread
+    // out of wait_pop(), and that thread's FIRST act is on_dispatch_start ->
+    // "remote.start" -> the page creates the assistant's bubble. That message
+    // and this transcript land in the SAME single UI queue
+    // (AssistantWindow::post_event), which is FIFO and preserves whatever order
+    // it is handed. So whichever thread enqueues first is the bubble that
+    // appears first -- and offering before publishing put the ANSWER ABOVE THE
+    // QUESTION every time the dispatcher won the race.
+    //
+    // Publishing first makes it deterministic rather than lucky: the push into
+    // the UI queue completes in program order before offer() is called, and
+    // offer()/wait_pop() synchronise, so remote.start cannot be enqueued ahead
+    // of the words it is answering. Do not merge these back into one call.
     void publish(std::string text, std::uint32_t utterance_id) noexcept {
         const bool empty = text.empty();
         auto task = [this, text = std::move(text), utterance_id, empty]() mutable {
+            if (!empty && transcript_cb_.on_text) transcript_cb_.on_text(text, utterance_id);
+
             bool committed = false;
             if (!empty) {
                 // Eos, and it is not a fiction: the commit rule asks whether the
@@ -574,7 +603,12 @@ private:
             // outcome with a stale TerminationReason::None and paint every
             // committed utterance as undispatched. The callback carries the
             // verdict directly instead.
-            if (transcript_cb_) transcript_cb_(text, utterance_id, committed);
+            //
+            // Text-free, and after the offer by necessity: it closes the bubble
+            // on_text already opened. It fires even for an empty transcript,
+            // because the UI is sitting on the "writing your words down" phase
+            // and only a turn boundary clears it.
+            if (transcript_cb_.on_verdict) transcript_cb_.on_verdict(utterance_id, committed);
         };
         if (!control_->post_engine_task(std::move(task))) {
             // The task deque is full, which means the engine thread has not
@@ -604,7 +638,7 @@ private:
     void*                                   vad_user_ = nullptr;
     Config                                  cfg_;
     SpeechStateCallback                     state_cb_ = nullptr;
-    TranscriptCallback                      transcript_cb_;
+    TranscriptCallbacks                     transcript_cb_;
     void*                                   callback_user_ = nullptr;
 
     // ---- DSP-thread state (no synchronisation: one owner) -------------------

@@ -266,11 +266,38 @@ function renderContent(content) {
 
 /* ============================ transcript ================================= */
 
+/* THE TRANSCRIPT IS INSERTION-ORDERED, AND DELIBERATELY SO. Bubbles are DOM
+   nodes appended in the order their messages arrive; nothing here sorts, and
+   nothing here reads a clock. A wall-clock sort would be actively wrong: the
+   messages are produced on four threads (engine, audio/VAD, dispatcher, UI) and
+   stamping them would only record a race faithfully instead of preventing it.
+   The app hands us one FIFO queue -- see AssistantWindow::post_event -- and the
+   order it hands us IS the conversation. Do not add a sort.
+
+   THE ONE ORDERING RULE THIS PAGE ENFORCES ITSELF: an answer may never be the
+   first bubble of a turn. The app is supposed to publish the user's words before
+   anything can announce a reply to them (WhisperCascadeMode::publish is where
+   that is guaranteed for the voice path), but "supposed to" spans three threads,
+   so the page also refuses to render an answer above its question -- see
+   orphanAssistant below. */
 const chat = $("#chat");
 const emptyState = $("#emptyState");
 let liveUser = null;        // the bubble filling with live transcription
 let lastUser = null;        // the most recent user bubble, live or finished
 let liveAssistant = null;   // the bubble filling with the remote reply
+
+/* An assistant bubble that was created with no user bubble above it -- i.e. the
+   reply reached the page before the question did. The next user bubble is
+   inserted BEFORE it rather than appended, which repairs the order in place with
+   no re-render and no flicker.
+
+   Bounded to exactly one turn: it is set at remote.start (only when the answer
+   genuinely has no question above it) and cleared the moment it is used or the
+   reply ends. It therefore cannot reach forward and hijack the next turn's user
+   bubble -- which is the failure mode a looser rule would have. The dispatcher
+   serialises requests one at a time, so there is never a second turn in flight
+   to confuse it with. */
+let orphanAssistant = null;
 
 function atBottom() {
   return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
@@ -289,10 +316,29 @@ function addBubble(role, text, streaming) {
   md.className = "md";
   bubble.appendChild(md);
   row.appendChild(bubble);
-  chat.appendChild(row);
+
+  // The repair described at orphanAssistant: a user bubble that arrives after
+  // the answer it prompted is placed above that answer, not below it.
+  if (role === "user" && orphanAssistant && orphanAssistant.row.parentNode === chat) {
+    chat.insertBefore(row, orphanAssistant.row);
+    orphanAssistant = null;
+  } else {
+    chat.appendChild(row);
+  }
+
   const handle = { row, bubble, md, text: "" };
   setText(handle, text || "");
-  if (role === "user") lastUser = handle;
+  if (role === "user") {
+    lastUser = handle;
+  } else {
+    // A turn always opens with the user -- typed messages arrive as `user.text`
+    // and spoken ones as `local.delta`, and an utterance that produced no text
+    // is never dispatched. So an assistant bubble whose predecessor is not a
+    // user row is an answer that outran its question; remember it so the
+    // question can be slotted in above when it lands.
+    const prev = row.previousElementSibling;
+    orphanAssistant = prev && prev.classList.contains("user") ? null : handle;
+  }
   scrollDown(true);
   return handle;
 }
@@ -1283,6 +1329,10 @@ function onMessage(msg) {
         if (!msg.ok) addNote(liveAssistant, msg.detail || "The reply failed.", "err");
         liveAssistant = null;
       }
+      // The turn is over: a question that has not arrived by now is not coming,
+      // and letting the anchor outlive its reply is what would let it capture
+      // the NEXT turn's user bubble.
+      orphanAssistant = null;
       break;
 
     case "transport": {

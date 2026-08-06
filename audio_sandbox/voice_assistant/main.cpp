@@ -1353,9 +1353,17 @@ int main(int argc, char** argv) {
             // order. The difference is that it arrives whole rather than token by
             // token, and that the gate's verdict comes with it instead of being
             // read back off the control (which never ran a decode loop here).
-            auto on_transcript = [&view](const std::string& text, std::uint32_t id,
-                                         bool committed) {
-                if (!text.empty()) view.on_local_token(text.c_str(), id);
+            //
+            // TWO EDGES, NOT ONE, and the mode fires them either side of the
+            // commit gate on purpose: on_text must reach the page before the
+            // offer wakes the dispatcher, or the assistant's bubble is created
+            // first and the answer renders above the question. See the note over
+            // WhisperCascadeMode::publish().
+            rt::WhisperCascadeMode::TranscriptCallbacks on_transcript;
+            on_transcript.on_text = [&view](const std::string& text, std::uint32_t id) {
+                view.on_local_token(text.c_str(), id);
+            };
+            on_transcript.on_verdict = [&view](std::uint32_t /*id*/, bool committed) {
                 view.on_local_final(committed
                                         ? blackwell::bridge::TerminationReason::Eos
                                         : blackwell::bridge::TerminationReason::None);
