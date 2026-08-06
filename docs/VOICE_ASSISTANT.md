@@ -218,6 +218,29 @@ Downstream, `NormalizeForSpeech` removes Markdown the model left in the spoken h
 resolves stress marks, whose failure mode on a character-level vocab is a *pause inside a
 word* rather than a mispronunciation.
 
+**Keeping the tags across a long thread (2026-08-06).** The contract is stated in the
+persona, which is pinned about as hard as this codebase pins anything: its length is
+published as the KV rewind floor, and `effective_keep_tokens()` (barge-in),
+`kv_cache_rollback()` (end of turn) and `rebuild_history_kv()` (bounded history) all clamp
+*up* to it. **It is never evicted — and it still drifts.** What it loses over a thread is
+*recency*: a few turns in, the rule sits a thousand tokens behind the conversation and the
+8B backbone starts answering in plain prose. Because `ReplySplitter` fails open the symptom
+is not an error but a *silence* — the screen looks perfect while the spoken half arrives
+late and whole, which is why this was worth a mechanism rather than a prompt tweak.
+
+The fix is `rt::kFormatReminder` (`reply_split.hpp`, beside the contract and the parser it
+must agree with), installed once via
+`RealEngineControl::set_reply_format_reminder()` and appended by `generate_local_reply()` to
+the end of every user block — the position immediately before the generation cue, which is
+the same place `build_user_instruction()` puts the transcription contract for the same
+reason. It is a *pointer* at the rule (~30 tokens), not a second copy of it.
+
+Its lifetime is **one turn**: it is prefilled into the KV with the user block but is absent
+from the retained history (`encode_history_turn` records the user's words verbatim), so a
+context rebuild does not stack a reminder onto every past turn. It is deliberately *not*
+applied in `commit_text_decode`, whose output is an intent offered to the commit gate rather
+than a reply — tagging that would dispatch the markup as the user's words.
+
 **The self-trigger problem and its resolution is the most instructive part of this app.**
 The loudspeaker feeds the microphone; Silero scores the assistant's own voice as speech —
 *correctly, because it is speech* — which fires speech-onset, which is barge-in, which

@@ -81,6 +81,39 @@ inline constexpr const char* kOutputContract =
     return out;
 }
 
+// THE SAME AGREEMENT, RESTATED WHERE THE MODEL READS IT LAST. Appended to the
+// user block of every locally-answered turn, immediately before the assistant's
+// generation cue.
+//
+// IT IS NOT THERE BECAUSE THE CONTRACT GETS EVICTED -- it cannot be. The persona
+// is prefilled once and frozen as the KV rewind floor
+// (RealEngineControl::prefill_system_prompt -> set_system_prefix_tokens), and
+// every path that drops KV clamps UP to that floor: the barge-in micro-rewind
+// (effective_keep_tokens), the end-of-turn flush (kv_cache_rollback) and the
+// bounded-history rebuild, which rolls back to exactly the floor and re-prefills
+// only the retained turns. History eviction prunes turn records; it never
+// reaches token 0.
+//
+// WHAT IT LOSES IS RECENCY. By the fourth or fifth turn the format rule sits a
+// thousand tokens behind the conversation, and an 8B backbone starts answering
+// in plain prose -- the drift kOutputContract's "an instruction placed last is
+// the one that survives a long prefix" note is about, applied to the prefix
+// itself once there is enough history in front of it. The symptom is silence
+// rather than a visible error: ReplySplitter fails open (see the header block),
+// so the screen looks perfect while the spoken half arrives late and whole.
+//
+// A POINTER AT THE RULE, NOT A SECOND COPY OF IT. The full contract is ~90
+// tokens and is still in the context; naming the two tags is enough to put the
+// model back on it, and this is paid for on every single turn.
+//
+// Its lifetime is ONE TURN. It is prefilled into the KV with the user block but
+// is deliberately absent from the retained history (encode_history_turn records
+// the user's words verbatim), so a context rebuild does not stack a reminder
+// onto every past turn and spend the history budget on N copies of one sentence.
+inline constexpr const char* kFormatReminder =
+    "\n\n[Format reminder] Answer with exactly one <voice>...</voice> block "
+    "followed by one <ui>...</ui> block, and nothing outside them.";
+
 // -----------------------------------------------------------------------------
 // ReplySplitter — the reader half of the contract.
 //

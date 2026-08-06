@@ -346,6 +346,40 @@ public:
         return audio_task_prompt_;
     }
 
+    // ---- the PER-TURN FORMAT REMINDER (prompt-drift guard) --------------------
+    // Appended to the user block of every turn generate_local_reply() answers,
+    // so it is the LAST thing the model reads before it starts writing. Empty
+    // (the default) appends nothing.
+    //
+    // WHY A REMINDER AND NOT A BIGGER PIN. The persona is already pinned as hard
+    // as this codebase can pin anything: prefill_prefix_on_active publishes its
+    // length as the KV rewind floor, and effective_keep_tokens(),
+    // kv_cache_rollback() and rebuild_history_kv() all clamp UP to it, so no
+    // barge-in, end-of-turn flush or history eviction can truncate a formatting
+    // rule written into it. Eviction is not the failure. RECENCY is: after a few
+    // turns that rule is a thousand tokens behind the conversation and the 8B
+    // backbone drifts out of the format. Restating it here is the same move
+    // build_user_instruction() makes for the transcription contract, and for the
+    // same reason -- the per-turn user block is the position that actually holds.
+    //
+    // THE TEXT BELONGS TO THE CALLER. What a reply must look like is the app's
+    // contract, not the engine control's: voice_assistant owns both halves of it
+    // in reply_split.hpp (the instruction AND the parser that reads it back), and
+    // a tag hardcoded here would be a third copy free to drift from those two.
+    // The translator app sets nothing and pays nothing.
+    //
+    // Same mutex as the audio task text, for the same reason: a std::string read
+    // at turn boundaries on the engine thread, written by the UI thread, never
+    // touched from the audio hot path.
+    void set_reply_format_reminder(std::string reminder) {
+        std::lock_guard<std::mutex> lk(audio_task_mu_);
+        reply_format_reminder_ = std::move(reminder);
+    }
+    std::string reply_format_reminder() const {
+        std::lock_guard<std::mutex> lk(audio_task_mu_);
+        return reply_format_reminder_;
+    }
+
     // ---- the SPOKEN LANGUAGE (Settings -> System prompts) ---------------------
     // Free text ("Russian", "English", ""), NOT an rt::kLanguages index, and that
     // is the point: the table is a fixed twelve-entry dropdown, while the failure
@@ -560,8 +594,27 @@ public:
             (*c->fn)(utf8);
         };
 
+        // WHAT THE MODEL READS vs WHAT THE HISTORY REMEMBERS -- and the split is
+        // the point. The KV gets the user's words PLUS the format reminder, so
+        // the reminder is the last instruction before the generation cue: the
+        // one position that still lands after a long prefix. The retained
+        // history gets pending_user_text_ (set above), which is the words alone.
+        //
+        // Two consequences, both wanted. A bounded-history rebuild re-prefills
+        // the conversation WITHOUT the reminders, so the history budget is never
+        // spent on N copies of one sentence; and the reminder is always attached
+        // to the turn actually being answered rather than accumulating behind it.
+        //
+        // NOT DONE IN commit_text_decode. That path's output is an INTENT offered
+        // to the commit gate, not a reply shown to anyone -- asking it for
+        // <voice>/<ui> blocks would wrap the intent itself in tags and dispatch
+        // the markup as the user's words.
+        std::string user_block = user_text;
+        if (const std::string reminder = reply_format_reminder(); !reminder.empty())
+            user_block += reminder;
+
         std::vector<int> turn = tok_->encode_chat_message(
-            blackwell::ChatMessage{"user", user_text});
+            blackwell::ChatMessage{"user", user_block});
         const std::vector<int> gen = tok_->encode_generation_prompt();
         turn.insert(turn.end(), gen.begin(), gen.end());
 
@@ -2331,6 +2384,11 @@ protected:
     // the mutex above: both are read together when the transcription prefix is
     // composed, so one lock is the natural granularity. See set_speech_language.
     std::string        speech_language_;
+    // Restated at the END of every locally-answered user block; empty = append
+    // nothing, which is what an app with no reply-format contract wants. Shares
+    // the mutex for the same reason the two above do. See
+    // set_reply_format_reminder for why a pinned system prefix is not enough.
+    std::string        reply_format_reminder_;
     std::atomic<bool> live_center_{false};    // UI streaming toggle (utterance-latched)
     std::atomic<float> last_ttft_ms_{0.0f};   // VAD->first-token, panel readout (0 = none)
 
