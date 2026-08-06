@@ -5,19 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Assistant</title>
 
-<!-- Markdown renderer + syntax highlighter, the SAME pair agent_playground uses,
-     from the same CDN. Both are optional by construction: app.js ships a
-     self-contained fallback renderer and highlighter, so a machine with no
-     network (a very ordinary state for a local voice assistant) still gets
-     formatted answers and coloured code. See renderMarkdown() in app.js.
+<!-- Markdown renderer + syntax highlighter, VENDORED. These used to be four
+     jsdelivr URLs, which meant a "local voice assistant" fetched code from the
+     public internet on every launch, rendered plain text whenever the machine
+     was offline, and handed a third party a request log of when this app was
+     opened. They are now files in web/vendor/, deployed next to the exe by the
+     same POST_BUILD copy that deploys this page (see audio_sandbox/CMakeLists).
+
+     SAME PINNED VERSIONS as the CDN served -- marked 12.0.0 and highlight.js
+     11.9.0 -- so rendering is byte-identical to what it was; only the origin
+     changed. Update them by replacing the files, not by adding a URL.
+
+     STILL OPTIONAL BY CONSTRUCTION, and that property is worth keeping now that
+     the reason has changed: app.js ships a self-contained fallback renderer and
+     highlighter, so a missing or corrupt vendor file degrades to readable
+     formatted output instead of a wall of plain text. See renderMarkdown().
+
      The theme is picked by media query rather than pinned dark: this window
      follows the OS scheme, and a dark code theme on a light page is unreadable. -->
 <link rel="stylesheet" media="(prefers-color-scheme: dark)"
-      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+      href="vendor/github-dark.min.css">
 <link rel="stylesheet" media="(prefers-color-scheme: light)"
-      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css">
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+      href="vendor/github.min.css">
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
 
 <link rel="stylesheet" href="style.css">
 </head>

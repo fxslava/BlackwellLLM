@@ -132,7 +132,9 @@ struct AssistantSettings {
     // Defaults to the LEGACY path. Cascade is opt-in until it has been validated
     // in production, which is the whole point of the flag -- and an unknown value
     // clamps back to legacy rather than to the newer path (see clamp_settings).
-    std::string pipeline_mode = "ultravox_legacy";   // | "whisper_cascade"
+    // "simultaneous" (ISpeechMode's Mode B) parses but is REFUSED at bring-up in
+    // this binary -- see clamp_settings and bring_up_speech_mode.
+    std::string pipeline_mode = "ultravox_legacy";   // | "whisper_cascade" | "simultaneous"
 
     // The GGML Whisper model the cascade transcribes with (e.g. a turbo-class
     // Whisper-Turbo-Platinum-F16.bin). Empty = fall back to the path CMake
@@ -538,7 +540,18 @@ inline void clamp_settings(AssistantSettings& s) {
     // file, an older build's value, or a typo must never be the thing that moves
     // a user onto an unvalidated pipeline -- the fallback direction is toward the
     // one that has been in production.
-    if (s.pipeline_mode != "ultravox_legacy" && s.pipeline_mode != "whisper_cascade") {
+    //
+    // "simultaneous" IS DELIBERATELY IN THIS SET even though voice_assistant
+    // cannot run it. It names ISpeechMode's Mode B (continuous rolling
+    // re-translation, docs/CONTINUOUS_STREAMING.md), which is a REAL mode this
+    // repo builds -- into audio_translator, not into this binary. Silently
+    // clamping it to legacy would make "I asked for Mode B" and "I typed
+    // ultravx_lgacy" produce the identical, unexplained outcome. Recognised here
+    // and REFUSED, loudly, where modes are actually constructed
+    // (AppLifecycleManager::bring_up_speech_mode) -- so the user is told which of
+    // the two things went wrong.
+    if (s.pipeline_mode != "ultravox_legacy" && s.pipeline_mode != "whisper_cascade" &&
+        s.pipeline_mode != "simultaneous") {
         s.pipeline_mode = "ultravox_legacy";
     }
     trim(s.whisper_model_path);

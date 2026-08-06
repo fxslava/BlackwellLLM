@@ -5,7 +5,10 @@
 // =============================================================================
 #include "engine_control_bridge.hpp"
 
+#include <cstdlib>    // std::abort (debug-only thread-ownership check)
 #include <exception>
+#include <iostream>   // std::cerr (ditto -- the check has no richer channel)
+#include <thread>
 
 #include "bridge/engine_api.h"  // BridgeStatus / BRIDGE_OK for the token sink
 
@@ -220,7 +223,46 @@ bool EngineControlBridge::post_engine_task(std::function<void()> fn) noexcept {
 // -----------------------------------------------------------------------------
 // CONSUMER edge (the single engine-owning thread).
 // -----------------------------------------------------------------------------
+
+void EngineControlBridge::adopt_engine_thread() noexcept {
+#ifndef NDEBUG
+    engine_thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+#endif
+}
+
+void EngineControlBridge::verify_engine_thread([[maybe_unused]] const char* op) const noexcept {
+#ifndef NDEBUG
+    const std::thread::id self = std::this_thread::get_id();
+    std::thread::id owner = engine_thread_id_.load(std::memory_order_acquire);
+    if (owner == std::thread::id{}) {
+        // Unclaimed: the first thread to reach the consumer edge owns it from now
+        // on. compare_exchange rather than a plain store so two threads racing to
+        // be first cannot BOTH believe they won -- the loser falls through to the
+        // mismatch check below and aborts, which is the correct verdict for a
+        // bridge being pumped from two threads.
+        if (engine_thread_id_.compare_exchange_strong(owner, self, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+            return;
+        }
+    }
+    if (owner != self) {
+        std::cerr << "[blackwell_bridge] FATAL: single-threaded control-plane contract "
+                     "violated -- EngineControlBridge::" << (op != nullptr ? op : "?")
+                  << " is a CONSUMER-edge call owned by thread " << owner
+                  << " but was entered from thread " << self
+                  << ".\n  The producer edge (cancel_generation / rewind_kv / warm_prefill /"
+                     " commit_and_decode / submit_text / post_engine_task / stop) is the"
+                     " any-thread surface; marshal engine work onto the owning thread with"
+                     " post_engine_task instead.\n"
+                  << std::flush;
+        std::abort();
+    }
+#endif
+}
+
 size_t EngineControlBridge::drain_engine_tasks() noexcept {
+    verify_engine_thread("drain_engine_tasks");
+
     // Fast path: one relaxed load per pump on the idle loop, no lock.
     if (pending_tasks_.load(std::memory_order_acquire) == 0) return 0;
 
@@ -256,6 +298,7 @@ bool EngineControlBridge::take_text_turn(std::string& out) noexcept {
 }
 
 size_t EngineControlBridge::pump() noexcept {
+    verify_engine_thread("pump");
     // Tasks FIRST, before this batch's commands. A task reconfigures the engine
     // (a system-prompt rebuild invalidates the whole KV cache), so running it
     // ahead of the batch means the batch executes against the new configuration
@@ -374,6 +417,11 @@ bool EngineControlBridge::is_eos(int /*token_id*/) const noexcept {
 bool EngineControlBridge::publish_intent(TerminationReason reason, uint64_t gen,
                                          std::string&& payload,
                                          uint32_t token_count) noexcept {
+    // The ONLY path from the engine thread to the network layer, and
+    // IntentCommitQueue is single-producer with the engine thread DEFINED as that
+    // producer (intent_commit.hpp). An offer from anywhere else corrupts the queue
+    // silently, so this is one of the two places the check earns its keep.
+    verify_engine_thread("publish_intent");
     // Record the verdict BEFORE the queue check: the UI badge must be correct
     // even when cloud routing is not wired at all (the local-only configuration).
     last_reason_.store(static_cast<uint32_t>(reason), std::memory_order_release);
@@ -385,6 +433,12 @@ EngineStatus EngineControlBridge::run_decode_loop(uint64_t gen, int first_token_
                                                   int start_pos, int max_new_tokens,
                                                   const TokenSink& sink,
                                                   TerminationReason* out_reason) {
+    // Reachable from pump() (which already checked) AND directly from an
+    // override's own loop -- RealEngineControl::decode_assistant_turn, which
+    // LocalEngineTransport marshals onto the engine thread. That second path is
+    // the one this call is here for: it launches kernels, so it is exactly the
+    // kind of work the doctrine exists to keep on one thread.
+    verify_engine_thread("run_decode_loop");
     EngineStatus st = EngineStatus::Success;
     // Start at TokenCap: that is what a loop which simply runs out the for-
     // condition without ever seeing EOS actually did. Every other exit below

@@ -32,10 +32,15 @@
 
    RENDERING is ported from agent_playground: marked + highlight.js with the
    same renderer overrides, and the same rule that model-emitted HTML is escaped
-   and shown rather than injected. What is new here is the FALLBACK -- a
-   self-contained markdown renderer and highlighter used whenever the CDN is
-   unreachable, because a local voice assistant that only formats code when it
-   has internet is not actually a local voice assistant.
+   and shown rather than injected. Both libraries are VENDORED into web/vendor/
+   and loaded from there -- a local voice assistant that only formats code when
+   it has internet is not actually a local voice assistant.
+
+   THE FALLBACK BELOW STAYS ANYWAY. It was written for a missing CDN and now
+   covers a missing or corrupt vendor file, which is a smaller risk but not a
+   zero one -- and it is what makes the two <script> tags in index.html
+   genuinely optional rather than load-bearing. Every `window.marked` /
+   `window.hljs` test in this file is that contract.
 --------------------------------------------------------------------------- */
 
 const $ = s => document.querySelector(s);

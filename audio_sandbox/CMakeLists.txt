@@ -216,9 +216,37 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
             "included from the root CMakeLists.")
     endif()
 
+    # main.cpp is ORCHESTRATION ONLY. Everything it used to hold inline lives in
+    # the components below, each of which owns one construction/destruction order
+    # that a comment alone could not enforce. voice_assistant/main.cpp's preamble
+    # has the map; the short version is lifecycle -> audio -> router -> UI.
     add_executable(voice_assistant
         voice_assistant/main.cpp
         voice_assistant/assistant_window.cpp   # WebView2 host for the messenger UI
+        # The pre-allocation VRAM guard. Its own TU because it is the only place
+        # that reads a checkpoint HEADER without loading it (SafetensorsLoader
+        # from the engine white-box tier) -- keeping that include out of main.cpp.
+        voice_assistant/vram_budget.cpp
+        # Startup order + strict reverse-order teardown: COM apartment, the VRAM
+        # guard, the engine stack, the neural VAD, the speech mode, the engine
+        # thread.
+        voice_assistant/app_lifecycle.cpp
+        # The AppContext handle and the three C-ABI speech-pipeline callbacks.
+        voice_assistant/app_context.cpp
+        # Microphone -> DSP -> PCM tap -> mode, plus speech output, the WASAPI
+        # loopback reference and the echo canceller.
+        voice_assistant/audio_pipeline_binder.cpp
+        # The Local Router: commit gate, both legs, dispatcher, reply splitter,
+        # chat history and the session store.
+        voice_assistant/conversation_router.cpp
+        # Chromium host bindings + the settings fan-out + the diagnostics poller.
+        voice_assistant/web_ui_bridge.cpp
+        # This app's own CLI flags, and the two self-tests that serve one.
+        voice_assistant/cli_options.cpp
+        # Asset resolution against the exe's directory, and the restart relaunch.
+        voice_assistant/asset_paths.cpp
+        # --test-llm-tts: one injected turn on the fully-loaded stack.
+        voice_assistant/full_stack_test.cpp
         # Recompiled here so audio_realtime's and audio_translator's own targets
         # stay untouched (same convention as audio_translator above).
         src/audio_capture.cpp

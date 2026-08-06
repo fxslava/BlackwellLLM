@@ -63,6 +63,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "bridge_internal.hpp"        // IEngineControl, TokenSink, AudioStreamHandle, AudioRingBuffer
 #include "intent_commit.hpp"          // TerminationReason, IntentCommitQueue (the commit gate)
@@ -273,7 +274,44 @@ public:
         return active_gen_.load(std::memory_order_acquire);
     }
 
+    // ---- THE SINGLE-THREADED CONTROL-PLANE CONTRACT, CHECKED -----------------
+    // The doctrine (CLAUDE.md, "the most important rule") says exactly one thread
+    // may drive the engine after load. EngineCom enforces it at the COM boundary
+    // with BLACKWELL_VERIFY_OWNING_THREAD; this is the same enforcement on the
+    // OTHER side of that boundary -- the bridge is what white-box consumers
+    // (voice_assistant, audio_translator, poc_overlay) actually drive, and until
+    // now the contract there was held together by comments alone.
+    //
+    // WHICH EDGE IS CHECKED, and this is the whole subtlety: only the CONSUMER
+    // edge. The producer edge (cancel_generation / rewind_kv / warm_prefill /
+    // commit_and_decode / submit_text / post_engine_task / stop) is DEFINED to be
+    // callable from any thread -- that is the point of the SPSC ring -- so
+    // asserting there would reject the design rather than enforce it. What must
+    // hold is that pump()/wait_and_pump() and everything they dispatch run on ONE
+    // thread, always the same one.
+    //
+    // CLAIMED LAZILY, on the first consumer-edge call, because that thread does
+    // not exist yet when the bridge is constructed: the ctor runs on the bootstrap
+    // thread and the engine thread is spawned later. The first thread to pump owns
+    // it from then on.
+    //
+    // DEBUG ONLY. Release builds (NDEBUG) compile the check to nothing -- zero
+    // hot-loop cost, exactly like the COM-boundary macro.
+    //
+    // Re-anchor the ownership to the CALLING thread. Escape hatch for the one
+    // legitimate case the lazy claim gets wrong: a host that deliberately hands
+    // the engine loop to a different thread (a thread-pool worker, a test driving
+    // two phases from two threads). Call it from the new owner BEFORE its first
+    // pump. No-op in Release.
+    void adopt_engine_thread() noexcept;
+
 protected:
+    // Abort if the caller is not the thread that owns this bridge's consumer edge,
+    // claiming ownership if nobody has yet. `op` names the call site in the abort
+    // message. No-op in Release. Available to subclasses so an override that owns
+    // its own decode loop can assert at its own entry point.
+    void verify_engine_thread(const char* op) const noexcept;
+
     enum class CommandType : uint32_t { Rewind, WarmPrefill, CommitDecode };
 
     // POD command marshaled producer → consumer. Trivially copyable (no heap on
@@ -448,6 +486,13 @@ private:
 
     std::atomic<bool> decoding_{false};   // single-in-flight guard (generation_in_flight)
     std::atomic<bool> stopping_{false};   // shutdown latch for wait_and_pump()
+
+    // The thread that owns the CONSUMER edge, claimed on its first pump. Mutable
+    // so verify_engine_thread() can stay const -- it is a check, not a mutation of
+    // observable state. Default-constructed std::thread::id means "unclaimed".
+    // Atomic because adopt_engine_thread() may run on a different thread than the
+    // one that claimed it.
+    mutable std::atomic<std::thread::id> engine_thread_id_{};
 };
 
 #if defined(_MSC_VER)

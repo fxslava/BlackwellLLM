@@ -14,6 +14,18 @@
 //                           reaches the backbone (voice_assistant only; see
 //                           voice_assistant/whisper_cascade_mode.hpp).
 //
+// WHICH BINARY BUILDS WHICH, because the interface describes more modes than any
+// one executable links and a reader should not have to infer that from the
+// absence of a construction site:
+//
+//   audio_translator   Mode A, Mode B
+//   voice_assistant    Mode A, Mode C
+//
+// Neither app silently substitutes. voice_assistant REFUSES a Mode B request with
+// a std::runtime_error naming the reason (AppLifecycleManager::bring_up_speech_mode),
+// and refuses a Mode C request it cannot serve -- a missing GGML model -- rather
+// than degrading to Mode A behind the user's back.
+//
 // WHY THE SEAM IS HERE AND NOT AT IEngineControl. The obvious-looking move is to
 // make Mode B another IEngineControl implementation, mapping Partial->warm_prefill
 // and Final->commit_and_decode. Every one of those verbs is wrong for it:
