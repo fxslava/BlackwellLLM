@@ -158,6 +158,13 @@ public:
     const char* transport_name() const noexcept { return router_.name(); }
     bool transport_is_live() const noexcept { return router_.is_live(); }
 
+    // The local leg itself, exposed for ONE purpose: installing the residency
+    // gate (LocalEngineTransport::set_ready_check) during wiring, before the
+    // dispatcher starts. Deliberately not a general handle -- everything else
+    // about which leg answers an intent goes through set_use_local above, and a
+    // caller reaching in here to send is bypassing the commit rule.
+    LocalEngineTransport& local_transport() noexcept { return local_transport_; }
+
     // The gate counters, for the diagnostics poller and the shutdown summary.
     blackwell::bridge::IntentCommitQueue& commit_queue() noexcept { return commit_queue_; }
     void print_shutdown_summary() const;

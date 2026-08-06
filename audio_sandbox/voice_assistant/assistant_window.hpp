@@ -36,6 +36,7 @@
 #include <string>
 
 #include "settings_store.hpp"  // rt::AssistantSettings
+#include "tray_icon.hpp"       // rt::TrayIcon, kTrayCallbackMessage
 
 namespace rt {
 
@@ -161,6 +162,17 @@ struct AssistantWindowCallbacks {
     // make the delete button mean different things on different rows.
     std::function<void(const std::string& id)> on_session_delete;
 
+    // The tray's "Exit". THE ONLY WAY OUT once WM_CLOSE has been intercepted,
+    // so it is wired to the real quit path rather than to another hide. Raised
+    // on the UI thread; the implementation must do nothing but ask the window to
+    // close for real, because main()'s shutdown ordering runs after the message
+    // loop returns and cannot be short-circuited from here.
+    std::function<void()> on_exit;
+    // Show or retract the log console. Raised by the tray menu -- deliberately,
+    // because the console's own global hotkey may have failed to register, and
+    // that is exactly the situation in which a user wants a log.
+    std::function<void()> on_toggle_console;
+
     // The system prompt changed and must be re-frozen: tokenize, prefill, and
     // republish the KV rewind floor. This is ENGINE work and is therefore
     // asynchronous by nature -- the implementation marshals it onto the engine
@@ -202,6 +214,18 @@ public:
     // a second from the telemetry thread; it is a display value, so it is
     // dropped rather than queued when the page is not up.
     void post_audio_level(float level);
+
+    // ---- tray & window behaviour (UI thread) ---------------------------------
+    // Un-hide, restore from minimized, and bring to the foreground. The one
+    // entry point for every summon gesture -- the show hotkey, the tray's left
+    // click, and the tray menu's Show all land here, so there is one definition
+    // of what "bring it back" means.
+    void summon();
+    // Hide to the notification area. What [X] does when minimize_to_tray is on.
+    void hide_to_tray_now();
+    // Apply the live window-behaviour settings: whether [X] hides, and whether
+    // the frame stays HWND_TOPMOST. Called at startup and on every save.
+    void apply_window_settings(const AssistantSettings& s);
 
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
 
@@ -266,6 +290,17 @@ private:
     bool listening_ = true;
     bool ptt_held_ = false;       // a hold-to-talk chord is currently down
     bool hotkeys_registered_ = false;
+
+    // The notification-area presence. Declared here rather than owned by main so
+    // that WM_CLOSE, WM_DESTROY and the summon path -- all of which are this
+    // class's messages -- can reach it without a callback round trip.
+    TrayIcon tray_;
+    bool     hide_to_tray_ = true;
+    bool     always_on_top_ = false;
+    // Whether the "still running in the tray" balloon has been shown. ONCE per
+    // process: it exists to stop the first hide reading as a crash, and an app
+    // that says it every time is worse than one that never did.
+    bool     tray_hint_shown_ = false;
 
     std::mutex q_mu_;
     std::deque<std::string> pending_;

@@ -40,7 +40,10 @@
 
 #include "assistant_view.hpp"
 #include "assistant_window.hpp"
+#include "console_overlay.hpp"
+#include "log_buffer.hpp"
 #include "settings_store.hpp"
+#include "settings_validator.hpp"
 
 #include "app_context.hpp"
 #include "app_lifecycle.hpp"
@@ -55,8 +58,11 @@ public:
     // constructing it LAST in main() gives. `settings` is the live copy the app
     // runs on: this class writes it (a save is the only thing that changes it) and
     // main reads it afterwards.
+    // `log` is BORROWED and may be null (a build or a launch with no capture);
+    // the console then shows only what is posted to it directly.
     WebUIBridge(AssistantSettings& settings, AppContext& ctx, AppLifecycleManager& lifecycle,
-                AudioPipelineBinder& audio, ConversationRouter& router, AssistantView& view);
+                AudioPipelineBinder& audio, ConversationRouter& router, AssistantView& view,
+                LogBuffer* log = nullptr);
     ~WebUIBridge();
 
     WebUIBridge(const WebUIBridge&) = delete;
@@ -86,15 +92,32 @@ public:
     }
 
     // Apply the whole live-settings fan-out once, at startup, with the launch
-    // configuration. Same function every later save runs.
+    // configuration. Same path every later save runs: it publishes on the bus.
     void apply_live_settings(const AssistantSettings& s);
 
+    // The validation context this launch validates against, assembled from what
+    // the lifecycle actually brought up rather than from the settings -- so the
+    // budget the modal quotes is the one bring-up would reach.
+    [[nodiscard]] ValidationContext validation_context() const;
+
     AssistantWindow& window() noexcept { return window_; }
+    SettingsBus&     bus() noexcept { return bus_; }
 
 private:
     void install_callbacks();
+    void install_subscribers();
     void on_settings_apply(const AssistantSettings& next, bool live_only);
     void on_audio_hot_update(const AudioHotUpdate& u);
+    // The engine-facing half of the fan-out: sampling knobs, context mode, the
+    // speech-mode thresholds and the audio-task prefix rebuild. A bus subscriber
+    // like every other consumer -- it is only a named method because it is the
+    // one with real policy in it.
+    void apply_engine_settings(const AssistantSettings& s);
+    // Push a validation report to the page so each message lands on the field
+    // that produced it. Errors also go to stderr, and therefore to the console.
+    void publish_diagnostics(const ValidationReport& report);
+    // Relay a residency transition to the page.
+    void publish_residency(const EngineResidency::Progress& p);
 
     AssistantSettings&   settings_;
     AppContext&          ctx_;
@@ -104,6 +127,17 @@ private:
     AssistantView&       view_;
 
     AssistantWindow window_{L"Assistant"};
+
+    // The log overlay. Created in create(), on the UI thread, so its messages are
+    // dispatched by the same GetMessage loop the main window's are -- which is
+    // why it needs no thread and no pump of its own.
+    ConsoleOverlay console_;
+    LogBuffer*     log_ = nullptr;   // borrowed, may be null
+
+    // THE FAN-OUT. Subscribers are registered once in the constructor and every
+    // settings change -- startup, a save, a hot update -- is published on it.
+    // See the threading contract in settings_validator.hpp.
+    SettingsBus bus_;
 
     // The persona system prompt is the ONE live setting absent from the fan-out:
     // it is a KV cache rebuild, not a store, and goes through the router. Under

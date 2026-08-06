@@ -65,9 +65,22 @@ public:
         const std::function<void(std::string_view)>& emit,
         blackwell::bridge::TerminationReason* out_reason)>;
 
+    // THE RESIDENCY GATE. Returns true when the weights are on the card; on
+    // false it fills its out-parameter with the reason, which becomes the
+    // Result's error_detail and therefore the text the user sees.
+    //
+    // A PREDICATE RATHER THAN AN EngineResidency*, for the same reason
+    // GenerateFn is a callable: this class is driven by the GPU-free backend too,
+    // and that one has no engine to be resident. An unset check means "always
+    // ready", which is the pre-residency behaviour.
+    using ReadyFn = std::function<bool(std::string* why_not)>;
+
     // `control` is BORROWED and must outlive this object.
     LocalEngineTransport(blackwell::bridge::EngineControlBridge* control, GenerateFn generate)
         : control_(control), generate_(std::move(generate)) {}
+
+    // Install the gate. Called once during wiring, before the dispatcher starts.
+    void set_ready_check(ReadyFn fn) { ready_ = std::move(fn); }
 
     [[nodiscard]] const char* name() const noexcept override { return "Local model"; }
     // FALSE, and this is load-bearing rather than cosmetic: `is_live` drives the
@@ -84,6 +97,26 @@ public:
             r.status = blackwell::cloud::Status::NetworkError;
             r.error_detail = "local transport is not bound to an engine";
             return r;
+        }
+
+        // CHECKED BEFORE THE TASK IS QUEUED, not inside it. While the engine is
+        // hibernated get_weight_ptr() THROWS, and a decode posted at released
+        // weights would raise that on the engine thread inside the pump loop --
+        // which has no handler for it. Refusing here turns a crash into a
+        // Result the dispatcher already knows how to report.
+        //
+        // ApiError rather than NetworkError: nothing was unreachable, the local
+        // leg was asked for something it is currently not configured to do, and
+        // the detail says what to turn back on.
+        if (ready_) {
+            std::string why_not;
+            if (!ready_(&why_not)) {
+                r.status = blackwell::cloud::Status::ApiError;
+                r.error_detail = why_not.empty()
+                                     ? "the local model's weights are not resident"
+                                     : why_not;
+                return r;
+            }
         }
 
         // Shared with the engine task and outliving both threads, so a task that
@@ -204,6 +237,7 @@ private:
 
     blackwell::bridge::EngineControlBridge* control_ = nullptr;   // borrowed
     GenerateFn                              generate_;
+    ReadyFn                                 ready_;
     std::atomic<bool>                       shutting_down_{false};
 };
 

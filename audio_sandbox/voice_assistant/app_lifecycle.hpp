@@ -54,6 +54,7 @@
 
 #include "app_context.hpp"
 #include "cli_config.hpp"               // rt::TranslatorArgs
+#include "engine_residency.hpp"         // rt::EngineResidency
 #include "reply_split.hpp"              // rt::compose_system_prompt (both modes' prefix)
 #include "settings_store.hpp"
 
@@ -145,6 +146,12 @@ public:
     const RealEngineStack& real_stack() const noexcept { return real_stack_; }
     ISpeechMode* mode() const noexcept { return active_; }
 
+    // Whether the local model's weights are on the card, and the handle that
+    // moves them. Never null once the constructor returns -- on the simulated
+    // backend it is a residency that permanently reports Ready and refuses to
+    // release anything, so callers never branch on which backend is live.
+    EngineResidency& residency() noexcept { return *residency_; }
+
     // The context the engine was ACTUALLY brought up with -- which may be less
     // than the configured max_context if the VRAM guard clamped it.
     int granted_context() const noexcept { return granted_context_; }
@@ -182,6 +189,11 @@ private:
     RealEngineStack                         real_stack_;
     std::unique_ptr<SimulatedEngineControl> simulated_;
     blackwell::bridge::EngineControlBridge*  control_ = nullptr;
+
+    // AFTER the stack it borrows the engine and the control from, and therefore
+    // destroyed BEFORE them. It queues work onto the engine thread, so it must
+    // also outlive nothing -- shutdown() joins that thread before this dies.
+    std::unique_ptr<EngineResidency> residency_;
 
 #if defined(VOICE_ASSISTANT_HAS_SILERO)
     // Constructed BEFORE the mode and outliving it: the ORT session is a

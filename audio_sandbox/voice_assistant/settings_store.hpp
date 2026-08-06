@@ -315,9 +315,58 @@ struct AssistantSettings {
     std::string hotkey_talk   = "Ctrl+Alt+Space";  // listen on/off, or hold-to-talk
     std::string hotkey_cancel = "Ctrl+Alt+X";      // interrupt the turn in flight
     std::string hotkey_show   = "Ctrl+Alt+A";      // bring the window to the front
+    // The Quake-style log console. Ctrl+~ is the convention this borrows from and
+    // the reason the chord is not Ctrl+Alt+something like its neighbours: the
+    // gesture is meant to be reachable with one hand without leaving the
+    // keyboard, and every game that has this console binds exactly this key.
+    //
+    // `~` and the backtick are one physical key (VK_OEM_3), and hotkey_spec.hpp
+    // accepts either spelling -- so a user who types the chord as they see it
+    // printed on the keycap gets what they meant either way.
+    std::string hotkey_console = "Ctrl+`";
     // Hold-to-talk rather than toggle. WM_HOTKEY has no key-up event, so hold
     // mode is driven by polling the chord while it is held -- see the window.
     bool hotkey_push_to_talk = false;
+
+    // ---- the log console (Direct2D overlay) ---------------------------------
+    // Fraction of the screen HEIGHT the console covers when fully down, [0.2, 1].
+    // The Quake proportion is about a third; more than that and the thing it is
+    // overlaying stops being visible, which defeats an overlay.
+    float console_height_pct = 0.45f;
+    // Background alpha, [0.2, 1]. 0.85 is the task's figure and is about where
+    // text stays readable over a bright window underneath.
+    float console_opacity = 0.85f;
+    // MONOSPACED OR THE LAYOUT IS WRONG: the renderer advances by one measured
+    // character width per column, so a proportional face would produce ragged
+    // columns. Falls back to Consolas (present on every Windows install) when the
+    // named family is missing -- Cascadia Code ships with Terminal and VS but is
+    // not guaranteed.
+    std::string console_font = "Cascadia Code";
+    float       console_font_size = 14.0f;
+    // How many lines the scrollback holds. Bounded because it is a live ring in
+    // memory and an unbounded log is a leak with a friendly name.
+    int console_scrollback_lines = 4000;
+
+    // ---- window & tray behaviour --------------------------------------------
+    // Intercept [X] and hide to the notification area instead of quitting. OFF
+    // means the button does what its shape promises and terminates the app.
+    //
+    // ON BY DEFAULT because this is a background utility that a hotkey summons:
+    // an assistant that has to be relaunched every time the window is dismissed
+    // is not a background utility. The tray menu's Exit is the way out, and the
+    // first hide says so.
+    bool minimize_to_tray = true;
+    // Keep the summoned window above other windows (HWND_TOPMOST). OFF by
+    // default: a chat window that cannot be put behind anything is a nuisance,
+    // and the hotkey already makes it one keystroke away.
+    bool always_on_top = false;
+    // Show the splash while the heavy initialization runs. Off is for developers
+    // who restart the app constantly and do not want the fade.
+    bool show_splash = true;
+    // Start hidden (tray only) rather than showing the window at launch. For a
+    // shortcut in the Startup folder, where a window appearing on login is the
+    // wrong behaviour.
+    bool start_minimized = false;
 
     // Answer locally instead of calling out. Swaps the transport under the
     // dispatcher (see local_transport.hpp); everything above it is unchanged, so
@@ -452,7 +501,27 @@ void visit_fields(S& s, Fn&& f) {
     f("hotkey_talk",              s.hotkey_talk,              Tier::Live);
     f("hotkey_cancel",            s.hotkey_cancel,            Tier::Live);
     f("hotkey_show",              s.hotkey_show,              Tier::Live);
+    f("hotkey_console",           s.hotkey_console,           Tier::Live);
     f("hotkey_push_to_talk",      s.hotkey_push_to_talk,      Tier::Live);
+    // ---- console & window behaviour -----------------------------------------
+    // All Live: the console re-reads its geometry and colours on the next slide,
+    // the font is re-created in place, and the window flags are one SetWindowPos.
+    // Nothing here allocates VRAM or touches a device, which is what keeps the
+    // whole group out of the restart tier.
+    f("console_height_pct",       s.console_height_pct,       Tier::Live);
+    f("console_opacity",          s.console_opacity,          Tier::Live);
+    f("console_font",             s.console_font,             Tier::Live);
+    f("console_font_size",        s.console_font_size,        Tier::Live);
+    // Restart: it sizes the ring buffer at construction, and re-sizing a live
+    // ring would either drop scrollback the user is reading or copy it under the
+    // writer's feet.
+    f("console_scrollback_lines", s.console_scrollback_lines, Tier::Restart);
+    f("minimize_to_tray",         s.minimize_to_tray,         Tier::Live);
+    f("always_on_top",            s.always_on_top,            Tier::Live);
+    f("start_minimized",          s.start_minimized,          Tier::Live);
+    // Restart, and only in the sense that it cannot apply retroactively: the
+    // splash is over before the settings modal can be opened.
+    f("show_splash",              s.show_splash,              Tier::Restart);
     f("local_inference",          s.local_inference,          Tier::Live);
     // Restart tier -- see the declarations for why the HTTP client cannot be
     // reconfigured under a live dispatcher.
@@ -589,6 +658,23 @@ inline void clamp_settings(AssistantSettings& s) {
     if (!s.remote_api_url.empty() && s.remote_api_url.find("://") == std::string::npos) {
         s.remote_api_url.insert(0, "https://");
     }
+    // ---- console geometry ---------------------------------------------------
+    // NaN-safe on the same pattern the gains use: `!(v >= lo)` catches NaN where
+    // `v < lo` does not, and a NaN height would make the slide animation compute
+    // a target rectangle no window can occupy.
+    if (!(s.console_height_pct >= 0.2f)) s.console_height_pct = 0.2f;
+    if (s.console_height_pct > 1.0f) s.console_height_pct = 1.0f;
+    // The floor is not cosmetic: an alpha near zero makes the console invisible
+    // while still swallowing the hotkey, so the user has a toggle that appears to
+    // do nothing at all.
+    if (!(s.console_opacity >= 0.2f)) s.console_opacity = 0.2f;
+    if (s.console_opacity > 1.0f) s.console_opacity = 1.0f;
+    if (!(s.console_font_size >= 8.0f)) s.console_font_size = 8.0f;
+    if (s.console_font_size > 48.0f) s.console_font_size = 48.0f;
+    trim(s.console_font);
+    if (s.console_font.empty()) s.console_font = "Consolas";
+    s.console_scrollback_lines = clamp_int(s.console_scrollback_lines, 200, 100000);
+
     if (s.data_dir.empty()) s.data_dir = "data";
     // No checkpoint means there is nothing to load -- the simulated backend is
     // the only runnable configuration, so make the stored state say so instead

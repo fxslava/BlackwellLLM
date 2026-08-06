@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "audio_devices.h"   // enumerate_audio_devices, for GET /api/audio-devices
+#include "hotkey_spec.hpp"   // rt::Hotkey, parse_hotkey, hotkey_is_down (one table)
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
@@ -51,86 +52,16 @@ constexpr int kHotkeyShow   = 3;
 constexpr UINT_PTR kPttTimerId = 1;
 constexpr UINT     kPttPollMs  = 60;
 
-struct Hotkey {
-    UINT mods = 0;   // MOD_* flags
-    UINT vk = 0;     // 0 == "no hotkey" (an empty or unparseable string)
-};
+// Hotkey, parse_hotkey, vk_from_name and hotkey_is_down now live in
+// hotkey_spec.hpp: the settings validator and the console overlay parse the same
+// chords, and a second copy of the key table is a second thing to keep in step.
+using rt::Hotkey;
+using rt::hotkey_is_down;
+using rt::parse_hotkey;
 
 // Uppercase ASCII compare; the page sends what the user typed and case is not a
 // meaningful distinction in a key name.
-bool iequals(const std::string& a, const char* b) {
-    size_t i = 0;
-    for (; a[i] != '\0' && b[i] != '\0'; ++i) {
-        const char ca = (a[i] >= 'a' && a[i] <= 'z') ? static_cast<char>(a[i] - 32) : a[i];
-        const char cb = (b[i] >= 'a' && b[i] <= 'z') ? static_cast<char>(b[i] - 32) : b[i];
-        if (ca != cb) return false;
-    }
-    return a[i] == '\0' && b[i] == '\0';
-}
-
-// One key NAME (no modifiers) -> virtual-key code. 0 means "not a key we accept",
-// which is what makes an unparseable chord register nothing rather than register
-// something the user did not ask for.
-UINT vk_from_name(const std::string& name) {
-    if (name.size() == 1) {
-        const char c = name[0];
-        if (c >= 'a' && c <= 'z') return static_cast<UINT>(c - 32);
-        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return static_cast<UINT>(c);
-    }
-    if (name.size() >= 2 && (name[0] == 'F' || name[0] == 'f')) {
-        const int n = std::atoi(name.c_str() + 1);
-        if (n >= 1 && n <= 24) return static_cast<UINT>(VK_F1 + n - 1);
-    }
-    static const struct { const char* name; UINT vk; } kNamed[] = {
-        {"Space", VK_SPACE},   {"Enter", VK_RETURN},  {"Return", VK_RETURN},
-        {"Tab", VK_TAB},       {"Escape", VK_ESCAPE}, {"Esc", VK_ESCAPE},
-        {"Backspace", VK_BACK},{"Delete", VK_DELETE}, {"Insert", VK_INSERT},
-        {"Home", VK_HOME},     {"End", VK_END},       {"PageUp", VK_PRIOR},
-        {"PageDown", VK_NEXT}, {"Left", VK_LEFT},     {"Right", VK_RIGHT},
-        {"Up", VK_UP},         {"Down", VK_DOWN},     {"Pause", VK_PAUSE},
-    };
-    for (const auto& k : kNamed) {
-        if (iequals(name, k.name)) return k.vk;
-    }
-    return 0;
-}
-
-// "Ctrl+Alt+Space" -> {MOD_CONTROL|MOD_ALT, VK_SPACE}. An empty string, a chord
-// with no non-modifier key, or an unknown key name all yield vk == 0, i.e. "this
-// hotkey is off" -- there is no partially-registered outcome.
-Hotkey parse_hotkey(const std::string& spec) {
-    Hotkey hk;
-    std::string token;
-    auto take = [&] {
-        if (token.empty()) return;
-        if (iequals(token, "Ctrl") || iequals(token, "Control")) hk.mods |= MOD_CONTROL;
-        else if (iequals(token, "Alt")) hk.mods |= MOD_ALT;
-        else if (iequals(token, "Shift")) hk.mods |= MOD_SHIFT;
-        else if (iequals(token, "Win") || iequals(token, "Super")) hk.mods |= MOD_WIN;
-        else hk.vk = vk_from_name(token);   // last non-modifier token wins
-        token.clear();
-    };
-    for (const char c : spec) {
-        if (c == '+' || c == '-' || c == ' ') take();
-        else token.push_back(c);
-    }
-    take();
-    return hk;
-}
-
-// Is the chord still physically down? Used only by the hold-to-talk watchdog.
-// The modifiers are checked too, so releasing Ctrl while keeping Space held ends
-// the hold -- which is what a user who let go of the chord means.
-bool hotkey_is_down(const Hotkey& hk) {
-    if (hk.vk == 0) return false;
-    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-    if (!down(static_cast<int>(hk.vk))) return false;
-    if ((hk.mods & MOD_CONTROL) && !down(VK_CONTROL)) return false;
-    if ((hk.mods & MOD_ALT) && !down(VK_MENU)) return false;
-    if ((hk.mods & MOD_SHIFT) && !down(VK_SHIFT)) return false;
-    if ((hk.mods & MOD_WIN) && !down(VK_LWIN) && !down(VK_RWIN)) return false;
-    return true;
-}
+bool iequals(const std::string& a, const char* b) { return rt::hotkey_iequals(a, b); }
 
 std::string to_utf8(const std::wstring& w) {
     if (w.empty()) return {};
@@ -289,6 +220,28 @@ bool AssistantWindow::create(int client_w, int client_h) {
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
 
+    // The tray, before the page loads and for the same reason the hotkeys are:
+    // it needs only the HWND, and it is the thing that makes the app reachable
+    // if WebView2 never comes up at all.
+    tray_.set_callbacks([this] {
+        TrayCallbacks tc;
+        tc.on_show = [this] { summon(); };
+        tc.on_hide = [this] { hide_to_tray_now(); };
+        tc.on_toggle_console = [this] { if (cb_.on_toggle_console) cb_.on_toggle_console(); };
+        // The real quit path. DestroyWindow rather than a hide, and NOT
+        // PostQuitMessage directly: WM_DESTROY is where the hotkeys are released,
+        // the WebView2 controller is closed and the tray icon is removed, and
+        // skipping it would leak all three.
+        tc.on_exit = [this] {
+            hide_to_tray_ = false;   // so the WM_CLOSE below is not intercepted
+            if (cb_.on_exit) cb_.on_exit();
+            if (hwnd_ != nullptr) DestroyWindow(hwnd_);
+        };
+        return tc;
+    }());
+    tray_.create(hwnd_, L"Assistant");
+    apply_window_settings(settings_);
+
     // Hotkeys need only the HWND, so they are live before the page has loaded --
     // the window is usable by keyboard while Chromium is still starting up.
     register_hotkeys();
@@ -301,6 +254,16 @@ bool AssistantWindow::create(int client_w, int client_h) {
     if (settings_.hotkey_push_to_talk) set_listening(false, /*tell_page=*/false);
 
     create_webview();
+
+    // AFTER the WebView has been asked for, not before. The frame was shown
+    // above so Chromium attaches to a window with a real (non-zero) client area;
+    // hiding it now keeps that sizing while putting the app straight into the
+    // tray, which is what a shortcut in the Startup folder wants. Hiding FIRST
+    // would attach the WebView to a zero-area window and the first summon would
+    // show a blank frame.
+    if (settings_.start_minimized && tray_.alive()) {
+        ShowWindow(hwnd_, SW_HIDE);
+    }
     return true;
 }
 
@@ -583,18 +546,60 @@ void AssistantWindow::on_hotkey(int id) {
             if (cb_.on_cancel) cb_.on_cancel();
             return;
         case kHotkeyShow:
-            if (hwnd_ == nullptr) return;
-            // Restore-and-raise. SetForegroundWindow is subject to the foreground
-            // lock, so this can legitimately do nothing when another app is
-            // actively being typed into -- the window still un-minimizes, which is
-            // the visible half of what the user asked for.
-            if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
-            else ShowWindow(hwnd_, SW_SHOW);
-            SetForegroundWindow(hwnd_);
+            // ONE definition of "bring it back", shared with the tray's left
+            // click and its Show item -- see summon().
+            summon();
             return;
         default:
             return;
     }
+}
+
+// ---- summoning, hiding, and the window flags --------------------------------
+void AssistantWindow::summon() {
+    if (hwnd_ == nullptr) return;
+    // THE ORDER MATTERS. A window hidden with SW_HIDE is not iconic, so the
+    // IsIconic branch alone would leave it hidden; and SW_RESTORE on a hidden
+    // window does not un-hide it. Doing the un-hide first and the restore second
+    // is what makes this work from BOTH states -- hidden-to-tray and minimized.
+    ShowWindow(hwnd_, SW_SHOW);
+    if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+
+    // SetForegroundWindow is subject to the foreground lock, so it can
+    // legitimately do nothing when another application is actively being typed
+    // into. BringWindowToTop raises it in the Z-order regardless, which is the
+    // visible half of what the user asked for and is why both are called rather
+    // than either alone.
+    BringWindowToTop(hwnd_);
+    SetForegroundWindow(hwnd_);
+    // Re-asserted on every summon: a window that was hidden while topmost can
+    // come back below the Z-order position it had, and re-stating the flag is
+    // cheaper than reasoning about when that happens.
+    SetWindowPos(hwnd_, always_on_top_ ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void AssistantWindow::hide_to_tray_now() {
+    if (hwnd_ == nullptr) return;
+    ShowWindow(hwnd_, SW_HIDE);
+    // ONCE. The balloon exists so the first hide does not read as a crash; an
+    // app that says it every time is worse than one that never did.
+    if (!tray_hint_shown_ && tray_.alive()) {
+        tray_hint_shown_ = true;
+        tray_.notify(L"Assistant is still running",
+                     L"The window was hidden, not closed. Click the tray icon to bring it "
+                     L"back, or use Exit to quit.");
+    }
+}
+
+void AssistantWindow::apply_window_settings(const AssistantSettings& s) {
+    hide_to_tray_ = s.minimize_to_tray;
+    always_on_top_ = s.always_on_top;
+    if (hwnd_ == nullptr) return;
+    // SWP_NOACTIVATE: applying a setting must not steal focus, and this runs on
+    // every save.
+    SetWindowPos(hwnd_, always_on_top_ ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 void AssistantWindow::poll_push_to_talk() {
@@ -921,6 +926,31 @@ LRESULT AssistantWindow::handle(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_HOTKEY:
             on_hotkey(static_cast<int>(wParam));
             return 0;
+
+        // ---- the tray, and the [X] that no longer quits ----------------------
+        // ONE forwarded message is the entire tray integration; TrayIcon answers
+        // everything else itself (see its header).
+        case kTrayCallbackMessage:
+            if (tray_.handle_message(wParam, lParam)) return 0;
+            break;
+
+        case WM_CLOSE:
+            // THE INTERCEPT. [X] hides to the notification area instead of
+            // terminating, because this is a background utility a hotkey
+            // summons -- an assistant that has to be relaunched every time its
+            // window is dismissed is not one.
+            //
+            // GATED ON THE TRAY ACTUALLY EXISTING, and that is not defensive
+            // padding: if Shell_NotifyIcon refused the icon (a notification area
+            // that has not started yet at login), hiding here would make the app
+            // unreachable by every route at once -- no window, no icon, and only
+            // Task Manager left. Falling through to a real close is the correct
+            // behaviour in exactly that case.
+            if (hide_to_tray_ && tray_.alive()) {
+                hide_to_tray_now();
+                return 0;
+            }
+            break;   // DefWindowProc -> WM_DESTROY -> PostQuitMessage
         case WM_TIMER:
             // Only OUR timer is claimed; anything else belongs to a component that
             // set it on this HWND and must reach the default handler.
@@ -938,6 +968,11 @@ LRESULT AssistantWindow::handle(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case WM_DESTROY:
             page_ready_ = false;
+            // BEFORE the window dies. An icon whose owner is destroyed without a
+            // NIM_DELETE leaves a ghost in the notification area until the user
+            // hovers over it -- the most recognisable symptom of an app that did
+            // not clean up after itself.
+            tray_.destroy();
             // Global hotkeys are a PROCESS-WIDE registration: releasing them here
             // (rather than leaving it to the window dying) is what lets the
             // relaunched instance re-register the same chords immediately after a

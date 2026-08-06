@@ -241,6 +241,23 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
         voice_assistant/conversation_router.cpp
         # Chromium host bindings + the settings fan-out + the diagnostics poller.
         voice_assistant/web_ui_bridge.cpp
+        # Weight residency: spill_kv_cache + hibernate/wakeup marshalled onto the
+        # engine thread, so "Remote Network" actually frees the card.
+        voice_assistant/engine_residency.cpp
+        # The schema pass over AssistantSettings (endpoint/key shapes, hotkey
+        # conflicts, the VRAM-driven max_context clamp) and the observer bus that
+        # fans an accepted change out to every running subsystem.
+        voice_assistant/settings_validator.cpp
+        # The log ring, and the stdout/stderr TEE that fills it without taking
+        # either away from the terminal.
+        voice_assistant/log_buffer.cpp
+        # The Quake-style Direct2D/DirectWrite log console (Ctrl+~).
+        voice_assistant/console_overlay.cpp
+        # The notification-area icon, its menu, and the [X]-hides-here contract.
+        voice_assistant/tray_icon.cpp
+        # The startup splash. Owns a thread because the load it covers runs on
+        # main's, with no message pump -- see splash_screen.hpp.
+        voice_assistant/splash_screen.cpp
         # This app's own CLI flags, and the two self-tests that serve one.
         voice_assistant/cli_options.cpp
         # Asset resolution against the exe's directory, and the restart relaunch.
@@ -267,6 +284,11 @@ if(WIN32 AND TARGET blackwell_bridge AND TARGET blackwell_core_obj)
 
     target_link_libraries(voice_assistant PRIVATE
         whisper_dsp blackwell::sandbox_headers
+        # The log console renders through Direct2D + DirectWrite, and the tray
+        # icon through the shell. All three ship with Windows and have import
+        # libraries in the SDK, so they are named here rather than found -- there
+        # is nothing to discover and no version to pin.
+        d2d1 dwrite shell32
         # Acoustic echo cancellation in the capture path (AecCaptureFilter). It
         # arrives transitively through blackwell_tts_f5 as well, but this app
         # includes its header directly, so it declares the dependency directly:

@@ -65,6 +65,18 @@ AppLifecycleManager::AppLifecycleManager(const Config& cfg, whisper::WhisperDSP&
     bring_up_vad(cfg);
     bring_up_speech_mode(cfg, ctx);
     ctx.control = control_;
+
+    // AFTER the engine exists, because it borrows it -- and unconditionally, so
+    // that `residency()` is never null and no caller has to branch on the
+    // backend. On the simulated path `engine` is null, which the residency reads
+    // as "no VRAM to release" and answers every request with a refusal while
+    // permanently reporting Ready.
+    //
+    // weights_serve_asr is `!cascade`: on the legacy pipeline the backbone IS
+    // the speech recogniser, so its weights cannot be released without making
+    // the app deaf. See the capability gate in engine_residency.hpp.
+    residency_ = std::make_unique<EngineResidency>(control_, real_stack_.engine.get(),
+                                                   /*weights_serve_asr=*/!cfg.cascade);
 }
 
 AppLifecycleManager::~AppLifecycleManager() { shutdown(); }

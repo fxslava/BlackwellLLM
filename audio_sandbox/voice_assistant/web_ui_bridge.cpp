@@ -14,6 +14,8 @@
 
 #include "web_ui_bridge.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
@@ -23,13 +25,14 @@ namespace rt {
 
 WebUIBridge::WebUIBridge(AssistantSettings& settings, AppContext& ctx,
                          AppLifecycleManager& lifecycle, AudioPipelineBinder& audio,
-                         ConversationRouter& router, AssistantView& view)
+                         ConversationRouter& router, AssistantView& view, LogBuffer* log)
     : settings_(settings),
       ctx_(ctx),
       lifecycle_(lifecycle),
       audio_(audio),
       router_(router),
       view_(view),
+      log_(log),
       applied_audio_task_(settings.audio_task_prompt),
       applied_speech_language_(settings.speech_language) {
     // The view's ONLY output is JSON; the window's post_event is the only thing
@@ -44,10 +47,94 @@ WebUIBridge::WebUIBridge(AssistantSettings& settings, AppContext& ctx,
             window_.post_system_prompt_applied(ok, tokens, detail);
         });
 
+    // Residency transitions fire on the ENGINE thread, so the sink does the one
+    // thing a callback from that thread may do: hand JSON to the window's queue.
+    lifecycle_.residency().set_progress_sink(
+        [this](const EngineResidency::Progress& p) { publish_residency(p); });
+
+    install_subscribers();
     install_callbacks();
 }
 
 WebUIBridge::~WebUIBridge() { stop_diagnostics_poller(); }
+
+// THE OBSERVER REGISTRY. Every consumer of a live setting is registered here,
+// once, and the order is the order they are notified in -- which matters in
+// exactly one place and is called out there.
+void WebUIBridge::install_subscribers() {
+    // FIRST, because the residency decides whether the local leg can serve an
+    // intent at all, and the router below is about to be told to route to it.
+    // Publishing them the other way round would open a window -- microseconds
+    // wide, but real -- in which the router dispatches locally at weights that
+    // are on their way out.
+    bus_.subscribe("residency", [this](const AssistantSettings& s) {
+        lifecycle_.residency().apply_local_inference(s.local_inference);
+    });
+    bus_.subscribe("router", [this](const AssistantSettings& s) {
+        // Where the NEXT intent gets answered, and the badge that has to follow it.
+        router_.set_use_local(s.local_inference);
+    });
+    bus_.subscribe("engine", [this](const AssistantSettings& s) { apply_engine_settings(s); });
+    bus_.subscribe("audio", [this](const AssistantSettings& s) {
+        // The AEC enable flag and the mute-folded speaker volume, plus the mic gain.
+        audio_.apply_live_settings(s);
+    });
+    bus_.subscribe("console", [this](const AssistantSettings& s) { console_.apply_settings(s); });
+    bus_.subscribe("window", [this](const AssistantSettings& s) {
+        window_.apply_window_settings(s);
+    });
+}
+
+void WebUIBridge::apply_live_settings(const AssistantSettings& s) { bus_.publish(s); }
+
+ValidationContext WebUIBridge::validation_context() const {
+    ValidationContext vc;
+    // What actually came up, not what was asked for: real_control() is non-null
+    // exactly when a checkpoint is resident, which is the condition under which
+    // a VRAM budget means anything.
+    vc.have_gpu = lifecycle_.real_control() != nullptr;
+    vc.cascade = settings_.pipeline_mode == "whisper_cascade";
+#if defined(VOICE_ASSISTANT_HAS_TTS)
+    vc.tts_enabled = ctx_.tts != nullptr;
+#endif
+    vc.whisper_model = settings_.whisper_model_path;
+    // The two-sequence topology doubles the per-token KV cost. Read off the
+    // stack rather than assumed, so a launch that failed to isolate is budgeted
+    // as the single sequence it actually got.
+    vc.branch_factor = lifecycle_.real_stack().isolated_sessions ? 2 : 1;
+    return vc;
+}
+
+void WebUIBridge::publish_diagnostics(const ValidationReport& report) {
+    // Straight to the page, one entry per finding, keyed by field so the modal
+    // can attach each message to the input that produced it rather than dumping
+    // everything into one banner.
+    nlohmann::json j;
+    j["type"] = "settings.diagnostics";
+    j["items"] = nlohmann::json::array();
+    for (const Diagnostic& d : report.items) {
+        j["items"].push_back({{"field", d.field},
+                              {"severity", to_string(d.severity)},
+                              {"message", d.message}});
+    }
+    window_.post_event(j.dump());
+    // AND to the log, because the console is where a user looks when the modal
+    // is closed -- and because errors belong on stderr regardless of whether a
+    // page is up to receive them.
+    report.print("settings");
+}
+
+void WebUIBridge::publish_residency(const EngineResidency::Progress& p) {
+    nlohmann::json j;
+    j["type"] = "residency";
+    j["state"] = to_string(p.state);
+    j["percent"] = p.percent;
+    j["detail"] = p.detail;
+    // Whether the checkbox can free VRAM at all on this launch, so the page can
+    // explain the toggle rather than hide it.
+    j["can_release"] = lifecycle_.residency().can_release_vram();
+    window_.post_event(j.dump());
+}
 
 void WebUIBridge::install_callbacks() {
     AssistantWindowCallbacks cb;
@@ -90,8 +177,19 @@ void WebUIBridge::install_callbacks() {
 
     cb.on_restart = [this] {
         restart_requested_.store(true, std::memory_order_release);
-        if (window_.hwnd() != nullptr) PostMessageW(window_.hwnd(), WM_CLOSE, 0, 0);
+        // DestroyWindow, not WM_CLOSE. WM_CLOSE is intercepted now and hides to
+        // the tray, so a restart posted through it would put the app in the
+        // notification area and never relaunch. This is the real quit path, and
+        // it still runs WM_DESTROY -- where the hotkeys, the WebView2 controller
+        // and the tray icon are released.
+        if (window_.hwnd() != nullptr) DestroyWindow(window_.hwnd());
     };
+
+    cb.on_toggle_console = [this] { console_.toggle(); };
+    // Nothing to do beyond letting the window run its real close path: main()'s
+    // shutdown ordering happens after run_message_loop() returns and must not be
+    // short-circuited from a menu handler.
+    cb.on_exit = [] {};
 
     window_.set_callbacks(std::move(cb));
 }
@@ -100,7 +198,12 @@ void WebUIBridge::install_callbacks() {
 // store read at the next VAD block or turn boundary -- no marshaling, no engine
 // work, doctrine intact (see settings_store.hpp) -- with the ONE documented
 // exception of the audio task prefix, which is a KV rebuild and is marshaled.
-void WebUIBridge::apply_live_settings(const AssistantSettings& s) {
+//
+// A BUS SUBSCRIBER like every other consumer; it is a named method only because
+// it is the one with real policy in it. The audio and router pokes that used to
+// sit at the two ends of this function are now their own subscribers, so what is
+// left here is exactly the engine-facing set.
+void WebUIBridge::apply_engine_settings(const AssistantSettings& s) {
     // Through the INTERFACE, not through Mode A's pipeline handle. Each mode
     // honours the knobs it actually has and ignores the rest (see ISpeechMode) --
     // which is the only arrangement that works now that there are two modes with
@@ -114,9 +217,6 @@ void WebUIBridge::apply_live_settings(const AssistantSettings& s) {
     // ring's read cursor. It is on the base bridge, so it applies to whichever
     // backend is live without a branch.
     lifecycle_.control()->set_pre_roll_ms(s.pre_roll_ms);
-
-    // The AEC enable flag and the mute-folded speaker volume, plus the mic gain.
-    audio_.apply_live_settings(s);
 
     // The sampling knobs and the reply ceiling exist on BOTH controls (the
     // simulated one honours the ceiling and stores the rest), so they are applied
@@ -180,9 +280,6 @@ void WebUIBridge::apply_live_settings(const AssistantSettings& s) {
         sc->set_sampling(s.temperature, s.top_p);
         sc->set_max_new_tokens(s.max_new_tokens);
     }
-
-    // Where the NEXT intent gets answered, and the badge that has to follow it.
-    router_.set_use_local(s.local_inference);
 }
 
 void WebUIBridge::on_settings_apply(const AssistantSettings& next, bool live_only) {
@@ -194,8 +291,26 @@ void WebUIBridge::on_settings_apply(const AssistantSettings& next, bool live_onl
     // engine keeps its 5.3 GB of weights, the KV pool stays allocated and the F5
     // ONNX session is not reloaded. That is the entire reason these settings are
     // their own tier.
-    const bool audio_moved = requires_audio_reload(settings_, next);
-    settings_ = next;
+    // VALIDATED BEFORE IT IS ADOPTED, so the value that reaches `settings_`, the
+    // subsystems and the file on disk is the CORRECTED one -- a max_context the
+    // card cannot afford is reduced here, once, rather than being persisted and
+    // then quietly clamped again at the next bring-up.
+    //
+    // A copy, because validate_settings corrects in place and `next` is the
+    // page's payload.
+    AssistantSettings vetted = next;
+    const ValidationReport report = validate_settings(vetted, validation_context());
+    publish_diagnostics(report);
+    // NOT REFUSED ON ERRORS, deliberately. A settings dialog that will not close
+    // is a worse failure than a setting that was corrected: the report tells the
+    // user exactly which field is wrong and what it will do instead, and every
+    // Error here describes something inert (a dead hotkey, an unusable key)
+    // rather than something dangerous.
+    const bool audio_moved = requires_audio_reload(settings_, vetted);
+    settings_ = vetted;
+    // The modal is re-seeded from what was ACTUALLY stored, so a corrected field
+    // shows its new value instead of the rejected one the user typed.
+    window_.set_settings(settings_);
     if (!save_settings(settings_)) {
         std::fprintf(stderr, "[settings] WARN: could not write %s\n", settings_path().c_str());
     }
@@ -294,6 +409,16 @@ void WebUIBridge::on_audio_hot_update(const AudioHotUpdate& u) {
 void WebUIBridge::create(int client_w, int client_h) {
     if (!window_.create(client_w, client_h)) {
         throw std::runtime_error("failed to create the assistant window");
+    }
+    // The console, on THIS thread -- which is the UI thread, so its messages are
+    // dispatched by the same GetMessage loop the main window's are and it needs
+    // no pump of its own.
+    //
+    // A failure here is a DEGRADATION, not an error: the app is fully usable
+    // without a log overlay and taking startup down over one would be the wrong
+    // trade. console_.create() prints the reason itself.
+    if (console_.create(settings_, log_)) {
+        std::printf("[console] press %s for the log overlay\n", settings_.hotkey_console.c_str());
     }
     view_.set_transport(router_.transport_name(), router_.transport_is_live());
 }

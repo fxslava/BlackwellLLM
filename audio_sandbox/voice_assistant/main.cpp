@@ -57,6 +57,7 @@
 
 #include "build_features.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -74,7 +75,10 @@
 #include "cli_options.hpp"         // rt::VoiceArgs, rt::parse_voice_args, the self-tests
 #include "conversation_router.hpp"
 #include "full_stack_test.hpp"
+#include "log_buffer.hpp"          // rt::LogBuffer, rt::LogTee
 #include "settings_store.hpp"
+#include "settings_validator.hpp"  // rt::validate_settings
+#include "splash_screen.hpp"       // rt::SplashScreen
 #include "web_ui_bridge.hpp"
 
 int main(int argc, char** argv) {
@@ -302,6 +306,50 @@ int main(int argc, char** argv) {
     // is visible on one screen without scrolling back.
     rt::print_audio_devices();
 
+    // ---- the log capture, and the splash that covers the load ----------------
+    // BOTH AFTER the CLI self-tests above and BEFORE the first heavy constructor.
+    //
+    // The tee has to be installed before anything worth capturing is printed, but
+    // NOT before the self-test paths return -- those exist to print to a terminal
+    // and redirecting their output through a ring nobody will display would be
+    // pure cost. Everything above this line has already returned if it was going
+    // to.
+    //
+    // The ring is sized from the setting; the tee borrows it and both outlive
+    // every producer because they are declared before the components and
+    // destroyed after them.
+    rt::LogBuffer log_ring(static_cast<std::size_t>(settings.console_scrollback_lines));
+    rt::LogTee    log_tee(&log_ring);
+
+    // The splash covers the audio device open, the VRAM budget, a multi-gigabyte
+    // weight load and the system-prompt prefill -- all of which happen on THIS
+    // thread, inside constructors, with no message pump running. That is exactly
+    // why the splash owns a thread of its own; see splash_screen.hpp.
+    rt::SplashScreen splash;
+    if (settings.show_splash) {
+        splash.show(L"Blackwell Assistant", L"local voice, local router");
+    }
+    // Dismissed on EVERY exit path below, including the throw: a splash left up
+    // over a fatal error box is the one thing worse than no splash.
+    struct SplashGuard {
+        rt::SplashScreen& s;
+        ~SplashGuard() { s.dismiss(); }
+    } splash_guard{splash};
+
+    // ---- validate the launch configuration -----------------------------------
+    // BEFORE anything loads, and with have_gpu false: no device has been selected
+    // yet, so the VRAM term is not answerable here. What IS answerable -- the
+    // hotkey chords, the endpoint and key shapes, every coerced field -- is
+    // exactly the set that would otherwise fail silently at bring-up.
+    {
+        rt::ValidationContext vc;
+        vc.have_gpu = false;
+        vc.cascade = cascade;
+        vc.whisper_model = whisper_model;
+        const rt::ValidationReport report = rt::validate_settings(settings, vc);
+        report.print("settings");
+    }
+
     try {
         // ---- the shared handle, and the JSON model ---------------------------
         rt::AppContext app_ctx;
@@ -321,6 +369,7 @@ int main(int argc, char** argv) {
         const int n_mels = (use_real && !cascade)
                                ? rt::resolve_projector_params(args.projector_path).num_mel_bins
                                : 128;
+        splash.set_status(L"opening the audio devices...");
         rt::AudioPipelineBinder audio(settings, n_mels, args.data_dir, app_ctx);
 
         // ---- 2. the engine, and the thread allowed to touch it ---------------
@@ -331,6 +380,8 @@ int main(int argc, char** argv) {
         lcfg.whisper_model = whisper_model;
         lcfg.use_real = use_real;
         lcfg.sample_rate = audio.sample_rate();
+        splash.set_status(use_real ? L"loading the model onto the GPU..."
+                                   : L"starting the simulated backend...");
         rt::AppLifecycleManager lifecycle(lcfg, audio.dsp(), app_ctx);
 
         // ---- 3. the Local Router ---------------------------------------------
@@ -366,6 +417,26 @@ int main(int argc, char** argv) {
         rcfg.local_inference = settings.local_inference;
         rt::ConversationRouter router(rcfg, app_ctx, view, lifecycle.control(),
                                       std::move(generate_locally), std::move(rebuild_prompt));
+
+        // THE RESIDENCY GATE, installed before the dispatcher starts. Without it
+        // a local intent arriving while the weights are hibernated would post a
+        // decode at an arena that is not there, and get_weight_ptr() throws --
+        // on the engine thread, inside a pump loop with no handler. See
+        // LocalEngineTransport::set_ready_check.
+        router.local_transport().set_ready_check([&lifecycle](std::string* why_not) {
+            rt::EngineResidency& res = lifecycle.residency();
+            if (res.ready()) return true;
+            if (why_not != nullptr) {
+                const std::string detail = res.failure();
+                *why_not = res.state() == rt::ResidencyState::Loading
+                               ? "the local model is still loading -- try again in a moment."
+                               : "the local model's weights have been released from VRAM. "
+                                 "Turn local inference back on in Settings to reload them." +
+                                     (detail.empty() ? std::string{} : " (" + detail + ")");
+            }
+            return false;
+        });
+
         router.load_persisted_history(settings.local_inference);
         lifecycle.control()->set_commit_queue(&router.commit_queue());
         router.start();
@@ -374,7 +445,9 @@ int main(int argc, char** argv) {
         // The engine thread first, because start_speech_output is built AFTER it so
         // a TTS failure cannot delay the thing the app is actually for -- and
         // BEFORE the UI, so the first reply can be spoken.
+        splash.set_status(L"warming the system prompt...");
         lifecycle.start_engine_thread();
+        splash.set_status(L"starting speech output...");
         audio.start_speech_output(settings, settings.device_id);
         // The last GPU consumer to load, so this line is the WHOLE budget: if it
         // says OVER BUDGET, the box is already paging and every latency number
@@ -387,7 +460,8 @@ int main(int argc, char** argv) {
         audio.bind_speech_mode(lifecycle.mode());
 
         // ---- 5. the UI, and every page-message binding -----------------------
-        rt::WebUIBridge ui(settings, app_ctx, lifecycle, audio, router, view);
+        splash.set_status(L"starting the interface...");
+        rt::WebUIBridge ui(settings, app_ctx, lifecycle, audio, router, view, &log_ring);
         ui.apply_live_settings(settings);
         ui.create(/*client_w=*/860, /*client_h=*/720);
         view.set_backend(use_real ? "Local model" : "Simulated",
@@ -395,6 +469,38 @@ int main(int argc, char** argv) {
                          use_real && lifecycle.real_stack().audio_head_ready);
         router.seed_startup_view();
         ui.start_diagnostics_poller();
+
+        // THE HANDOFF. Everything the splash was covering is up and the window
+        // has been created, so the splash fades out and joins here rather than
+        // waiting for the guard at scope exit -- which would leave it on screen
+        // for the whole session. The guard remains as the throw path's answer.
+        splash.dismiss();
+
+        // A second validation pass against the LIVE stack, which is the first
+        // moment the VRAM term is answerable: the device is selected, the
+        // checkpoint is resident and the topology is known. The startup pass
+        // above could only check the shapes.
+        //
+        // ONLY THE VRAM FINDINGS ARE PRINTED. Everything else this pass produces
+        // is byte-for-byte what the startup pass already said -- the shapes have
+        // not changed -- and reporting the whole set twice trains the reader to
+        // skip the block. max_context is the one field whose verdict genuinely
+        // differs between the two passes, so it is the one that speaks here.
+        {
+            rt::AssistantSettings probe = settings;
+            rt::ValidationReport report =
+                rt::validate_settings(probe, ui.validation_context());
+            report.items.erase(
+                std::remove_if(report.items.begin(), report.items.end(),
+                               [](const rt::Diagnostic& d) { return d.field != "max_context"; }),
+                report.items.end());
+            report.print("vram");
+            // The clamp is ADOPTED, not merely reported: it is the same value the
+            // engine was actually brought up with (AppLifecycleManager applied its
+            // own budget), so leaving the setting above it would show the user a
+            // context length nothing is running on.
+            settings.max_context = probe.max_context;
+        }
 
         // ---- the optional full-stack diagnostic ------------------------------
         std::thread test_thread;
