@@ -25,6 +25,10 @@
   --err:           #f0736a;
   --radius:        16px;
   --radius-sm:     10px;
+  /* THE COMPOSER ROW'S ONE HEIGHT. Mic, speaker, gear, the text box and
+     Send/Stop all size from this, and the text box's pill radius is derived from
+     it -- so the row cannot go out of alignment by editing one control. */
+  --control-h:     40px;
   --shadow:        0 10px 30px rgba(0, 0, 0, .35);
   --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
   --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -319,33 +323,63 @@ details.think .think-body {
 
 /* ---------- composer ------------------------------------------------------ */
 
+/* ONE ROW, ONE AXIS. Mic, speaker, gear, the text box and Send/Stop are all
+   exactly --control-h tall and centred against each other, so the bar reads as
+   a single horizontal line rather than five controls that happen to be adjacent.
+
+   `center` rather than `flex-end`: at the resting height they are identical
+   (every item is the same height), and once the textarea grows past one line the
+   round buttons stay centred against the box instead of hanging off its floor.
+   Symmetric padding for the same reason -- the 11px/14px split tilted the whole
+   row down by 3px against the border above it. */
 .composer {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 9px;
-  padding: 11px 14px 14px;
+  padding: 12px 14px;
   border-top: 1px solid var(--line);
   background: var(--bg-elev);
 }
 
 .input-wrap {
-  flex: 1;
+  flex: 1 1 auto;
+  /* Or an unbroken paste (a URL, a stack frame) sets the flex base to its own
+     width and shoulders the buttons off the end of the bar. */
+  min-width: 0;
   display: flex;
+  align-items: center;
+  /* The floor is the row's height, so an empty composer is exactly as tall as
+     the buttons beside it. 8px of padding around a 22px line box reaches it
+     naturally as well -- the min-height is what holds the shape if either
+     number is ever tuned. */
+  min-height: var(--control-h);
   background: var(--bg-elev-2);
   border: 1px solid var(--line);
-  border-radius: 20px;
-  padding: 7px 14px;
+  /* A true pill: half the height, so the cap matches the circular buttons
+     instead of approximating them. */
+  border-radius: calc(var(--control-h) / 2);
+  padding: 8px 14px;
   transition: border-color .12s;
 }
 .input-wrap:focus-within { border-color: var(--accent); }
 
 #input {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: block;
   resize: none;
   border: 0; outline: 0;
+  /* EXPLICIT, not inherited. .input-wrap already draws the box, so the textarea
+     must contribute no inset of its own -- and app.js sizes it from
+     scrollHeight, which counts padding, so any padding here would compound on
+     every keystroke. */
+  margin: 0; padding: 0;
   background: transparent;
   color: var(--text);
-  font: 15px/1.45 var(--sans);
+  /* A WHOLE-PIXEL line box. 15px/1.45 is 21.75px, which leaves the caret and the
+     placeholder on a fractional baseline and rounds differently from the box
+     around it; 22px makes every wrapped line an exact multiple. */
+  font: 15px/22px var(--sans);
   max-height: 140px;
   overflow-y: auto;
   scrollbar-width: thin;
@@ -355,7 +389,7 @@ details.think .think-body {
 .mic-btn, .send-btn {
   position: relative;
   display: grid; place-items: center;
-  width: 40px; height: 40px; flex: none;
+  width: var(--control-h); height: var(--control-h); flex: none;
   border: 1px solid var(--line);
   border-radius: 50%;
   background: var(--bg-elev-2);
@@ -686,7 +720,20 @@ details.think .think-body {
 }
 .field em, .check em { font-style: normal; color: var(--text-faint); }
 
-input[type="text"], input:not([type]), input[type="number"], textarea, select {
+/* SCOPED TO THE PANELS THAT OWN THEM, not to every control on the page. As a
+   bare element selector this rule also reached the COMPOSER's textarea, which
+   has its own shell (.input-wrap draws the border and the padding) -- so #input
+   silently carried a second 8px/11px inset on top of it. The composer's box
+   measured 54px against 40px buttons and the whole bottom bar sat 14px out of
+   line.
+   #input overrode the visible half (border, background, font), which is exactly
+   why this survived: the leak was in the box model, where nothing named it.
+
+   `:where()` keeps the specificity at zero, so this stays a BASE style that
+   every rule below (.prompt-editor, input.hotkey, .check input, .audio-popover
+   select) overrides as it did when the selector was a bare element. */
+:where(.modal-body, .audio-popover)
+:where(input[type="text"], input:not([type]), input[type="number"], textarea, select) {
   width: 100%;
   padding: 8px 11px;
   background: var(--bg-elev-2);
@@ -696,7 +743,7 @@ input[type="text"], input:not([type]), input[type="number"], textarea, select {
   font: 13.5px/1.45 var(--sans);
   outline: 0;
 }
-textarea { resize: vertical; font-family: var(--sans); }
+:where(.modal-body, .audio-popover) textarea { resize: vertical; font-family: var(--sans); }
 input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 
 .row { display: flex; gap: 8px; align-items: center; }
@@ -904,6 +951,12 @@ button.primary:hover { filter: brightness(1.08); }
   display: flex;
   align-items: center;
   gap: 6px;
+  /* Its own height IS the row's, so it lines up with the mic and the send
+     button on the composer's centre axis. `flex: none` because the buttons
+     inside already refuse to shrink: letting the dock shrink would only pull
+     its box off the controls it is supposed to contain. */
+  height: var(--control-h);
+  flex: none;
 }
 
 .audio-btn.active {
