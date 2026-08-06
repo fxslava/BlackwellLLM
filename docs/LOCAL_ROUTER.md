@@ -148,16 +148,26 @@ payload is immutable, so a retry is byte-identical and hits the warm cache
 ## Build
 
 The gate and the decode-loop changes are always built — they are header-only /
-engine-side and add no dependencies. The **cloud target is opt-in**:
+engine-side and add no dependencies. The **cloud target is on by default**, and
+it is the one component whose dependencies are neither fetched nor vendored, so
+they must be present before the first configure:
 
 ```bat
 vcpkg install curl[core,ssl,http2]:x64-windows simdjson:x64-windows
-cmake --preset x64-debug -DBUILD_CLOUD_CLIENT=ON ^
-      -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+cmake --preset x64-debug -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
 ```
 
-`BUILD_CLOUD_CLIENT` defaults **OFF** so the default preset keeps working on a
-machine with neither library. The local pipeline is fully testable with it off.
+`BUILD_CLOUD_CLIENT` defaults **ON** (root `CMakeLists.txt`). `CloudDeps.cmake`
+uses `find_package(... REQUIRED)`, so a machine without libcurl + simdjson now
+**fails to configure** rather than silently producing an offline-only app. On
+such a machine, opt out explicitly:
+
+```bat
+cmake --preset x64-debug -DBUILD_CLOUD_CLIENT=OFF
+```
+
+`OFF` remains a fully supported configuration — the local pipeline is testable
+with no network client at all.
 
 ## Wiring it up
 

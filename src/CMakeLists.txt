@@ -34,12 +34,11 @@ add_subdirectory(tts)    # blackwell_tts (speech synthesis text frontend; CUDA-f
 add_subdirectory(bridge) # blackwell_bridge (app<->engine SPSC audio + prompt splice + C-ABI)
 
 # ☁️ Cloud leg of the Local Router pattern: the Anthropic Messages API client
-# the EOS commit gate dispatches to. Default OFF — it is the only target in the
-# tree that needs libcurl + simdjson, and gating it keeps `cmake --preset
-# x64-debug` working on a machine with neither. See cmake/CloudDeps.cmake for
-# the vcpkg line. The commit gate itself (src/bridge/intent_commit.hpp) is
-# header-only and always built, so the local pipeline is testable with this OFF.
-option(BUILD_CLOUD_CLIENT "Build the Anthropic Messages API client (needs libcurl + simdjson)" OFF)
+# the EOS commit gate dispatches to. The option is declared at the ROOT with the
+# other feature switches (it defaults ON, and the prerequisite that default
+# carries is documented there); this is only where it is consumed. The commit
+# gate itself (src/bridge/intent_commit.hpp) is header-only and always built, so
+# the local pipeline stays testable with this OFF.
 if(BUILD_CLOUD_CLIENT)
     include(${CMAKE_SOURCE_DIR}/cmake/CloudDeps.cmake)
     blackwell_setup_cloud_deps()

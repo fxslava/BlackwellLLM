@@ -175,6 +175,27 @@ option(USE_WHISPER_CPP "Enable the whisper.cpp Cascade ASR pipeline (fetches whi
 # Declared before that module.
 option(BLACKWELL_WHISPER_CUDA "Build whisper.cpp with the ggml CUDA backend" ON)
 
+# Cloud leg of the Local Router pattern: the Anthropic Messages API client the
+# EOS commit gate dispatches to (src/cloud, gated in src/CMakeLists.txt).
+#
+# ON by default, and that default has a PREREQUISITE the other options here do
+# not: this is the only component whose dependencies are neither fetched nor
+# vendored. cmake/CloudDeps.cmake does find_package(CURL REQUIRED) +
+# find_package(simdjson CONFIG REQUIRED) -- deliberately, because a from-source
+# libcurl on Windows is a reliable way to end up trusting no CA at all -- so a
+# machine without them now FAILS TO CONFIGURE rather than quietly building an
+# offline-only app. Supply them, or turn this off:
+#     vcpkg install curl[core,ssl,http2]:x64-windows simdjson:x64-windows
+#     cmake --preset x64-debug -DCMAKE_PREFIX_PATH=<vcpkg>/installed/x64-windows
+#     cmake --preset x64-debug -DBUILD_CLOUD_CLIENT=OFF     (opt out entirely)
+#
+# OFF REMAINS A REAL CONFIGURATION and must stay one: the commit gate
+# (src/bridge/intent_commit.hpp) and OfflineTransport are header-only and always
+# built, so the whole local pipeline is testable with no network client at all.
+# Nothing outside src/cloud may include a header that needs libcurl.
+# Declared here with the other feature options; consumed in src/CMakeLists.txt.
+option(BUILD_CLOUD_CLIENT "Build the Anthropic Messages API client (needs libcurl + simdjson)" ON)
+
 # 3. Зависимости: pinned FetchContent + опциональный DirectStorage SDK
 # (интерфейсный таргет blackwell::dstorage + blackwell_copy_dstorage_dlls())
 # + ONNXRuntime CPU для нейросетевого VAD (blackwell::onnxruntime +

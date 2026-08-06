@@ -40,7 +40,7 @@ Useful target names:
 | `agent_playground` | HTTP playground GUI (links core + orchestrator) |
 | `agent_core`, `agent_env`, `agent_orchestrator` | CUDA-free agent stack |
 | `awq_benchmark` | standalone experiment (`src/experiments/`) |
-| `blackwell_cloud` | remote legs (Anthropic + OpenAI-compatible); needs `BUILD_CLOUD_CLIENT=ON` |
+| `blackwell_cloud` | remote legs (Anthropic + OpenAI-compatible); `BUILD_CLOUD_CLIENT` (ON by default, needs libcurl + simdjson) |
 | `validation_tests`, `benchmark_tests`, `integration_tests`, `cloud_tests`, `agent_tests`, `agent_env_tests`, `agent_orchestrator_tests` | test executables |
 
 Build only the target you need — a full build is slow (CUDA), and test suites glob their
@@ -67,9 +67,10 @@ anchoring — plain `-L agent` regex-matches all three agent suites.)
 Sharp edges:
 - **Build the test target first** — ctest does not build, and `gtest_discover_tests`
   registers tests at build time.
-- **`cloud` needs libcurl + simdjson**, so `cloud_tests` does not exist in a default
-  configure (`BUILD_CLOUD_CLIENT` defaults OFF) and `ctest --preset cloud` finds nothing.
-  Arm it with vcpkg — see `cmake/CloudDeps.cmake` for the install line and why
+- **`cloud` needs libcurl + simdjson**, and `BUILD_CLOUD_CLIENT` now defaults **ON**, so
+  a machine without them fails at CONFIGURE time (`find_package(CURL REQUIRED)`) rather
+  than merely lacking `cloud_tests`. Either install them with vcpkg or configure with
+  `-DBUILD_CLOUD_CLIENT=OFF` — see `cmake/CloudDeps.cmake` for the install line and why
   `-DCMAKE_PREFIX_PATH=<vcpkg>/installed/x64-windows` is preferred over the toolchain
   file on an existing build tree. No GPU and no network egress: the suite targets the
   loopback discard port and never contacts a billed endpoint.
