@@ -348,6 +348,11 @@ add_executable(tts_tests
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/transcript_model_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/test_duplex_pipeline.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tts/speech_text_test.cpp"
+    # The other two text-frontend stages: number/symbol expansion and stress
+    # placement. Pure functions over UTF-8, so they belong in the same CPU-only
+    # suite -- and both fix failures that are SILENT everywhere downstream (an
+    # unexpanded '%' tokenises to a pause; a mis-stressed word to nothing at all).
+    "${CMAKE_CURRENT_SOURCE_DIR}/tts/text_frontend_test.cpp"
     # The AEC lives in blackwell::audio_rt, not in blackwell_tts, but it is
     # tested here for the same reason SpscRing is: this is the suite that already
     # runs the duplex path CPU-only, and the canceller's whole purpose is to make

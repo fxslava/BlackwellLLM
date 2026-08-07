@@ -53,6 +53,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -69,6 +70,7 @@
 #include "f5_tokenizer.hpp"
 #include "f5_tts_engine.hpp"
 #include "spsc_ring.hpp"
+#include "stress_marker.hpp"
 #include "text_chunker.hpp"
 #include "tts_duplex_bridge.hpp"
 
@@ -83,11 +85,25 @@ struct TtsRuntimeConfig {
     int  device_id = 0;
     float speed    = 1.0f;
 
-    // Chunking. Defaults match settings_store.hpp; the ranges are enforced in
+    // Chunking. Defaults match settings_store.hpp; the range is enforced in
     // MakeChunkerConfig rather than trusted, because these arrive from a UI.
+    // There is no maximum any more: splitting is punctuation-only (see
+    // text_chunker.hpp), so a "longest chunk" knob has nothing to act on.
     bool split_on_commas = true;
     int  min_chunk_chars = 20;    // clamped to [5, 50]
-    int  max_chunk_chars = 150;   // clamped to [50, 300]
+
+    // Text frontend. Both default ON because both fix failures that are silent
+    // rather than loud -- an unread digit run and a mis-stressed word.
+    bool expand_numbers = true;
+    bool stress_marks = true;
+    // Optional accent dictionary (one marked word per line, "золота+я").
+    // Empty = the built-in seed table only. See stress_marker.hpp.
+    std::string stress_dictionary;
+    // Which side of the stressed vowel the '+' goes on. False = "ры+бка"
+    // (this project's voice packs); true = "р+ыбка" (the ruaccent convention).
+    // MUST match what the checkpoint was fine-tuned with, or every marked word
+    // acquires a pause -- stress_marker.hpp explains why the failure is loud.
+    bool stress_before_vowel = false;
 
     // Output endpoint: name (empty = system default) and zero-based index
     // (-1 = not selected by index, and the index wins when both are set).
@@ -106,21 +122,54 @@ public:
           engine_(MakeEngineConfig(cfg), nullptr),
           synth_(engine_),
           tokenizer_(cfg.vocab_path),
-          // ~2 s at 24 kHz. Sized from the deadline to survive, not the steady
-          // state: this is how long synthesis may stall before the speaker
-          // starves, and synthesis runs several times faster than realtime.
-          speaker_(48000),
+          // ~15 s at 24 kHz (rounded up to 2^19 samples = 2 MB) and the size is
+          // load-bearing, not slack.
+          //
+          // IT DECOUPLES SYNTHESIS FROM PLAYBACK. F5 emits a whole chunk at
+          // once -- several seconds of PCM in one call -- and the worker cannot
+          // start chunk N+1 until chunk N has been handed over. At the old 2 s
+          // the handoff BLOCKED for most of chunk N's playback, so the GPU sat
+          // idle exactly while there was work queued for it, and every chunk
+          // after the first paid its full synthesis time in serial. Sized past
+          // one chunk, Publish() returns immediately and the solver runs for
+          // chunk N+1 while the device plays chunk N -- which is the whole
+          // premise of chunked TTS.
+          //
+          // The old rationale ("how long synthesis may stall before the speaker
+          // starves") is still satisfied: this is strictly more headroom.
+          speaker_(360000),
           // INERT under MakeDuplexConfig()'s AecTap::None -- nothing writes it
           // and nothing reads it. It exists because the bridge takes the
           // reference ring by reference and cannot be handed nothing. Sized like
           // the speaker so that flipping the tap back to Playback is a one-line
           // change here rather than a silent stream of dropped reference.
           aec_ref_(48000),
+          accentor_(MakeAccentOptions(cfg)),
           bridge_(synth_, tokenizer_, speaker_, aec_ref_, MakeChunkerConfig(cfg),
-                  MakeDuplexConfig()) {
+                  MakeDuplexConfig(cfg)) {
         LoadReference();
 
         bridge_.SetCancelSignal(&cancel_);
+
+        // Stress marks, if this voice can read them. SetAccentor answers that
+        // question against the vocab and says no rather than turning every
+        // marked word into a stutter -- see tts_duplex_bridge.hpp. Installed
+        // BEFORE the worker starts, which is the contract on that method.
+        if (cfg.stress_marks) {
+            if (!cfg.stress_dictionary.empty()) {
+                // INIT tier, but NOT fatal: a missing accent dictionary costs
+                // intonation, and refusing to speak at all over it would be a
+                // worse trade than the one this whole class is built on.
+                try {
+                    const std::size_t n = accentor_.LoadDictionary(cfg.stress_dictionary);
+                    std::printf("[tts] accent dictionary: %zu entries from %s\n", n,
+                                cfg.stress_dictionary.c_str());
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "[tts] accent dictionary ignored: %s\n", e.what());
+                }
+            }
+            bridge_.SetAccentor(&accentor_);
+        }
 
         // Volume BEFORE the device starts, so the very first buffer is already
         // at the configured level rather than briefly at full scale.
@@ -262,16 +311,35 @@ private:
         k.split_on_sentence_ends = true;
         k.split_on_commas = c.split_on_commas;
 
-        // CLAMPED, not trusted. These come from a settings file a user can hand
+        // The first chunk goes out at the first punctuation mark of any kind:
+        // it is the only one whose synthesis the user waits through.
+        k.first_chunk_asap = true;
+
+        // CLAMPED, not trusted. This comes from a settings file a user can hand
         // edit, and out-of-range values fail in ways that look like model bugs:
-        // a tiny minimum fragments every reply into clipped barks, and a maximum
-        // below the minimum would make the chunker split on every codepoint.
+        // a tiny floor fragments every reply into clipped barks.
         k.min_chunk_chars = static_cast<std::size_t>(std::clamp(c.min_chunk_chars, 5, 50));
-        k.max_chunk_chars = static_cast<std::size_t>(std::clamp(c.max_chunk_chars, 50, 300));
+
+        // The safety valve stays at its default (ON). Punctuation-free replies
+        // are routine for an LLM -- enumerations, code, a transcript read back
+        // -- and with the valve off none of it is spoken until end-of-turn, so
+        // the user hears silence for the whole generation and then the entire
+        // reply at once. That is a worse failure than one break at a space.
+        // See ChunkerConfig::runaway_guard_chars.
         return k;
     }
 
-    static blackwell::tts::DuplexConfig MakeDuplexConfig() {
+    static blackwell::tts::AccentOptions MakeAccentOptions(const TtsRuntimeConfig& c) {
+        blackwell::tts::AccentOptions a;
+        a.placement = c.stress_before_vowel ? blackwell::tts::PlusPlacement::BeforeVowel
+                                            : blackwell::tts::PlusPlacement::AfterVowel;
+        // Monosyllables stay unmarked: the stress has nowhere else to go, so
+        // the mark is a character the model reads for no information.
+        a.mark_monosyllables = false;
+        return a;
+    }
+
+    static blackwell::tts::DuplexConfig MakeDuplexConfig(const TtsRuntimeConfig& c) {
         blackwell::tts::DuplexConfig d;
         // NO reference published from here. The canceller's far end is a WASAPI
         // LOOPBACK capture of the render endpoint (main.cpp), which observes what
@@ -300,8 +368,20 @@ private:
         //                          other way merely flattens the intonation.
         //                          A voice pack fine-tuned WITH stress should
         //                          set Combining or Plus to match its vocab.
+        //
+        // STRIP IS STILL RIGHT EVEN THOUGH THIS APP NOW ADDS MARKS OF ITS OWN,
+        // and the two are not in tension: stage 1 removes whatever notation the
+        // MODEL happened to emit (it has no idea which one this checkpoint
+        // speaks), and stage 3 puts back marks this pipeline chose, in the
+        // convention it chose, after the digits have become words. Letting the
+        // model's marks through would mean two notations in one sentence.
         d.text.stress = blackwell::tts::StressPolicy::Strip;
         d.text.strip_markdown = true;
+
+        // Stage 2: digits and symbols become spoken Russian. Left on unless the
+        // caller says otherwise -- an unread "%" is a hole in the sentence, not
+        // a rough edge.
+        d.expand_numbers = c.expand_numbers;
         return d;
     }
 
@@ -406,6 +486,10 @@ private:
     blackwell::tts::F5Tokenizer          tokenizer_;
     blackwell::audio_rt::SpscRing<float> speaker_;
     blackwell::audio_rt::SpscRing<float> aec_ref_;
+    // BEFORE bridge_, which holds a bare pointer to it (SetAccentor). Reversing
+    // the pair would let the accentor die while the worker is still inside a
+    // chunk that is reading its dictionary.
+    blackwell::tts::DictionaryAccentor   accentor_;
     blackwell::tts::TTSDuplexBridge      bridge_;
 
     AudioPlayback     playback_;

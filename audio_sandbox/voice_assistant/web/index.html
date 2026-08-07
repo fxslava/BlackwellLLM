@@ -571,6 +571,8 @@
             Nothing can be spoken until its whole chunk is generated, so smaller
             chunks start sooner. The trade is that the voice is re-anchored to the
             reference at every split, which flattens intonation across the seam.
+            Splits are only ever taken at punctuation &mdash; the first one in a
+            reply goes out immediately, whatever it is.
           </p>
 
           <div class="field">
@@ -580,21 +582,46 @@
             <input id="s_tts_min_chunk_chars" type="range" min="5" max="50" step="1">
             <div class="scale"><span>Splits more</span><span>Splits less</span></div>
             <p class="hint">
-              Stops a stray &ldquo;Yes,&rdquo; becoming its own utterance &mdash; a
-              clipped bark that costs a full synthesis to say one word.
+              Stops a stray &ldquo;Yes,&rdquo; becoming its own utterance in the
+              MIDDLE of a reply &mdash; a clipped bark that costs a full synthesis
+              to say one word. The opening chunk ignores this, because it is the
+              only one you actually wait for.
             </p>
           </div>
 
+          <label class="check">
+            <input type="checkbox" id="s_tts_expand_numbers">
+            <span>Read numbers and symbols as words
+              <em>(&ldquo;123&rdquo; &rarr; &ldquo;сто двадцать три&rdquo;)</em></span>
+          </label>
+          <p class="hint">
+            The voice is character-level: it has never been taught what a digit
+            sounds like, and &ldquo;%&rdquo; is usually not in its alphabet at all
+            &mdash; an unknown character reaches it as a pause, so the symbol
+            becomes a hole in the sentence rather than a word.
+          </p>
+
+          <label class="check">
+            <input type="checkbox" id="s_tts_stress_marks">
+            <span>Mark Russian stress
+              <em>(&ldquo;рыбка&rdquo; &rarr; &ldquo;ры+бка&rdquo;)</em></span>
+          </label>
+          <p class="hint">
+            Russian stress is not predictable from spelling, and the Russian voice
+            packs were trained on text where it was marked. Turned off, the model
+            guesses. Automatically disabled if this voice&rsquo;s alphabet has no
+            &ldquo;+&rdquo; in it.
+          </p>
+
           <div class="field">
-            <label for="s_tts_max_chunk_chars">
-              Longest chunk <span class="hint-inline" id="maxChunkValue"></span>
-            </label>
-            <input id="s_tts_max_chunk_chars" type="range" min="50" max="300" step="5">
-            <div class="scale"><span>Speaks sooner</span><span>Smoother</span></div>
+            <label for="s_tts_stress_dictionary">Accent dictionary</label>
+            <input id="s_tts_stress_dictionary" type="text"
+                   placeholder="(built-in word list)">
             <p class="hint">
-              A run-on sentence with no punctuation is broken at the next space
-              once it reaches this length, so it cannot buffer until the reply
-              ends.
+              Optional. One marked word per line
+              (&ldquo;золота+я&rdquo;), or &ldquo;word 4&rdquo; with the number of
+              the stressed vowel. Overrides the built-in list, which only covers
+              numerals, units and common words.
             </p>
           </div>
 

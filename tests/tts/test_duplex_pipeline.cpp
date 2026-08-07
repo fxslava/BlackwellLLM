@@ -48,7 +48,7 @@ std::vector<std::string> DrainAll(TextChunker& c) {
 // TextChunker
 // =============================================================================
 TEST(TextChunker, SplitsOnSentenceEnds) {
-    TextChunker c;   // defaults: min 20, max 150
+    TextChunker c;   // defaults: clause floor 20, first chunk unfloored
     c.PushToken("This is a reasonably long first sentence. And here is a second one. ");
     const auto got = DrainAll(c);
     ASSERT_EQ(got.size(), 2u);
@@ -77,24 +77,36 @@ TEST(TextChunker, CommaSplittingCanBeDisabled) {
     EXPECT_EQ(got[0], "A clause long enough to pass the minimum, and then another clause here.");
 }
 
-// THE case min_chunk_chars exists for: a short interjection must not become its
-// own utterance. "Да," is 3 characters; splitting there would produce a clipped
-// ~200 ms bark whose reference conditioning costs more than its content.
-TEST(TextChunker, ShortLeadingClauseIsNotFragmented) {
+// THE latency rule: the FIRST punctuation mark of a reply ends the first chunk,
+// whatever it is, because that chunk's synthesis is the only one the user waits
+// through. "Да," is 3 characters and becomes an utterance on purpose.
+TEST(TextChunker, FirstChunkGoesOutAtTheFirstPunctuation) {
     TextChunker c;
     c.PushToken("Да, конечно я могу помочь тебе с этим прямо сейчас.");
     const auto got = DrainAll(c);
-    ASSERT_FALSE(got.empty());
-    EXPECT_NE(got[0], "Да,") << "min_chunk_chars failed to suppress a 3-char split";
-    EXPECT_GE(got[0].size(), 20u);
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[0], "Да,");
+    EXPECT_EQ(got[1], "конечно я могу помочь тебе с этим прямо сейчас.");
+}
+
+// ...and the floor applies again from the second chunk on, where the latency is
+// already hidden behind playback and only prosody is left to protect.
+TEST(TextChunker, ClauseFloorAppliesAfterTheFirstChunk) {
+    TextChunker c;
+    c.PushToken("Начало первой фразы. Да, и дальше идёт длинное продолжение фразы.");
+    const auto got = DrainAll(c);
+    ASSERT_GE(got.size(), 2u);
+    EXPECT_EQ(got[0], "Начало первой фразы.");
+    EXPECT_NE(got[1], "Да,") << "the mid-reply clause floor did not suppress a 3-char split";
 }
 
 TEST(TextChunker, MinChunkCharsCountsCodepointsNotBytes) {
     // 12 Cyrillic characters = 24 UTF-8 bytes. With min_chunk_chars = 20 the
-    // split must NOT be taken -- if the implementation counted bytes it would
-    // see 24 >= 20 and split, fragmenting the reply.
+    // mid-reply split must NOT be taken -- if the implementation counted bytes
+    // it would see 24 >= 20 and split, fragmenting the reply.
     ChunkerConfig cfg;
     cfg.min_chunk_chars = 20;
+    cfg.first_chunk_asap = false;   // otherwise the floor is suspended here
     TextChunker c(cfg);
     c.PushToken("Привет мир, и снова здравствуйте дорогие друзья.");
     const auto got = DrainAll(c);
@@ -102,25 +114,64 @@ TEST(TextChunker, MinChunkCharsCountsCodepointsNotBytes) {
     EXPECT_NE(got[0], "Привет мир,");
 }
 
-TEST(TextChunker, ForcesSplitAtWhitespacePastMaxChars) {
+// Punctuation is the only boundary a chunk is CHOSEN at: text under the safety
+// valve's threshold is never cut at a character count.
+TEST(TextChunker, ShortPunctuationFreeTextNeverSplits) {
     ChunkerConfig cfg;
     cfg.min_chunk_chars = 5;
-    cfg.max_chunk_chars = 20;
     TextChunker c(cfg);
-    // No punctuation at all, so only the max-chars rule can fire.
     const std::string input = "aaaa bbbb cccc dddd eeee ffff gggg hhhh";
     c.PushToken(input);
-    // Flush is required: the trailing remainder is under max_chunk_chars and has
-    // no punctuation, so it correctly waits for more input rather than being
-    // emitted early. Draining without flushing tests nothing about the tail.
+    EXPECT_FALSE(c.HasPendingChunk()) << "a character count split a phrase";
+
+    c.Flush();
+    const auto got = DrainAll(c);
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0], input);
+}
+
+// THE case the valve exists for: a long reply with no punctuation at all --
+// routine LLM output -- must produce audio BEFORE the generation finishes,
+// not a silence followed by the whole reply at once.
+TEST(TextChunker, LongPunctuationFreeReplySpeaksBeforeFlush) {
+    TextChunker c;   // default valve: 180 codepoints
+    std::string input;
+    for (int i = 0; i < 60; ++i) input += "слово ";   // 6 cp each, no punctuation
+    c.PushToken(input);
+
+    ASSERT_TRUE(c.HasPendingChunk()) << "nothing was speakable before Flush";
+    const std::string first = c.PopChunk();
+    EXPECT_FALSE(first.empty());
+    // Broke at a space, so no word was cut in half. Compared as a STRING, not
+    // via back(): "о" is two bytes in UTF-8 and a char comparison would be
+    // testing the continuation byte.
+    const std::string word = "слово";
+    ASSERT_GE(first.size(), word.size());
+    EXPECT_EQ(first.compare(first.size() - word.size(), word.size(), word), 0)
+        << "the valve split mid-word: " << first;
+
+    c.Flush();
+    std::string rejoined = first;
+    for (const auto& s : DrainAll(c)) {
+        rejoined += ' ';
+        rejoined += s;
+    }
+    // Trailing space is trimmed by Emit; compare against the trimmed input.
+    std::string expect = input;
+    while (!expect.empty() && expect.back() == ' ') expect.pop_back();
+    EXPECT_EQ(rejoined, expect) << "characters were lost or reordered";
+}
+
+TEST(TextChunker, RunawayGuardSplitsAtWhitespace) {
+    ChunkerConfig cfg;
+    cfg.runaway_guard_chars = 20;
+    TextChunker c(cfg);
+    const std::string input = "aaaa bbbb cccc dddd eeee ffff gggg hhhh";
+    c.PushToken(input);
     c.Flush();
 
     const auto got = DrainAll(c);
-    EXPECT_GT(got.size(), 1u) << "max_chunk_chars never fired";
-
-    // Every word must survive intact: reassembling the chunks with single
-    // spaces must reproduce the input exactly. That is a real "never split
-    // mid-word" check, unlike looking for double spaces.
+    EXPECT_GT(got.size(), 1u) << "the runaway guard never fired";
     std::string rejoined;
     for (const auto& s : got) {
         EXPECT_FALSE(s.empty());
@@ -128,6 +179,116 @@ TEST(TextChunker, ForcesSplitAtWhitespacePastMaxChars) {
         rejoined += s;
     }
     EXPECT_EQ(rejoined, input) << "a word was split or characters were lost";
+}
+
+// Text with no whitespace at all cannot be broken between words, and the valve
+// must not simply give up: the hard cap accepts a mid-word cut rather than
+// buffer without bound.
+TEST(TextChunker, HardCapFiresWhenThereIsNoWhitespace) {
+    ChunkerConfig cfg;
+    cfg.runaway_guard_chars = 20;
+    cfg.runaway_hard_cap_chars = 40;
+    TextChunker c(cfg);
+    c.PushToken(std::string(100, 'a'));
+    ASSERT_TRUE(c.HasPendingChunk()) << "the hard cap never fired";
+    EXPECT_EQ(c.PopChunk().size(), 40u);
+}
+
+// A '+' separated from its vowel becomes a bare token in one utterance and a
+// silently unstressed vowel in the next. No split may land on either side of
+// one, under EITHER placement convention.
+TEST(TextChunker, NeverSplitsBetweenAStressMarkAndItsVowel) {
+    ChunkerConfig cfg;
+    cfg.runaway_guard_chars = 8;
+    cfg.runaway_hard_cap_chars = 8;
+    TextChunker c(cfg);
+
+    // No whitespace, so every split is taken by the hard cap -- which lands on
+    // an arbitrary codepoint boundary and would hit the marks if unguarded.
+    std::string input;
+    for (int i = 0; i < 12; ++i) input += "р+ыбка";
+    c.PushToken(input);
+    c.Flush();
+
+    std::string rejoined;
+    for (const auto& s : DrainAll(c)) {
+        ASSERT_FALSE(s.empty());
+        EXPECT_NE(s.back(), '+') << "chunk ended on a stress mark: " << s;
+        EXPECT_NE(s.front(), '+') << "chunk began with an orphaned mark: " << s;
+        rejoined += s;
+    }
+    EXPECT_EQ(rejoined, input) << "characters were lost";
+}
+
+// The same guard on the whitespace path, where the mark sits next to the space.
+TEST(TextChunker, ValveSkipsASplitPointAdjacentToAMark) {
+    ChunkerConfig cfg;
+    cfg.runaway_guard_chars = 6;
+    TextChunker c(cfg);
+    // The space at index 6 is followed by '+', so splitting there would open
+    // the next chunk with an orphaned mark under the after-vowel convention.
+    c.PushToken("абвгде +южя ещё слова");
+    c.Flush();
+
+    for (const auto& s : DrainAll(c)) {
+        EXPECT_NE(s.back(), '+') << "chunk ended on a stress mark: " << s;
+        EXPECT_NE(s.front(), '+') << "chunk began with an orphaned mark: " << s;
+    }
+}
+
+// A decimal point is not a sentence end. Splitting here would hand the text
+// normaliser "3." and "14" and it would read them as two numbers.
+TEST(TextChunker, DoesNotSplitInsideNumbers) {
+    TextChunker c;
+    c.PushToken("Погрешность 3.14 процента, и это устраивает.");
+    const auto got = DrainAll(c);
+    ASSERT_FALSE(got.empty());
+    EXPECT_EQ(got[0], "Погрешность 3.14 процента,");
+}
+
+// The digit guard must WAIT rather than guess when the deciding byte has not
+// arrived: "3." at a token boundary is undecidable until the next token.
+TEST(TextChunker, DigitGuardWaitsForTheDecidingByte) {
+    TextChunker c;
+    c.PushToken("Значение равно 3.");
+    EXPECT_FALSE(c.HasPendingChunk()) << "split on a '.' whose successor was unknown";
+    c.PushToken("14 и не больше.");
+    const auto got = DrainAll(c);
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0], "Значение равно 3.14 и не больше.");
+}
+
+// An initial or an abbreviation ends a token, not a sentence.
+TEST(TextChunker, DoesNotSplitAfterASingleLetterInitial) {
+    TextChunker c;
+    c.PushToken("Об этом писал А. Пушкин, и не только он.");
+    const auto got = DrainAll(c);
+    ASSERT_FALSE(got.empty());
+    EXPECT_EQ(got[0], "Об этом писал А. Пушкин,");
+}
+
+// A reply opening with punctuation must not spend a whole synthesis on it. The
+// stray mark is dropped (it is inaudible), and the first REAL clause becomes
+// the first chunk.
+TEST(TextChunker, PunctuationOnlySpanIsNotAnUtterance) {
+    TextChunker c;
+    c.PushToken(", хорошо, теперь по существу дела.");
+    const auto got = DrainAll(c);
+    ASSERT_FALSE(got.empty());
+    EXPECT_EQ(got[0], "хорошо,") << "a lone comma became a chunk";
+}
+
+// Flush ends the reply, so the NEXT one gets the first-chunk rule again.
+TEST(TextChunker, FirstChunkRuleIsReArmedByFlush) {
+    TextChunker c;
+    c.PushToken("Первая реплика целиком.");
+    c.Flush();
+    (void)DrainAll(c);
+
+    c.PushToken("Да, вторая реплика начинается здесь.");
+    const auto got = DrainAll(c);
+    ASSERT_FALSE(got.empty());
+    EXPECT_EQ(got[0], "Да,");
 }
 
 // An LLM stream splits wherever its tokenizer decided, which for Cyrillic lands

@@ -24,12 +24,23 @@
 # engine. It carries its own radix-2 FFT rather than reaching for pocketfft via
 # blackwell::sandbox_headers, which keeps this target's link line EMPTY -- the
 # property the block above is protecting.
+#
+# THE TEXT FRONTEND IS FOUR STAGES AND THEY ALL LIVE HERE (the order is fixed
+# and documented above DuplexConfig in tts_duplex_bridge.hpp):
+#   text_chunker      punctuation-only splitting of the LLM stream
+#   speech_text       Markdown / symbol / stress-notation normalisation
+#   text_normalizer   digits and symbols -> spoken Russian words
+#   stress_marker     '+' accent placement (dictionary; ONNX behind IAccentor)
+# All four are STL-only: no ONNXRuntime, no CUDA, no engine, which is what lets
+# tts_tests exercise the whole frontend on a machine with no GPU.
 add_library(blackwell_tts STATIC
     phonemizer.cpp
     f5_mel_extractor.cpp
     f5_tokenizer.cpp
     text_chunker.cpp
     speech_text.cpp
+    text_normalizer.cpp
+    stress_marker.cpp
     tts_duplex_bridge.cpp)
 
 # blackwell::audio_rt is a HEADER-ONLY INTERFACE target (SpscRing) -- no objects,

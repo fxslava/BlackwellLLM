@@ -6,6 +6,7 @@
 #include "tts_duplex_bridge.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>    // printf (the worker-side handoff diagnostics)
 #include <cstring>
 #include <thread>
@@ -27,6 +28,27 @@ TTSDuplexBridge::TTSDuplexBridge(ISynthesizer& synth,
 
 void TTSDuplexBridge::SetCancelSignal(const std::atomic<bool>* cancel) noexcept {
     cancel_ = cancel;
+}
+
+bool TTSDuplexBridge::SetAccentor(const IAccentor* accentor) {
+    if (accentor == nullptr) {
+        accentor_ = nullptr;
+        return true;
+    }
+    // THE GUARD THAT MATTERS. A '+' the voice does not know does not read as
+    // "no stress"; it reads as id 0, which is a space, i.e. a pause in the
+    // middle of every marked word. Checking costs one hash lookup at startup
+    // and turns a checkpoint mismatch from a stutter into a log line.
+    if (tokenizer_.IdForCodepoint('+') == F5Tokenizer::kUnknownId) {
+        std::printf("[tts] stress marks DISABLED: '+' is not in this voice's vocabulary, "
+                    "so every mark would reach the model as a pause inside a word. "
+                    "Use a voice pack whose vocab.txt contains '+'.\n");
+        std::fflush(stdout);
+        accentor_ = nullptr;
+        return false;
+    }
+    accentor_ = accentor;
+    return true;
 }
 
 // Relaxed on both: a one-iteration delay in observing a cancel is
@@ -79,16 +101,27 @@ TtsStatus TTSDuplexBridge::PumpOnce(std::size_t* out_samples) {
     }
     if (chunk.empty()) return TtsStatus::EmptyResult;
 
-    // THE LAST THING THAT TOUCHES THE TEXT. Markdown the model was asked not to
-    // put in the spoken half but did, and stress marks in whichever of the two
-    // notations it happened to use -- both would otherwise reach a character-level
-    // tokenizer that maps what it does not know to the SPACE id, i.e. as pauses
-    // inside words rather than as an error (speech_text.hpp).
+    // ---- the text frontend, stages 1-3 (see the block above DuplexConfig) ---
+    // Here and not in PushToken because every one of these needs whole
+    // constructs, and a token stream splits "**", "2026" and "золотая" down the
+    // middle wherever the LLM's tokenizer felt like it.
     //
-    // Here and not in PushToken because a normaliser needs whole constructs, and
-    // a token stream splits "**" down the middle. See DuplexConfig::text.
+    // 1. Markdown the model was asked not to put in the spoken half but did,
+    //    plus whatever stress notation IT used, normalised away.
     chunk = NormalizeForSpeech(chunk, cfg_.text);
     if (chunk.empty()) return TtsStatus::EmptyResult;   // decoration only, no words
+
+    // 2. Digits and symbols become words. Before the accentor, because "123"
+    //    has no vowels to stress until it is "сто двадцать три".
+    if (cfg_.expand_numbers) {
+        chunk = ExpandForSpeech(chunk, cfg_.normalizer);
+        if (chunk.empty()) return TtsStatus::EmptyResult;
+    }
+
+    // 3. Stress marks go in LAST, so nothing downstream of here rewrites them.
+    if (accentor_ != nullptr) {
+        chunk = accentor_->Accentuate(chunk);
+    }
 
     std::size_t unknown = 0;
     std::vector<std::int32_t> ids32 = tokenizer_.Tokenize(chunk, &unknown);
@@ -155,9 +188,29 @@ TtsStatus TTSDuplexBridge::PushPcm(const std::vector<float>& pcm) {
     return st;
 }
 
+// PUBLISHING IS A HANDOFF, NOT A RENDEZVOUS. The speaker ring is sized to hold
+// a whole chunk (see TtsRuntime), so the steady state is: this writes the chunk
+// in one call, returns, and the worker goes straight back to synthesising chunk
+// N+1 on the GPU while chunk N plays. The wait below is the exceptional path --
+// a chunk longer than the ring, or a sink that has stopped pulling.
+//
+// IT SLEEPS RATHER THAN YIELDS, and that is a correctness argument rather than
+// a tidiness one. yield() returns immediately whenever no other thread is
+// runnable on that core, so the "wait" was a hot spin: on a machine whose cores
+// are already carrying an LLM decode and a real-time audio callback, it burns a
+// core for the entire duration of playback -- competing with the exact callback
+// it is waiting on. A 2 ms sleep gives the same wake-up latency (the ring
+// drains at device rate; one poll interval is a fraction of one buffer) at no
+// cpu cost at all.
 TtsStatus TTSDuplexBridge::Publish(const std::vector<float>& pcm) {
     std::size_t pushed = 0;
-    std::size_t spins = 0;
+    // Measured from the last PROGRESS, not from entry: a chunk longer than the
+    // ring is handed over across several playback periods, and that is normal
+    // operation rather than a stall. What the budget must catch is a consumer
+    // that has stopped consuming.
+    auto last_progress = std::chrono::steady_clock::now();
+    const auto poll = std::chrono::milliseconds(
+        cfg_.write_poll_ms == 0 ? 1 : static_cast<long long>(cfg_.write_poll_ms));
 
     while (pushed < pcm.size()) {
         // Re-checked every iteration: a chunk can be several seconds long, and a
@@ -176,20 +229,23 @@ TtsStatus TTSDuplexBridge::Publish(const std::vector<float>& pcm) {
         // would make that metric meaningless -- spsc_ring.hpp is explicit.
         const std::size_t n = speaker_.write(pcm.data() + pushed, pcm.size() - pushed);
         if (n == 0) {
-            if (cfg_.write_spin_limit != 0 && ++spins > cfg_.write_spin_limit) {
-                // The consumer has stopped pulling. Report back-pressure rather
-                // than spin forever; the caller decides whether that is a stalled
-                // device or a paused session.
-                samples_discarded_.fetch_add(pcm.size() - pushed, std::memory_order_relaxed);
-                return TtsStatus::RuntimeFailure;
+            if (cfg_.write_wait_ms != 0) {
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - last_progress)
+                                        .count();
+                if (waited > static_cast<long long>(cfg_.write_wait_ms)) {
+                    // The consumer has stopped pulling. Report back-pressure
+                    // rather than wait forever; the caller decides whether that
+                    // is a stalled device or a paused session.
+                    samples_discarded_.fetch_add(pcm.size() - pushed,
+                                                 std::memory_order_relaxed);
+                    return TtsStatus::RuntimeFailure;
+                }
             }
-            // Yield rather than spin hot: the consumer is a real-time callback,
-            // and burning a core here is the one thing that could make it miss
-            // the deadline we are waiting on.
-            std::this_thread::yield();
+            std::this_thread::sleep_for(poll);
             continue;
         }
-        spins = 0;
+        last_progress = std::chrono::steady_clock::now();
         pushed += n;
 
         if (cfg_.aec_tap == AecTap::Synthesis) {

@@ -228,7 +228,9 @@ int run_say_check(const AssistantSettings& settings, const std::string& text) {
         tcfg.nfe_step            = settings.tts_nfe_step;
         tcfg.split_on_commas     = settings.tts_split_on_commas;
         tcfg.min_chunk_chars     = settings.tts_min_chunk_chars;
-        tcfg.max_chunk_chars     = settings.tts_max_chunk_chars;
+        tcfg.expand_numbers      = settings.tts_expand_numbers;
+        tcfg.stress_marks        = settings.tts_stress_marks;
+        tcfg.stress_dictionary   = settings.tts_stress_dictionary;
         tcfg.output_device       = settings.output_device_name;
         tcfg.output_device_index = settings.output_device_index;
         tcfg.volume              = settings.tts_volume;

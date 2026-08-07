@@ -220,17 +220,29 @@ costs the user their assistant.
 `saw_voice_block()` is the telemetry for it — a run of `false` means the persona
 edit dropped the contract or the backbone is too small to follow it.
 
-### The last thing that touches the text
+### The last things that touch the text
 
-`NormalizeForSpeech` (`src/tts/speech_text.hpp`), applied per chunk in
-`TTSDuplexBridge` — **per chunk and not per token**, because a token stream
-splits `**` down the middle and a normaliser fed fragments cannot see the
-constructs it is removing.
+Four stages, applied **per chunk and not per token** in `TTSDuplexBridge`,
+because a token stream splits `**`, `2026` and `золотая` down the middle
+wherever the LLM's tokenizer felt like it, and a rewriter fed fragments cannot
+see the constructs it is acting on:
 
-The prompt asks; this guarantees. It covers the three residuals a prompt cannot:
-a model that puts Markdown in `<voice>` anyway, the fallback path where the
-Markdown answer *is* what gets spoken, and stress marks — which no instruction
-can regularise because the two notations look identical on screen.
+| # | Stage | What it guarantees |
+|---|---|---|
+| 1 | `NormalizeForSpeech` (`src/tts/speech_text.hpp`) | Markdown out, whatever stress notation the *model* emitted normalised away, unspeakable symbols dropped. |
+| 2 | `ExpandForSpeech` (`src/tts/text_normalizer.hpp`) | Digits and symbols become words, with Russian agreement: `123%` → `сто двадцать три процента`, `в 2026 году` → `в две тысячи двадцать шестом году`. |
+| 3 | `IAccentor` (`src/tts/stress_marker.hpp`) | Stress marks go **in**: `рыбка` → `ры+бка`. Off unless an accentor is installed *and* the voice's vocab contains `+`. |
+| 4 | `F5Tokenizer` | Characters become ids. |
+
+The order is fixed and each constraint is real: 2 must follow 1 (it would
+otherwise see `**2026**`), and 3 must follow 2 (it marks *words*, and `123` is
+not a word yet) as well as 1 (which would strip the marks it just added).
+
+The prompt asks; these guarantee. Between them they cover the residuals a prompt
+cannot: a model that puts Markdown in `<voice>` anyway, the fallback path where
+the Markdown answer *is* what gets spoken, digits — which a character-level
+model has never been taught to read — and stress, which no instruction can
+regularise because the two notations look identical on screen.
 
 > Russian TTS text marks lexical stress either as `U+0301` **after** the vowel
 > (`хорошо́`) or as `+` **before** it (`хорош+о`). F5 is character-level, so only
@@ -241,8 +253,18 @@ can regularise because the two notations look identical on screen.
 
 Hence `StressPolicy` rather than a hardcoded rule: the caller states which
 convention its checkpoint speaks and the normaliser converts between them.
-`Strip` is the default because getting it wrong that way is merely flat, while
-getting it wrong the other way is unintelligible.
+`Strip` is the default *for stage 1* because the model's own marks are in an
+unknown notation, and getting that wrong is unintelligible while dropping them
+is merely flat.
+
+Stage 3 then puts marks back — in the convention **this pipeline** chose, after
+the digits have become words. `PlusPlacement` names the side of the vowel
+(`ры+бка` vs `р+ыбка`), and `TTSDuplexBridge::SetAccentor` refuses to install an
+accentor at all when `+` is missing from the voice's `vocab.txt`, because that
+is precisely the case where every marked word would acquire a pause. The default
+`DictionaryAccentor` marks only what it can be right about — an explicit entry,
+then `ё`, then nothing — since an unmarked word falls back on the model's prior
+while a wrongly marked one overrides that prior with a confident error.
 
 ## Conversation memory on the remote leg
 
@@ -432,6 +454,10 @@ into a conversation it has nothing to do with.
 | `src/cloud/curl_stream_core.hpp` | The shared HTTP half; owns the **cancel epoch** both live clients abort through. |
 | `audio_sandbox/voice_assistant/reply_split.hpp` | The `<voice>`/`<ui>` contract: `kOutputContract` + `compose_system_prompt` (the instruction) and `ReplySplitter` (the parser). Header-only, CUDA-free. |
 | `src/tts/speech_text.{hpp,cpp}` | `NormalizeForSpeech` — Markdown removal, `StressPolicy`, symbol filtering. Pure function. |
+| `src/tts/text_chunker.{hpp,cpp}` | Punctuation-only splitting of the LLM stream. First chunk at the first mark of any kind (TTFA); the length floor guards mid-sentence splits only. |
+| `src/tts/text_normalizer.{hpp,cpp}` | `ExpandForSpeech` + `RussianCardinal`/`RussianOrdinalMasculine` — numbers, units, symbols, abbreviations, with gender/plural/case agreement. Pure function. |
+| `src/tts/stress_marker.{hpp,cpp}` | `IAccentor` (the seam an ONNX accentor slots into) + `DictionaryAccentor`. `+` placement, the built-in seed table, `LoadDictionary`. |
+| `tests/tts/text_frontend_test.cpp` | The grammar, pinned: agreement, year evidence and case, digit-by-digit fallbacks, and what must NOT be marked. CPU-only. |
 | `tests/bridge/reply_split_test.cpp` | Tags split across deltas, and the fail-open fallback. CPU-only. |
 | `tests/tts/speech_text_test.cpp` | Both stress notations in all three directions, and what must NOT be rewritten (`2 + 2`, `max_new_tokens`). CPU-only. |
 | `src/cloud/offline_transport.hpp` | `OfflineTransport` — the simulated remote. Header-only; builds with `BUILD_CLOUD_CLIENT=OFF`. |

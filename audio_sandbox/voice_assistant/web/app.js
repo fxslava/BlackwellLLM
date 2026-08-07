@@ -695,7 +695,10 @@ const FIELDS = {
   tts_ckpt_dir: "value", tts_vocab_path: "value", tts_ref_audio: "value",
   tts_ref_text: "value", tts_nfe_step: "int",
   tts_split_on_commas: "check", tts_min_chunk_chars: "int",
-  tts_max_chunk_chars: "int",
+  // Text frontend. tts_max_chunk_chars is GONE: splitting is punctuation-only
+  // now (src/tts/text_chunker.hpp), so there is nothing for a length cap to do.
+  tts_expand_numbers: "check", tts_stress_marks: "check",
+  tts_stress_dictionary: "value",
   // "float" (not "int") is load-bearing: tts_volume arriving as an integer would
   // be 0 or 1 and nothing between, i.e. a mute switch wearing a slider.
   tts_volume: "float", mic_gain: "float",
@@ -724,12 +727,11 @@ const READOUTS = {
   silence_hangover_ms:      ["#hangoverValue", v => Number(v) === 0 ? "off" : Number(v) + " ms"],
   pre_roll_ms:              ["#prerollValue",  v => Number(v) === 0 ? "off" : Number(v) + " ms"],
   warm_prefill_interval_ms: ["#warmValue",     v => Number(v) === 0 ? "off" : Number(v) + " ms"],
-  // Chunk sizes read as characters, not an abstract scale -- the whole point of
-  // the two knobs is "how much text before it starts talking".
+  // The chunk floor reads as characters, not an abstract scale -- the point of
+  // the knob is "how much text before it starts talking".
   mic_gain:                 ["#micGainValue",  v => Math.round(Number(v) * 100) + "%"],
   tts_nfe_step:             ["#nfeValue",      v => Number(v) + " steps"],
   tts_min_chunk_chars:      ["#minChunkValue", v => Number(v) + " chars"],
-  tts_max_chunk_chars:      ["#maxChunkValue", v => Number(v) + " chars"],
   // Milliseconds of room, not an abstract scale: it is a physical length the
   // canceller can model, and reading it as one is what makes it settable.
   aec_tail_ms:              ["#aecTailValue",  v => Number(v) + " ms"],

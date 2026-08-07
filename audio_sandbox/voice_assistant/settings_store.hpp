@@ -219,9 +219,23 @@ struct AssistantSettings {
     // is given, so the only latency lever is giving it less at once. Each split
     // re-conditions the voice on the reference rather than on what was just
     // spoken, so splitting harder is faster AND flatter.
+    //
+    // Splitting is PUNCTUATION-ONLY (text_chunker.hpp): there is no "longest
+    // chunk" setting any more, because a cut taken at a character count lands
+    // mid-phrase by construction and is heard as the sentence restarting.
     bool tts_split_on_commas = true;   // clause-level splits; off = sentences only
-    int  tts_min_chunk_chars = 20;     // [5, 50]   stops "Да," becoming an utterance
-    int  tts_max_chunk_chars = 150;    // [50, 300] forces a split at the next space
+    int  tts_min_chunk_chars = 20;     // [5, 50] floor for MID-SENTENCE splits only
+
+    // ---- text frontend ------------------------------------------------------
+    // Both fix failures that are SILENT rather than loud, which is why both
+    // default on: an unexpanded "%" reaches a character-level model as an
+    // unknown character, i.e. as a pause, and an unmarked Russian word gets its
+    // stress from a coin flip.
+    bool tts_expand_numbers = true;    // "123" -> "сто двадцать три"
+    bool tts_stress_marks = true;      // "рыбка" -> "ры+бка"
+    // Optional accent dictionary, one marked word per line ("золота+я").
+    // Empty = the built-in seed table (numerals, units, common vocabulary).
+    std::string tts_stress_dictionary;
 
     // ---- acoustic echo cancellation -----------------------------------------
     // ON by default, and the microphone is never muted: the assistant's own
@@ -491,7 +505,12 @@ void visit_fields(S& s, Fn&& f) {
     f("mic_gain",                 s.mic_gain,                 Tier::Live);
     f("tts_split_on_commas",      s.tts_split_on_commas,      Tier::Restart);
     f("tts_min_chunk_chars",      s.tts_min_chunk_chars,      Tier::Restart);
-    f("tts_max_chunk_chars",      s.tts_max_chunk_chars,      Tier::Restart);
+    // Restart: the text frontend is built with the bridge. A settings file
+    // written by an older build still carries tts_max_chunk_chars; unknown keys
+    // are ignored on load, so the knob simply disappears rather than failing.
+    f("tts_expand_numbers",       s.tts_expand_numbers,       Tier::Restart);
+    f("tts_stress_marks",         s.tts_stress_marks,         Tier::Restart);
+    f("tts_stress_dictionary",    s.tts_stress_dictionary,    Tier::Restart);
     // Live: the filter is bypassable in place (and resets its learned response
     // on the way back in), so toggling it costs nothing but a re-convergence.
     // The tail sizes fixed buffers in the constructor, so that one is Restart.

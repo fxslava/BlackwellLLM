@@ -104,7 +104,9 @@
 #include "f5_tokenizer.hpp"
 #include "speech_text.hpp"
 #include "spsc_ring.hpp"
+#include "stress_marker.hpp"
 #include "text_chunker.hpp"
+#include "text_normalizer.hpp"
 #include "tts_status.hpp"
 
 namespace blackwell::tts {
@@ -149,25 +151,58 @@ enum class AecTap : std::int32_t {
     None = 2,
 };
 
+// =============================================================================
+// THE TEXT FRONTEND: FOUR STAGES, IN THIS ORDER, PER CHUNK
+// =============================================================================
+// Every one of them is applied to a WHOLE CHUNK and never to a token, and that
+// ordering constraint is the reason they are configured here rather than at
+// PushToken. An LLM stream splits wherever its tokenizer decided, so "**"
+// routinely arrives as two tokens and a link's "](" as three; a rewriter fed
+// those fragments cannot see the constructs it is supposed to act on. By the
+// time the chunker emits, the span is a clause.
+//
+//   1. NormalizeForSpeech  (speech_text.hpp)     Markdown out, stress marks the
+//                                                MODEL emitted normalised away,
+//                                                unspeakable symbols dropped.
+//   2. ExpandForSpeech     (text_normalizer.hpp) digits and symbols become
+//                                                words. Must follow 1, so it
+//                                                never sees "**2026**".
+//   3. IAccentor           (stress_marker.hpp)   stress marks go IN. Must follow
+//                                                2 -- it marks words, and "123"
+//                                                is not a word yet -- and must
+//                                                follow 1, or stage 1 would
+//                                                strip the marks it just added.
+//   4. F5Tokenizer                               characters become ids.
+//
+// Stage 3 is off unless an accentor is installed; stage 2 is on by default.
+// =============================================================================
 struct DuplexConfig {
     AecTap aec_tap = AecTap::Playback;
 
-    // How a chunk is cleaned up on its way to the tokenizer: Markdown removal,
-    // stress-mark convention, symbol filtering (speech_text.hpp).
-    //
-    // APPLIED PER CHUNK, NOT PER TOKEN, and that is the reason it lives here
-    // rather than at PushToken: an LLM stream splits wherever its tokenizer
-    // decided, so "**" routinely arrives as two tokens and a link's "](" as
-    // three. A normaliser fed those fragments cannot see the constructs it is
-    // supposed to remove. By the time the chunker emits, the span is a clause.
+    // Stage 1. See the block above and speech_text.hpp.
     SpeechTextOptions text;
 
-    // How long PumpOnce will spin trying to hand a finished chunk to a full
-    // speaker ring before giving up and reporting back-pressure. The producer
-    // runs far faster than realtime, so a full ring means "the sink is still
-    // playing", not "audio was lost" -- it should wait, not drop. 0 = wait
-    // indefinitely (still abandoning if cancel fires).
-    std::size_t write_spin_limit = 100000;
+    // Stage 2. Off leaves digit runs for the model to interpret, which for a
+    // Russian voice pack means they are read in the wrong language or skipped.
+    NormalizerOptions normalizer;
+    bool expand_numbers = true;
+
+    // How long PumpOnce will WAIT to hand a finished chunk to a full speaker
+    // ring before giving up and reporting back-pressure. The producer runs far
+    // faster than realtime, so a full ring means "the sink is still playing",
+    // not "audio was lost" -- it should wait, not drop. 0 = wait indefinitely
+    // (still abandoning if cancel fires).
+    //
+    // A TIME budget, not a spin count, because the wait is now a sleep: with a
+    // ring sized for one chunk of speech, the correct behaviour when it fills
+    // is to block for as long as playback takes and to consume NO cpu doing it.
+    std::size_t write_wait_ms = 30000;
+
+    // How long each wait between write attempts lasts. Two milliseconds is far
+    // below the smallest device period we run and far above the cost of a
+    // context switch, so the producer resumes within one buffer of space
+    // appearing without spinning a core against the audio callback's deadline.
+    std::size_t write_poll_ms = 2;
 };
 
 class TTSDuplexBridge {
@@ -190,6 +225,21 @@ public:
     // and threaded into the solver so a long generation aborts mid-flight.
     // May be null (uninterruptible).
     void SetCancelSignal(const std::atomic<bool>* cancel) noexcept;
+
+    // Installs stage 3 of the text frontend (see DuplexConfig). Owned by the
+    // caller and must outlive the bridge; null disables accentuation.
+    //
+    // REFUSED WHEN THE VOICE CANNOT READ A '+'. The bridge asks the tokenizer
+    // whether '+' is in the vocabulary, because an out-of-vocabulary character
+    // maps to id 0 -- which in F5 IS the space character (f5_tokenizer.hpp) --
+    // so marks aimed at a checkpoint that was not trained with them do not
+    // degrade to "unstressed": they insert a PAUSE INSIDE EVERY MARKED WORD.
+    // Returns false and leaves accentuation off in that case, which is the
+    // difference between flat speech and a stutter.
+    //
+    // Call before the worker thread starts; not synchronised against PumpOnce.
+    bool SetAccentor(const IAccentor* accentor);
+    bool accentuating() const noexcept { return accentor_ != nullptr; }
 
     // ---- text side (LLM stream thread) --------------------------------------
     void PushToken(std::string_view token);
@@ -281,6 +331,11 @@ private:
 
     mutable std::mutex       text_mu_;     // guards chunker_ only
     TextChunker              chunker_;
+
+    // Stage 3 of the text frontend. External and non-owning, like cancel_:
+    // the accentor may be a 100k-word dictionary or an ONNX tagger, and neither
+    // belongs to a class whose other members are rings and counters.
+    const IAccentor*         accentor_ = nullptr;
 
     // Reused across chunks so the steady state allocates only when a chunk grows
     // past the high-water mark.
