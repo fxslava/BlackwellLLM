@@ -148,7 +148,19 @@ ConversationRouter::ConversationRouter(const Config& cfg, AppContext& ctx, Assis
               // this is the edge a mute that lands MID-answer has to stop, and it
               // must not depend on the reader agreeing that the bridge drops
               // post-cancel pushes.
-              if (ctx_.tts != nullptr && !ctx_.tts_muted.load(std::memory_order_acquire)) {
+              // THE DISPATCH BOUNDARY, and the one place a zero-length payload
+              // must die. A bypassed or failed local pass emits nothing, and an
+              // empty (or all-whitespace) fragment pushed from here reaches the
+              // synthesiser as a turn with no text: F5 conditions on the
+              // reference pair and INFILLS, so asked to speak nothing it invents
+              // something -- which is how a silent turn becomes a burst of
+              // reference-voice babble rather than silence.
+              //
+              // Whitespace counts as empty: a lone "\n" survives the chunker,
+              // tokenizes to nothing, and costs a full solver run to say it.
+              const bool has_text = s.find_first_not_of(" \t\r\n") != std::string_view::npos;
+              if (has_text && ctx_.tts != nullptr &&
+                  !ctx_.tts_muted.load(std::memory_order_acquire)) {
                   ctx_.tts->PushToken(s);
               }
               {
@@ -569,18 +581,34 @@ void ConversationRouter::switch_to_session(const std::string& id, bool restore_f
         const std::lock_guard<std::mutex> lk(prompt_mu_);
         prompt = system_prompt_;
     }
-    // Captured BY VALUE, not by reference: this task outlives the call that queued
-    // it.
-    const bool queued = control_->post_engine_task([this, prompt] {
-        try {
-            (void)rebuild_system_prompt_(prompt);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[session] local context reset failed: %s\n", e.what());
+    // ---- THE BYPASS -----------------------------------------------------------
+    // No local model resident means there is no local KV to rewind, so the whole
+    // step is skipped rather than queued. Not merely an optimisation: with the
+    // engine hibernated (or never constructed) the prefill this queues reaches an
+    // arena that is not mapped, which faults on the ENGINE thread inside the pump
+    // loop -- and the pump loop has no handler for it.
+    //
+    // Nothing is lost by skipping. The rewind exists so the on-device model does
+    // not answer a newly-opened conversation with the closed one's context, and a
+    // model with no weights has no context to carry. When local mode is switched
+    // back on the load path lays a fresh prefix down anyway, which is the same
+    // rewind arrived at by a different route.
+    if (!local_context_available()) {
+        std::printf("[session] local context reset skipped -- no local model resident\n");
+    } else {
+        // Captured BY VALUE, not by reference: this task outlives the call that
+        // queued it.
+        const bool queued = control_->post_engine_task([this, prompt] {
+            try {
+                (void)rebuild_system_prompt_(prompt);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[session] local context reset failed: %s\n", e.what());
+            }
+        });
+        if (!queued) {
+            std::fprintf(stderr, "[session] could not reach the engine thread -- the local "
+                                 "model keeps the previous conversation's context\n");
         }
-    });
-    if (!queued) {
-        std::fprintf(stderr, "[session] could not reach the engine thread -- the local model "
-                             "keeps the previous conversation's context\n");
     }
 
     view_.on_session_restored(id, turns);
@@ -697,6 +725,24 @@ void ConversationRouter::apply_system_prompt(const std::string& persona) {
     // weight set and belongs to the engine thread alone (CLAUDE.md). post_engine_task
     // runs it at the next command-batch boundary -- after any turn already decoding,
     // before any turn not yet started.
+    // THE BYPASS, same argument as switch_to_session's: a prefix rebuild is a
+    // prefill, and a prefill against weights that are not resident faults on the
+    // engine thread. The prompt IS still adopted -- the cloud string was swapped
+    // above and persisted -- so the remote leg immediately answers with the new
+    // persona; only the local KV work is skipped, and the load path lays the new
+    // prefix down when the weights come back.
+    //
+    // Reported to the page as a SUCCESS with zero tokens, not as a failure: the
+    // user's edit did take effect everywhere it currently means anything, and an
+    // error toast here would be telling them something is broken when nothing is.
+    if (!local_context_available()) {
+        std::printf("[system-prefix] rebuild skipped -- no local model resident; the prompt "
+                    "applies to the remote leg immediately\n");
+        std::fflush(stdout);
+        if (prompt_applied_) prompt_applied_(true, 0u, {});
+        return;
+    }
+
     const bool queued = control_->post_engine_task([this, prompt] {
         try {
             const std::uint32_t n = rebuild_system_prompt_(prompt);

@@ -84,6 +84,19 @@ public:
     };
     using ProgressFn = std::function<void(const Progress&)>;
 
+    // How the residency reaches the engine. A CALLABLE rather than a pointer
+    // because on a lazy launch there IS no engine yet -- the cold load builds
+    // one and attaches it to the (already borrowed, already stable) control, so
+    // any pointer captured here would be null forever.
+    using EngineFn = std::function<::BlackwellEngine*()>;
+
+    // Build the engine and attach it to the existing control. Runs ON THE ENGINE
+    // THREAD. Throws on failure (INIT tier: this is a checkpoint load).
+    //
+    // Unset means "this launch cannot cold-load" -- the simulated backend, or a
+    // launch that already loaded eagerly and only ever needs wakeup().
+    using ColdLoadFn = std::function<void()>;
+
     // `control` is BORROWED and must outlive this object; `engine` may be NULL,
     // which is the simulated backend and means there is no VRAM to release.
     //
@@ -94,8 +107,17 @@ public:
     // Rather than guessing, unload is refused there with a message naming the
     // thing to do instead. False on whisper_cascade, where whisper.cpp
     // transcribes independently and the backbone is purely the reply generator.
-    EngineResidency(blackwell::bridge::EngineControlBridge* control,
-                    ::BlackwellEngine* engine, bool weights_serve_asr) noexcept;
+    EngineResidency(blackwell::bridge::EngineControlBridge* control, EngineFn engine,
+                    bool weights_serve_asr) noexcept;
+
+    // Install the deferred-load path and start in UNLOADED. Called only by a
+    // lazy launch; without it the residency can wake a hibernated engine but
+    // cannot build one that was never made.
+    //
+    // `after_load` runs on the engine thread once the engine is attached and is
+    // where the system-prompt prefill goes -- the speech mode skipped it at
+    // startup because there was nothing to prefill into.
+    void enable_cold_load(ColdLoadFn load, std::function<void()> after_load);
 
     EngineResidency(const EngineResidency&) = delete;
     EngineResidency& operator=(const EngineResidency&) = delete;
@@ -129,10 +151,10 @@ public:
     [[nodiscard]] bool ready() const noexcept {
         return state() == ResidencyState::Ready;
     }
-    // Whether an unload is even possible on this launch. The UI uses it to
-    // explain the checkbox rather than to hide it.
+    // Whether the VRAM can be released (or withheld) on this launch at all. The
+    // UI uses it to explain the checkbox rather than to hide it.
     [[nodiscard]] bool can_release_vram() const noexcept {
-        return engine_ != nullptr && !weights_serve_asr_;
+        return !weights_serve_asr_ && (engine_fn_ && engine_fn_() != nullptr);
     }
     // Empty unless the last transition failed.
     [[nodiscard]] std::string failure() const;
@@ -143,7 +165,11 @@ private:
     void publish(ResidencyState s, int percent, std::string detail) noexcept;
 
     blackwell::bridge::EngineControlBridge* control_ = nullptr;   // borrowed
-    ::BlackwellEngine*             engine_ = nullptr;    // borrowed, may be null
+    // Re-read on every use rather than captured: a cold load changes the answer
+    // from null to a real engine, and a stored pointer would never see it.
+    EngineFn                                engine_fn_;
+    ColdLoadFn                              cold_load_;
+    std::function<void()>                   after_cold_load_;
     bool                                    weights_serve_asr_ = false;
 
     std::atomic<ResidencyState> state_{ResidencyState::Ready};

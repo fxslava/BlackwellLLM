@@ -104,6 +104,34 @@ public:
     explicit EngineControlBridge(BlackwellEngine* engine, const Config& cfg = {});
     ~EngineControlBridge() override;
 
+    // Bind an engine to a bridge that was constructed without one — the
+    // DEFERRED-LOAD seam.
+    //
+    // WHY THIS EXISTS AND WHAT IT IS NOT. It is not a way to swap engines under
+    // a running system: it exists so a host can construct the control (and let
+    // everything downstream borrow a STABLE pointer to it) before deciding
+    // whether to spend several seconds and several gigabytes building the engine
+    // behind it. voice_assistant boots remote-only that way -- no weights, no KV
+    // pool, no arena -- and attaches an engine if and when the user turns local
+    // inference on. Without this the same feature means destroying the control
+    // and re-pointing every borrower of it, which is a lifetime problem rather
+    // than a lifecycle one.
+    //
+    // CONTRACT. Engine thread only, engine idle, and the bridge must currently
+    // hold no engine (re-binding over a live one is refused, not tolerated: the
+    // KV state of the outgoing engine has no meaning to the incoming one).
+    // Returns false when either precondition fails.
+    //
+    // `engine` remains NON-OWNING: the caller keeps it alive for the bridge's
+    // lifetime, exactly as the constructor's parameter is.
+    bool attach_engine(BlackwellEngine* engine) noexcept;
+
+    // Whether a decode can run at all. False on a bridge that was built without
+    // an engine and has not been attached one; the do_* paths already answer
+    // InvalidConfig in that state, and this is how a caller asks BEFORE queuing
+    // work that would come back as a status nobody reads.
+    [[nodiscard]] bool has_engine() const noexcept { return engine_ != nullptr; }
+
     EngineControlBridge(const EngineControlBridge&) = delete;
     EngineControlBridge& operator=(const EngineControlBridge&) = delete;
     EngineControlBridge(EngineControlBridge&&) = delete;

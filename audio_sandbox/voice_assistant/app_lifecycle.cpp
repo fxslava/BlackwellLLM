@@ -60,6 +60,13 @@ AppLifecycleManager::AppLifecycleManager(const Config& cfg, whisper::WhisperDSP&
     // this BINARY, not of the machine or the checkpoint, so it is knowable before
     // any work is done -- and answering it after a 5.3 GB weight load would make
     // an instantly-decidable configuration error cost thirty seconds.
+    // Captured for the DEFERRED load: the Config that carries them is gone by the
+    // time the user flips the toggle, and `dsp` is borrowed on exactly the terms
+    // the constructor borrows it (it outlives this object).
+    load_args_ = cfg.args;
+    dsp_ = &dsp;
+    cascade_ = cfg.cascade;
+
     refuse_unsupported_mode(cfg);
     bring_up_engine(cfg, dsp);
     bring_up_vad(cfg);
@@ -75,8 +82,33 @@ AppLifecycleManager::AppLifecycleManager(const Config& cfg, whisper::WhisperDSP&
     // weights_serve_asr is `!cascade`: on the legacy pipeline the backbone IS
     // the speech recogniser, so its weights cannot be released without making
     // the app deaf. See the capability gate in engine_residency.hpp.
-    residency_ = std::make_unique<EngineResidency>(control_, real_stack_.engine.get(),
-                                                   /*weights_serve_asr=*/!cfg.cascade);
+    // A CALLABLE, not real_stack_.engine.get(): on a lazy launch the engine is
+    // null now and becomes real later, and a pointer captured here would never
+    // see it. Reading through the stack keeps one source of truth.
+    residency_ = std::make_unique<EngineResidency>(
+        control_, [this] { return real_stack_.engine.get(); },
+        /*weights_serve_asr=*/!cfg.cascade);
+
+    if (lazy_) {
+        // The deferred half of bring_up_engine, as a closure the residency runs
+        // ON THE ENGINE THREAD when the user turns local inference on. It fills
+        // in the SAME stack whose control everything is already borrowing, so
+        // nothing downstream is re-pointed and nothing is rebuilt.
+        residency_->enable_cold_load(
+            [this] {
+                load_engine_into(real_stack_, load_args_, *dsp_, granted_context_, device_id_,
+                                 /*arm_streaming_plan=*/true,
+                                 /*isolated_sessions=*/!cascade_,
+                                 /*load_audio_head=*/!cascade_);
+            },
+            // The prefill the speech mode skipped at startup. It has to happen
+            // AFTER the engine is attached and BEFORE the first intent is
+            // answered, which is exactly this seam -- the residency does not
+            // publish Ready until it returns.
+            [this] {
+                if (active_ != nullptr) active_->start_on_engine_thread();
+            });
+    }
 }
 
 AppLifecycleManager::~AppLifecycleManager() { shutdown(); }
@@ -148,6 +180,29 @@ void AppLifecycleManager::bring_up_engine(const Config& cfg, whisper::WhisperDSP
     // it. The persisted setting is deliberately left alone -- a budget is a
     // property of THIS machine on THIS launch, and writing it back would silently
     // lower the user's ceiling forever the first time they ran with a browser open.
+    // ---- THE LAZY BRANCH ----------------------------------------------------
+    // Booting on the cloud leg means no local model is going to answer anything,
+    // so nothing is read from disk and no VRAM is committed: the control is
+    // constructed DETACHED and the residency starts UNLOADED. Turning local
+    // inference on later runs load_engine_into() against this same control (see
+    // EngineResidency's cold-load path), which is why the control is created here
+    // rather than at load time -- its identity is what AppContext, the speech
+    // mode, the router and the transport all borrow.
+    //
+    // NOT ON THE LEGACY PIPELINE. There the backbone is also the speech
+    // recogniser, so deferring its weights produces an app that cannot hear
+    // rather than one that starts faster. Same capability gate the unload path
+    // applies, arrived at from the other direction.
+    lazy_ = !cfg.local_inference && cfg.cascade;
+    if (lazy_) {
+        real_stack_ = make_detached_real_control(cfg.args, granted_context_);
+        control_ = real_stack_.bridge();
+        std::printf("[engine] remote-only launch: no weights loaded, no KV pool allocated "
+                    "(turn on local inference in Settings to load them)\n");
+        std::fflush(stdout);
+        return;
+    }
+
     real_stack_ = bring_up_real_engine(cfg.args, dsp, granted_context_, cfg.settings.device_id,
                                        /*arm_streaming_plan=*/true,
                                        /*isolated_sessions=*/!cfg.cascade,
@@ -300,15 +355,32 @@ void AppLifecycleManager::bring_up_speech_mode(const Config& cfg, AppContext& ct
 void AppLifecycleManager::start_engine_thread() {
     const int  device_id = device_id_;
     const bool real = use_real_;
+    const bool lazy = lazy_;
     ISpeechMode* active = active_;
-    engine_thread_ = std::thread([this, device_id, real, active] {
+    engine_thread_ = std::thread([this, device_id, real, lazy, active] {
         try {
             // CUDA's current device is PER-THREAD. This thread launches every
             // kernel, so it must select the same device the weights were allocated
             // on -- doing it only in main() would silently run kernels on device 0
             // against device-N memory.
-            if (real) select_cuda_device(device_id);
-            active->start_on_engine_thread();   // system-prompt prefill (INIT tier: throws)
+            //
+            // SKIPPED on a lazy launch: nothing has been allocated yet, and
+            // creating a CUDA context here would commit the very VRAM the
+            // remote-only path exists to avoid. The cold load selects the device
+            // itself (load_engine_into calls select_cuda_device) and it runs on
+            // this same thread.
+            if (real && !lazy) select_cuda_device(device_id);
+            // THE STARTUP PREFILL, and the reason it is conditional. Freezing a
+            // system prefix is a forward pass; with no engine attached it would
+            // reach an arena that does not exist. On a lazy launch the residency
+            // runs this exact call after the cold load instead (see
+            // enable_cold_load's after_load).
+            if (!lazy) {
+                active->start_on_engine_thread();   // INIT tier: throws
+            } else {
+                std::printf("[system-prefix] deferred -- no local model loaded yet\n");
+                std::fflush(stdout);
+            }
             prefilled_.store(true, std::memory_order_release);
             while (running_.load(std::memory_order_acquire)) {
                 active->pump_engine();   // 0% CPU until a boundary event arrives

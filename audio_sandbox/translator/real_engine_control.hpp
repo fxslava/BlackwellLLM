@@ -121,6 +121,33 @@ public:
         }
     }
 
+    // Bind the engine and tokenizer to a control that was constructed WITHOUT
+    // them — the deferred-load seam (see EngineControlBridge::attach_engine).
+    //
+    // WHY IT IS NOT JUST attach_engine(). The constructor does more than store
+    // the pointer: it seeds the forced-language and live-streaming atomics from
+    // the engine's RESOLVED tier-3 plan. A control built with no engine holds
+    // the compile-time defaults for all three, so attaching without re-seeding
+    // would run the deferred-loaded engine with settings the launch never chose
+    // — silently, and only on the lazy path.
+    //
+    // ENGINE THREAD ONLY, engine idle. Returns false if a bind is refused.
+    bool adopt_engine(BlackwellEngine* engine, blackwell::ITokenizer* tok) noexcept {
+        if (engine == nullptr || tok == nullptr) return false;
+        if (!attach_engine(engine)) return false;
+        tok_ = tok;
+        const auto& plan = engine->get_impl()->m_runtime;
+        src_lang_.store(rt::language_index_or_auto(plan.source_language),
+                        std::memory_order_relaxed);
+        tgt_lang_.store(rt::language_index_or_auto(plan.target_language),
+                        std::memory_order_relaxed);
+        live_center_.store(plan.audio_streaming.enabled &&
+                           plan.audio_streaming.mode ==
+                               blackwell::AudioStreamingMode::CenterSlice,
+                           std::memory_order_relaxed);
+        return true;
+    }
+
     // ---- ISOLATED SESSIONS (the engine's NATIVE CoW branching) ---------------
     // Transcription and conversation are two different jobs with two different
     // system prompts, and running them on one linear sequence poisons both: the

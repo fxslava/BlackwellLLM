@@ -106,6 +106,16 @@ public:
         std::string whisper_model;
         // THE decision. False means SimulatedEngineControl: no GPU, no checkpoint.
         bool use_real = false;
+        // Which leg the app BOOTS on. False (remote/cloud) is what makes the
+        // launch LAZY: the control is constructed detached and no weights are
+        // read from disk until the user turns local inference on.
+        //
+        // It does NOT gate the legacy pipeline, and that exception is structural
+        // rather than a convenience: on ultravox_legacy the backbone is also the
+        // speech recogniser, so a launch with no weights is a launch that cannot
+        // hear. Deferring there would trade a few seconds of startup for an app
+        // that silently does not work. See bring_up_engine.
+        bool local_inference = false;
         // The capture rate, from the audio pipeline's DspConfig rather than from
         // settings: it is the rate the microphone is ACTUALLY delivering at, and
         // the speech modes segment against it. Passing the configured value
@@ -183,6 +193,17 @@ private:
     int  device_id_ = 0;
     bool use_real_ = false;
     int  granted_context_ = 0;
+    // True when the engine was NOT loaded at bring-up (remote-only launch). The
+    // control exists and is detached; the residency starts UNLOADED and its
+    // cold-load path is what fills the stack in.
+    bool lazy_ = false;
+    bool cascade_ = false;
+
+    // Everything the DEFERRED load needs, captured at construction because the
+    // Config that carried it is gone by the time the user flips the toggle.
+    // `dsp` is borrowed on the same terms the constructor borrows it.
+    TranslatorArgs      load_args_;
+    whisper::WhisperDSP* dsp_ = nullptr;
 
     // Exactly one of these is constructed; control_ is the only handle anything
     // outside this class uses.

@@ -19,15 +19,26 @@ const char* to_string(ResidencyState s) noexcept {
     return "ready";
 }
 
-EngineResidency::EngineResidency(blackwell::bridge::EngineControlBridge* control,
-                                 ::BlackwellEngine* engine,
+EngineResidency::EngineResidency(blackwell::bridge::EngineControlBridge* control, EngineFn engine,
                                  bool weights_serve_asr) noexcept
-    : control_(control), engine_(engine), weights_serve_asr_(weights_serve_asr) {
-    // READY, not Unloaded. The constructor runs AFTER bring-up, so by the time
-    // this object exists the weights are already on the card -- starting in
+    : control_(control), engine_fn_(std::move(engine)),
+      weights_serve_asr_(weights_serve_asr) {
+    // SEEDED FROM WHAT IS ACTUALLY THERE. On an eager launch the weights are
+    // already on the card by the time this object exists, and starting in
     // Unloaded would make the first ready() check refuse a perfectly resident
-    // engine and the UI show a load that never happened.
-    state_.store(ResidencyState::Ready, std::memory_order_release);
+    // engine. On a LAZY launch there is no engine at all, and starting in Ready
+    // would let a local intent through to a control with nothing behind it.
+    const bool resident = engine_fn_ && engine_fn_() != nullptr;
+    state_.store(resident ? ResidencyState::Ready : ResidencyState::Unloaded,
+                 std::memory_order_release);
+}
+
+void EngineResidency::enable_cold_load(ColdLoadFn load, std::function<void()> after_load) {
+    cold_load_ = std::move(load);
+    after_cold_load_ = std::move(after_load);
+    // Explicit, per the task's wording, and it is also already true: the seed
+    // above resolved to Unloaded because engine_fn_() returned null.
+    state_.store(ResidencyState::Unloaded, std::memory_order_release);
 }
 
 void EngineResidency::set_progress_sink(ProgressFn fn) {
@@ -66,10 +77,11 @@ bool EngineResidency::request_unload(std::string* why_refused) noexcept {
         if (why_refused != nullptr) *why_refused = why;
         return false;
     };
-    if (engine_ == nullptr) {
-        // Not a failure and not worth a banner: the simulated backend holds no
-        // VRAM, so "release it" is already true.
-        return refuse("the simulated backend holds no VRAM to release");
+    if (!engine_fn_ || engine_fn_() == nullptr) {
+        // Not a failure and not worth a banner: with no engine there is nothing
+        // holding VRAM, so "release it" is already true. Covers both the
+        // simulated backend and a lazy launch that has not loaded yet.
+        return true;
     }
     // THE CAPABILITY GATE. Phrased the way require_branching() phrases its
     // refusals (CLAUDE.md extension pattern #1): say what to do instead, because
@@ -96,7 +108,13 @@ bool EngineResidency::request_load(std::string* why_refused) noexcept {
         if (why_refused != nullptr) *why_refused = why;
         return false;
     };
-    if (engine_ == nullptr) return refuse("no local engine was loaded on this launch");
+    // NO ENGINE plus NO COLD LOADER is the simulated backend: there is nothing
+    // to load and never was. With a cold loader this is the lazy launch's first
+    // load, which is the whole point of the toggle.
+    const bool have_engine = engine_fn_ && engine_fn_() != nullptr;
+    if (!have_engine && !cold_load_) {
+        return refuse("this launch has no local checkpoint to load");
+    }
     if (state() == ResidencyState::Ready) return true;       // already there
     bool expected = false;
     if (!in_flight_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -138,19 +156,39 @@ void EngineResidency::run_transition(bool load) noexcept {
     }
     try {
         if (load) {
-            publish(ResidencyState::Loading, 35, "restoring weights over PCIe");
-            engine_->wakeup();
-            publish(ResidencyState::Ready, 100, "local model resident");
-            std::printf("[residency] weights resident -- local inference available\n");
+            // TWO WAYS TO BECOME RESIDENT, and which one applies is decided by
+            // whether an engine exists rather than by a flag:
+            //
+            //   COLD  no engine at all (a remote-only launch never built one).
+            //         Read the checkpoint, build the engine, attach it to the
+            //         control every borrower already holds, then lay the system
+            //         prefix down -- the startup prefill was skipped because
+            //         there was nothing to prefill into. Seconds, and it is disk
+            //         and PCIe bound.
+            //   WARM  the engine exists and is hibernated. One bulk H2D burst
+            //         from the pinned stash; no disk, no re-parse.
+            if (engine_fn_() == nullptr) {
+                publish(ResidencyState::Loading, 20, "loading the checkpoint");
+                cold_load_();
+                publish(ResidencyState::Loading, 85, "freezing the system prompt");
+                if (after_cold_load_) after_cold_load_();
+                publish(ResidencyState::Ready, 100, "local model loaded");
+                std::printf("[residency] cold load complete -- local inference available\n");
+            } else {
+                publish(ResidencyState::Loading, 35, "restoring weights over PCIe");
+                engine_fn_()->wakeup();
+                publish(ResidencyState::Ready, 100, "local model resident");
+                std::printf("[residency] weights resident -- local inference available\n");
+            }
         } else {
             publish(ResidencyState::Loading, 35, "spilling KV cache");
             // STAGE 1 FIRST, and the order matters: the KV pool is freed by
             // demoting pages down the tier waterfall, which is engine work that
             // needs the weights' arena registry intact. Hibernating first would
             // leave the pages stranded in VRAM behind a hibernated engine.
-            const int spilled = engine_->spill_kv_cache();
+            const int spilled = engine_fn_()->spill_kv_cache();
             publish(ResidencyState::Loading, 80, "releasing weight arena");
-            engine_->hibernate();
+            engine_fn_()->hibernate();
             publish(ResidencyState::Unloaded, 0, "VRAM released");
             std::printf("[residency] VRAM released (%d KV pages spilled) -- remote only\n",
                         spilled);

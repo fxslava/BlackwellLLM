@@ -379,6 +379,9 @@ int main(int argc, char** argv) {
         lcfg.cascade = cascade;
         lcfg.whisper_model = whisper_model;
         lcfg.use_real = use_real;
+        // Which leg the app boots on. False makes the launch LAZY on the cascade
+        // pipeline: the control comes up detached and no weights are read.
+        lcfg.local_inference = settings.local_inference;
         lcfg.sample_rate = audio.sample_rate();
         splash.set_status(use_real ? L"loading the model onto the GPU..."
                                    : L"starting the simulated backend...");
@@ -437,6 +440,13 @@ int main(int argc, char** argv) {
             return false;
         });
 
+        // THE LOCAL-CONTEXT GATE. Session switches and persona edits maintain the
+        // LOCAL leg's KV as a side effect; with no weights resident that work is
+        // pure waste, and against a hibernated or never-built engine it faults on
+        // the engine thread. One predicate, consulted at both sites.
+        router.set_local_context_gate(
+            [&lifecycle] { return lifecycle.residency().ready(); });
+
         router.load_persisted_history(settings.local_inference);
         lifecycle.control()->set_commit_queue(&router.commit_queue());
         router.start();
@@ -476,31 +486,23 @@ int main(int argc, char** argv) {
         // for the whole session. The guard remains as the throw path's answer.
         splash.dismiss();
 
-        // A second validation pass against the LIVE stack, which is the first
-        // moment the VRAM term is answerable: the device is selected, the
-        // checkpoint is resident and the topology is known. The startup pass
-        // above could only check the shapes.
+        // THE GRANTED CONTEXT, taken from the lifecycle rather than re-planned.
         //
-        // ONLY THE VRAM FINDINGS ARE PRINTED. Everything else this pass produces
-        // is byte-for-byte what the startup pass already said -- the shapes have
-        // not changed -- and reporting the whole set twice trains the reader to
-        // skip the block. max_context is the one field whose verdict genuinely
-        // differs between the two passes, so it is the one that speaks here.
-        {
-            rt::AssistantSettings probe = settings;
-            rt::ValidationReport report =
-                rt::validate_settings(probe, ui.validation_context());
-            report.items.erase(
-                std::remove_if(report.items.begin(), report.items.end(),
-                               [](const rt::Diagnostic& d) { return d.field != "max_context"; }),
-                report.items.end());
-            report.print("vram");
-            // The clamp is ADOPTED, not merely reported: it is the same value the
-            // engine was actually brought up with (AppLifecycleManager applied its
-            // own budget), so leaving the setting above it would show the user a
-            // context length nothing is running on.
-            settings.max_context = probe.max_context;
-        }
+        // There used to be a second validate_settings() pass here, on the theory
+        // that the VRAM term is only answerable once the device is selected. It
+        // was wrong, and wrong in the direction that cries wolf: by this point
+        // the GGML model, the F5 graphs and the ORT arena are already resident,
+        // so cudaMemGetInfo's `free` has ALREADY had them deducted -- and
+        // plan_vram_budget then subtracts them a second time. On a 12 GB card
+        // running the cascade that double-count reported "does not fit at even
+        // the minimum context" for a configuration that was running fine.
+        //
+        // The authoritative budget runs at the only moment it can be right:
+        // inside bring_up_engine, after cudaSetDevice and BEFORE anything is
+        // allocated. Its verdict is granted_context(), so that is what is
+        // adopted -- and on a lazy launch it is the ceiling the deferred load
+        // will use.
+        settings.max_context = lifecycle.granted_context();
 
         // ---- the optional full-stack diagnostic ------------------------------
         std::thread test_thread;

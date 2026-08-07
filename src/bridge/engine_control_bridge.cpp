@@ -56,6 +56,39 @@ EngineControlBridge::EngineControlBridge(BlackwellEngine* engine, const Config& 
     slots_ = std::make_unique<Command[]>(capacity_);
 }
 
+bool EngineControlBridge::attach_engine(BlackwellEngine* engine) noexcept {
+    if (engine == nullptr) return false;
+    // REFUSED rather than tolerated. Re-binding over a live engine would leave
+    // the bridge's sequence/position bookkeeping describing the KV of an engine
+    // that is no longer there -- a silent corruption rather than a failure.
+    if (engine_ != nullptr) return false;
+#ifndef NDEBUG
+    // A NON-CLAIMING thread check, and deliberately not verify_engine_thread().
+    //
+    // This call has two legitimate sites, on two different threads. The EAGER
+    // path runs it during bring-up, on the startup thread, before the engine
+    // thread exists at all; the DEFERRED path runs it inside a post_engine_task,
+    // on the engine thread. verify_engine_thread() would ADOPT whichever thread
+    // called first as the permanent owner -- so on the eager path it would hand
+    // ownership to main and then abort the real engine thread on its first
+    // pump(). That is a regression the eager path cannot afford, and it would
+    // only appear in Debug builds.
+    //
+    // So: if an owner has already been claimed we must BE it; if none has, we
+    // claim nothing and leave the first pump() to decide.
+    const std::thread::id owner = engine_thread_id_.load(std::memory_order_acquire);
+    if (owner != std::thread::id{} && owner != std::this_thread::get_id()) {
+        std::cerr << "[blackwell_bridge] FATAL: attach_engine entered from thread "
+                  << std::this_thread::get_id() << " but the control plane is owned by "
+                  << owner << ". Marshal it with post_engine_task.\n"
+                  << std::flush;
+        std::abort();
+    }
+#endif
+    engine_ = engine;
+    return true;
+}
+
 EngineControlBridge::~EngineControlBridge() {
     // Unblock any thread parked in wait_and_pump() before the ring is destroyed.
     stop();

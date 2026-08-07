@@ -165,11 +165,34 @@ public:
     // caller reaching in here to send is bypassing the commit rule.
     LocalEngineTransport& local_transport() noexcept { return local_transport_; }
 
+    // ---- THE LOCAL-CONTEXT GATE ---------------------------------------------
+    // Answers "may I touch the local KV right now?". FALSE means the weights are
+    // not resident -- remote-only mode, a load still in flight, or a launch that
+    // never built an engine at all.
+    //
+    // WHY THIS EXISTS. Two routines here maintain the LOCAL leg's context as a
+    // side effect of a conversation change: switch_to_session rewinds the KV so
+    // the on-device model does not answer a newly-opened chat with the previous
+    // one's context, and apply_system_prompt re-freezes the prefix. Both are
+    // correct and both are pure waste when there is no local model -- and worse
+    // than waste when the engine is hibernated or was never constructed, because
+    // the prefill they queue reaches an arena that is not mapped.
+    //
+    // A PREDICATE, not an EngineResidency&, for the same reason the transport's
+    // readiness check is one: this class is driven by the GPU-free backend too,
+    // and an unset gate means "always available" -- the pre-residency behaviour.
+    using LocalContextGateFn = std::function<bool()>;
+    void set_local_context_gate(LocalContextGateFn fn) { local_context_gate_ = std::move(fn); }
+
     // The gate counters, for the diagnostics poller and the shutdown summary.
     blackwell::bridge::IntentCommitQueue& commit_queue() noexcept { return commit_queue_; }
     void print_shutdown_summary() const;
 
 private:
+    // True when local KV maintenance is legal. Unset gate == always legal.
+    [[nodiscard]] bool local_context_available() const {
+        return !local_context_gate_ || local_context_gate_();
+    }
     void wire_dispatcher_callbacks();
     // Everything a conversation change has to touch, in the order it has to
     // happen. See the .cpp -- step 4 (rewinding the LOCAL KV) is the one with no
@@ -183,6 +206,8 @@ private:
     AssistantView&                          view_;
     blackwell::bridge::EngineControlBridge* control_;
     RebuildSystemPromptFn                   rebuild_system_prompt_;
+    // Consulted before every local KV touch. See set_local_context_gate.
+    LocalContextGateFn                      local_context_gate_;
     PromptAppliedFn                         prompt_applied_;
 
     // Capacity 4: an intent is one finished utterance. A deep backlog of stale

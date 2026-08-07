@@ -138,13 +138,43 @@ inline void report_vram(const char* stage) {
 // Cascade mode is precisely what makes a backbone of another width usable here
 // (Qwen2.5-7B is 3584), and running the check anyway would reject it for a
 // mismatch that has no consumer.
-inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper::WhisperDSP& dsp,
-                                            int max_context, int device_id,
-                                            bool arm_streaming_plan,
-                                            bool isolated_sessions = false,
-                                            bool load_audio_head = true) {
+// ---------------------------------------------------------------------------
+// THE DETACHED CONTROL — a RealEngineControl with no engine behind it.
+//
+// This is the whole of what a remote-only launch constructs: no tokenizer, no
+// safetensors read, no KV pool, no arena, no CUDA context. What it buys is a
+// STABLE control pointer for everything downstream to borrow (AppContext, the
+// speech mode, the router, the transport) so that loading an engine LATER is an
+// attach rather than a teardown and a re-pointing of five borrowers.
+//
+// The stack it returns has `control` set and `engine`/`tokenizer` null, which is
+// exactly the state load_engine_into() fills in.
+// ---------------------------------------------------------------------------
+inline RealEngineStack make_detached_real_control(const TranslatorArgs& args, int max_context) {
     RealEngineStack st;
+    st.control = std::make_unique<RealEngineControl>(/*engine=*/nullptr, /*tok=*/nullptr,
+                                                     max_context);
+    st.control->set_context_mode(args.context_mode == "bounded"
+                                     ? RealEngineControl::ContextMode::BoundedHistory
+                                     : RealEngineControl::ContextMode::Stateless);
+    st.control->set_history_budget_tokens(args.history_budget_tokens);
+    return st;
+}
 
+// Fill in a stack that already has a control: read the checkpoint, build the
+// engine, ADOPT it into the existing control, then run the post-engine
+// configuration (isolation, audio head). This is the expensive half, and it is
+// the half a lazy launch defers.
+//
+// MUST run on the ENGINE THREAD when the control is already live (adopt_engine
+// verifies it); at startup it runs on main's thread before the engine thread is
+// spawned, which is the same thread by adoption.
+//
+// INIT tier: throws on a bad checkpoint.
+inline void load_engine_into(RealEngineStack& st, const TranslatorArgs& args,
+                             whisper::WhisperDSP& dsp, int max_context, int device_id,
+                             bool arm_streaming_plan, bool isolated_sessions,
+                             bool load_audio_head) {
     select_cuda_device(device_id);
     {
         cudaDeviceProp prop{};
@@ -222,12 +252,17 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
     // 4096 tokens over 2 branches is ~1.05 GB; halving max_context halves it.
     report_vram("backbone + KV");
 
-    st.control = std::make_unique<RealEngineControl>(st.engine.get(), st.tokenizer.get(),
-                                                     max_context);
-    st.control->set_context_mode(args.context_mode == "bounded"
-                                     ? RealEngineControl::ContextMode::BoundedHistory
-                                     : RealEngineControl::ContextMode::Stateless);
-    st.control->set_history_budget_tokens(args.history_budget_tokens);
+    // ADOPTED, not constructed. The control already exists -- either from
+    // make_detached_real_control() on the lazy path, or from the line in
+    // bring_up_real_engine() that creates one before calling this -- and its
+    // identity is what every downstream borrower holds. adopt_engine() re-seeds
+    // the language and streaming atomics off the resolved plan, which the
+    // constructor would otherwise have done.
+    if (!st.control->adopt_engine(st.engine.get(), st.tokenizer.get())) {
+        throw std::runtime_error(
+            "could not bind the loaded engine to the control (already bound, or called off "
+            "the engine thread)");
+    }
 
     // Fork the ephemeral transcription sequence off the (still empty) root, so
     // the two prompts never share a KV prefix. Capability-gated inside; reports
@@ -248,7 +283,7 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
     // degradation, so it must not print the text-only warning below.
     if (!load_audio_head) {
         report_vram("cascade (no audio head)");
-        return st;
+        return;
     }
     std::printf("[audio] loading audio head from %s ...\n", args.audio_head.c_str());
     std::fflush(stdout);
@@ -268,6 +303,21 @@ inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper:
         std::fprintf(stderr, "[audio] WARN: audio head not loaded (%s) -- text-only mode\n",
                      e.what());
     }
+}
+
+// The eager path, unchanged for every existing caller: build the control and
+// load the engine into it, in one call. Composed from the two halves above so
+// there is exactly ONE definition of what a loaded stack looks like -- a lazy
+// launch that later loads must arrive at the same configuration as an eager one,
+// and two copies of this sequence is how the two would drift.
+inline RealEngineStack bring_up_real_engine(const TranslatorArgs& args, whisper::WhisperDSP& dsp,
+                                            int max_context, int device_id,
+                                            bool arm_streaming_plan,
+                                            bool isolated_sessions = false,
+                                            bool load_audio_head = true) {
+    RealEngineStack st = make_detached_real_control(args, max_context);
+    load_engine_into(st, args, dsp, max_context, device_id, arm_streaming_plan,
+                     isolated_sessions, load_audio_head);
     return st;
 }
 
