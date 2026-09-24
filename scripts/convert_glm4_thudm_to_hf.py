@@ -245,8 +245,15 @@ def main() -> int:
         json.dump(build_config(src_cfg), f, indent=2)
 
     # Tokenizer assets travel along so the converted tree is self-contained.
+    # tokenization_chatglm.py is included deliberately: GLM-4 ships a CUSTOM
+    # tokenizer class (ChatGLM4Tokenizer, tiktoken-backed) and without its module
+    # AutoTokenizer cannot load the copied tokenizer.model at all -- which also
+    # means the engine's own TokenizerFactory cannot serve this checkpoint, since
+    # it requires a byte-level-BPE tokenizer.json. See the tokenizer status report
+    # in docs/GLM4_TURBOQUANT_INTEGRATION.md §1.6.
     for asset in ("tokenizer.model", "tokenizer_config.json", "tokenizer.json",
-                  "generation_config.json", "special_tokens_map.json"):
+                  "tokenization_chatglm.py", "generation_config.json",
+                  "special_tokens_map.json"):
         if (src / asset).exists():
             shutil.copy2(src / asset, dst / asset)
 

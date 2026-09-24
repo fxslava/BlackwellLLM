@@ -197,6 +197,37 @@ python -c "import json,sys; ix=json.load(open(sys.argv[1]))['weight_map']; print
 
 ---
 
+### 1.6 Tokenizer and chat-template status
+
+**The engine cannot tokenize this checkpoint, and the gap is structural.** Verified
+2026-09-24 and pinned by `Glm4ChatRegression.TokenizerFactoryRejectsGlm4Checkpoint`.
+
+| Concern | What the engine supports natively | What GLM-4-9B-Chat-1M ships | Verdict |
+|---|---|---|---|
+| Vocabulary file | `tokenizer.json` — HF byte-level-BPE dump (`model.vocab` + `model.merges`); the factory **throws** when absent | `tokenizer.model` — 151 329 lines of `base64(token) rank`, a **tiktoken rank file**; no `tokenizer.json` at all | **bridged** |
+| Tokenizer class | `ByteLevelBpeTokenizer`, driven entirely from JSON sidecars | `ChatGLM4Tokenizer` in `tokenization_chatglm.py` (remote code), wrapping `tiktoken.Encoding` | **bridged** |
+| Pre-tokenizer regex | parsed out of `tokenizer.json`'s `Split` node (`parse_max_digit_run`) | a `pat_str` literal in the Python class; `\p{N}{1,3}`, i.e. the same tiktoken family, digit-run 3 | compatible *in principle* |
+| Chat template | two families only — ChatML (`<\|im_start\|>`) and Llama-3 (`<\|start_header_id\|>`); anything else **throws** | a third family: `[gMASK]<sop>` then `<\|{role}\|>{metadata}\n{content}` per message, `<\|assistant\|>` as the generation prompt (**no** trailing newline — the model emits token 198 itself) | **bridged** |
+| Special tokens | resolved from `added_tokens` / `tokenizer_config.json` by name | 151329 `<\|endoftext\|>`, 151331 `[gMASK]`, 151333 `<sop>`, 151335 `<\|system\|>`, 151336 `<\|user\|>`, 151337 `<\|assistant\|>`, 151338 `<\|observation\|>` | resolvable, but only *after* a vocab loads |
+| Stop set | `generation_config.json` → `config.json` → tokenizer EOS | `eos_token_id = [151329, 151336, 151338]` | **natively supported** — this part needs no work |
+
+So the engine's id→behaviour plumbing (stop sets, position handling, sampling) is
+already correct for GLM-4; what is missing is purely the text↔id boundary.
+
+**The bridge** (`scripts/glm4_chat_regression.py`): Python owns tokenization and
+detokenization, and the engine is handed nothing but token ids. The ids crossing that
+boundary are the same ids a native tokenizer would produce — the script's
+`verify_against_template` asserts its hand-built turns equal
+`tokenizer.apply_chat_template(...)` before emitting any — so the generation being
+measured is entirely the engine's.
+
+**What native support would take**, if the tray app ever needs to run GLM-4 without
+Python: (1) a tiktoken loader — decode base64 ranks into the existing `BpeModelData`
+(`vocab` + implied merges by rank) and hardcode nothing else, since the pre-tokenizer
+regex is the same family the factory already parses; (2) a `GlmTemplate` class beside
+`ChatMLTemplate` / `Llama3Template`, ~20 lines. Neither is on the TurboQuant critical
+path, which is why this is a documented bridge rather than a port.
+
 ## 2. TurboQuant digital-twin audit and translation map
 
 ### 2.1 What `qjl-lab` actually is
