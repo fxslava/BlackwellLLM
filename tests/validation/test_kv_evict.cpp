@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/cuda_test_utils.h"
+#include "kernels/full_attention.cuh"   // partial RoPE (both pairings) + kv_append
 #include "kernels/kv_evict.cuh"
 #include "kernels/rope.cuh"
 
@@ -39,7 +40,13 @@ struct Geom {
     size_t kv_heads = 2;
     size_t head_dim = 64;
     size_t max_seq  = 512;
+    // Rotary span and pairing. 0 == full rotary (follows head_dim), which keeps
+    // every pre-existing case on the fused full-head half-split append path.
+    size_t rotary_dim  = 0;
+    bool   interleaved = false;   // true: GLM-4 adjacent-pair partial RoPE
 
+    size_t rot() const { return rotary_dim ? rotary_dim : head_dim; }
+    bool   partial() const { return rot() != head_dim || interleaved; }
     size_t row_elems() const { return kv_heads * head_dim; }
     size_t cache_elems() const { return kv_heads * max_seq * head_dim; }
 };
@@ -85,8 +92,26 @@ Cache build_cache(const Geom& g, const Rows& rows, const std::vector<int>& row_i
         d_Q.upload(q_scratch);
         d_K.upload(rows.k[static_cast<size_t>(row_ids[i])]);
         d_V.upload(rows.v[static_cast<size_t>(row_ids[i])]);
-        launch_fused_rope_kv_kernel(d_Q, d_K, d_V, d_K_cache, d_V_cache, positions[i],
-                                    g.q_heads, g.kv_heads, g.head_dim, g.max_seq, theta, scaling);
+        if (!g.partial()) {
+            launch_fused_rope_kv_kernel(d_Q, d_K, d_V, d_K_cache, d_V_cache, positions[i],
+                                        g.q_heads, g.kv_heads, g.head_dim, g.max_seq, theta, scaling);
+        } else if (g.interleaved) {
+            // The GLM-4 append path: adjacent-pair partial RoPE, then a plain
+            // append into the very same contiguous slot the fused kernel writes.
+            launch_rope_interleaved_partial_inplace(d_Q, d_K, positions[i], g.q_heads,
+                                                    g.kv_heads, g.head_dim, g.rot(),
+                                                    theta, scaling);
+            launch_kv_append(d_K, d_V, d_K_cache, d_V_cache, positions[i],
+                             static_cast<int>(g.kv_heads), static_cast<int>(g.head_dim),
+                             static_cast<int>(g.max_seq));
+        } else {
+            launch_rope_partial_inplace(d_K, positions[i], static_cast<int>(g.kv_heads),
+                                        static_cast<int>(g.head_dim),
+                                        static_cast<int>(g.rot()), theta, scaling);
+            launch_kv_append(d_K, d_V, d_K_cache, d_V_cache, positions[i],
+                             static_cast<int>(g.kv_heads), static_cast<int>(g.head_dim),
+                             static_cast<int>(g.max_seq));
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -108,7 +133,7 @@ Cache evict(const Geom& g, const Cache& in, int keep_from, int delta, int cache_
     d_V.upload(in.v);
 
     launch_kv_evict_head(d_K, d_V, keep_from, delta, cache_len, g.kv_heads, g.head_dim,
-                         g.max_seq, theta, scaling);
+                         g.rot(), g.interleaved, g.max_seq, theta, scaling);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -241,6 +266,38 @@ TEST_F(KvEvictValidation, TransparentAtProductionHeadGeometry) {
     g.max_seq = 256;
     expect_eviction_is_transparent(g, /*total=*/192, /*keep_from=*/16, /*delta=*/64,
                                    500000.0f, RopeScaling{}, 5e-4f, "8B geometry");
+}
+
+// PARTIAL ROTARY. A model that rotates only head_dim/2 channels (GLM-4) leaves
+// the upper half phase-free. A full-head evict would re-phase those channels
+// against a frequency they never carried, so they are the interesting ones here:
+// expect_eviction_is_transparent compares the WHOLE row, tail included.
+TEST_F(KvEvictValidation, TransparentAtPartialRotaryHalfSplit) {
+    Geom g{};
+    g.head_dim = 128;
+    g.rotary_dim = 64;       // partial_rotary_factor 0.5, half-split pairing
+    g.max_seq = 256;
+    expect_eviction_is_transparent(g, /*total=*/160, /*keep_from=*/8, /*delta=*/32,
+                                   500000.0f, RopeScaling{}, 5e-4f, "partial half-split");
+}
+
+// The GLM-4 configuration end to end: adjacent-pair rotation over 64 of 128
+// channels, appended by the interleaved kernel and evicted by the matching
+// pairing. Pins the claim that the composition argument is about the ANGLE, not
+// about which two channels happen to hold it.
+TEST_F(KvEvictValidation, TransparentAtGlm4PartialInterleaved) {
+    Geom g{};
+    g.q_heads = 8;
+    g.kv_heads = 2;          // GLM-4-9B GQA ratio 16 shrunk to keep the test quick
+    g.head_dim = 128;
+    g.rotary_dim = 64;
+    g.interleaved = true;
+    g.max_seq = 256;
+    expect_eviction_is_transparent(g, /*total=*/160, /*keep_from=*/4, /*delta=*/48,
+                                   10000.0f, RopeScaling{}, 5e-4f, "GLM-4 interleaved");
+    expect_eviction_is_transparent(g, /*total=*/128, /*keep_from=*/0, /*delta=*/4,
+                                   10000.0f, RopeScaling{}, 5e-4f,
+                                   "GLM-4 interleaved, overlapping shift");
 }
 
 // Evictions compose: a window that has already slid can slide again, which is

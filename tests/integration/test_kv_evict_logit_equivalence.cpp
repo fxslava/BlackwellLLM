@@ -203,7 +203,9 @@ protected:
             launch_kv_evict_head(static_cast<float*>(core()->kv_mgr->get_layer_k_ptr(l)),
                                  static_cast<float*>(core()->kv_mgr->get_layer_v_ptr(l)),
                                  prefix_, evicted_, cache_len, c.num_key_value_heads,
-                                 c.head_dim, core()->arena.get_max_seq_len(), c.rope_theta,
+                                 c.head_dim, c.rotary_dim,
+                                 c.rope_pairing == RopePairing::Interleaved,
+                                 core()->arena.get_max_seq_len(), c.rope_theta,
                                  rope_scaling_from(c));
         }
         CUDA_CHECK(cudaGetLastError());

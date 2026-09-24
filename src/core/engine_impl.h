@@ -107,6 +107,17 @@ struct BlackwellEngine::Impl {
     // Owned per-step compute scratch (allocated unconditionally in the ctor).
     blackwell::DeviceBuffer<float> d_Q, d_K, d_V, d_Attn_out;
     blackwell::DeviceBuffer<float> d_Gate, d_Up, d_Swiglu_out;
+    // GLM-4 fused MLP in-projection: ONE [num_tokens, 2*intermediate_dim] buffer
+    // holding [gate | up] per row, so the projection is a single GEMV/GEMM and the
+    // SwiGLU reads both halves in place (no split kernel, no copy). Allocated only
+    // when m_config.mlp_fused_gate_up; d_Gate / d_Up stay empty in that case,
+    // because nothing else ever writes them.
+    blackwell::DeviceBuffer<float> d_GateUp;
+    // GLM-4-0414 sandwich norms: a sub-layer output has to survive long enough to
+    // be normalized BEFORE it joins the residual, so o_proj / down_proj write here
+    // instead of accumulating straight into d_X_accum. Allocated only when
+    // m_config.has_sandwich_norms.
+    blackwell::DeviceBuffer<float> d_sublayer_out;
     blackwell::DeviceBuffer<float> d_logits;
     blackwell::DeviceBuffer<int> d_next_token;
 
@@ -216,6 +227,12 @@ struct BlackwellEngine::Impl {
                                                         int num_tokens, int seq_id);
     blackwell::EngineStatus step_full_attention_chunk(int layer_idx, int start_pos,
                                                       int num_tokens, int seq_id);
+
+    // GLM-4-0414 sandwich-norm epilogue: RMSNorm `num_tokens` rows of
+    // d_sublayer_out with the named weight and ADD the result into the residual
+    // stream d_X_accum. Called by step_attention_out / step_mlp_out (and their
+    // batched twins) in place of the projection's fused residual-accumulate.
+    void sandwich_norm_accum(const std::string& weight_name, size_t num_tokens);
 
     blackwell::EngineStatus step_mlp_norm(int layer_idx);
     blackwell::EngineStatus step_mlp_projections(int layer_idx);

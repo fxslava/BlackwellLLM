@@ -4,7 +4,10 @@
 // isolation, so the branching veto / head_dim cap / context bound stay pinned.
 // ============================================================================
 #include <gtest/gtest.h>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
+#include <string>
 
 #include "blackwell/config.h"
 #include "blackwell/runtime_config.h"
@@ -413,4 +416,177 @@ TEST(RuntimeConfig, CenterSliceGatedOffForHybrid) {
     EXPECT_FALSE(rt.audio_streaming.enabled);             // gated off
     EXPECT_EQ(rt.audio_streaming.mode, blackwell::AudioStreamingMode::CenterSlice);
     EXPECT_EQ(rt.audio_streaming.left_edge_tokens, 2);    // geometry still resolved
+}
+
+// ============================================================================
+// ConfigLoader: the GLM-4 parse branches (tier-1 facts, not the tier-3 plan).
+// These write a throwaway config.json and read it back through the real loader —
+// the mapping from checkpoint JSON to ModelConfig is exactly where a GLM-4 bring-up
+// goes silently wrong (a defaulted eps, an unrotated pairing, a missed alias).
+// ============================================================================
+namespace {
+
+// Writes `body` as a config.json in a uniquely named temp dir; returns its path.
+// The dir is left behind (a few hundred bytes in TEMP) rather than risking a
+// recursive remove in a test process.
+std::string write_temp_config(const char* tag, const std::string& body) {
+    static int counter = 0;
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("blackwell_cfg_" + std::string(tag) + "_" + std::to_string(++counter));
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "config.json";
+    std::ofstream out(path);
+    out << body;
+    out.close();
+    return path.string();
+}
+
+// GLM-4-9B-Chat as transformers >= 4.46 exports it (model_type "glm"): HF-native
+// tensor names, partial rotary at the document root, no sandwich norms.
+const char* kGlm4HfConfig = R"({
+  "model_type": "glm",
+  "architectures": ["GlmForCausalLM"],
+  "hidden_size": 4096,
+  "intermediate_size": 13696,
+  "num_hidden_layers": 40,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 2,
+  "head_dim": 128,
+  "vocab_size": 151552,
+  "rms_norm_eps": 1.5625e-07,
+  "rope_theta": 10000.0,
+  "partial_rotary_factor": 0.5,
+  "attention_bias": true,
+  "tie_word_embeddings": false,
+  "max_position_embeddings": 131072
+})";
+
+} // namespace
+
+TEST(ConfigLoaderGlm4, HfNativeGlmTopology) {
+    const auto path = write_temp_config("glm_hf", kGlm4HfConfig);
+    const ModelConfig c = ConfigLoader::load_from_json(path);
+
+    EXPECT_EQ(c.hidden_dim, 4096u);
+    EXPECT_EQ(c.intermediate_dim, 13696u);
+    EXPECT_EQ(c.num_layers, 40u);
+    EXPECT_EQ(c.num_attention_heads, 32u);
+    EXPECT_EQ(c.num_key_value_heads, 2u);
+    EXPECT_EQ(c.head_dim, 128u);
+    EXPECT_EQ(c.vocab_size, 151552u);
+    EXPECT_EQ(c.max_position_embeddings, 131072u);
+
+    // The three GLM-4 deltas.
+    EXPECT_EQ(c.rope_pairing, RopePairing::Interleaved);
+    EXPECT_EQ(c.rotary_dim, 64u);                  // head_dim * 0.5
+    EXPECT_TRUE(c.mlp_fused_gate_up);
+    EXPECT_FALSE(c.has_sandwich_norms);            // "glm", not "glm4"
+
+    // Parsed, not defaulted: 1.5625e-07 is ~6x below the loader's 1e-6 fallback.
+    EXPECT_FLOAT_EQ(c.rms_norm_eps, 1.5625e-07f);
+    EXPECT_TRUE(c.has_qkv_bias);
+    EXPECT_FALSE(c.tie_word_embeddings);
+    EXPECT_FALSE(c.norm_add_unit_offset);          // GLM uses plain-weight RMSNorm
+    EXPECT_FALSE(c.has_qk_norm);
+    EXPECT_EQ(c.weight_prefix, "model.");
+    EXPECT_EQ(c.rope_scaling_type, 0);             // plain theta stretch
+}
+
+// The 0414 family ("glm4") additionally normalizes each sub-layer output.
+TEST(ConfigLoaderGlm4, Glm4FamilyEnablesSandwichNorms) {
+    std::string body = kGlm4HfConfig;
+    body.replace(body.find("\"glm\""), 5, "\"glm4\"");
+    const auto path = write_temp_config("glm4_0414", body);
+    const ModelConfig c = ConfigLoader::load_from_json(path);
+
+    EXPECT_TRUE(c.has_sandwich_norms);
+    EXPECT_TRUE(c.mlp_fused_gate_up);
+    EXPECT_EQ(c.rope_pairing, RopePairing::Interleaved);
+}
+
+// THUDM parameter spellings resolve to the same topology as the HF ones. The
+// canonical key always wins when both are present (asserted by the HF case above,
+// which carries only canonical keys).
+TEST(ConfigLoaderGlm4, ThudmParameterAliases) {
+    const auto path = write_temp_config("glm_alias", R"({
+      "model_type": "glm",
+      "architectures": ["GlmForCausalLM"],
+      "hidden_size": 4096,
+      "ffn_hidden_size": 13696,
+      "num_layers": 40,
+      "num_attention_heads": 32,
+      "multi_query_group_num": 2,
+      "kv_channels": 128,
+      "padded_vocab_size": 151552,
+      "layernorm_epsilon": 1.5625e-07,
+      "rope_ratio": 500,
+      "partial_rotary_factor": 0.5,
+      "add_qkv_bias": true,
+      "seq_length": 131072
+    })");
+    const ModelConfig c = ConfigLoader::load_from_json(path);
+
+    EXPECT_EQ(c.intermediate_dim, 13696u);         // ffn_hidden_size
+    EXPECT_EQ(c.num_layers, 40u);                  // num_layers
+    EXPECT_EQ(c.num_key_value_heads, 2u);          // multi_query_group_num
+    EXPECT_EQ(c.head_dim, 128u);                   // kv_channels
+    EXPECT_EQ(c.vocab_size, 151552u);              // padded_vocab_size
+    EXPECT_EQ(c.max_position_embeddings, 131072u); // seq_length
+    EXPECT_FLOAT_EQ(c.rms_norm_eps, 1.5625e-07f);  // layernorm_epsilon
+    EXPECT_FLOAT_EQ(c.rope_theta, 5000000.0f);     // 10000 * rope_ratio
+    EXPECT_TRUE(c.has_qkv_bias);                   // add_qkv_bias
+    EXPECT_EQ(c.rotary_dim, 64u);
+}
+
+// A THUDM-native checkpoint must be refused with an actionable message, not
+// mis-loaded: its weights live in a different namespace entirely
+// (transformer.encoder.* with a fused query_key_value).
+TEST(ConfigLoaderGlm4, ThudmNativeCheckpointRejected) {
+    const auto path = write_temp_config("chatglm", R"({
+      "model_type": "chatglm",
+      "architectures": ["ChatGLMForConditionalGeneration"],
+      "hidden_size": 4096,
+      "ffn_hidden_size": 13696,
+      "num_layers": 40,
+      "num_attention_heads": 32,
+      "multi_query_group_num": 2,
+      "kv_channels": 128,
+      "padded_vocab_size": 151552,
+      "layernorm_epsilon": 1.5625e-07,
+      "add_qkv_bias": true,
+      "seq_length": 131072
+    })");
+    try {
+        ConfigLoader::load_from_json(path);
+        FAIL() << "expected a THUDM-native rejection";
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("transformer.encoder"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("gate_up_proj"), std::string::npos) << msg;
+    }
+}
+
+// Non-GLM checkpoints are untouched by every branch above: full rotary span,
+// half-split pairing, separate gate/up, no sandwich norms.
+TEST(ConfigLoaderGlm4, NonGlmCheckpointKeepsHalfSplitFullRotary) {
+    const auto path = write_temp_config("qwen2", R"({
+      "model_type": "qwen2",
+      "architectures": ["Qwen2ForCausalLM"],
+      "hidden_size": 3584,
+      "intermediate_size": 18944,
+      "num_hidden_layers": 28,
+      "num_attention_heads": 28,
+      "num_key_value_heads": 4,
+      "vocab_size": 152064,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 1000000.0,
+      "max_position_embeddings": 32768
+    })");
+    const ModelConfig c = ConfigLoader::load_from_json(path);
+
+    EXPECT_EQ(c.rope_pairing, RopePairing::HalfSplit);
+    EXPECT_EQ(c.rotary_dim, c.head_dim);           // 128, full rotary
+    EXPECT_FALSE(c.mlp_fused_gate_up);
+    EXPECT_FALSE(c.has_sandwich_norms);
+    EXPECT_TRUE(c.has_qkv_bias);                   // qwen2 hardcodes it
 }

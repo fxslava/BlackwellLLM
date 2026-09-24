@@ -129,9 +129,21 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
     d_V.allocate(tc * m_config.num_key_value_heads * m_config.head_dim);
     d_Attn_out.allocate(tc * m_config.hidden_dim);
 
-    d_Gate.allocate(tc * m_config.intermediate_dim);
-    d_Up.allocate(tc * m_config.intermediate_dim);
+    // GLM-4 ships gate and up as one tensor, so the activation buffer is one
+    // [tc, 2*I] block and the separate halves are never materialized. Exactly one
+    // of the two layouts is allocated -- see the members' declaration comments.
+    if (m_config.mlp_fused_gate_up) {
+        d_GateUp.allocate(tc * 2 * m_config.intermediate_dim);
+    } else {
+        d_Gate.allocate(tc * m_config.intermediate_dim);
+        d_Up.allocate(tc * m_config.intermediate_dim);
+    }
     d_Swiglu_out.allocate(tc * m_config.intermediate_dim);
+
+    // Sandwich norms need a landing buffer for the un-normalized sub-layer output
+    // (see the member declaration); one hidden-width row per active token.
+    if (m_config.has_sandwich_norms)
+        d_sublayer_out.allocate(tc * m_config.hidden_dim);
 
     // One logits row per active token: batched decode leaves [batch, vocab] here
     // and samples each row; every single-row path (run_token, run_chunk,
@@ -414,9 +426,34 @@ EngineStatus BlackwellEngine::Impl::step_attention_math(int layer_idx, int pos) 
     return EngineStatus::Success;
 }
 
+// GLM-4-0414 sandwich norm: d_X_accum += post_*_layernorm(d_sublayer_out).
+void BlackwellEngine::Impl::sandwich_norm_accum(const std::string& weight_name,
+                                                size_t num_tokens) {
+    const void* d_w = arena.get_weight_ptr(weight_name);
+    if (half_weights_are_fp16(m_config))
+        launch_rmsnorm_accum_fp16_kernel(d_sublayer_out, d_X_accum, d_w, num_tokens,
+                                         m_config.hidden_dim, m_config.rms_norm_eps,
+                                         m_config.norm_add_unit_offset);
+    else
+        launch_rmsnorm_accum_kernel(d_sublayer_out, d_X_accum, d_w, num_tokens,
+                                    m_config.hidden_dim, m_config.rms_norm_eps,
+                                    m_config.norm_add_unit_offset);
+}
+
 EngineStatus BlackwellEngine::Impl::step_attention_out(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".self_attn.o_proj";
+    const std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
+    const std::string base = prefix + "self_attn.o_proj";
+
+    if (m_config.has_sandwich_norms) {
+        // h = x + post_self_attn_layernorm(o_proj(context)): the norm sits BETWEEN
+        // the projection and the residual add, so the projection cannot fuse the
+        // accumulate -- it would add the un-normalized output.
+        dispatcher.forward(base, d_Attn_out, d_sublayer_out,
+                           m_config.hidden_dim, m_config.hidden_dim, nullptr);
+        sandwich_norm_accum(prefix + "post_self_attn_layernorm.weight", 1);
+        return EngineStatus::Success;
+    }
 
     dispatcher.forward(base, d_Attn_out, nullptr,
                        m_config.hidden_dim, m_config.hidden_dim, d_X_accum);
@@ -571,6 +608,13 @@ EngineStatus BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
     std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".mlp.";
 
+    if (m_config.mlp_fused_gate_up) {
+        // One projection for both halves: [2*I] rows, gate first (see ModelConfig).
+        dispatcher.forward(prefix + "gate_up_proj", d_X_norm, d_GateUp,
+                           2 * m_config.intermediate_dim, m_config.hidden_dim);
+        return EngineStatus::Success;
+    }
+
     dispatcher.forward(prefix + "gate_proj", d_X_norm, d_Gate,
                        m_config.intermediate_dim, m_config.hidden_dim);
     dispatcher.forward(prefix + "up_proj",   d_X_norm, d_Up,
@@ -580,9 +624,25 @@ EngineStatus BlackwellEngine::Impl::step_mlp_projections(int layer_idx) {
 
 EngineStatus BlackwellEngine::Impl::step_mlp_out(int layer_idx) {
     arena.ensure_layer_ready(layer_idx);
-    std::string base = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".mlp.down_proj";
+    const std::string prefix = m_config.weight_prefix + "layers." + std::to_string(layer_idx) + ".";
+    const std::string base = prefix + "mlp.down_proj";
 
-    launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, m_config.intermediate_dim);
+    if (m_config.mlp_fused_gate_up) {
+        // Single token: the gate and up halves ARE two adjacent contiguous runs of
+        // d_GateUp, so the plain elementwise SwiGLU reads them in place.
+        launch_fused_swiglu_kernel(d_GateUp, d_GateUp + m_config.intermediate_dim,
+                                   d_Swiglu_out, m_config.intermediate_dim);
+    } else {
+        launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out, m_config.intermediate_dim);
+    }
+
+    if (m_config.has_sandwich_norms) {
+        // h = h + post_mlp_layernorm(down_proj(swiglu)) -- same reason as o_proj.
+        dispatcher.forward(base, d_Swiglu_out, d_sublayer_out,
+                           m_config.hidden_dim, m_config.intermediate_dim, nullptr);
+        sandwich_norm_accum(prefix + "post_mlp_layernorm.weight", 1);
+        return EngineStatus::Success;
+    }
 
     dispatcher.forward(base, d_Swiglu_out, nullptr,
                        m_config.hidden_dim, m_config.intermediate_dim, d_X_accum);
@@ -919,7 +979,15 @@ EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_po
         kv_mgr->attention_prefill(i, start_pos, num_tokens, d_Q, d_K, d_V, d_Attn_out);
 
         // --- o_proj, accumulate into the residual stream (batched) ---
-        dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, H, H, d_X_accum, num_tokens);
+        // Sandwich norms (GLM-4-0414) break the fused accumulate for the same
+        // reason they do in step_attention_out: the norm sits in between.
+        if (m_config.has_sandwich_norms) {
+            dispatcher.forward(sa + "o_proj", d_Attn_out, d_sublayer_out, H, H, nullptr, num_tokens);
+            sandwich_norm_accum(lp + "post_self_attn_layernorm.weight",
+                                static_cast<size_t>(num_tokens));
+        } else {
+            dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, H, H, d_X_accum, num_tokens);
+        }
 
         // --- MLP (batched) ---
         {
@@ -929,14 +997,31 @@ EngineStatus BlackwellEngine::Impl::run_chunk(const int* token_ids, int start_po
             else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, num_tokens, H,
                                               m_config.rms_norm_eps, m_config.norm_add_unit_offset);
         }
-        dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
-                           nullptr, num_tokens);
-        dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
-                           nullptr, num_tokens);
-        launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
-                                   static_cast<size_t>(num_tokens) * m_config.intermediate_dim);
-        dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
-                           m_config.intermediate_dim, d_X_accum, num_tokens);
+        if (m_config.mlp_fused_gate_up) {
+            dispatcher.forward(lp + "mlp.gate_up_proj", d_X_norm, d_GateUp,
+                               2 * m_config.intermediate_dim, H, nullptr, num_tokens);
+            // A row of d_GateUp is [gate | up], so the halves are interleaved BY ROW
+            // once num_tokens > 1 -- the strided launcher, not a pointer pair.
+            launch_fused_swiglu_gate_up_kernel(d_GateUp, d_Swiglu_out,
+                                               static_cast<size_t>(num_tokens),
+                                               m_config.intermediate_dim);
+        } else {
+            dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
+                               nullptr, num_tokens);
+            dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
+                               nullptr, num_tokens);
+            launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
+                                       static_cast<size_t>(num_tokens) * m_config.intermediate_dim);
+        }
+        if (m_config.has_sandwich_norms) {
+            dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, d_sublayer_out, H,
+                               m_config.intermediate_dim, nullptr, num_tokens);
+            sandwich_norm_accum(lp + "post_mlp_layernorm.weight",
+                                static_cast<size_t>(num_tokens));
+        } else {
+            dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
+                               m_config.intermediate_dim, d_X_accum, num_tokens);
+        }
     }
 
     // 3. Final norm + lm_head for the LAST token only (its logits drive sampling).
@@ -1313,7 +1398,13 @@ EngineStatus BlackwellEngine::Impl::run_decode_batch(const int* token_ids, const
         kv_mgr->attention_decode_batch(i, batch_size, d_Q, d_K, d_V, d_Attn_out);
 
         // --- o_proj, accumulate into the residual stream (batched) ---
-        dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, H, H, d_X_accum, batch_size);
+        if (m_config.has_sandwich_norms) {
+            dispatcher.forward(sa + "o_proj", d_Attn_out, d_sublayer_out, H, H, nullptr, batch_size);
+            sandwich_norm_accum(lp + "post_self_attn_layernorm.weight",
+                                static_cast<size_t>(batch_size));
+        } else {
+            dispatcher.forward(sa + "o_proj", d_Attn_out, nullptr, H, H, d_X_accum, batch_size);
+        }
 
         // --- MLP (batched) ---
         {
@@ -1323,14 +1414,29 @@ EngineStatus BlackwellEngine::Impl::run_decode_batch(const int* token_ids, const
             else        launch_rmsnorm_kernel(d_X_accum, d_X_norm, w, batch_size, H,
                                               m_config.rms_norm_eps, m_config.norm_add_unit_offset);
         }
-        dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
-                           nullptr, batch_size);
-        dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
-                           nullptr, batch_size);
-        launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
-                                   static_cast<size_t>(batch_size) * m_config.intermediate_dim);
-        dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
-                           m_config.intermediate_dim, d_X_accum, batch_size);
+        if (m_config.mlp_fused_gate_up) {
+            dispatcher.forward(lp + "mlp.gate_up_proj", d_X_norm, d_GateUp,
+                               2 * m_config.intermediate_dim, H, nullptr, batch_size);
+            launch_fused_swiglu_gate_up_kernel(d_GateUp, d_Swiglu_out,
+                                               static_cast<size_t>(batch_size),
+                                               m_config.intermediate_dim);
+        } else {
+            dispatcher.forward(lp + "mlp.gate_proj", d_X_norm, d_Gate, m_config.intermediate_dim, H,
+                               nullptr, batch_size);
+            dispatcher.forward(lp + "mlp.up_proj",   d_X_norm, d_Up,   m_config.intermediate_dim, H,
+                               nullptr, batch_size);
+            launch_fused_swiglu_kernel(d_Gate, d_Up, d_Swiglu_out,
+                                       static_cast<size_t>(batch_size) * m_config.intermediate_dim);
+        }
+        if (m_config.has_sandwich_norms) {
+            dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, d_sublayer_out, H,
+                               m_config.intermediate_dim, nullptr, batch_size);
+            sandwich_norm_accum(lp + "post_mlp_layernorm.weight",
+                                static_cast<size_t>(batch_size));
+        } else {
+            dispatcher.forward(lp + "mlp.down_proj", d_Swiglu_out, nullptr, H,
+                               m_config.intermediate_dim, d_X_accum, batch_size);
+        }
     }
 
     // 3. Batched final norm over ALL rows -> d_X_norm [batch, H].

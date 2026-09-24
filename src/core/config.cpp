@@ -68,14 +68,55 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
 
     const std::string model_type = t.value("model_type", j.value("model_type", std::string("unknown")));
 
+    // ----- Checkpoint family ------------------------------------------------
+    // GLM-4 ships under three spellings: "glm" (GLM-4-9B-Chat-hf, HF-native
+    // tensor names), "glm4" (the 0414 series, HF-native + sandwich norms) and
+    // "chatglm" (THUDM trust_remote_code, transformer.encoder.* tensor names).
+    // Only the first two are servable here — see the rejection below.
+    std::string architectures;
+    if (j.contains("architectures") && j.at("architectures").is_array())
+        for (const auto& a : j.at("architectures"))
+            if (a.is_string()) architectures += a.get<std::string>() + ";";
+
+    const bool is_chatglm_native =
+        model_type == "chatglm" || architectures.find("ChatGLM") != std::string::npos;
+    const bool is_glm = model_type == "glm" || model_type == "glm4" || is_chatglm_native ||
+                        architectures.find("Glm") != std::string::npos;
+
+    // THUDM-native checkpoints lay their decoder out as transformer.encoder.layers.N.*
+    // with a FUSED query_key_value projection, an embedding under
+    // transformer.embedding.word_embeddings and the head under
+    // transformer.output_layer -- a different tensor namespace end to end, not a
+    // prefix swap. Refuse here, where the message can still be actionable, rather
+    // than failing later on a missing "model.layers.0.self_attn.q_proj.weight".
+    if (is_chatglm_native)
+        throw std::runtime_error(
+            "ConfigLoader: " + json_path + " is a THUDM-native GLM checkpoint "
+            "(model_type=\"chatglm\"), whose weights are named transformer.encoder.* with a "
+            "fused query_key_value projection. This engine serves the HF-native GLM layout "
+            "(model.layers.N.self_attn.{q,k,v,o}_proj + mlp.gate_up_proj). Use the \"-hf\" "
+            "variant of the checkpoint (e.g. THUDM/glm-4-9b-chat-hf) or re-export it with "
+            "transformers >= 4.46.");
+
     ModelConfig cfg{};
 
+    // Required dimensions. Four of them have a THUDM spelling; the canonical key
+    // always wins, and every supported non-GLM checkpoint carries only that one,
+    // so the alias lookup never fires for them and their parse is unchanged.
+    auto dim = [&t, &json_path](const char* key, const char* alias) -> size_t {
+        if (t.contains(key))   return t.at(key).get<size_t>();
+        if (t.contains(alias)) return t.at(alias).get<size_t>();
+        throw std::runtime_error("ConfigLoader: " + json_path +
+                                 " is missing required field \"" + key +
+                                 "\" (alias \"" + alias + "\")");
+    };
+
     cfg.hidden_dim          = t.at("hidden_size").get<size_t>();
-    cfg.intermediate_dim    = t.at("intermediate_size").get<size_t>();
-    cfg.num_layers          = t.at("num_hidden_layers").get<size_t>();
     cfg.num_attention_heads = t.at("num_attention_heads").get<size_t>();
-    cfg.num_key_value_heads = t.at("num_key_value_heads").get<size_t>();
-    cfg.vocab_size          = t.at("vocab_size").get<size_t>();
+    cfg.intermediate_dim    = dim("intermediate_size",   "ffn_hidden_size");
+    cfg.num_layers          = dim("num_hidden_layers",   "num_layers");
+    cfg.num_key_value_heads = dim("num_key_value_heads", "multi_query_group_num");
+    cfg.vocab_size          = dim("vocab_size",          "padded_vocab_size");
 
     if (cfg.hidden_dim == 0 || cfg.intermediate_dim == 0 || cfg.num_layers == 0 ||
         cfg.num_attention_heads == 0 || cfg.num_key_value_heads == 0 || cfg.vocab_size == 0)
@@ -87,15 +128,21 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
             ") is not a multiple of num_key_value_heads (" +
             std::to_string(cfg.num_key_value_heads) + "); GQA grouping would be broken");
 
-    cfg.head_dim            = t.value("head_dim", cfg.hidden_dim / cfg.num_attention_heads);
+    // head_dim: "kv_channels" is the THUDM spelling of the same quantity.
+    cfg.head_dim            = t.value("head_dim",
+                              t.value("kv_channels", cfg.hidden_dim / cfg.num_attention_heads));
     if (cfg.head_dim == 0)
         throw std::runtime_error("ConfigLoader: head_dim resolved to zero");
 
     // Trained positional range. 0 == unspecified (the runtime validator treats it
     // as unbounded rather than rejecting every context length).
-    cfg.max_position_embeddings = t.value("max_position_embeddings", size_t{0});
+    cfg.max_position_embeddings = t.value("max_position_embeddings",
+                                  t.value("seq_length", size_t{0}));
 
-    cfg.rms_norm_eps        = t.value("rms_norm_eps", 1e-6f);
+    // GLM writes the same field as "layernorm_epsilon", and its value (1.5625e-07)
+    // is two orders below this default -- silently defaulting it would shift every
+    // norm in the model, so the alias is not cosmetic.
+    cfg.rms_norm_eps        = t.value("rms_norm_eps", t.value("layernorm_epsilon", 1e-6f));
     cfg.tie_word_embeddings = j.value("tie_word_embeddings", t.value("tie_word_embeddings", false));
     cfg.attn_output_gate    = t.value("attn_output_gate", false);
 
@@ -123,15 +170,49 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
                       << "(mrope_section) but the RoPE kernel applies vanilla 1D rotate_half; "
                       << "multimodal positional encoding will be WRONG.\n";
     } else {
+        // Flat checkpoints. "partial_rotary_factor" sits at the (text) root for
+        // GLM-4 and is absent for Llama/Qwen2.5, whose default 1.0 rotates the
+        // whole head -- so this stays byte-identical for them.
         cfg.rope_theta = t.value("rope_theta", 10000.0f);
-        cfg.rotary_dim = cfg.head_dim;
+        // THUDM spelling: base 10000 scaled by "rope_ratio" (500 for the 128k
+        // chat checkpoints). Only consulted when rope_theta is absent.
+        if (!t.contains("rope_theta") && t.contains("rope_ratio"))
+            cfg.rope_theta = 10000.0f * t.at("rope_ratio").get<float>();
+
+        const float prf = t.value("partial_rotary_factor", 1.0f);
+        cfg.rotary_dim = static_cast<size_t>(static_cast<double>(cfg.head_dim) * prf);
+        if (cfg.rotary_dim == 0 || cfg.rotary_dim > cfg.head_dim)
+            cfg.rotary_dim = cfg.head_dim;
+        // Both pairings rotate CHANNEL PAIRS, so an odd rotary span has a lone
+        // channel no kernel can place. Round down rather than silently rotating
+        // one channel too many.
+        cfg.rotary_dim &= ~size_t{1};
+        if (cfg.rotary_dim == 0)
+            throw std::runtime_error(
+                "ConfigLoader: partial_rotary_factor " + std::to_string(prf) +
+                " resolves to a rotary span below 2 channels for head_dim " +
+                std::to_string(cfg.head_dim));
+    }
+
+    // ----- GLM-4 topology ---------------------------------------------------
+    // Three deltas from the Llama/Qwen shape this engine already serves, all of
+    // them config-level: the rotary pairing, the fused MLP in-projection, and
+    // (0414 only) the sandwich norms. Everything else -- GQA, SwiGLU, RMSNorm,
+    // separate q/k/v with bias, an untied lm_head -- is already the common path.
+    if (is_glm) {
+        cfg.rope_pairing      = RopePairing::Interleaved;
+        cfg.mlp_fused_gate_up = true;
+        cfg.has_sandwich_norms = (model_type == "glm4");
     }
 
     // Qwen2-family checkpoints (incl. Qwen2.5-Coder) hardcode q/k/v bias in the
     // modeling code and OMIT "attention_bias" from config.json entirely, so for
     // model_type "qwen2" the key's absence means true, not false. Qwen3/Qwen3.5
     // dropped the bias (and added q_norm/k_norm instead), so they set it false.
-    cfg.has_qkv_bias = t.value("attention_bias", model_type == "qwen2");
+    // GLM-4 always carries q/k/v bias (and never an o_proj one); its THUDM
+    // spelling of the flag is "add_qkv_bias".
+    cfg.has_qkv_bias = t.value("attention_bias",
+                       t.value("add_qkv_bias", model_type == "qwen2" || is_glm));
 
     // q_norm/k_norm (per-head RMSNorm before RoPE) ships with the Qwen3 family.
     // This is a config-level heuristic; the weight binder makes the authoritative

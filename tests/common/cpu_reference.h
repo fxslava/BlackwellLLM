@@ -141,6 +141,37 @@ inline void cpu_fp8_gemv(const uint8_t* W_fp8,
 
 // Apply RoPE to Q and K while simultaneously writing K and V into the cache.
 // Operates on a single token at position pos.
+// GLM-4 INTERLEAVED partial RoPE, in place over a [num_heads, head_dim] buffer.
+// Mirrors rope_interleaved_partial_qk_kernel (kernels/full_attention.cu):
+//   * pair j is the ADJACENT couple (2j, 2j+1), j < rotary_dim/2;
+//   * frequency for pair j is rope_theta^(-2j/rotary_dim) -- indexed by the pair
+//     and divided by the ROTARY span, not by head_dim;
+//   * channels [rotary_dim, head_dim) are left untouched.
+// This is HF Glm*/Glm4* apply_rotary_pos_emb: cos/sin are built over
+// head_dim*partial_rotary_factor dims and repeat_interleave(2)'d, which is
+// exactly an adjacent-pair rotation over the first rotary_dim channels.
+inline void cpu_rope_interleaved_partial(float* X, int pos, size_t num_heads,
+                                        size_t head_dim, size_t rotary_dim,
+                                        float rope_theta)
+{
+    const size_t pairs = rotary_dim / 2;
+    for (size_t h = 0; h < num_heads; ++h) {
+        float* row = X + h * head_dim;
+        for (size_t j = 0; j < pairs; ++j) {
+            const float freq =
+                1.0f / std::pow(rope_theta, static_cast<float>(2 * j) / rotary_dim);
+            const float angle = pos * freq;
+            const float c = std::cos(angle);
+            const float s = std::sin(angle);
+
+            const float x0 = row[2 * j];
+            const float x1 = row[2 * j + 1];
+            row[2 * j]     = x0 * c - x1 * s;
+            row[2 * j + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
 inline void cpu_fused_rope_kv_append(
     float* Q,               // In/out query vector [q_heads * head_dim]
     float* K,               // Input key vector [kv_heads * head_dim]

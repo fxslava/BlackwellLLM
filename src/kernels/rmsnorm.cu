@@ -87,7 +87,11 @@ __global__ void rmsnorm_residual_bf16_weight_kernel(float* x,
 // Шаблон по типу весов: семантика HF (hidden_states.to(input_dtype)) требует,
 // чтобы и нормализованный вход, и результат защелкивались в сетку ТОГО ЖЕ
 // половинного типа, в котором хранится чекпойнт (BF16 у Llama, FP16 у AWQ).
-template <typename WT>
+// ACCUM == true turns the epilogue into `output += normalized * w` (fp32, exactly
+// like the GEMV kernels' residual epilogue). That is the GLM-4-0414 sandwich norm:
+// the sub-layer output is normalized and then JOINS the residual stream, so the
+// projection kernels' fused residual-accumulate cannot be used for those layers.
+template <typename WT, bool ACCUM = false>
 __global__ void rmsnorm_half_weight_kernel(const float* __restrict__ input,
                                            float* __restrict__ output,
                                            const WT* __restrict__ weight,
@@ -119,18 +123,21 @@ __global__ void rmsnorm_half_weight_kernel(const float* __restrict__ input,
     float rsqrt = s_rsqrt;
     for (size_t idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
         float norm_val = cur_input[idx] * rsqrt;
+        float out_val;
         if (add_unit_offset) {
             // Qwen3_5RMSNorm: (x * (1 + w)).to(dtype) -- multiply in fp32, latch once
             // at the end (zero-centered weight). See modeling_qwen3_5.Qwen3_5RMSNorm.
             float mul_val = norm_val * (1.0f + rms_to_fp32(weight[idx]));
-            cur_output[idx] = rms_latch(mul_val, static_cast<WT*>(nullptr));
+            out_val = rms_latch(mul_val, static_cast<WT*>(nullptr));
         } else {
             // Llama / Qwen2.5 semantics: x.to(dtype) * w (latch the normalized input
             // BEFORE multiplying the weight).
             float norm_latched = rms_latch(norm_val, static_cast<WT*>(nullptr));
             float mul_val = norm_latched * rms_to_fp32(weight[idx]);
-            cur_output[idx] = rms_latch(mul_val, static_cast<WT*>(nullptr));
+            out_val = rms_latch(mul_val, static_cast<WT*>(nullptr));
         }
+        if (ACCUM) cur_output[idx] += out_val;   // fp32 residual join (see above)
+        else       cur_output[idx]  = out_val;
     }
 }
 
@@ -168,4 +175,30 @@ void launch_rmsnorm_fp16_kernel(const float* d_input,
 {
     const __half* fp16_w = reinterpret_cast<const __half*>(d_weight);
     rmsnorm_half_weight_kernel<__half><<<seq_len, RMSNORM_BLOCK_SIZE>>>(d_input, d_output, fp16_w, hidden_dim, eps, add_unit_offset);
+}
+
+void launch_rmsnorm_accum_kernel(const float* d_input,
+                                 float* d_accum,
+                                 const void* d_weight,
+                                 size_t seq_len,
+                                 size_t hidden_dim,
+                                 float eps,
+                                 bool add_unit_offset)
+{
+    const __nv_bfloat16* bf16_w = reinterpret_cast<const __nv_bfloat16*>(d_weight);
+    rmsnorm_half_weight_kernel<__nv_bfloat16, /*ACCUM=*/true><<<seq_len, RMSNORM_BLOCK_SIZE>>>(
+        d_input, d_accum, bf16_w, hidden_dim, eps, add_unit_offset);
+}
+
+void launch_rmsnorm_accum_fp16_kernel(const float* d_input,
+                                      float* d_accum,
+                                      const void* d_weight,
+                                      size_t seq_len,
+                                      size_t hidden_dim,
+                                      float eps,
+                                      bool add_unit_offset)
+{
+    const __half* fp16_w = reinterpret_cast<const __half*>(d_weight);
+    rmsnorm_half_weight_kernel<__half, /*ACCUM=*/true><<<seq_len, RMSNORM_BLOCK_SIZE>>>(
+        d_input, d_accum, fp16_w, hidden_dim, eps, add_unit_offset);
 }

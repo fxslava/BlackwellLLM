@@ -1,5 +1,6 @@
 #include "kv_cache/paged_kv_manager.h"
 #include "kernels/rope.cuh"
+#include "kernels/full_attention.cuh"   // interleaved partial RoPE (GLM-4)
 #include "kernels/paged_flash_attention.cuh"
 #include "rope_config.h"   // rope_scaling_from(ModelConfig)
 #include <algorithm>
@@ -15,6 +16,8 @@ PagedKVManager::PagedKVManager(const ModelConfig& config, size_t max_seq_len,
       m_num_q_heads(static_cast<int>(config.num_attention_heads)),
       m_num_kv_heads(static_cast<int>(config.num_key_value_heads)),
       m_head_dim(static_cast<int>(config.head_dim)),
+      m_rotary_dim(static_cast<int>(config.rotary_dim ? config.rotary_dim : config.head_dim)),
+      m_rope_interleaved(config.rope_pairing == RopePairing::Interleaved),
       m_rope_theta(config.rope_theta)
 {
     const int max_blocks =
@@ -105,9 +108,19 @@ void PagedKVManager::attention_decode(int layer_idx, int pos,
         throw std::runtime_error(
             "PagedKVManager::attention_decode called without a preceding prepare_decode_step");
 
-    // RoPE in place on this layer's freshly projected Q and K (rotate_half).
-    launch_rope_inplace(d_Q, pos, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
-    launch_rope_inplace(d_K, pos, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    // RoPE in place on this layer's freshly projected Q and K. GLM-4 pairs
+    // adjacent channels over a partial span and takes both buffers in one launch;
+    // every other family is the full-head rotate_half pair of launches.
+    if (m_rope_interleaved) {
+        launch_rope_interleaved_partial_inplace(
+            d_Q, d_K, pos,
+            static_cast<size_t>(m_num_q_heads), static_cast<size_t>(m_num_kv_heads),
+            static_cast<size_t>(m_head_dim), static_cast<size_t>(m_rotary_dim),
+            m_rope_theta, rope_scaling_from(m_config));
+    } else {
+        launch_rope_inplace(d_Q, pos, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+        launch_rope_inplace(d_K, pos, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    }
 
     // KV-offloaded layer: fault its live pages back from the pinned host mirror
     // into its device staging slab BEFORE the append/attention read it (no-op for
@@ -175,8 +188,21 @@ void PagedKVManager::attention_prefill(int layer_idx, int start_pos, int num_tok
             "PagedKVManager::attention_prefill called without a preceding prepare_prefill_step");
 
     // Batched RoPE over all num_tokens rows: row t rotates for position start_pos+t.
-    launch_rope_inplace_batched(d_Q, start_pos, num_tokens, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
-    launch_rope_inplace_batched(d_K, start_pos, num_tokens, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    // Same pairing split as attention_decode -- prefill and decode MUST rotate
+    // identically or the cached keys disagree with the queries that read them.
+    if (m_rope_interleaved) {
+        launch_rope_interleaved_partial_inplace_batched(
+            d_Q, start_pos, static_cast<size_t>(num_tokens),
+            static_cast<size_t>(m_num_q_heads),  static_cast<size_t>(m_head_dim),
+            static_cast<size_t>(m_rotary_dim), m_rope_theta, rope_scaling_from(m_config));
+        launch_rope_interleaved_partial_inplace_batched(
+            d_K, start_pos, static_cast<size_t>(num_tokens),
+            static_cast<size_t>(m_num_kv_heads), static_cast<size_t>(m_head_dim),
+            static_cast<size_t>(m_rotary_dim), m_rope_theta, rope_scaling_from(m_config));
+    } else {
+        launch_rope_inplace_batched(d_Q, start_pos, num_tokens, m_num_q_heads,  m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+        launch_rope_inplace_batched(d_K, start_pos, num_tokens, m_num_kv_heads, m_head_dim, m_rope_theta, rope_scaling_from(m_config));
+    }
 
     // Fault the layer's live pages in from the host mirror (no-op if resident).
     m_seqmgr->stage_in_layer(layer_idx, m_active);
@@ -219,6 +245,14 @@ void PagedKVManager::prepare_decode_batch(const SeqId* seqs, const int* position
         throw std::runtime_error(
             "PagedKVManager::prepare_decode_batch: batched decode requires all layers "
             "resident (KV offloading is single-sequence only)");
+    // The multi-sequence RoPE kernel (launch_batched_rope, per-row positions) has
+    // no interleaved partial variant, so a GLM-4 batch would rotate with the wrong
+    // pairing and silently poison every cached key. Capability gating, not a TODO.
+    if (m_rope_interleaved)
+        throw std::runtime_error(
+            "PagedKVManager::prepare_decode_batch: this model uses interleaved partial "
+            "RoPE (GLM-4), for which the true-batch decode path has no rotation kernel; "
+            "decode the sequences one at a time via forward_status");
 
     // A batch supersedes any latched single-token context; drop it so a stray
     // attention_decode cannot consume a block table this step is about to rebuild.

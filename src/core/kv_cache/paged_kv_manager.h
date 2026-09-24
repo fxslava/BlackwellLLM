@@ -122,6 +122,8 @@ private:
     int   m_num_q_heads;
     int   m_num_kv_heads;
     int   m_head_dim;
+    int   m_rotary_dim;          // == head_dim for full rotary; 64 for GLM-4
+    bool  m_rope_interleaved;    // GLM-4 adjacent-pair rotation (RopePairing)
     float m_rope_theta;
 
     // Per-token context latched by prepare_decode_step, consumed per layer.

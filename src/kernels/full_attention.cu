@@ -92,6 +92,92 @@ void launch_rope_partial_inplace(float* d_X, int pos, int num_heads,
 }
 
 // ---------------------------------------------------------------------------
+// Partial INTERLEAVED RoPE (GLM-4). Deliberately written next to the half-split
+// kernel above: the two differ in exactly one place -- which two channels a
+// thread loads -- and that is the whole GLM-4 delta. The frequency ladder,
+// the scaling hook and the rotation itself are character-for-character the same.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void rope_interleaved_pair(float* __restrict__ row,
+                                                      int j, float angle) {
+    float s, c;
+    sincosf(angle, &s, &c);
+    // The adjacent couple. Half-split reads (j, j + rotary_dim/2) instead.
+    const float x0 = row[2 * j];
+    const float x1 = row[2 * j + 1];
+    row[2 * j]     = x0 * c - x1 * s;
+    row[2 * j + 1] = x0 * s + x1 * c;
+}
+
+// inv_freq[j] = rope_theta^-(2j/rotary_dim): the ladder is indexed by the PAIR,
+// and the pair count is rotary_dim/2 under either pairing, so this expression is
+// shared with rope_partial_kernel verbatim.
+__device__ __forceinline__ float rope_pair_freq(int j, int rotary_dim,
+                                                float rope_theta, RopeScaling scaling) {
+    float freq = __fdividef(1.0f,
+        powf(rope_theta, __fdividef((float)(2 * j), (float)rotary_dim)));
+    return apply_rope_scaling(freq, scaling);
+}
+
+// grid.x == q_heads + kv_heads: heads [0, q_heads) index d_Q, the rest d_K.
+__global__ void rope_interleaved_partial_qk_kernel(float* __restrict__ Q,
+                                                   float* __restrict__ K,
+                                                   int pos, int q_heads,
+                                                   int head_dim, int rotary_dim,
+                                                   float rope_theta,
+                                                   RopeScaling scaling) {
+    const int head = blockIdx.x;
+    const int j    = threadIdx.x;              // 0 .. rotary_dim/2 - 1
+    if (j >= rotary_dim / 2) return;
+
+    float* row = (head < q_heads) ? (Q + (size_t)head * head_dim)
+                                  : (K + (size_t)(head - q_heads) * head_dim);
+    rope_interleaved_pair(row, j, pos * rope_pair_freq(j, rotary_dim, rope_theta, scaling));
+}
+
+// grid = (num_tokens, num_heads); row t sits at logical position start_pos + t.
+__global__ void rope_interleaved_partial_batched_kernel(float* __restrict__ X,
+                                                        int start_pos, int num_heads,
+                                                        int head_dim, int rotary_dim,
+                                                        float rope_theta,
+                                                        RopeScaling scaling) {
+    const int token = blockIdx.x;
+    const int head  = blockIdx.y;
+    const int j     = threadIdx.x;
+    if (j >= rotary_dim / 2) return;
+
+    float* row = X + ((size_t)token * num_heads + head) * head_dim;
+    rope_interleaved_pair(
+        row, j, (start_pos + token) * rope_pair_freq(j, rotary_dim, rope_theta, scaling));
+}
+
+void launch_rope_interleaved_partial_inplace(
+    float* d_Q, float* d_K, int pos,
+    size_t q_heads, size_t kv_heads,
+    size_t head_dim, size_t rotary_dim,
+    float rope_theta, RopeScaling scaling, cudaStream_t stream)
+{
+    const unsigned heads   = static_cast<unsigned>(q_heads + kv_heads);
+    const unsigned threads = static_cast<unsigned>(rotary_dim / 2);
+    if (heads == 0 || threads == 0) return;
+    rope_interleaved_partial_qk_kernel<<<heads, threads, 0, stream>>>(
+        d_Q, d_K, pos, static_cast<int>(q_heads), static_cast<int>(head_dim),
+        static_cast<int>(rotary_dim), rope_theta, scaling);
+}
+
+void launch_rope_interleaved_partial_inplace_batched(
+    float* d_X, int start_pos, size_t num_tokens, size_t num_heads,
+    size_t head_dim, size_t rotary_dim,
+    float rope_theta, RopeScaling scaling, cudaStream_t stream)
+{
+    const unsigned threads = static_cast<unsigned>(rotary_dim / 2);
+    if (num_tokens == 0 || num_heads == 0 || threads == 0) return;
+    const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(num_heads));
+    rope_interleaved_partial_batched_kernel<<<grid, threads, 0, stream>>>(
+        d_X, start_pos, static_cast<int>(num_heads), static_cast<int>(head_dim),
+        static_cast<int>(rotary_dim), rope_theta, scaling);
+}
+
+// ---------------------------------------------------------------------------
 // KV append (no rotation): write full head_dim of K and V into the cache slot.
 // ---------------------------------------------------------------------------
 __global__ void kv_append_kernel(const float* __restrict__ K,

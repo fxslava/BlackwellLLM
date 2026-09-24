@@ -41,6 +41,14 @@
 //   * K_cache / V_cache layout float[kv_heads][max_seq_len][head_dim] -- the
 //     same layout rope_kv_append_kernel writes.
 //   * head_dim even, head_dim/2 <= 1024 (one thread per channel pair).
+//   * rotary_dim even, 2 <= rotary_dim <= head_dim, and EQUAL to the rotary span
+//     the append kernel used. Channels [rotary_dim, head_dim) carry no phase and
+//     are moved verbatim; re-phasing them (which a full-head evict does on a
+//     partial-rotary model like GLM-4) corrupts them silently.
+//   * rope_interleaved must match the append kernel's PAIRING: false for
+//     rope_kv_append_kernel's half-split (k, k + rotary_dim/2), true for GLM-4's
+//     adjacent (2k, 2k+1). Span and pairing are independent, and getting either
+//     wrong is silent -- the survivors simply claim a position nothing agrees with.
 //   * 0 <= keep_from, delta > 0, keep_from + delta <= cache_len <= max_seq_len.
 //   * rope_theta and scaling MUST match what the append kernel was called with,
 //     or the composed angle is measured against a different frequency ladder.
@@ -67,6 +75,8 @@ void launch_kv_evict_head(
     int cache_len,       // live rows before the call (the sequence length)
     size_t kv_heads,
     size_t head_dim,
+    size_t rotary_dim,   // rotated channel span; == head_dim for full rotary
+    bool rope_interleaved, // false: half-split pairing; true: GLM-4 adjacent pairs
     size_t max_seq_len,
     float rope_theta = 500000.0f,
     RopeScaling scaling = {},

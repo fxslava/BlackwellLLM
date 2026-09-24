@@ -1,6 +1,7 @@
 #include "kv_cache/continuous_kv_manager.h"
 #include "kernels/rope.cuh"
 #include "kernels/attention.cuh"
+#include "kernels/full_attention.cuh"   // interleaved partial RoPE + launch_kv_append
 #include "rope_config.h"   // rope_scaling_from(ModelConfig)
 #include <stdexcept>
 
@@ -28,10 +29,26 @@ void ContinuousKVManager::attention_decode(int layer_idx, int pos,
     float* d_layer_k_cache = m_arena.get_layer_k_cache(layer_idx);
     float* d_layer_v_cache = m_arena.get_layer_v_cache(layer_idx);
 
-    launch_fused_rope_kv_kernel(
-        d_Q, d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos,
-        m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
-        m_arena.get_max_seq_len(), m_config.rope_theta, rope_scaling_from(m_config));
+    if (m_config.rope_pairing == RopePairing::Interleaved) {
+        // GLM-4: the rotation pairs adjacent channels and covers only
+        // [0, rotary_dim), which the fused rope+append kernel cannot express, so
+        // rotate in place and append separately. launch_kv_append writes the very
+        // same float[kv_heads][max_seq_len][head_dim] slot the fused kernel would.
+        launch_rope_interleaved_partial_inplace(
+            d_Q, d_K, pos,
+            m_config.num_attention_heads, m_config.num_key_value_heads,
+            m_config.head_dim, m_config.rotary_dim,
+            m_config.rope_theta, rope_scaling_from(m_config));
+        launch_kv_append(d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos,
+                         static_cast<int>(m_config.num_key_value_heads),
+                         static_cast<int>(m_config.head_dim),
+                         static_cast<int>(m_arena.get_max_seq_len()));
+    } else {
+        launch_fused_rope_kv_kernel(
+            d_Q, d_K, d_V, d_layer_k_cache, d_layer_v_cache, pos,
+            m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
+            m_arena.get_max_seq_len(), m_config.rope_theta, rope_scaling_from(m_config));
+    }
 
     launch_attention_decoding_kernel(
         d_Q, d_layer_k_cache, d_layer_v_cache, d_O, pos,
