@@ -95,6 +95,43 @@ private:
     std::string default_system_; // Llama-3 has none; the system block itself is unconditional.
 };
 
+// ---- GLM-4 / ChatGLM --------------------------------------------------------
+//   [gMASK]<sop>  then, per turn,  <|{role}|>{metadata}\n{content}
+// Three things make this family unlike the two above:
+//   * the prelude is textual and UNCONDITIONAL -- "[gMASK]<sop>" opens every
+//     conversation, system block or not (the tokenizer maps both literals to
+//     ids, so apply_chat_template must not also prepend a numeric prefix);
+//   * turns have NO terminator: the next "<|role|>" marker is what ends them;
+//   * the generation prompt is a bare "<|assistant|>" with NO trailing newline,
+//     unlike the "\n" that follows the marker in a *rendered* turn. The model
+//     emits that newline itself -- adding one here shifts every generation by a
+//     token and is the classic way to break GLM-4 output.
+// `metadata` (the tool-call slot) is always empty for plain chat, so the
+// rendered marker line is exactly "<|role|>\n".
+class GlmChatTemplate final : public IChatTemplate {
+public:
+    std::string name() const override { return "glm4"; }
+
+    std::string render_prelude(const std::string& system_prompt) const override {
+        std::string out = "[gMASK]<sop>";
+        if (!system_prompt.empty()) out += "<|system|>\n" + system_prompt;
+        return out;
+    }
+
+    std::string render_message(const ChatMessage& msg) const override {
+        // {% if item['content'] %} -- an empty turn renders nothing at all.
+        if (msg.content.empty()) return "";
+        return "<|" + msg.role + "|>\n" + msg.content;
+    }
+
+    std::string render_generation_prompt() const override { return "<|assistant|>"; }
+
+    const std::string& default_system_prompt() const override { return default_system_; }
+
+private:
+    std::string default_system_; // GLM-4 ships none; the tool-call preamble is not one.
+};
+
 // Default system prompt of a ChatML template, e.g. Qwen2.5:
 //   {{- '<|im_start|>system\nYou are Qwen, ...<|im_end|>\n' }}
 // In the Jinja source "\n" is the two-character escape, which makes the
@@ -168,11 +205,23 @@ std::unique_ptr<IChatTemplate> ChatTemplateFactory::from_jinja_source(
         return std::make_unique<Llama3Template>(
             bos_token, extract_llama3_system_preamble(jinja_source));
 
+    // GLM-4: "[gMASK]<sop>" opens the template source itself. Probe for it
+    // rather than for "<|assistant|>", which ChatML-adjacent families also use.
+    if (jinja_source.find("[gMASK]") != std::string::npos &&
+        jinja_source.find("<sop>") != std::string::npos)
+        return std::make_unique<GlmChatTemplate>();
+
     throw std::runtime_error(
         "ChatTemplateFactory: tokenizer_config.json carries a chat_template of an "
-        "unrecognized family (neither ChatML \"<|im_start|>\" nor Llama-3 "
-        "\"<|start_header_id|>\" markers found). Add a native implementation in "
-        "src/tokenizer/chat_template.cpp.");
+        "unrecognized family (none of ChatML \"<|im_start|>\", Llama-3 "
+        "\"<|start_header_id|>\" or GLM-4 \"[gMASK]<sop>\" markers found). Add a "
+        "native implementation in src/core/tokenizer/chat_template.cpp.");
+}
+
+std::unique_ptr<IChatTemplate> ChatTemplateFactory::from_model_type(const std::string& model_type) {
+    if (model_type == "glm" || model_type == "glm4" || model_type == "chatglm")
+        return std::make_unique<GlmChatTemplate>();
+    return nullptr;
 }
 
 } // namespace blackwell

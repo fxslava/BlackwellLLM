@@ -1,7 +1,15 @@
-// TokenizerFactory: builds a ByteLevelBpeTokenizer purely from a checkpoint
-// directory in HuggingFace layout. Every id (BOS/EOS/stop set, post-processor
-// inserts) is resolved from the JSON sidecar files at load time -- nothing in
-// the engine hardcodes vocabulary knowledge.
+// TokenizerFactory: builds a tokenizer purely from a checkpoint directory in
+// HuggingFace layout. Every id (BOS/EOS/stop set, post-processor inserts,
+// tiktoken prefix) is resolved from the JSON sidecar files at load time --
+// nothing in the engine hardcodes vocabulary knowledge.
+//
+// Two families, chosen by which vocabulary file the checkpoint ships:
+//   tokenizer.json  -> ByteLevelBpeTokenizer (Llama-3, Qwen2): byte-alphabet
+//                      symbols, explicit merges list.
+//   tokenizer.model -> TiktokenTokenizer (GLM-4): raw-byte symbols, merge order
+//                      implied by vocabulary rank. Only probed when there is no
+//                      tokenizer.json, so no existing checkpoint changes path.
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -12,6 +20,7 @@
 
 #include "blackwell/tokenizer.h"
 #include "tokenizer/bpe_tokenizer.h"
+#include "tokenizer/tiktoken_tokenizer.h"
 
 namespace blackwell {
 
@@ -129,16 +138,139 @@ std::vector<int> parse_stop_ids(const json& cfg) {
     return {};
 }
 
+// ---- tiktoken branch ("tokenizer.model" rank files: GLM-4 / ChatGLM) --------
+
+// Special tokens live in tokenizer_config.json's added_tokens_decoder, keyed by
+// id-as-string: {"151331": {"content": "[gMASK]", "special": true, ...}}.
+void parse_added_tokens_decoder(const json& cfg, TiktokenModelData& data) {
+    const auto it = cfg.find("added_tokens_decoder");
+    if (it == cfg.end() || !it->is_object()) return;
+
+    for (const auto& [id_str, entry] : it->items()) {
+        if (!entry.is_object() || !entry.contains("content")) continue;
+        if (!entry.value("special", false)) continue; // non-special added tokens go through BPE
+
+        int id = -1;
+        try {
+            id = std::stoi(id_str);
+        } catch (const std::exception&) {
+            throw std::runtime_error("TokenizerFactory: added_tokens_decoder key \"" + id_str +
+                                     "\" is not an integer token id");
+        }
+        data.specials.emplace(entry["content"].get<std::string>(), id);
+    }
+}
+
+// The ids encode(..., add_special_tokens=true) prepends. There is no JSON field
+// for these, but the chat template's *leading literal* is exactly them (GLM-4's
+// source opens "[gMASK]<sop>{% for ... %}", which is ChatGLM4Tokenizer's
+// get_prefix_tokens()). Deriving them from the template keeps the rule that no
+// vocabulary knowledge is hardcoded here; an absent template means no prefix.
+std::vector<int> derive_prefix_ids(const std::string& jinja_source,
+                                   const TiktokenModelData& data) {
+    size_t longest = 0;
+    for (const auto& kv : data.specials) longest = std::max(longest, kv.first.size());
+
+    std::vector<int> prefix;
+    size_t pos = 0;
+    while (pos < jinja_source.size()) {
+        bool matched = false;
+        // Longest-first so "[gMASK]" is preferred over any shorter literal
+        // sharing its prefix.
+        const size_t probe = std::min(longest, jinja_source.size() - pos);
+        for (size_t len = probe; len >= 1 && !matched; --len) {
+            const auto it = data.specials.find(jinja_source.substr(pos, len));
+            if (it == data.specials.end()) continue;
+            prefix.push_back(it->second);
+            pos += len;
+            matched = true;
+        }
+        if (!matched) break; // first non-special character ends the prelude
+    }
+    return prefix;
+}
+
+std::unique_ptr<ITokenizer> create_tiktoken(const std::filesystem::path& dir,
+                                            const std::filesystem::path& rank_file) {
+    TiktokenModelData data = TiktokenTokenizer::load_rank_file(rank_file.string());
+
+    // GLM-4's pre-tokenizer regex lives in tokenization_chatglm.py, not in any
+    // JSON sidecar, so there is nothing to parse: \p{N}{1,3} is both GLM-4's
+    // value and the tiktoken-family default that TiktokenModelData starts with.
+
+    std::string chat_template_src;
+    std::string model_type;
+    if (const auto cfg = load_json_if_present(dir / "tokenizer_config.json")) {
+        parse_added_tokens_decoder(*cfg, data);
+
+        auto resolve = [&](const char* key) {
+            const std::string name = token_name(*cfg, key);
+            if (name.empty()) return -1;
+            if (const auto it = data.specials.find(name); it != data.specials.end())
+                return it->second;
+            const auto vit = data.encoder.find(name);
+            return vit != data.encoder.end() ? vit->second : -1;
+        };
+        data.special_tokens.bos = resolve("bos_token");
+        data.special_tokens.eos = resolve("eos_token");
+        data.special_tokens.unk = resolve("unk_token");
+        data.special_tokens.pad = resolve("pad_token");
+
+        if (cfg->contains("chat_template") && (*cfg)["chat_template"].is_string())
+            chat_template_src = (*cfg)["chat_template"].get<std::string>();
+    }
+
+    data.prefix_ids = derive_prefix_ids(chat_template_src, data);
+
+    // Stop set: generation_config wins (GLM-4 lists <|endoftext|>, <|user|> and
+    // <|observation|> -- a turn ends when the model hands the floor back, not
+    // only at EOS), then config.json, then the tokenizer's own EOS.
+    if (const auto gen = load_json_if_present(dir / "generation_config.json"))
+        data.special_tokens.stop_ids = parse_stop_ids(*gen);
+    if (const auto cfg = load_json_if_present(dir / "config.json")) {
+        if (data.special_tokens.stop_ids.empty())
+            data.special_tokens.stop_ids = parse_stop_ids(*cfg);
+        model_type = cfg->value("model_type", "");
+    }
+    if (data.special_tokens.stop_ids.empty() && data.special_tokens.eos >= 0)
+        data.special_tokens.stop_ids = {data.special_tokens.eos};
+
+    auto tmpl = ChatTemplateFactory::from_jinja_source(chat_template_src, /*bos_token=*/"");
+    if (!tmpl) tmpl = ChatTemplateFactory::from_model_type(model_type);
+
+    std::cout << "[Tokenizer] tiktoken: " << data.decoder.size() << " ranks + "
+              << data.specials.size() << " special, digit-run<=" << data.max_digit_run
+              << ", prefix=" << data.prefix_ids.size()
+              << ", template=" << (tmpl ? tmpl->name() : "none") << "\n";
+
+    return std::make_unique<TiktokenTokenizer>(std::move(data), std::move(tmpl));
+}
+
 } // namespace
 
 std::unique_ptr<ITokenizer> TokenizerFactory::create(const std::string& model_dir) {
     namespace fs = std::filesystem;
     const fs::path dir(model_dir);
 
+    // Probe order: tokenizer.json (HuggingFace byte-level BPE) first, so every
+    // checkpoint that has one keeps its existing, validated path. Only when it
+    // is absent do we consider a tiktoken rank file.
     const auto tokenizer_json = load_json_if_present(dir / "tokenizer.json");
-    if (!tokenizer_json)
-        throw std::runtime_error("TokenizerFactory: " + (dir / "tokenizer.json").string() +
-                                 " not found; cannot construct a tokenizer");
+    if (!tokenizer_json) {
+        const fs::path rank_file = dir / "tokenizer.model";
+        std::error_code ec;
+        if (fs::exists(rank_file, ec)) {
+            if (!TiktokenTokenizer::looks_like_rank_file(rank_file.string()))
+                throw std::runtime_error(
+                    "TokenizerFactory: " + rank_file.string() + " exists but is not a tiktoken "
+                    "rank file (\"<base64> <rank>\" per line). SentencePiece .model files are "
+                    "not supported; convert the checkpoint or supply tokenizer.json");
+            return create_tiktoken(dir, rank_file);
+        }
+        throw std::runtime_error("TokenizerFactory: neither " +
+                                 (dir / "tokenizer.json").string() + " nor " +
+                                 rank_file.string() + " found; cannot construct a tokenizer");
+    }
 
     const json& tj = *tokenizer_json;
     if (!tj.contains("model") || !tj["model"].contains("vocab"))

@@ -1,6 +1,7 @@
 #include "tokenizer/unicode.h"
 
 #include <array>
+#include <limits>
 #include <unordered_map>
 
 namespace blackwell::unicode {
@@ -164,6 +165,84 @@ int unicode_to_byte(uint32_t cp) {
     const auto& m = byte_alphabet().to_byte;
     const auto it = m.find(cp);
     return it == m.end() ? -1 : it->second;
+}
+
+namespace {
+
+bool is_cr_lf(uint32_t cp) { return cp == '\r' || cp == '\n'; }
+
+uint32_t ascii_lower(uint32_t cp) {
+    return (cp >= 'A' && cp <= 'Z') ? cp + 32 : cp;
+}
+
+} // namespace
+
+// Contract and the regex it implements: see unicode.h.
+size_t match_pretoken(const std::vector<uint32_t>& cp, size_t i, int max_digit_run) {
+    const size_t n = cp.size();
+    const uint32_t c = cp[i];
+
+    // 1: English contractions, case-insensitive.
+    if (c == '\'' && i + 1 < n) {
+        const uint32_t a = ascii_lower(cp[i + 1]);
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') return i + 2;
+        if (i + 2 < n) {
+            const uint32_t b = ascii_lower(cp[i + 2]);
+            if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l'))
+                return i + 3;
+        }
+    }
+
+    // 2: word with one optional non-letter/non-digit/non-newline prefix char.
+    {
+        size_t j = i;
+        if (!is_letter(c) && !is_number(c) && !is_cr_lf(c)) j = i + 1;
+        if (j < n && is_letter(cp[j])) {
+            while (j < n && is_letter(cp[j])) ++j;
+            return j;
+        }
+    }
+
+    // 3: digit run, capped at max_digit_run.
+    if (is_number(c)) {
+        size_t j = i + 1;
+        while (j < n && j - i < static_cast<size_t>(max_digit_run) && is_number(cp[j])) ++j;
+        return j;
+    }
+
+    // 4: punctuation run with optional leading space, swallowing trailing newlines.
+    {
+        size_t j = i;
+        if (cp[j] == ' ') ++j;
+        size_t k = j;
+        while (k < n && !is_whitespace(cp[k]) && !is_letter(cp[k]) && !is_number(cp[k])) ++k;
+        if (k > j) {
+            while (k < n && is_cr_lf(cp[k])) ++k;
+            return k;
+        }
+    }
+
+    if (is_whitespace(c)) {
+        size_t e = i;
+        while (e < n && is_whitespace(cp[e])) ++e;
+
+        // 5: \s*[\r\n]+ -- backtracking ends the match after the run's last newline.
+        size_t last_nl = std::numeric_limits<size_t>::max();
+        for (size_t k = i; k < e; ++k)
+            if (is_cr_lf(cp[k])) last_nl = k;
+        if (last_nl != std::numeric_limits<size_t>::max()) return last_nl + 1;
+
+        // 6: \s+(?!\S) -- keep the run's final space for the following token.
+        if (e == n) return e;
+        if (e - i >= 2) return e - 1;
+
+        // 7: \s+
+        return e;
+    }
+
+    // No alternative matched (isolated symbol the classes above exclude,
+    // e.g. a stray combining mark): emit it alone rather than dropping it.
+    return i + 1;
 }
 
 } // namespace blackwell::unicode

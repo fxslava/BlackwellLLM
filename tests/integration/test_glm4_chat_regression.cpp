@@ -1,16 +1,16 @@
 // GLM-4-9B-Chat-1M multi-turn chat regression, driven by token ids.
 //
-// The engine's TokenizerFactory cannot serve this checkpoint -- GLM-4 ships a
-// tiktoken-format `tokenizer.model` behind a custom ChatGLM4Tokenizer class, while
-// the factory requires a byte-level-BPE `tokenizer.json`, and its chat-template
-// factory knows only the ChatML and Llama-3 families. Both limitations are asserted
-// as such in Glm4ChatRegression.TokenizerFactoryRejectsGlm4Checkpoint below, so
-// they stay documented facts rather than surprises.
+// Tokenization here comes from HuggingFace, through
+// scripts/glm4_chat_regression.py: this runner speaks only ids -- it reads
+// jobs.tsv, generates greedily, and writes outputs.tsv for the script to decode.
+// Everything between the two files -- prefill, sampling, the KV cache, the
+// offload pipeline -- is the engine under test.
 //
-// So tokenization lives in scripts/glm4_chat_regression.py and this runner speaks
-// only ids: it reads jobs.tsv, generates greedily, and writes outputs.tsv for the
-// script to decode. Everything between the two files -- prefill, sampling, the KV
-// cache, the offload pipeline -- is the engine under test.
+// The engine can now tokenize GLM-4 itself (TiktokenTokenizer + GlmChatTemplate;
+// see Glm4ChatRegression.TokenizerFactoryServesGlm4Checkpoint below, and the
+// Python-free end-to-end run in test_glm4_native_chat.cpp). This file is kept
+// deliberately: driving the same four prompts from HuggingFace's own tokenizer
+// is what makes the native one's agreement evidence rather than self-report.
 //
 // THE POINT OF THE MULTI-TURN CASE. A turn with reset=0 does NOT re-prefill: its
 // delta is appended at the position where the previous turn's generation stopped, so
@@ -134,28 +134,29 @@ double ms_since(const clock_t_::time_point& t0) {
 
 }  // namespace
 
-// The tokenizer limitation, pinned. If someone later teaches TokenizerFactory the
-// tiktoken format, this test fails and tells them to retire the Python bridge.
-TEST(Glm4ChatRegression, TokenizerFactoryRejectsGlm4Checkpoint) {
+// TokenizerFactory now serves this checkpoint natively (TiktokenTokenizer +
+// GlmChatTemplate). This test pins that: it is the precondition that lets
+// test_glm4_native_chat.cpp run the whole chat in C++, and the reason the
+// Python bridge below is a cross-check rather than the only way in.
+TEST(Glm4ChatRegression, TokenizerFactoryServesGlm4Checkpoint) {
     if (!engine_test::file_exists(model_index_path()))
         GTEST_SKIP() << "GLM-4 checkpoint not found at " << model_index_path();
 
     const std::string dir = model_dir();
-    ASSERT_FALSE(engine_test::file_exists(dir + "/tokenizer.json"))
-        << "a tokenizer.json appeared in " << dir
-        << " -- the native tokenizer may now work; re-evaluate the Python bridge";
     ASSERT_TRUE(engine_test::file_exists(dir + "/tokenizer.model"))
         << "GLM-4 is expected to ship a tiktoken-format tokenizer.model";
 
-    try {
-        auto tok = blackwell::TokenizerFactory::create(dir);
-        FAIL() << "TokenizerFactory unexpectedly built a tokenizer for a checkpoint "
-                  "with no tokenizer.json";
-    } catch (const std::exception& e) {
-        const std::string msg = e.what();
-        EXPECT_NE(msg.find("tokenizer.json"), std::string::npos) << msg;
-        std::cout << "[Tokenizer] as expected: " << msg << "\n";
-    }
+    auto tok = blackwell::TokenizerFactory::create(dir);
+    ASSERT_NE(tok, nullptr);
+
+    // The tiktoken branch, not the byte-level-BPE one: 151329 ranks + 14
+    // special tokens from added_tokens_decoder.
+    EXPECT_EQ(tok->vocab_size(), 151329u + 14u);
+    ASSERT_NE(tok->chat_template(), nullptr);
+    EXPECT_EQ(tok->chat_template()->name(), "glm4");
+
+    // The stop set the Python bridge writes into jobs.tsv, resolved natively.
+    EXPECT_EQ(tok->special_tokens().stop_ids, (std::vector<int>{151329, 151336, 151338}));
 }
 
 TEST(Glm4ChatRegression, FourPromptGreedyChat) {

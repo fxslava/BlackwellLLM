@@ -49,6 +49,12 @@ public:
     // Returns nullptr when `jinja_source` is empty; throws on an unknown family.
     static std::unique_ptr<IChatTemplate> from_jinja_source(const std::string& jinja_source,
                                                             const std::string& bos_token);
+
+    // Fallback for checkpoints that ship no chat_template but whose config.json
+    // `model_type` names a family with a fixed, non-negotiable prompt DSL
+    // (GLM-4). Returns nullptr for any other model_type -- a base model without
+    // a template is legitimate, so this never throws.
+    static std::unique_ptr<IChatTemplate> from_model_type(const std::string& model_type);
 };
 
 } // namespace blackwell

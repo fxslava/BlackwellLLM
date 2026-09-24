@@ -29,4 +29,24 @@ const uint32_t* byte_to_unicode_table(); // [256]
 // Reverse lookup; returns -1 when `cp` is not part of the byte alphabet.
 int unicode_to_byte(uint32_t cp);
 
+// Matches one token of the tiktoken-family pre-tokenizer regex
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+//   | [^\r\n\p{L}\p{N}]?\p{L}+
+//   | \p{N}{1,max_digit_run}
+//   |  ?[^\s\p{L}\p{N}]+[\r\n]*
+//   | \s*[\r\n]+
+//   | \s+(?!\S)
+//   | \s+
+// at codepoint index `i`, returning one-past-the-end of the match. The
+// alternatives are tried in regex order (Perl semantics: first match wins).
+// `i` must be < cp.size(); the result is always > i, so a caller loop
+// terminates.
+//
+// Lives here rather than in a tokenizer because BOTH BPE implementations split
+// on this exact regex: the HuggingFace byte-level path (ByteLevelBpeTokenizer,
+// \p{N}{1,3} for Llama-3 / bare \p{N} for Qwen2) and the raw-byte tiktoken path
+// (TiktokenTokenizer, GLM-4's pat_str). Keeping one definition is what makes
+// the two agree on pre-token boundaries.
+size_t match_pretoken(const std::vector<uint32_t>& cp, size_t i, int max_digit_run);
+
 } // namespace blackwell::unicode

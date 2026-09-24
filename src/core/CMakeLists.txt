@@ -27,6 +27,7 @@ set(CORE_SOURCES
     kv_cache/paged_kv_manager.cpp
     tokenizer/unicode.cpp
     tokenizer/bpe_tokenizer.cpp
+    tokenizer/tiktoken_tokenizer.cpp
     tokenizer/chat_template.cpp
     tokenizer/tokenizer_factory.cpp
     weight_loader.cpp

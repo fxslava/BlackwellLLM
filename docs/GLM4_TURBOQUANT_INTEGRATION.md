@@ -547,6 +547,157 @@ directories, no new dependencies — per skill `cmake-hygiene`.
 
 ---
 
+## 3b. Layer-offload pipeline audit (measured 2026-09-24, RTX 5070 12 GB)
+
+Running GLM-4-9B-Chat-1M bf16 with `BLACKWELL_GPU_LAYERS=16` yields **2.65 tok/s** at
+11 286 MiB of 12 227 MiB VRAM. The question this section answers is whether that number is
+recoverable by fixing stalls in the pipeline, or whether it is the hardware speaking.
+
+**It is the hardware speaking.** The pipeline runs at ~91% of the measured PCIe ceiling.
+
+### The arithmetic, end to end
+
+One bf16 GLM-4 layer, packed the way `VRAMArena` packs it (hidden 4096, ffn 13696, 32 q heads /
+4 kv heads, head_dim 128):
+
+| Block | Params | Bytes (bf16) |
+|---|---:|---:|
+| `q_proj` + `k_proj` + `v_proj` + `o_proj` (+ QKV bias) | 37.75 M | 75.5 MB |
+| `gate_up_proj` (fused, 2 x 13696 x 4096) | 112.20 M | 224.4 MB |
+| `down_proj` | 56.10 M | 112.2 MB |
+| 4 x RMSNorm weight | 0.02 M | 0.03 MB |
+| **total per layer** | **206.07 M** | **412.13 MB = 393.0 MiB** |
+
+At 16/40 resident, 24 layers cross PCIe **every decode step**: 24 x 412.13 MB = **9.89 GB per
+token**. Observed 2.65 tok/s = 377.4 ms/token, so the pipeline is sustaining **26.2 GB/s**.
+
+### The ceiling, measured rather than assumed
+
+`nvidia-smi` reports the decisive fact:
+
+```
+name, pcie.link.gen.current, pcie.link.gen.max, pcie.link.width.current, pcie.link.width.max
+NVIDIA GeForce RTX 5070, 4, 4, 16, 16
+```
+
+The RTX 5070 is a **Gen5** part, but `link.gen.max` is **4** -- the platform (slot / CPU lanes),
+not the card, caps the link at Gen4 x16: 31.5 GB/s theoretical. A standalone pinned-host to
+device benchmark at exactly the transaction size the arena uses (one 393.0 MiB layer block, 20
+copies on a non-blocking stream) measures what is actually achievable:
+
+```
+pinned H2D, 393.0 MiB per copy, 20 copies
+  total 8.24 GB in 285.56 ms  ->  28.86 GB/s
+  per-layer transfer time: 14.28 ms
+```
+
+So the floor for 24 offloaded layers is **24 x 14.28 ms = 342.7 ms/token = 2.92 tok/s**, and the
+engine delivers 2.65 tok/s. **The pipeline captures 90.8% of the hardware ceiling.** The residual
+34.7 ms/token is the 16 resident layers' compute (~0.7 ms each, with no transfer to hide behind),
+KV staging, sampling and the non-overlapped head and tail -- not a stall waiting to be removed.
+
+### Is the overlap actually working? Yes
+
+Reading `stage_layer_weights` ([src/core/memory_pool.cpp:493](../src/core/memory_pool.cpp)) and
+the layer loop at [src/core/engine.cpp:846](../src/core/engine.cpp), the double-buffering is
+correctly implemented and genuinely active:
+
+- Transfers are `cudaMemcpyAsync` on a dedicated **non-blocking** `m_transfer_stream`, never on
+  the compute stream and never a synchronous `cudaMemcpy`. No host-side blocking call exists
+  anywhere on the decode path.
+- `prefetch_layer(i + 1, pos)` is issued *before* layer `i`'s kernels are enqueued, so layer
+  `i+1`'s H2D is in flight while layer `i` computes. Depth-1 prefetch, two slots (`layer % 2`).
+- Ordering is expressed only through events: `ev_retire` (compute to transfer, the eviction
+  handshake) and `ev_ready` (transfer to compute, via `cudaStreamWaitEvent(0, ...)`, which
+  blocks the *stream*, not the host).
+
+Depth-1 is **sufficient here, and more slots would not help**: per layer, transfer is 14.28 ms
+against ~0.7 ms of compute, a 20:1 ratio. The transfer stream is therefore never idle waiting on
+`ev_retire` -- compute is always far ahead, parked on `ev_ready`. Overlap can hide at most ~5% of
+the transfer, and it already does. Raising `kNumSlots` would only cost VRAM (`m_max_layer_bytes`
+per extra slot, another 393 MiB) for no throughput.
+
+### Resident-layer sizing: 17 is safe, 18 is not
+
+Each layer promoted to residency removes exactly 14.28 ms from every token:
+
+| Resident | Streamed/token | PCIe time | Projected | Delta |
+|---:|---:|---:|---:|---:|
+| 16 (today) | 9.89 GB | 342.7 ms | 2.65 tok/s (measured) | -- |
+| 17 | 9.48 GB | 328.4 ms | ~2.75 tok/s | +3.9% |
+| 18 | 9.07 GB | 314.2 ms | ~2.87 tok/s | +8.1% |
+
+The VRAM budget decides it. 12227 MiB total minus 11286 MiB in use leaves **941 MiB**, and that
+free pool must still absorb WDDM's own reserve and transient allocations. One more resident layer
+costs 393 MiB of weights **plus** a resident KV slab (`kv_heads x max_seq_len x head_dim x 4 B`,
+doubled for K and V, so 4096 B per token of context per layer -- 33.5 MiB at 8k, 134 MiB at 32k):
+
+- **17 layers at 8k ctx**: +426 MiB, leaving ~515 MiB. **Safe.**
+- **18 layers at 8k ctx**: +853 MiB, leaving ~88 MiB. **Not safe** -- WDDM starts demoting
+  allocations to system memory, which costs far more than the 8% it buys.
+
+Recommendation: **`BLACKWELL_GPU_LAYERS=17`**, treating 18 as available only once KV is
+compressed (or the context is short). This is a ~4% improvement. Take it, but it is not the
+answer.
+
+Confirmed by running it (`Glm4NativeChat.FourPromptGreedyChatWithoutPython`, 17 resident,
+1024-token context): peak VRAM **11739 MiB of 12227**, i.e. 488 MiB free -- a 453 MiB step up
+from the 16-layer baseline, which is the predicted 393 MiB of weights plus its KV slab and
+allocator slack. An 18th layer would land at ~95 MiB free, so the table's "not safe" verdict
+is measured, not projected.
+
+### What would actually move the number
+
+Ranked by effect, because 91%-of-ceiling means *nothing* improves without moving fewer bytes:
+
+1. **Quantize the offloaded weights (~3.5x).** AWQ-int4 at ~4.5 effective bits takes a layer from
+   412 MB to ~116 MB, so 24 layers = 2.78 GB/token = 96.5 ms, giving **~7.6 tok/s**. Better
+   still, it collapses the whole model from 17.7 GiB to ~5.5 GiB, which **fits in 12 GB with room
+   for KV** -- offloading stops being necessary at all and decode returns to VRAM-bandwidth
+   speed. This is the single decisive lever, and it is already Phases 2-6 of this document.
+2. **Amortize the sweep over more tokens (up to ~3x, composes with 1).** Speculative decoding
+   pays one 9.89 GB weight sweep per *k* accepted tokens rather than per token. It is the only
+   lever that works without changing the weight format.
+3. **Fix the KV slot-rotation defect (below).** Free at short context, up to 29% at 32k.
+4. **`BLACKWELL_GPU_LAYERS=17` (+3.9%).** Worth taking, a rounding error next to 1.
+5. **A Gen5 slot, if the platform has one (2x).** `link.gen.max = 4` is a board/CPU property, not
+   a driver setting -- worth checking the physical slot, but nothing in software fixes it.
+
+### Defect found: offloaded KV prefixes are re-streamed in full every token
+
+`stage_layer_kv` ([src/core/memory_pool.cpp:558](../src/core/memory_pool.cpp)) carries the
+comment *"When the slot still holds this layer from the previous decode step, this is a
+single-token copy."* **With 24 offloaded layers and `kNumSlots = 2`, that condition is never
+true.** Slot `layer % 2` is reused by layers *l*, *l+2*, ... *l+22* within a single step, so by
+the time the next step reaches layer 16 the slot holds layer 38. `slot.layer != layer` resets
+`valid_upto = 0`, and the layer's **entire** KV prefix crosses PCIe again.
+
+The cost is `pos x 4096 B` per offloaded layer per token, i.e. `pos x 98304 B` per token overall
+-- which grows linearly per token and therefore *quadratically* over a generation:
+
+| Context | KV re-streamed/token | Added time | Share of step |
+|---:|---:|---:|---:|
+| 2k | 201 MB | 7.0 ms | ~2% |
+| 8k | 805 MB | 27.9 ms | ~7% |
+| 32k | 3.22 GB | 111.6 ms | ~29% |
+
+At the short contexts measured here this hides inside the 9% residual, which is why it never
+surfaced as an anomaly. On a **1M-context model** it is a real scaling bug.
+
+The clean fix -- one persistent device KV slab per offloaded layer -- costs 24 x 33.5 MiB =
+805 MiB at 8k, which is precisely the VRAM unavailable at 16/40 resident. Two cheaper steps:
+
+- **Immediate and free: store KV in bf16 rather than fp32.** `allocate_dynamic_pool` uses
+  `sizeof(float)` throughout. Halving it halves the re-stream, halves the resident slabs, and
+  buys back ~470 MiB -- enough on its own to make 18 resident layers safe.
+- **Structural: compressed KV.** At QJL 3+1 (4.25 bits) a per-layer persistent slab costs ~1/8 of
+  fp32, making "one KV slot per offloaded layer" affordable and eliminating the re-stream
+  outright. Another argument for Phase 5, recorded here so the trade is not rediscovered.
+
+Correcting the comment is not sufficient: either the slab count or the KV precision has to
+change.
+
+
 ## 4. Validation strategy
 
 The house pattern is: CPU reference in `tests/common/*.h` → tolerance-checked kernel test in
