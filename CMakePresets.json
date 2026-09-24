@@ -149,6 +149,21 @@
         { "name": "cloud",              "inherits": "test-base", "filter": { "include": { "label": "^cloud$" } } },
         { "name": "agent",              "inherits": "test-base", "filter": { "include": { "label": "^agent$" } } },
         { "name": "agent-env",          "inherits": "test-base", "filter": { "include": { "label": "^agent_env$" } } },
-        { "name": "agent-orchestrator", "inherits": "test-base", "filter": { "include": { "label": "^agent_orchestrator$" } } }
+        { "name": "agent-orchestrator", "inherits": "test-base", "filter": { "include": { "label": "^agent_orchestrator$" } } },
+
+        {
+            "name": "test-base-release",
+            "hidden": true,
+            "configurePreset": "x64-release",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true }
+        },
+        { "name": "validation-release",         "inherits": "test-base-release", "filter": { "include": { "label": "^validation$" } } },
+        { "name": "benchmark-release",          "inherits": "test-base-release", "filter": { "include": { "label": "^benchmark$" } } },
+        { "name": "integration-release",        "inherits": "test-base-release", "filter": { "include": { "label": "^integration$" } } },
+        { "name": "cloud-release",              "inherits": "test-base-release", "filter": { "include": { "label": "^cloud$" } } },
+        { "name": "agent-release",              "inherits": "test-base-release", "filter": { "include": { "label": "^agent$" } } },
+        { "name": "agent-env-release",          "inherits": "test-base-release", "filter": { "include": { "label": "^agent_env$" } } },
+        { "name": "agent-orchestrator-release", "inherits": "test-base-release", "filter": { "include": { "label": "^agent_orchestrator$" } } }
     ]
 }

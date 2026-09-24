@@ -64,6 +64,18 @@ ctest --preset agent-orchestrator    :: ReAct loop (MockLLM)
 (`ctest -L <label>` from `out/build/x64-Debug` still works; the presets add exact-label
 anchoring — plain `-L agent` regex-matches all three agent suites.)
 
+**Every label also has a `-release` preset** (`ctest --preset validation-release`,
+`integration-release`, ...) running `out/build/x64-Release` / `Release`. Use those for
+**anything timed**: the Debug CUDA build compiles kernels with `-G -Od`, so a
+tokens-per-second or milliseconds figure taken from it measures the build flags, not the
+engine (measured: the GLM-4 chat regression reports 1.45 tok/s in Debug against a
+multiple of that in Release, same code, same offload split). Correctness metrics barely
+move — Release's `--use_fast_math` costs ~1e-5 of logits cosine on the GLM-4 parity
+suite — so Debug remains fine for pass/fail work. The bare presets stay pinned to
+x64-Debug so existing workflows do not silently change build under anyone; there is no
+Release counterpart of `build_target.bat`, so build with
+`cmake --build --preset x64-release --target <t>` from a vcvars shell.
+
 Sharp edges:
 - **Build the test target first** — ctest does not build, and `gtest_discover_tests`
   registers tests at build time.

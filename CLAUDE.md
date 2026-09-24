@@ -101,6 +101,9 @@ cmake --preset x64-debug                                  :: configure (once, or
 cmake --build --preset x64-debug --target poc_overlay
 ctest --preset validation                                 :: fast kernel-correctness suite
 :: other test presets: benchmark / integration / cloud / agent / agent-env / agent-orchestrator
+:: Every label also has a -release preset (ctest --preset validation-release) running the
+:: x64-Release tree. Use those for ANYTHING TIMED: Debug builds CUDA with -G -Od, so a
+:: tok/s or ms figure from it measures the build flags, not the engine.
 
 :: One-shot from ANY shell (transitional wrapper: vcvars64 + CUDA include, then the preset build):
 .\build_target.bat poc_overlay
