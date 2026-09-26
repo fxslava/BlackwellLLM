@@ -89,17 +89,18 @@ F64 = torch.float64
 # --------------------------------------------------------------------------- #
 
 class PiecewiseWarp:
-    """u = 16*F(v) - 8.5 for the empirical CDF F, and its inverse.
+    """u = L*F(v) - (L/2 + 0.5) for the empirical CDF F and L levels, plus its inverse.
 
-    The offset puts the 16 integer coordinate values -8..+7 exactly on the 16 quantile
-    midpoints (i+0.5)/16, which is precisely where NF4 puts its levels -- so quantizing the
-    warped value on the integer grid reproduces NF4's partition, and the only remaining
-    difference between NF4 and companded E8 is the lattice's cell shape. That equivalence is
-    the reason this particular offset is used rather than a convenient one.
+    The offset puts the L integer coordinate values -L/2 .. L/2-1 exactly on the L quantile
+    midpoints (i+0.5)/L, which is precisely where NF-b puts its levels -- so quantizing the
+    warped value on the integer grid reproduces NF-b's partition, and the only remaining
+    difference between NF-b and companded E8 is the lattice's cell shape. That equivalence is
+    the reason this particular offset is used rather than a convenient one, and it is why
+    ``n_levels`` must track the coordinate width rather than staying at 16.
     """
 
     def __init__(self, v: torch.Tensor, n_knots: int = 2048, seed: int = 0,
-                 subsample: int = 1 << 21):
+                 subsample: int = 1 << 21, n_levels: int = 16, lam: float = 1.0):
         s = _subsample(v, subsample, seed).to(F64)
         ps = torch.linspace(0.0, 1.0, n_knots + 1, device=s.device, dtype=F64)
         xs = torch.quantile(s, ps)
@@ -108,6 +109,26 @@ class PiecewiseWarp:
         xs = torch.cummax(xs, dim=0)[0]
         xs = xs + torch.arange(xs.numel(), device=xs.device, dtype=F64) * eps
         self.xs, self.ps = xs, ps
+        self.n_levels = n_levels
+        self.offset = n_levels / 2.0 + 0.5
+        self.lam = lam
+        self._us: Optional[torch.Tensor] = None
+
+    def with_lambda(self, lam: float) -> "PiecewiseWarp":
+        """A view of the same fitted CDF at a different companding strength.
+
+        ``lam`` blends the quantile map toward the identity: lam=1 is full companding, lam=0
+        is a plain affine map, i.e. *uniform* quantization. Having lam=0 inside the family
+        matters -- it guarantees the companded quantizer can never be worse than the uniform
+        one, which is not true when a single parameter has to serve as both step size and
+        warp shape. That coupling is what made companded E8 collapse at b=3 before this
+        existed.
+        """
+        other = object.__new__(PiecewiseWarp)
+        other.xs, other.ps = self.xs, self.ps
+        other.n_levels, other.offset = self.n_levels, self.offset
+        other.lam, other._us = lam, None
+        return other
 
     @staticmethod
     def _interp(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Tensor:
@@ -118,11 +139,22 @@ class PiecewiseWarp:
         return y0 + t * (y1 - y0)
 
     def forward(self, v: torch.Tensor) -> torch.Tensor:
-        return (16.0 * self._interp(v.to(F64), self.xs, self.ps) - 8.5).to(torch.float32)
+        vd = v.to(F64)
+        comp = self.n_levels * self._interp(vd, self.xs, self.ps) - self.offset
+        if self.lam >= 1.0:
+            return comp.to(torch.float32)
+        return ((1.0 - self.lam) * (vd - 0.5) + self.lam * comp).to(torch.float32)
 
     def inverse(self, u: torch.Tensor) -> torch.Tensor:
-        p = ((u.to(F64) + 8.5) / 16.0).clamp(0.0, 1.0)
-        return self._interp(p, self.ps, self.xs).to(torch.float32)
+        if self.lam >= 1.0:
+            # analytic inverse of the pure quantile map; kept as its own branch so the
+            # lam=1 path stays bit-identical to the Part IV results
+            p = ((u.to(F64) + self.offset) / self.n_levels).clamp(0.0, 1.0)
+            return self._interp(p, self.ps, self.xs).to(torch.float32)
+        if self._us is None:
+            # the blend is monotone but not analytically invertible; invert it on the knots
+            self._us = self.forward(self.xs).to(F64)
+        return self._interp(u.to(F64), self._us, self.xs).to(torch.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +248,8 @@ def _bulk_e8_radial(grid: torch.Tensor, coord_bits: int = 4, n_bins: int = 16,
 # --------------------------------------------------------------------------- #
 
 def _bulk_e8_companded(grid: torch.Tensor, coord_bits: int = 4, iters: int = 2,
-                       n_knots: int = 2048):
+                       n_knots: int = 2048,
+                       lambda_grid: Optional[List[float]] = None):
     """Quantize in the warped domain, reconstruct through a 2x16-entry conditional-mean LUT.
 
     This is the construction that can actually earn companding gain: the encoder's cells are
@@ -236,7 +269,11 @@ def _bulk_e8_companded(grid: torch.Tensor, coord_bits: int = 4, iters: int = 2,
         lo, hi = box_for(coord_bits)
         n_lv = 1 << coord_bits
         rms = buf.pow(2).mean(dim=1, keepdim=True).sqrt().clamp(min=1e-30)
-        warp = PiecewiseWarp(buf / rms, n_knots=n_knots)
+        base_warp = PiecewiseWarp(buf / rms, n_knots=n_knots, n_levels=n_lv)
+        # lambda is a property of the format (the decoder's LUT depends on it), so it is
+        # chosen globally, not per row.
+        lams = lambda_grid if lambda_grid is not None else [1.0]
+        warp = base_warp
         lut: Optional[torch.Tensor] = None                      # [2 * n_lv]
         best_delta = rms.clone()
 
@@ -252,35 +289,47 @@ def _bulk_e8_companded(grid: torch.Tensor, coord_bits: int = 4, iters: int = 2,
                    + (k.to(torch.int64) - lo))
             return lut[idx].to(torch.float32)
 
-        for _ in range(iters):
-            best_mse = torch.full((rows, 1), float("inf"), device=buf.device, dtype=F64)
-            for a in grid.tolist():
-                delta = (rms * a).to(torch.float16).to(torch.float32)
-                k, c = encode(buf / delta)
-                rec = decode(k, c).reshape(rows, padded) * delta
-                mse = (buf - rec).to(F64).pow(2).mean(dim=1, keepdim=True)
-                take = mse < best_mse
-                best_mse = torch.where(take, mse, best_mse)
-                best_delta = torch.where(take, delta, best_delta)
-                del k, c, rec, mse
-            # refit the 2 x 16 LUT as conditional means of the normalized weights
-            v = buf / best_delta
-            k, c = encode(v)
-            idx = (c.unsqueeze(-1).to(torch.int64) * n_lv + (k.to(torch.int64) - lo)
-                   ).reshape(-1)
-            vals = v.reshape(-1).to(F64)
-            sums = torch.zeros(2 * n_lv, device=buf.device, dtype=F64).scatter_add_(
-                0, idx, vals)
-            cnts = torch.zeros(2 * n_lv, device=buf.device, dtype=F64).scatter_add_(
-                0, idx, torch.ones_like(vals))
-            fallback = warp.inverse(
-                torch.stack([torch.arange(lo, hi + 1, device=buf.device,
-                                          dtype=torch.float32),
-                             torch.arange(lo, hi + 1, device=buf.device,
-                                          dtype=torch.float32) + 0.5]).reshape(-1)
-            ).to(F64)
-            lut = torch.where(cnts > 0, sums / cnts.clamp(min=1), fallback)
-            del v, k, c, idx, vals, sums, cnts
+        best_global = None
+        for lam in lams:
+            warp = base_warp.with_lambda(lam) if lam < 1.0 else base_warp
+            lut = None
+            best_delta = rms.clone()
+            for _ in range(iters):
+                best_mse = torch.full((rows, 1), float("inf"), device=buf.device,
+                                      dtype=F64)
+                for a in grid.tolist():
+                    delta = (rms * a).to(torch.float16).to(torch.float32)
+                    k, c = encode(buf / delta)
+                    rec = decode(k, c).reshape(rows, padded) * delta
+                    mse = (buf - rec).to(F64).pow(2).mean(dim=1, keepdim=True)
+                    take = mse < best_mse
+                    best_mse = torch.where(take, mse, best_mse)
+                    best_delta = torch.where(take, delta, best_delta)
+                    del k, c, rec, mse
+                # refit the 2 x n_lv LUT as conditional means of the normalized weights
+                v = buf / best_delta
+                k, c = encode(v)
+                idx = (c.unsqueeze(-1).to(torch.int64) * n_lv + (k.to(torch.int64) - lo)
+                       ).reshape(-1)
+                vals = v.reshape(-1).to(F64)
+                sums = torch.zeros(2 * n_lv, device=buf.device, dtype=F64).scatter_add_(
+                    0, idx, vals)
+                cnts = torch.zeros(2 * n_lv, device=buf.device, dtype=F64).scatter_add_(
+                    0, idx, torch.ones_like(vals))
+                fallback = warp.inverse(
+                    torch.stack([torch.arange(lo, hi + 1, device=buf.device,
+                                              dtype=torch.float32),
+                                 torch.arange(lo, hi + 1, device=buf.device,
+                                              dtype=torch.float32) + 0.5]).reshape(-1)
+                ).to(F64)
+                lut = torch.where(cnts > 0, sums / cnts.clamp(min=1), fallback)
+                del v, k, c, idx, vals, sums, cnts
+            total = float(best_mse.mean())
+            if best_global is None or total < best_global[0]:
+                best_global = (total, lam, lut, best_delta.clone())
+        assert best_global is not None
+        _, lam_best, lut, best_delta = best_global
+        warp = base_warp.with_lambda(lam_best) if lam_best < 1.0 else base_warp
 
         v = buf / best_delta
         k, c = encode(v)
@@ -294,7 +343,8 @@ def _bulk_e8_companded(grid: torch.Tensor, coord_bits: int = 4, iters: int = 2,
             "coord_bits": coord_bits, "pad_columns": padded - n,
             "lut_entries": 2 * n_lv, "lookups_per_block": E8_DIM,
             "lut": [float(x) for x in lut], "sat_at_bound": sat,
-            "warp_knots": n_knots, "pack_verified": True}
+            "warp_knots": n_knots, "pack_verified": True,
+            "lambda": lam_best, "lambda_grid": list(lams)}
     return fn
 
 

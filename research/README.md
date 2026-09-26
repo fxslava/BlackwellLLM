@@ -18,6 +18,8 @@ Needs the GLM-4-9B HF checkpoint (`BLACKWELL_MODELS_DIR`, default `F:/AI/models`
 downloads wikitext-2 on first use.
 
 ```bat
+python research/eval_multirate_sweep.py                            :: Part V, ~7 min
+python research/eval_multirate_sweep.py --tier1-only                :: ceiling per b, ~20 s
 python research/eval_companded_e8.py                               :: Part IV, ~3 min
 python research/eval_1d_vs_e8_kl.py                                :: Part III, ~90 s
 python research/eval_fixed_rate_e8.py                              :: Part II, ~40 s
@@ -39,6 +41,7 @@ python research/nvcomp_stream_bench.py --payload e8=some.bin        :: codecs st
 | `run_full_engine_eval.py` | Orchestration → `bench_report.json` + the CLI matrix. |
 | `eval_fixed_rate_e8.py` | **Part II** — zero-entropy fixed-rate E8: 8 coordinates in one 32-bit register (the coset flag paid for by D8's parity), box-constrained decode, FWHT incoherence vs sparse outlier retention, cosine metrics. → `FIXED_RATE_E8.md` + `fixed_rate_e8_report.json`. |
 | `eval_1d_vs_e8_kl.py` | **Part III** — the head-to-head that decides whether to write the kernel: 1-D RTN/Lloyd-Max/NF4 against 8-D E8 at a matched 4.013 bpw, identical outliers and identical per-row scale search, scored all the way to logit KL by streaming the model tail. → `KL_1D_VS_E8.md` + `kl_comparison_report.json`. |
+| `eval_multirate_sweep.py` | **Part V** — the b in {3,4,5} sweep that finds the cross-over. Tier 1 measures the packing ceiling per width with no model; Tier 2 runs the full logit-KL chain. Fits the companding strength lambda rather than assuming it. → `MULTIRATE_SWEEP.md` + `multirate_report.json`. |
 | `eval_companded_e8.py` | **Part IV** — can the lattice capture companding gain *and* packing gain? Radial shell scaling (a centroid condition) vs Cartesian 32-LUT companding (a real warp), against an NF4-centroid control. Includes `boundary_diagnostic()`, which measures the +0.405 dB ceiling in seconds without touching the model. → `COMPANDED_E8.md` + `companded_e8_report.json`. |
 
 `artifacts/` (gitignored) holds the captured activations; they are re-derivable from the
@@ -63,9 +66,15 @@ new scheme added here must be scored against baselines fitted the same way.
 
 **Screen a lattice idea with `boundary_diagnostic()` before building the plumbing.** It
 measures, in seconds and with no model, what a lattice can win over the cubic lattice at a
-given coordinate width. A non-tiling lattice forfeits 0.25 dB of its asymptotic packing gain
-to overload in a bounded 4-bit code, and Z^8 is the one lattice that tiles the code box
-exactly. That single number would have predicted all of Part IV in advance.
+given coordinate width: +0.202 dB at b=3, +0.405 at b=4, +0.522 at b=5, against an asymptotic
++0.654. Z^8 is the one lattice that tiles the code box exactly, so a non-tiling lattice
+forfeits part of its packing gain to overload, and that loss halves with every added bit.
+Run `eval_multirate_sweep.py --tier1-only` first; it would have predicted Part IV in advance.
+
+**Never judge a lattice format at one bitwidth, and fit the companding strength.** The
+lattice's advantage is non-monotone in b with a trough at exactly b=4 (Part V section 30), and
+pinning the companding strength at "full" instead of fitting it cost 4.5 dB at b=3. Both
+mistakes are in this repo's history.
 
 **Accumulate the scale-search MSE in float64.** Adjacent grid points are often near-tied for
 a row, so float32 reduction noise flips which scale that row picks and moves the downstream
