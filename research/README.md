@@ -18,10 +18,12 @@ Needs the GLM-4-9B HF checkpoint (`BLACKWELL_MODELS_DIR`, default `F:/AI/models`
 downloads wikitext-2 on first use.
 
 ```bat
-python research/run_full_engine_eval.py --skip-nvcomp --layers 10   # quantization only
-python research/e8_lattice_engine.py                               # E8 decoder self-test
-python research/capture_activations.py --num-seqs 8 --seq-len 256   # bigger calib set
-python research/nvcomp_stream_bench.py --payload e8=some.bin        # codecs standalone
+python research/eval_fixed_rate_e8.py                              :: Part II, ~40 s
+python research/eval_fixed_rate_e8.py --self-test                  :: pack + boxed decode
+python research/run_full_engine_eval.py --skip-nvcomp --layers 10   :: quantization only
+python research/e8_lattice_engine.py                               :: E8 decoder self-test
+python research/capture_activations.py --num-seqs 8 --seq-len 256   :: bigger calib set
+python research/nvcomp_stream_bench.py --payload e8=some.bin        :: codecs standalone
 ```
 
 ## Modules
@@ -33,6 +35,7 @@ python research/nvcomp_stream_bench.py --payload e8=some.bin        # codecs sta
 | `qjl_residual.py` | **C** — 1-bit JL residual sketching, the closed-form noise/signal prediction, and the m-sweep that tests it. |
 | `nvcomp_stream_bench.py` | **D** — nvCOMP v5 warm decompression latency and throughput, with round-trip verification and a d2d-bandwidth reference. |
 | `run_full_engine_eval.py` | Orchestration → `bench_report.json` + the CLI matrix. |
+| `eval_fixed_rate_e8.py` | **Part II** — zero-entropy fixed-rate E8: 8 coordinates in one 32-bit register (the coset flag paid for by D8's parity), box-constrained decode, FWHT incoherence vs sparse outlier retention, cosine metrics. → `FIXED_RATE_E8.md` + `fixed_rate_e8_report.json`. |
 
 `artifacts/` (gitignored) holds the captured activations; they are re-derivable from the
 checkpoint, so they are not tracked.
