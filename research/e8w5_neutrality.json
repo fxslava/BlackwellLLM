@@ -1,0 +1,64 @@
+{
+ "format": "E8W5-A16",
+ "coord_bits": 5,
+ "group": 128,
+ "codebook_entries": 64,
+ "neutrality": {
+  "slice": [
+   512,
+   4096
+  ],
+  "layer": 10,
+  "grid_points": 20,
+  "cells": [
+   {
+    "scales": "per_row",
+    "layout": "k_linear",
+    "e8w5_wsqnr_db": 25.985725336026473,
+    "nf5_wsqnr_db": 25.374687460968612,
+    "margin_db": 0.6110378750578604,
+    "lambda": 1.0,
+    "sat_at_bound": 0.0015268325805664062,
+    "seconds": 5.4
+   },
+   {
+    "scales": "per_row",
+    "layout": "mma_m16n8k16",
+    "e8w5_wsqnr_db": 25.97815263983709,
+    "nf5_wsqnr_db": 25.374687460968612,
+    "margin_db": 0.6034651788684791,
+    "lambda": 1.0,
+    "sat_at_bound": 0.0015006065368652344,
+    "seconds": 5.8
+   },
+   {
+    "scales": "group_128",
+    "layout": "k_linear",
+    "e8w5_wsqnr_db": 26.863927284810984,
+    "nf5_wsqnr_db": 26.11101082408699,
+    "margin_db": 0.7529164607239949,
+    "lambda": 1.0,
+    "sat_at_bound": 0.005202770233154297,
+    "seconds": 5.1
+   },
+   {
+    "scales": "group_128",
+    "layout": "mma_m16n8k16",
+    "e8w5_wsqnr_db": 26.860351698789398,
+    "nf5_wsqnr_db": 26.11101082408699,
+    "margin_db": 0.7493408747024084,
+    "lambda": 1.0,
+    "sat_at_bound": 0.005347251892089844,
+    "seconds": 5.4
+   }
+  ],
+  "layout_delta_db": {
+   "per_row": -0.007572696189381389,
+   "group_128": -0.0035755860215864743
+  },
+  "scale_delta_db": {
+   "k_linear": 0.8782019487845112,
+   "mma_m16n8k16": 0.8821990589523061
+  }
+ }
+}

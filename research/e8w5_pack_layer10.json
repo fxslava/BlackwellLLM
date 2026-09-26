@@ -1,0 +1,27 @@
+{
+ "format": "E8W5-A16",
+ "coord_bits": 5,
+ "group": 128,
+ "codebook_entries": 64,
+ "pack_tensor": {
+  "wsqnr_db": 26.873751005895762,
+  "lambda": 1.0,
+  "bulk_cols": 13683,
+  "pad_cols": 13,
+  "layout": "k_linear",
+  "planes_match_scored_reconstruction": true,
+  "bpw_plane_lo": 4.0,
+  "bpw_plane_hi": 1.0,
+  "bpw_scales": 0.125,
+  "bpw_codebook": 1.8253504672897195e-05,
+  "bpw_outlier_vals": 0.015186915887850467,
+  "bpw_outlier_cols": 7.415486273364486e-06,
+  "bits_total": 288359840.0,
+  "bpw_total": 5.140212584878797,
+  "bpw_payload": 5.015186915887851,
+  "bpw_metadata": 0.12502566899094625,
+  "pad_columns": 13.0,
+  "pad_waste_bpw": 0.004745911214953271,
+  "bytes_total": 36044980.0
+ }
+}

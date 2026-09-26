@@ -28,6 +28,9 @@ python research/run_full_engine_eval.py --skip-nvcomp --layers 10   :: quantizat
 python research/e8_lattice_engine.py                               :: E8 decoder self-test
 python research/capture_activations.py --num-seqs 8 --seq-len 256   :: bigger calib set
 python research/nvcomp_stream_bench.py --payload e8=some.bin        :: codecs standalone
+python research/pack_e8w5.py --self-test                           :: E8W5 pack/decode, no model
+python research/pack_e8w5.py --neutrality                          :: what G=128 + the MMA perm cost
+python research/pack_e8w5.py --pack-tensor --full-rows 4096        :: pack a tensor, print exact BPW
 ```
 
 ## Modules
@@ -43,6 +46,7 @@ python research/nvcomp_stream_bench.py --payload e8=some.bin        :: codecs st
 | `eval_1d_vs_e8_kl.py` | **Part III** — the head-to-head that decides whether to write the kernel: 1-D RTN/Lloyd-Max/NF4 against 8-D E8 at a matched 4.013 bpw, identical outliers and identical per-row scale search, scored all the way to logit KL by streaming the model tail. → `KL_1D_VS_E8.md` + `kl_comparison_report.json`. |
 | `eval_multirate_sweep.py` | **Part V** — the b in {3,4,5} sweep that finds the cross-over. Tier 1 measures the packing ceiling per width with no model; Tier 2 runs the full logit-KL chain. Fits the companding strength lambda rather than assuming it. → `MULTIRATE_SWEEP.md` + `multirate_report.json`. |
 | `eval_companded_e8.py` | **Part IV** — can the lattice capture companding gain *and* packing gain? Radial shell scaling (a centroid condition) vs Cartesian 32-LUT companding (a real warp), against an NF4-centroid control. Includes `boundary_diagnostic()`, which measures the +0.405 dB ceiling in seconds without touching the model. → `COMPANDED_E8.md` + `companded_e8_report.json`. |
+| `pack_e8w5.py` | **Format** — the b=5 companded-E8 quantizer turned into a byte-exact kernel weight format: two 16-byte-aligned bit-planes, a 64-entry codebook, per-group-128 scales, and the MMA coordinate permutation. Verifies the pack round-trip and the *kernel's own integer decode* bit-exactly, and measures the two things Part V did not (group scales, block regrouping). → [`docs/E8W5_FORMAT_SPEC.md`](../docs/E8W5_FORMAT_SPEC.md) + `kernels/e8w5_dequant.cuh`. |
 
 `artifacts/` (gitignored) holds the captured activations; they are re-derivable from the
 checkpoint, so they are not tracked.
@@ -75,6 +79,8 @@ Run `eval_multirate_sweep.py --tier1-only` first; it would have predicted Part I
 lattice's advantage is non-monotone in b with a trough at exactly b=4 (Part V section 30), and
 pinning the companding strength at "full" instead of fitting it cost 4.5 dB at b=3. Both
 mistakes are in this repo's history.
+
+**A format is not the quantizer.** `pack_e8w5.py` reuses Part IV's encoder, warp and codebook unchanged, so Part V's dB transfer — but per-group-128 scales and the MMA block permutation are *new*, and a dB measured with per-row scales does not describe them. Anything that changes scale granularity, block grouping or codebook precision has to be re-measured, not inherited; `--neutrality` is where that happens.
 
 **Accumulate the scale-search MSE in float64.** Adjacent grid points are often near-tied for
 a row, so float32 reduction noise flips which scale that row picks and moves the downstream

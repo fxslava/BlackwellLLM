@@ -1,0 +1,26 @@
+{
+ "format": "E8W5-A16",
+ "coord_bits": 5,
+ "group": 128,
+ "codebook_entries": 64,
+ "self_test": {
+  "roundtrip_bit_exact": true,
+  "blocks_checked": 66048,
+  "coords_checked": 528384,
+  "distinct_coord_values_seen": 32,
+  "both_cosets_seen": true,
+  "mirror_index_bit_exact": true,
+  "mirror_value_exact": true,
+  "index_range": [
+   0,
+   63
+  ],
+  "bits_per_block": 40,
+  "bytes_plane_lo_per_group": 64,
+  "bytes_plane_hi_per_group": 16,
+  "group_bytes_total": 80,
+  "both_planes_16B_aligned": true,
+  "mma_perm_valid": true,
+  "mma_block_within_one_group": true
+ }
+}
