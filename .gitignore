@@ -51,3 +51,7 @@ logits_comparison.csv
 
 # audio_sandbox microphone capture output
 audio_sandbox/recordings/
+
+# research/ experiment artifacts: captured activations are re-derivable from the
+# checkpoint by capture_activations.py, so they are not worth tracking (14 MB each).
+research/artifacts/
