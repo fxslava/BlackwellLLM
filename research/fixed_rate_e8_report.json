@@ -1,6 +1,6 @@
 {
   "meta": {
-    "generated": "2026-09-26T19:22:46",
+    "generated": "2026-09-26T19:29:11",
     "gpu": "NVIDIA GeForce RTX 5070",
     "torch": "2.13.0.dev20260516+cu130",
     "model_dir": "F:/AI/models\\GLM-4-9B-Chat-1M-hf",
@@ -46,14 +46,14 @@
     {
       "scheme": "Lloyd-Max 16-LUT",
       "total_bpw": 4.001172787675234,
-      "weight_sqnr_db": 19.57990090830036,
-      "weight_linf": 0.5724280029535294,
-      "act_snr_db": 17.11668278746352,
-      "cos_global": 0.9903137021393482,
-      "cos_token_min": 0.9321778983492857,
-      "cos_token_mean": 0.9932307172094335,
-      "act_linf": 1.5748075246810913,
-      "act_mean_bias": 3.492616404761773e-06,
+      "weight_sqnr_db": 19.57989869723075,
+      "weight_linf": 0.5724280476570129,
+      "act_snr_db": 17.116804663582187,
+      "cos_global": 0.9903139667806515,
+      "cos_token_min": 0.9321763203766036,
+      "cos_token_mean": 0.9932309150088268,
+      "act_linf": 1.5748084783554077,
+      "act_mean_bias": 3.3836082173953168e-06,
       "act_rms": 0.025409322572020887
     },
     {
@@ -349,14 +349,14 @@
     {
       "scheme": "Lloyd-Max 16-LUT",
       "total_bpw": 4.001172787675234,
-      "weight_sqnr_db": 19.712314235834338,
-      "weight_linf": 0.6528469510376453,
-      "act_snr_db": 4.505212903875052,
-      "cos_global": 0.8059592475021566,
-      "cos_token_min": 0.4757086793153603,
-      "cos_token_mean": 0.975511380170837,
-      "act_linf": 4.796340972185135,
-      "act_mean_bias": -1.8229689413329733e-05,
+      "weight_sqnr_db": 19.71230153647823,
+      "weight_linf": 0.652846947312355,
+      "act_snr_db": 4.505216339135978,
+      "cos_global": 0.8059592527135102,
+      "cos_token_min": 0.47570630111121254,
+      "cos_token_mean": 0.9755116477533405,
+      "act_linf": 4.796341195702553,
+      "act_mean_bias": -1.818605025806036e-05,
       "act_rms": 0.013394649101098161
     },
     {
