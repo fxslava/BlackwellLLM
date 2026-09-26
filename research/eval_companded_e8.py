@@ -249,7 +249,8 @@ def _bulk_e8_radial(grid: torch.Tensor, coord_bits: int = 4, n_bins: int = 16,
 
 def _bulk_e8_companded(grid: torch.Tensor, coord_bits: int = 4, iters: int = 2,
                        n_knots: int = 2048,
-                       lambda_grid: Optional[List[float]] = None):
+                       lambda_grid: Optional[List[float]] = None,
+                       lam_scan_grid: Optional[torch.Tensor] = None):
     """Quantize in the warped domain, reconstruct through a 2x16-entry conditional-mean LUT.
 
     This is the construction that can actually earn companding gain: the encoder's cells are
@@ -288,6 +289,31 @@ def _bulk_e8_companded(grid: torch.Tensor, coord_bits: int = 4, iters: int = 2,
             idx = (c.unsqueeze(-1).to(torch.int64) * n_lv
                    + (k.to(torch.int64) - lo))
             return lut[idx].to(torch.float32)
+
+        # Two-stage lambda search. Scoring every lambda on the full step grid costs
+        # 5x40x2 = 400 lattice passes per tensor, which is 74 minutes for a whole 9 B model.
+        # With lam_scan_grid the lambda is chosen on a coarse grid at one iteration and only
+        # the winner gets the full fit: 5x12 + 40x2 = 140 passes, same answer in a third of
+        # the time. Left off by default so the earlier parts reproduce exactly.
+        if lam_scan_grid is not None and len(lams) > 1:
+            scan_best = None
+            for lam in lams:
+                warp = base_warp.with_lambda(lam) if lam < 1.0 else base_warp
+                lut = None
+                mse_min = torch.full((rows, 1), float("inf"), device=buf.device, dtype=F64)
+                for a in lam_scan_grid.tolist():
+                    delta = (rms * a).to(torch.float16).to(torch.float32)
+                    k, c = encode(buf / delta)
+                    rec = decode(k, c).reshape(rows, padded) * delta
+                    mse = (buf - rec).to(F64).pow(2).mean(dim=1, keepdim=True)
+                    mse_min = torch.minimum(mse_min, mse)
+                    del k, c, rec, mse
+                tot = float(mse_min.mean())
+                if scan_best is None or tot < scan_best[0]:
+                    scan_best = (tot, lam)
+                del mse_min
+            assert scan_best is not None
+            lams = [scan_best[1]]
 
         best_global = None
         for lam in lams:
