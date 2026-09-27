@@ -1512,6 +1512,46 @@ blackwell::EngineStatus BlackwellEngine::forward_status(int token_id, int pos,
 }
 
 // ============================================================================
+// Prompt prefill. See the contract on BlackwellEngine::prefill_status
+// (include/blackwell/engine.h): equivalent to a forward_status() sweep over the
+// same tokens, minus the lm_head work for the tokens whose logits nobody reads,
+// plus chunk-tiling where the resolved token capacity permits it.
+// ============================================================================
+blackwell::EngineStatus BlackwellEngine::prefill_status(const int* token_ids, int num_tokens,
+                                                        int start_pos, float temperature,
+                                                        float top_p, int seq_id,
+                                                        int* next_token) noexcept {
+    if (!token_ids || !next_token || num_tokens <= 0) return EngineStatus::InvalidArgument;
+    try {
+        auto* impl = pImpl.get();
+        // capacity 1 (Continuous, or batch=1 dense) => the run_token branch below
+        // for every token; > 1 (Paged dense) => 64-token tiles through run_chunk.
+        const size_t cap = std::max<size_t>(1, impl->m_token_capacity);
+        int consumed = 0;
+        while (consumed < num_tokens) {
+            const int n = static_cast<int>(
+                std::min<size_t>(cap, static_cast<size_t>(num_tokens - consumed)));
+            // Only the final token of the final tile needs logits; every earlier
+            // pass skips step_final_ops entirely.
+            const bool want_logits = (consumed + n == num_tokens);
+            if (n == 1) {
+                ENGINE_TRY(impl->run_token(token_ids[consumed], start_pos + consumed, seq_id,
+                                           want_logits));
+            } else {
+                ENGINE_TRY(impl->run_chunk(token_ids + consumed, start_pos + consumed, n,
+                                           seq_id, want_logits));
+            }
+            consumed += n;
+        }
+        *next_token = sample_top_p(impl->d_logits, impl->m_config.vocab_size, temperature,
+                                   top_p);
+        return EngineStatus::Success;
+    } catch (...) {
+        return status_from_current_exception("prefill_status");
+    }
+}
+
+// ============================================================================
 // Evaluation Inference (Для расчета Перплексии)
 // ============================================================================
 blackwell::EngineStatus BlackwellEngine::forward_eval_status(int token_id, int pos,

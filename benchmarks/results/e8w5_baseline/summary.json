@@ -1,0 +1,113 @@
+{
+  "config": {
+    "model": "F:/AI/models/GLM-4-9B-e8w5",
+    "exe": "D:\\Projects\\BlackwellLLM\\out\\build\\x64-Release\\src\\apps\\Release\\blackwell_llm.exe",
+    "ctx": 4096,
+    "max_input_tokens": 2000,
+    "limit": 50,
+    "tasks": [
+      "qasper",
+      "multifieldqa_en",
+      "lcc",
+      "trec"
+    ],
+    "gpu_layers": null,
+    "kv_mode": "paged",
+    "prefill": "fast",
+    "sampling": "greedy (temperature=0)"
+  },
+  "engine": {
+    "weights_gb": 7.23083,
+    "kv_dynamic_mb": 646.688,
+    "restarts": 0
+  },
+  "vram": {
+    "baseline_mb": 936,
+    "peak_total_mb": 11846,
+    "peak_over_baseline_mb": 10910,
+    "n_samples": 5861
+  },
+  "wall_clock_s": 6154.5,
+  "tasks": {
+    "qasper": {
+      "n": 50,
+      "failures": 0,
+      "metric": "qa_f1",
+      "score": 25.98,
+      "score_stderr": 5.36,
+      "secondary": {
+        "rouge_l": 25.82
+      },
+      "prompt_tokens_mean": 2019.0,
+      "prompt_tokens_max": 2019,
+      "truncated_frac": 1.0,
+      "stop_reasons": {
+        "eos": 50
+      },
+      "prefill_ms_mean": 27767.2,
+      "prefill_ms_per_token": 13.75,
+      "decode_ms_per_token": 63.53,
+      "wall_s_mean": 28.3
+    },
+    "multifieldqa_en": {
+      "n": 50,
+      "failures": 0,
+      "metric": "qa_f1",
+      "score": 50.26,
+      "score_stderr": 4.93,
+      "secondary": {
+        "rouge_l": 49.75
+      },
+      "prompt_tokens_mean": 2007.1,
+      "prompt_tokens_max": 2020,
+      "truncated_frac": 0.94,
+      "stop_reasons": {
+        "eos": 49,
+        "limit": 1
+      },
+      "prefill_ms_mean": 28137.9,
+      "prefill_ms_per_token": 14.02,
+      "decode_ms_per_token": 64.48,
+      "wall_s_mean": 29.2
+    },
+    "lcc": {
+      "n": 50,
+      "failures": 0,
+      "metric": "edit_sim",
+      "score": 59.9,
+      "score_stderr": 4.55,
+      "secondary": {
+        "exact_prefix": 24.0,
+        "edit_sim_difflib": 58.11
+      },
+      "prompt_tokens_mean": 1870.4,
+      "prompt_tokens_max": 2002,
+      "truncated_frac": 0.66,
+      "stop_reasons": {
+        "limit": 50
+      },
+      "prefill_ms_mean": 28355.2,
+      "prefill_ms_per_token": 15.37,
+      "decode_ms_per_token": 68.12,
+      "wall_s_mean": 32.7
+    },
+    "trec": {
+      "n": 50,
+      "failures": 0,
+      "metric": "classification",
+      "score": 81.0,
+      "score_stderr": 5.51,
+      "secondary": {},
+      "prompt_tokens_mean": 2002.0,
+      "prompt_tokens_max": 2002,
+      "truncated_frac": 1.0,
+      "stop_reasons": {
+        "limit": 50
+      },
+      "prefill_ms_mean": 28631.0,
+      "prefill_ms_per_token": 14.3,
+      "decode_ms_per_token": 66.21,
+      "wall_s_mean": 32.9
+    }
+  }
+}

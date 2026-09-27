@@ -108,6 +108,33 @@ public:
                                                 int target_token_id, int seq_id,
                                                 float* log_prob) noexcept;
 
+    // PROMPT PREFILL: consume `num_tokens` context tokens starting at `start_pos`
+    // and sample only the continuation that follows the LAST of them.
+    //
+    // Semantically identical to a forward_status() loop over the same tokens --
+    // same KV cache contents, same final logits, same sampled token -- but it does
+    // not pay for logits it is going to throw away. A forward_status() loop runs
+    // the final RMSNorm and the lm_head GEMV for EVERY prompt token; on a
+    // 151552-vocab model that head is a 1.24 GiB read per token, and the caller
+    // discards all but the last. This endpoint passes want_logits=false for every
+    // interior token, and additionally tiles the prompt through
+    // Impl::run_chunk when the resolved token capacity allows it (Paged mode on a
+    // dense model -- see resolve_token_capacity), so the residual stream, the
+    // norms and the paged-flash attention are widened to a 64-token tile.
+    //
+    // Deliberately NOT capability-gated: when the token capacity is 1 (Continuous
+    // mode) it falls back to the single-token sweep, which is still strictly
+    // cheaper than the caller's own loop. Skipping work is never an error, so a
+    // harness or a UI can call this unconditionally for a prompt and get the best
+    // path the loaded configuration supports.
+    //
+    // RUNTIME tier, like forward_status: noexcept, reports by EngineStatus. A
+    // faulted prefill leaves the KV cache truncated at whatever it managed to
+    // append, so the caller must re-prefill (or rewind) rather than decode on.
+    blackwell::EngineStatus prefill_status(const int* token_ids, int num_tokens,
+                                           int start_pos, float temperature, float top_p,
+                                           int seq_id, int* next_token) noexcept;
+
     // TRUE batched decode: advance `requests.size()` INDEPENDENT sequences by one
     // token each in a SINGLE forward pass (batched embedding -> per-layer batched
     // RMSNorm + Tensor-Core projections + batched paged-flash attention over

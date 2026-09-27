@@ -1,0 +1,121 @@
+LongBench baseline - GLM-4-9B E8W5 (5.14 bpw companded-E8 lattice)
+==================================================================
+STATUS: COMPLETE. 200/200 samples scored, 0 failures, 0 engine restarts.
+Run date:      2026-09-27
+Wall clock:    102.6 min (1.71 h)
+Parked:        GPU profiling suspended to free VRAM for a parallel attention-kernel
+               session. No further runs needed to use this baseline.
+
+CONFIGURATION (all of it matters for comparability)
+--------------------------------------------------
+model          F:/AI/models/GLM-4-9B-e8w5
+exe            out/build/x64-Release/src/apps/Release/blackwell_llm.exe   (x64-Release)
+engine path    --kv-mode paged --prefill fast   (PrefillTokens + chunked prefill)
+ctx            4096
+input budget   2000 tokens, middle-truncated inside the engine
+sampling       greedy, temperature=0  -> this run is bit-reproducible
+tasks          qasper, multifieldqa_en, lcc, trec   (50 samples each, first N in file order)
+
+RESULTS (LongBench 0-100 scale; +/- is the standard error of the mean)
+---------------------------------------------------------------------
+task              metric          n   score   +/-    published*   truncated
+qasper            qa_f1          50   25.98   5.36      43.3         100%
+multifieldqa_en   qa_f1          50   50.26   4.93      51.7          94%
+lcc               edit_sim       50   59.90   4.55      57.66         66%
+trec              classification 50   81.00   5.51      79.0         100%
+
+* ChatGLM3-6B-32k, full precision, 32k context - CONTEXT ONLY, NOT A BASELINE.
+  Different model, different precision, and 16x the context budget. Do not read a
+  quantization loss out of these gaps.
+
+qasper, decomposed: 18/50 samples answered "unanswerable" because truncation removed
+the evidence (each scores exactly 0.000). The remaining 32 average 40.60 F1. That
+40.60-vs-43.3 comparison is the strongest quality statement this run supports.
+
+COST PROFILE (engine's own instrumentation, load excluded)
+----------------------------------------------------------
+prefill    13.75 - 15.37 ms/token   (~65-73 tok/s)
+decode     63.50 - 68.10 ms/token   (~15.6 tok/s)   <- 4.6x more per token than prefill
+weights    7.231 GB resident
+KV/dynamic 646.7 MB at ctx 4096 Paged (~158 KB/token)
+GPU peak   11 846 MB of 12 227 MB total (baseline 936 MB desktop; delta 10 910 MB)
+
+The decode/prefill gap is only ~13% explained (the 1.24 GiB lm_head read per token).
+The rest is NOT diagnosed - the Continuous-vs-Paged decode A/B that would separate
+the ranked hypotheses was cancelled before producing data. See
+docs/LONGBENCH_E8W5_BASELINE.md section 4 for the hypotheses and the exact experiment.
+
+READY FOR A/B DIFFING
+---------------------
+Run a later checkpoint (Lattice-OBS, Split-K, Hadamard, MMA-permuted pack, ...) with
+the SAME four flags that matter - --limit 50 --max-input-tokens 2000 --ctx 4096 and
+the same --kv-mode/--prefill - into a NEW output directory, then:
+
+    python benchmarks/report_tables.py benchmarks/results/<new-run> \
+           --against benchmarks/results/e8w5_baseline
+
+That pairs samples by (task, _id), reports per-sample deltas, the win/loss/tie split,
+a paired t-statistic, and the largest individual regressions with both predictions
+side by side. Use the paired t, not the task averages: the +/- above is 4.5-5.5 points,
+so an unpaired comparison cannot see a real change smaller than ~10 points, while the
+paired test on identical samples resolves far less.
+
+DO NOT re-run into this directory. The harness OPENS predictions.jsonl IN APPEND MODE
+("a"), so a second run here silently appends 200 more rows and report_tables.py would
+then read whichever row for a given (task, _id) it saw last. Use a new --output-dir.
+(--resume exists for continuing an INTERRUPTED run; this one is complete.)
+
+The three artifacts are marked read-only to enforce that. To deliberately modify them:
+    attrib -R benchmarks\results\e8w5_baseline\*
+
+INTEGRITY (verify before trusting a later diff)
+-----------------------------------------------
+predictions.jsonl  200 rows, 50 per task, 0 duplicate (task,_id)  117302 bytes
+                   sha256[:16] 903a68b2b7fe6d55
+summary.json       4 tasks                                          2740 bytes
+                   sha256[:16] 93860ac7a268d9c9
+engine.log         arena + DirectStorage output                      1375 bytes
+                   sha256[:16] 3146c5b707a0f57c
+
+WHAT WOULD MAKE THIS BASELINE BETTER (in value order)
+-----------------------------------------------------
+1. Re-run at --max-input-tokens 16000: truncates only 3/200 samples, ~7.0 h. That
+   number is citable against published LongBench; this one is only self-comparable.
+2. Finish the decode diagnosis (the cancelled 2-minute A/B). Decode is the repo's
+   actual hot path - short prompt, long generation - and it is 4.6x prefill per token.
+3. A paired BF16 subset. GLM-4-9B-Chat-1M-hf is 18 GB against 12 GB of VRAM, so it
+   needs --gpu-layers 17 and streams 23 of 40 layers per token; a full run is a
+   multi-day job, but ~20 samples at a 500-token budget is roughly an hour and would
+   replace the 83-token perplexity A/B with a real quality delta.
+
+BINARY PROVENANCE (read this before diffing a Split-K run against this baseline)
+-------------------------------------------------------------------------------
+git HEAD during the run: e1cc792 ("fix(e8w5): say when the model directory is
+missing, and glob the tokenizer instead of listing it")
+
+Measured binaries, both x64-Release, built 2026-09-27 21:27:03:
+    out/build/x64-Release/src/core/Release/blackwell_core.dll
+    out/build/x64-Release/src/apps/Release/blackwell_llm.exe
+The run spawned the engine at ~21:56 and finished 23:38; the DLL was not rebuilt at
+any point during it.
+
+IN the measured binary: HEAD plus the uncommitted prefill work from this session -
+BlackwellEngine::prefill_status, IBlackwellEngine::PrefillTokens, and the
+blackwell_llm --serve / --kv-mode / --prefill flags.
+
+NOT in the measured binary: a parallel attention-kernel (Split-K) session edited the
+same working tree from 22:39 onward - i.e. AFTER this build and, for most of them,
+during this run. None of these edits can have affected these numbers, because the
+running process held the 21:27 DLL image:
+    src/kernels/attention.cu / .cuh
+    src/core/memory_pool.cpp / .h
+    src/core/runtime_config.cpp, include/blackwell/runtime_config.h
+    src/core/kv_cache/continuous_kv_manager.cpp / .h
+    src/core/engine.cpp   (their later edits only; prefill_status WAS in the build)
+    tests/validation/test_attention_split_k.cpp, tests/benchmarks/bench_attention_split_k.cpp
+
+CONSEQUENCE: this baseline is a clean pre-Split-K measurement, which is exactly what
+makes it usable as the "before" side of that comparison - but the binaries on disk are
+now STALE relative to the working tree. Rebuild before measuring the "after" side, and
+record that build's provenance the same way, or the diff conflates the attention
+kernel change with anything else that landed in between.

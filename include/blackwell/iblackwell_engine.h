@@ -128,6 +128,23 @@ struct IBlackwellEngine {
     virtual HRESULT STDMETHODCALLTYPE ForwardBatch(const BLACKWELL_DECODE_REQUEST* pRequests,
                                                    uint32_t count,
                                                    BLACKWELL_DECODE_RESULT* pResults) = 0;
+
+    // PROMPT PREFILL: consume pTokens[count] as context starting at start_pos and
+    // return only the continuation sampled after the LAST of them
+    // (BlackwellEngine::prefill_status). Equivalent to calling Forward() once per
+    // token and keeping the last result, but it does not run the lm_head for the
+    // logits the caller would discard, and it tiles the prompt through the batched
+    // chunk path where the loaded configuration supports it.
+    //
+    // Never capability-gated: a configuration that cannot batch falls back to the
+    // per-token sweep, so this is always the right call for a prompt.
+    // Appended at the END of the vtable after ForwardBatch: existing method
+    // ordinals are unchanged, so binaries built against the prior interface keep
+    // their ABI.
+    virtual HRESULT STDMETHODCALLTYPE PrefillTokens(const int32_t* pTokens, uint32_t count,
+                                                    int32_t start_pos, float temperature,
+                                                    float top_p, int32_t seq_id,
+                                                    int32_t* pNextToken) = 0;
 };
 
 // The tokenizer boundary: everything a chat/eval loop needs. Configured

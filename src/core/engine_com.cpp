@@ -297,6 +297,25 @@ public:
             return S_OK;
         });
     }
+    HRESULT STDMETHODCALLTYPE PrefillTokens(const int32_t* pTokens, uint32_t count,
+                                            int32_t start_pos, float temperature,
+                                            float top_p, int32_t seq_id,
+                                            int32_t* pNextToken) override {
+        BLACKWELL_VERIFY_OWNING_THREAD();
+        if (!pTokens || !pNextToken) return E_POINTER;
+        if (count == 0) return E_INVALIDARG;
+        // RUNTIME tier, like Forward: the status translates straight to an HRESULT.
+        return boundary("PrefillTokens", [&] {
+            int next = -1;
+            const auto st = engine_->prefill_status(
+                pTokens, static_cast<int>(count), start_pos, temperature, top_p, seq_id,
+                &next);
+            if (st != blackwell::EngineStatus::Success)
+                return hresult_from_status(st, "PrefillTokens");
+            *pNextToken = next;
+            return S_OK;
+        });
+    }
 
 private:
     std::unique_ptr<BlackwellEngine> engine_;

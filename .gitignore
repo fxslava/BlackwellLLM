@@ -55,3 +55,6 @@ audio_sandbox/recordings/
 # research/ experiment artifacts: captured activations are re-derivable from the
 # checkpoint by capture_activations.py, so they are not worth tracking (14 MB each).
 research/artifacts/
+
+# LongBench task data cached from the HF hub (113 MB zip, extracted per task)
+benchmarks/data/

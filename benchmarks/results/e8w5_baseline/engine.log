@@ -1,0 +1,18 @@
+
+=== spawn 21:55:47: D:\Projects\BlackwellLLM\out\build\x64-Release\src\apps\Release\blackwell_llm.exe --model F:/AI/models/GLM-4-9B-e8w5 --ctx 4096 --serve --kv-mode paged --prefill fast
+[Tokenizer] tiktoken: 151329 ranks + 14 special, digit-run<=3, prefix=2, template=glm4
+[Safetensors] Parsing multi-file index: F:/AI/models/GLM-4-9B-e8w5/model.safetensors.index.json
+[Safetensors] Registered metadata for slice: model-00004-of-00005.safetensors
+[Safetensors] Registered metadata for slice: model-00001-of-00005.safetensors
+[Safetensors] Registered metadata for slice: model-00002-of-00005.safetensors
+[Safetensors] Registered metadata for slice: model-00003-of-00005.safetensors
+[Safetensors] Registered metadata for slice: model-00005-of-00005.safetensors
+[Safetensors] Multi-file registry complete. Total tensors loaded: 1163
+[VRAM Arena] Initializing static memory pools...
+[VRAM Arena] Contiguous VRAM weights footprint: 7.23083 GB
+[DirectStorage] flush: 63 batches, 1469 aligned DS requests (7410.07 MB), 5 tail reads (7608 B), Win32 fallback: 0 MB
+[VRAM Arena] Weights successfully transferred to device arena.
+[VRAM Arena] Loaded 0 quantized AWQ/GPTQ modules.
+[VRAM Arena] Dynamic pool allocated. Context capacity: 4096 tokens.
+[VRAM Arena] Total dynamic memory consumption: 646.688 MB
+[VRAM Arena] All static device pools successfully released.

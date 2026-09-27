@@ -307,6 +307,13 @@ Prefill is consequently slower than BF16 prefill per token. For this repo's stat
 batch=1, latency-critical, hotkey-driven translation — decode dominates, but a long first
 prompt will feel it.
 
+**Partially mitigated since (2026-09).** `IBlackwellEngine::PrefillTokens` skips the 1.24 GiB
+`lm_head` read for every prompt token whose logits are discarded, and tiles the prompt through
+`Impl::run_chunk` under Paged mode. The linear projections still sweep per row — that needs the
+MMA-permuted pack below — but the batched attention/norm/RoPE path cuts the quadratic
+context term 21x, which is 4.7x on a 16k-token prompt. Measured in
+docs/LONGBENCH_E8W5_BASELINE.md §6.
+
 ---
 
 ## 6. Verification register and what to do next
@@ -324,8 +331,8 @@ prompt will feel it.
 | 9 | End-to-end generation on the converted checkpoint, coherent output | **verified** (§4.5) |
 | 10 | Perplexity vs BF16 | **measured**, 12.4701 -> 13.0102 (+4.33%) — on an 83-token text, so indicative only |
 | 11 | Act-SNR / logit-KL of the G=128 no-outlier quantizer | **NOT measured** |
-| 12 | Prefill / batched throughput | **NOT measured** (no batched kernel) |
-| 13 | End-to-end tok/s isolated from load time | **NOT measured** |
+| 12 | Prefill / batched throughput | **measured, 13.75-15.37 ms/token (~65-73 tok/s)** on GLM-4-9B E8W5 at ~2k-token prompts, Paged + chunked prefill with `want_logits=false` for interior tokens (docs/LONGBENCH_E8W5_BASELINE.md §4). Still NO batched E8W5 GEMM — the linear projections sweep per row either way — but batching attention/norms/RoPE/KV-append cuts the context-dependent quadratic term 21x: `15.6*N + 6.26e-4*N^2` ms vs the token-by-token `17.2*N + 6.43e-3*N^2`, i.e. 4.7x on a 16k prompt, greedy output byte-identical within a KV mode |
+| 13 | End-to-end tok/s isolated from load time | **measured** (docs/LONGBENCH_E8W5_BASELINE.md §4): prefill 13.75-15.37 ms/token, **decode 63.5-68.1 ms/token (~15.6 tok/s)**, timed separately per sample after the DirectStorage load over 200 LongBench prompts. Decode costs 4.6x more per token than prefill; ~13% of a decode step is the 1.24 GiB `lm_head` read, the rest is **unattributed** — ranked hypotheses (Paged-decode block-table overhead, `sample_top_p`'s per-token `cudaMalloc`/`cudaFree` + synchronising D2H copy, batch-1 SM occupancy) are listed in §4, and the Continuous-vs-Paged A/B that would separate them was cancelled before it ran — NOT yet diagnosed |
 
 Next, in order of value:
 

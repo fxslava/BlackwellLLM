@@ -24,6 +24,7 @@ workloads: a background app that wakes on a hotkey, translates, and goes back to
 | Build modules | `cmake/` | — | `Dependencies.cmake` (pinned FetchContent: gtest, nlohmann_json), `DirectStorage.cmake` (`blackwell::dstorage` INTERFACE target + `blackwell_copy_dstorage_dlls()` helper), `OnnxRuntime.cmake` (`blackwell::onnxruntime` + `blackwell_copy_onnxruntime_dlls()` / `blackwell_copy_vad_model()`; hash-pinned ORT CPU zip + `silero_vad.onnx` → gitignored `models/`). |
 | Design docs | `docs/` | — | Read these before touching the corresponding subsystem (list below). |
 | Python scripts | `scripts/` | — | PyTorch golden-dump generators + CLI chat reference. Checkpoint roots resolve via `BLACKWELL_MODELS_DIR` (default `F:/AI`). |
+| Benchmarks | `benchmarks/` | — | End-to-end quality harness: `run_longbench_harness.py` drives `blackwell_llm --serve` over a pipe on a LongBench subset, `metrics.py` is the dependency-free scorer (official LongBench F1 / classification / code edit-sim). Results and the measured prefill cost model: `docs/LONGBENCH_E8W5_BASELINE.md`. Task data caches to gitignored `benchmarks/data/`. |
 
 ## The single-threaded engine doctrine (the most important rule)
 

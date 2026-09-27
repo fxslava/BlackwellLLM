@@ -113,8 +113,9 @@ next hotkey re-triggers construction. Section 3 shows this end to end.
 tokenizer_->encode(...)              // text -> ids (chat template applied)
    |
    v
-engine->forward(tok, pos)  x N       // prefill: one call per prompt token
-   |                                    (position-addressed KV cache)
+engine->prefill_status(ids, n, 0)    // prefill: ONE call for the whole prompt
+   |                                    (or forward() per token -- same result,
+   |                                     more work; see below)
    v
 engine->forward(tok, pos)  loop      // decode: feed the sampled id back in
    |                                    until eos / stop string / max tokens
@@ -128,8 +129,29 @@ Re-decoding at a `pos` you've already written silently overwrites that slot —
 this is how KV-cache reuse across turns works (see `reset_state` below for
 the one case where it *isn't* safe).
 
-**Prefill is no longer strictly token-by-token.** The `forward()`-per-token loop
-above is the simple, always-available path. On the Paged-mode prefix-cache path
+**Prefill is no longer strictly token-by-token.** `prefill_status(ids, n,
+start_pos, ...)` is the entry point to prefer for a prompt: it consumes the whole
+token array and samples only the continuation after the last token. Two things
+make it cheaper than the caller's own `forward()` loop, and neither changes the
+result:
+
+- it passes `want_logits = false` for every interior token, so the final RMSNorm
+  and the `lm_head` GEMV run **once per prompt** instead of once per token (on a
+  151552-vocab model that head is a 1.24 GiB read, so the loop was paying it
+  ~N times to discard N-1 of the answers);
+- where the resolved token capacity allows it (Paged mode on a dense model —
+  `resolve_token_capacity()` returns 64 there, 1 under Continuous), it tiles the
+  prompt through `Impl::run_chunk`, the same batched path described below.
+
+It is deliberately **not** capability-gated: a configuration that cannot batch
+falls back to the single-token sweep, which is still strictly less work than the
+caller's loop. Measured on GLM-4-9B E8W5 / RTX 5070, x64-Release: **4.7x** at a
+16k-token prompt (32 min -> 6.8 min), with the greedy continuation byte-identical
+to the per-token sweep in the same KV mode. Across KV modes the continuations can
+differ, because Continuous and Paged run different attention kernels — that is a
+property of the mode, not of this entry point.
+
+The `forward()`-per-token loop remains the simple, always-available path. On the Paged-mode prefix-cache path
 (dense full-attention models; `has_prefix_cache()`), `prefill_driver()` restores
 the longest cached prefix and prefills the remaining delta in **batched
 Tensor-Core chunks** instead of one token at a time: embedding, RMSNorm,
@@ -186,6 +208,18 @@ for perplexity / teacher-forcing checks). `seq_id` selects the sequence
 (`Paged` mode only; `Continuous` supports only `seq_id = 0`).
 
 ```cpp
+blackwell::EngineStatus prefill_status(const int* token_ids, int num_tokens,
+                                       int start_pos, float temperature, float top_p,
+                                       int seq_id, int* next_token) noexcept;
+```
+Consumes `num_tokens` prompt tokens from `start_pos` and samples only the
+continuation after the last one — see §1.5 for why this is cheaper than, and
+equivalent to, a `forward()` loop over the same ids. RUNTIME tier: `noexcept`,
+reports by `EngineStatus`. A faulted prefill leaves the KV cache truncated at
+whatever it appended, so re-prefill (or `rewind`) rather than decoding on.
+Exposed across the DLL boundary as `IBlackwellEngine::PrefillTokens`.
+
+```cpp
 void fork(int parent_id, int child_id);   // Paged only; CoW-shares KV pages
 void rewind(int seq_id, int pos);         // Paged only; rolls back to `pos`
 ```
@@ -233,6 +267,7 @@ struct InferenceConfig {                 // tier 2: what you ask for
     size_t max_batch_size     = 1;       // > 1 rejected for hybrid SSM models
     bool   require_branching  = false;
     int    batched_gemm_threshold = 16;  // GEMV<->batched-GEMM crossover (>= 1)
+    int    attention_split_k_max  = 0;   // decode split-K ceiling; 0 = auto, 1 = off
     float  temperature = 0.6f;
     float  top_p       = 0.9f;
 };
@@ -245,6 +280,7 @@ struct RuntimeConfig {                   // tier 3: resolved execution plan
     size_t num_gpu_layers = RuntimeConfig::kAllLayersResident;
     bool   uses_dedicated_full_attention = false;
     int    batched_gemm_threshold = 16;
+    int    attention_split_k_max  = KernelLimits::kAttentionSplitKMax;  // resolved: [1, 16]
 };
 
 struct RuntimeOverrides {                // optional low-level knobs
@@ -252,6 +288,7 @@ struct RuntimeOverrides {                // optional low-level knobs
     std::optional<size_t> num_gpu_layers;
     std::optional<int>    paged_branch_factor;
     std::optional<int>    batched_gemm_threshold;
+    std::optional<int>    attention_split_k_max;
 };
 
 ModelCapabilities derive_capabilities(const ModelConfig& model);
@@ -271,6 +308,26 @@ high-throughput GEMM. The override wins over the request; the overlay pins it to
 16 explicitly. `max_batch_size > 1` requests true batch width but are **rejected
 for hybrid SSM checkpoints** in `build_and_validate_runtime` — their recurrent
 linear-attention state advances one position at a time and cannot be batched.
+
+`attention_split_k_max` (default 0 = auto) caps the **Split-K (Flash-Decoding)**
+split factor for decode attention. Decode attention launches one block per query
+head, so at GLM-4-9B geometry it occupies 32 blocks — and at batch = 1 there is no
+other work in flight to cover the remaining SMs. Split-K partitions the *context*
+dimension instead, widening the grid to `[q_heads, S]`: phase 1 runs the same exact
+online softmax over each slice into an L2-resident scratchpad the arena owns, and
+phase 2 rescales the slices by the global log-sum-exp. The engine picks `S` per
+step from the context length (`attn::select_split_k`) and clamps it to this
+ceiling; the resolved plan carries a decided number, never the `0` sentinel.
+
+Values: `0` = auto (the kernel's own maximum, `KernelLimits::kAttentionSplitKMax`),
+`1` = split-K **off** — decode runs the single-block kernel, which is the FP32
+parity reference and the thing to pin when bisecting a numerical regression —
+`2..kAttentionSplitKMax` = a hard ceiling. Anything outside `[0, 16]` is rejected
+rather than clamped, so a deliberate experiment cannot silently measure a different
+split factor than it asked for. The path is exact (same attention, differing only
+in fp32 summation order, and it reproduces the single-block kernel's deliberate
+bf16 output truncation), so the two agree to within one bf16 ULP. It applies to
+`KVCacheMode::Continuous`; the paged cache has its own Tensor-Core flash kernel.
 
 ### 2.4 `ModelConfig` / `ConfigLoader` — [`config.h`](../include/blackwell/config.h)
 
