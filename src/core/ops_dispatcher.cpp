@@ -5,6 +5,7 @@
 #include "kernels/bf16_linear_residual.cuh"
 #include "kernels/batched_bf16_gemm.cuh"
 #include "kernels/sym_int4_linear.cuh"
+#include "kernels/e8w5_linear.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdexcept>
@@ -104,9 +105,13 @@ void LinearDispatcher::forward(const std::string& base_name,
     }
 
     case QuantStrategy::COMPRESSED_TENSORS_INT4:
+    case QuantStrategy::E8W5_LATTICE:
     default:
-        // No batched symmetric-int4 kernel yet — sweep the rows even above the
-        // crossover.
+        // No batched symmetric-int4 or E8W5 kernel yet — sweep the rows even above the
+        // crossover. For E8W5 the obstruction is structural, not just unwritten: an MMA
+        // fragment hands one lane 4 k-values per k16 tile while an E8 block needs all 8 of
+        // its coordinates in one lane to recover u_7's parity bit, so a batched kernel needs
+        // the MMA-permuted pack (spec section 9.2) that the converter does not yet emit.
         sweep_rows(base_name, d_in, d_out, out_features, in_features,
                    d_residual_accum, num_tokens);
         return;
@@ -174,6 +179,23 @@ void LinearDispatcher::forward_row(const std::string& base_name,
             launch_sym_int4_gemv_residual(packed, scales, d_in, d_residual_accum,
                                           static_cast<int>(out_features), static_cast<int>(in_features),
                                           m_config.quant_group_size);
+        }
+        break;
+    }
+
+    case QuantStrategy::E8W5_LATTICE: {
+        // 5-bit companded-E8 lattice: dual bit-plane + per-group-128 FP16 scales + a
+        // per-tensor 64-entry codebook. Raw float input, like AWQ -- the decode hands back
+        // FP32 and the dot accumulates in FP32, so the activation precision the golden
+        // dumps pin is unchanged. See docs/E8W5_BLACKWELLLLM_INTEGRATION.md.
+        E8W5TensorPtrs p = m_arena.get_e8w5_pointers(base_name);
+        if (d_residual_accum == nullptr) {
+            launch_e8w5_gemv_kernel(p.plane_lo, p.plane_hi, p.scales, p.codebook,
+                                    d_in, d_out, out_features, in_features);
+        } else {
+            launch_e8w5_gemv_residual_kernel(p.plane_lo, p.plane_hi, p.scales, p.codebook,
+                                             d_in, d_residual_accum,
+                                             out_features, in_features);
         }
         break;
     }

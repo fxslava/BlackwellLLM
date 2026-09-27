@@ -43,7 +43,7 @@ std::string decode_token(IBlackwellTokenizer* tok, int32_t token_id) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -52,7 +52,25 @@ int main() {
     std::cout << "==================================================\n\n";
 
     try {
-        const std::string model_dir = "F:/AI/llama-3.1-8B-Instruct-AWQ-INT4";
+        // Checkpoint under test. The default is the long-standing hardcoded one so existing
+        // invocations are unchanged; `--model <dir>` (or a bare first argument) points it at
+        // another, which is what makes a quantization A/B possible at all.
+        std::string model_dir = "F:/AI/llama-3.1-8B-Instruct-AWQ-INT4";
+        uint32_t gpu_layers = BLACKWELL_ALL_LAYERS_RESIDENT;
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg(argv[i]);
+            if ((arg == "-m" || arg == "--model") && i + 1 < argc) model_dir = argv[++i];
+            else if (arg.rfind("--model=", 0) == 0) model_dir = arg.substr(8);
+            else if (arg == "--gpu-layers" && i + 1 < argc)
+                gpu_layers = static_cast<uint32_t>(std::stoul(argv[++i]));
+            else if (arg.rfind("--gpu-layers=", 0) == 0)
+                gpu_layers = static_cast<uint32_t>(std::stoul(arg.substr(13)));
+            else if (arg.rfind("-", 0) != 0) model_dir = arg;
+            else throw std::runtime_error(
+                "unknown argument: " + arg +
+                "  (usage: blackwell_bench [--model <dir>] [--gpu-layers <n>])");
+        }
+        std::cout << "[Bench] Model: " << model_dir << "\n";
         const std::string index_path = model_dir + "/model.safetensors.index.json";
 
         IBlackwellTokenizer* tok_raw = nullptr;
@@ -62,7 +80,7 @@ int main() {
         BLACKWELL_ENGINE_DESC desc{};
         desc.index_path         = index_path.c_str();
         desc.max_context_length = 2048;
-        desc.num_gpu_layers     = BLACKWELL_ALL_LAYERS_RESIDENT;
+        desc.num_gpu_layers     = gpu_layers;
         desc.kv_mode            = BLACKWELL_KV_MODE_CONTINUOUS;
 
         IBlackwellEngine* eng_raw = nullptr;

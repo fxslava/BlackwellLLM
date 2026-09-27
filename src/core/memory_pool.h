@@ -16,6 +16,16 @@ struct QuantizedTensorPtrs {
     const void* qzeros;
 };
 
+// E8W5 needs four tensors rather than AWQ's three, and one of them (the codebook) is
+// per-tensor metadata rather than a weight plane, so it gets its own struct instead of
+// overloading QuantizedTensorPtrs. See docs/E8W5_FORMAT_SPEC.md section 5.
+struct E8W5TensorPtrs {
+    const void* plane_lo;   // uint32[out_features][in_features/8]
+    const void* plane_hi;   // uint8 [out_features][in_features/8]
+    const void* scales;     // half  [out_features][in_features/128]
+    const void* codebook;   // half  [64], fitted per tensor
+};
+
 // Page-locked (pinned) host memory pool. Every host<->device tensor transfer in
 // the offloading path must source/sink cudaHostAlloc'd memory so cudaMemcpyAsync
 // can DMA over PCIe without an internal pageable staging copy; pageable malloc
@@ -84,6 +94,11 @@ public:
     const void* get_weight_ptr_optional(const std::string& name) const;
 
     QuantizedTensorPtrs get_quantized_pointers(const std::string& base_name) const;
+
+    // All four E8W5 tensors for one projection. Throws on any missing tensor when the
+    // checkpoint declares e8w5: a half-populated projection would decode to garbage
+    // silently, which is worse than failing the load.
+    E8W5TensorPtrs get_e8w5_pointers(const std::string& base_name) const;
 
     // Ping-Pong activation buffers (reused across all 32 layers)
     float* get_activation_buffer_A() const { return d_activation_A; }

@@ -487,6 +487,29 @@ QuantizedTensorPtrs VRAMArena::get_quantized_pointers(const std::string& base_na
     return {qweight, scales, qzeros};
 }
 
+E8W5TensorPtrs VRAMArena::get_e8w5_pointers(const std::string& base_name) const {
+    const bool is_e8w5 = (m_config.quant_method == "e8w5");
+
+    const void* plane_lo = get_weight_ptr_optional(base_name + ".plane_lo");
+    const void* plane_hi = get_weight_ptr_optional(base_name + ".plane_hi");
+    const void* scales   = get_weight_ptr_optional(base_name + ".scales");
+    const void* codebook = get_weight_ptr_optional(base_name + ".codebook");
+
+    if (is_e8w5) {
+        auto require = [&](const void* p, const char* suffix) {
+            if (!p)
+                throw std::runtime_error("[VRAMArena] Missing E8W5 tensor: " + base_name +
+                                         suffix);
+        };
+        require(plane_lo, ".plane_lo");
+        require(plane_hi, ".plane_hi");
+        require(scales,   ".scales");
+        require(codebook, ".codebook");
+    }
+
+    return {plane_lo, plane_hi, scales, codebook};
+}
+
 // ============================================================================
 // Asynchronous layer staging (weights)
 // ============================================================================

@@ -124,6 +124,12 @@ reference dumps the integration suite compares against: skill `golden-dumps`.
   commit pointer, and RoPE-aware KV head eviction.
 - `docs/LOCAL_ROUTER.md` — the strict local arbiter in front of the paid Cloud API: the
   EOS commit rule, `TerminationReason`, and why the network client has no cancellation.
+- `docs/E8W5_FORMAT_SPEC.md` + `docs/E8W5_BLACKWELLLLM_INTEGRATION.md` — the 5-bit
+  companded-E8 lattice weight format (dual bit-plane, 64-entry per-tensor codebook,
+  G=128 scales) and its engine wiring: `QuantStrategy::E8W5_LATTICE`,
+  `src/kernels/e8w5_linear.cu`, `scripts/e8w5_convert.py`. Read §1 of the integration
+  doc before touching any GEMV: it records why activations stay FP32 and why the
+  format cannot use AWQ's K-major thread mapping.
 
 **Architectural Atlas** (`docs/README.md` + numbered guides) — the cross-cutting
 architecture the subsystem docs above assume: [`docs/README.md`](docs/README.md) (repo map),

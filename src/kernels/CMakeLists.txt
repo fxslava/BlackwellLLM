@@ -1,4 +1,4 @@
-# Явный список вместо file(GLOB): GLOB вычисляется только на этапе configure,
+﻿# Явный список вместо file(GLOB): GLOB вычисляется только на этапе configure,
 # поэтому новые ядра (bias.cu, bf16_linear_bias.cu) молча выпадали бы из сборки
 # до ручного переконфигурирования.
 set(SOURCES
@@ -9,6 +9,7 @@ set(SOURCES
     bf16_linear_bias.cu
     bf16_linear_residual.cu
     bias.cu
+    e8w5_linear.cu
     embedding.cu
     fp8_linear.cu
     full_attention.cu

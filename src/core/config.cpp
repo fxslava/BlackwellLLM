@@ -40,6 +40,18 @@ static QuantStrategy resolve_quant_strategy(const std::string& method, int bits)
         }
     }
 
+    // 5-bit companded-E8 lattice (docs/E8W5_FORMAT_SPEC.md). Emitted by
+    // tools/e8w5_convert.py, which writes quant_method="e8w5", bits=5, group_size=128.
+    // The group size is a format constant, not a tunable: 128 weights is 16 E8 blocks is
+    // 640 bits, the smallest unit at which a 5-bit stream is 16-byte aligned.
+    if (method == "e8w5") {
+        if (bits != 5)
+            throw std::runtime_error(
+                "ConfigLoader: quant_method \"e8w5\" requires bits=5, got " +
+                std::to_string(bits));
+        return QuantStrategy::E8W5_LATTICE;
+    }
+
     // Explicit unquantized path.
     if (method == "none") {
         return QuantStrategy::NONE;
@@ -48,7 +60,7 @@ static QuantStrategy resolve_quant_strategy(const std::string& method, int bits)
     throw std::runtime_error(
         "ConfigLoader: unrecognised quantization configuration "
         "(quant_method=\"" + method + "\", bits=" + std::to_string(bits) + "). "
-        "Supported combinations: awq/4, gptq/4, fp8/8, compressed-tensors/8, none.");
+        "Supported combinations: awq/4, gptq/4, fp8/8, compressed-tensors/8, e8w5/5, none.");
 }
 
 ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
@@ -317,6 +329,14 @@ ModelConfig ConfigLoader::load_from_json(const std::string& json_path) {
             cfg.quant_group_size = qc.value("group_size", 128);
             cfg.quant_strategy   = resolve_quant_strategy(method, cfg.quant_bits);
             cfg.quant_method     = method; // kept for VRAMArena weight-routing (memory_pool.cpp)
+            // E8W5's 128-weight group is a property of the bit layout, so a checkpoint
+            // claiming anything else is malformed rather than merely unusual: the kernel
+            // indexes scales as q >> 2 off a 4-uint4-per-group assumption.
+            if (cfg.quant_strategy == QuantStrategy::E8W5_LATTICE &&
+                cfg.quant_group_size != 128)
+                throw std::runtime_error(
+                    "ConfigLoader: e8w5 requires group_size=128, got " +
+                    std::to_string(cfg.quant_group_size));
         }
     } else {
         cfg.quant_bits       = 16;

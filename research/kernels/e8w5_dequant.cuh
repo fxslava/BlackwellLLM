@@ -110,14 +110,16 @@ __device__ __forceinline__ void e8w5_decode_block(uint32_t lo4, uint32_t hi8,
 {
     const uint32_t base = e8w5_coset(lo4) << E8W5_COORD_BITS;   // index bit 5
     const uint32_t nib = e8w5_uniform_nibbles(lo4);
-    const uint32_t msb = e8w5_spread8(hi8) << 4;                // coord i's bit 4 -> bit 4i+4
+    const uint32_t sp = e8w5_spread8(hi8);                      // coord i's bit 4 at bit 4i
 
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint32_t s0 = 8u * static_cast<uint32_t>(i);
         const uint32_t s1 = s0 + 4u;
-        const uint32_t i0 = base | ((nib >> s0) & 0xFu) | ((msb >> s0) & 0x10u);
-        const uint32_t i1 = base | ((nib >> s1) & 0xFu) | ((msb >> s1) & 0x10u);
+        // Extract THEN shift: pre-shifting sp by 4 puts coordinate 7's MSB at bit 32 and
+        // drops it. The byte-plane variant below is unaffected (its masks never cross 31).
+        const uint32_t i0 = base | ((nib >> s0) & 0xFu) | (((sp >> s0) & 1u) << 4);
+        const uint32_t i1 = base | ((nib >> s1) & 0xFu) | (((sp >> s1) & 1u) << 4);
         out[i] = __halves2half2(cb[i0], cb[i1]);
     }
 }

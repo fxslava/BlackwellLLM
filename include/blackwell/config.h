@@ -10,7 +10,8 @@ enum class QuantStrategy {
     NONE,                   // Unquantized / BF16 / FP32 weights
     ROWWISE_FP8,            // Per-row FP8 weight quantization with per-token activation scaling
     WEIGHT_ONLY_PACKED,     // Weight-only packed int4 (AWQ / GPTQ) — asymmetric, qweight/qzeros/scales
-    COMPRESSED_TENSORS_INT4 // compressed-tensors "pack-quantized" — symmetric int4, weight_packed/weight_scale (no zero-point)
+    COMPRESSED_TENSORS_INT4, // compressed-tensors "pack-quantized" — symmetric int4, weight_packed/weight_scale (no zero-point)
+    E8W5_LATTICE            // 5-bit companded-E8 lattice (docs/E8W5_FORMAT_SPEC.md) — dual bit-plane + 64-entry codebook, no zero-point
 };
 
 // Per-layer attention kind for hybrid stacks (Qwen3.5: interleaved linear-attention
