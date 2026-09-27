@@ -267,6 +267,14 @@ std::unique_ptr<ITokenizer> TokenizerFactory::create(const std::string& model_di
                     "not supported; convert the checkpoint or supply tokenizer.json");
             return create_tiktoken(dir, rank_file);
         }
+        // Distinguish "the directory is not there" from "the directory has no tokenizer".
+        // Naming two absent files when the whole path is absent sends the reader looking for
+        // a conversion bug instead of a typo, which is exactly what it did once.
+        std::error_code dir_ec;
+        if (!fs::is_directory(dir, dir_ec))
+            throw std::runtime_error(
+                "TokenizerFactory: model directory " + dir.string() +
+                " does not exist (or is not a directory); check the --model path");
         throw std::runtime_error("TokenizerFactory: neither " +
                                  (dir / "tokenizer.json").string() + " nor " +
                                  rank_file.string() + " found; cannot construct a tokenizer");

@@ -188,14 +188,50 @@ def write_config(src: str, dst: str) -> None:
         json.dump(cfg, f, indent=2)
 
 
-def copy_aux_files(src: str, dst: str) -> None:
-    """Tokenizer and friends: the engine reads the checkpoint's own tokenizer."""
-    for name in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
-                 "special_tokens_map.json", "generation_config.json", "vocab.json",
-                 "merges.txt", "added_tokens.json", "chat_template.jinja"):
-        p = os.path.join(src, name)
-        if os.path.isfile(p):
-            shutil.copy2(p, os.path.join(dst, name))
+# Files the engine or HF tooling needs beside the weights. TokenizerFactory accepts either
+# tokenizer.json or tokenizer.model, so a checkpoint shipping only one of them is normal --
+# GLM-4 ships only tokenizer.model.
+AUX_EXACT = ("special_tokens_map.json", "generation_config.json", "vocab.json",
+             "merges.txt", "added_tokens.json", "chat_template.jinja",
+             "preprocessor_config.json")
+AUX_GLOBS = ("tokenizer*", "tokenization_*.py")
+# At least one of these must land in the destination or the engine cannot build a tokenizer
+# at all, which is a broken conversion rather than a missing nicety.
+TOKENIZER_REQUIRED_ANY = ("tokenizer.json", "tokenizer.model")
+
+
+def copy_aux_files(src: str, dst: str, verbose: bool = True) -> List[str]:
+    """Copy tokenizer and metadata assets so the output directory is runnable on its own.
+
+    Globbed rather than enumerated: a hardcoded list silently produces an unrunnable model
+    when a checkpoint names its tokenizer something unanticipated, and the failure then
+    surfaces much later as TokenizerFactory refusing to construct. Raises instead if no
+    tokenizer artifact reaches the destination.
+    """
+    import glob as _glob
+
+    copied: List[str] = []
+    names = set(AUX_EXACT)
+    for pattern in AUX_GLOBS:
+        for path in _glob.glob(os.path.join(src, pattern)):
+            if os.path.isfile(path):
+                names.add(os.path.basename(path))
+
+    for name in sorted(names):
+        srcp = os.path.join(src, name)
+        if os.path.isfile(srcp):
+            shutil.copy2(srcp, os.path.join(dst, name))
+            copied.append(name)
+
+    if not any(os.path.isfile(os.path.join(dst, n)) for n in TOKENIZER_REQUIRED_ANY):
+        raise RuntimeError(
+            f"no tokenizer artifact found in {src}: the engine needs one of "
+            f"{' or '.join(TOKENIZER_REQUIRED_ANY)} beside the weights, and the converted "
+            f"model would fail at CreateBlackwellTokenizer. Copy one in and re-run with "
+            f"--assets-only.")
+    if verbose:
+        print(f"  [assets] copied {len(copied)}: {', '.join(copied)}")
+    return copied
 
 
 def convert(src: str, dst: str, device: str, grid_n: int,
@@ -288,8 +324,22 @@ def main() -> int:
                     help="skip the per-tensor pack round-trip check")
     ap.add_argument("--dry-run", action="store_true",
                     help="quantize and report quality, write nothing")
+    ap.add_argument("--assets-only", action="store_true",
+                    help="copy config/tokenizer assets into an existing --dst and exit, "
+                         "touching no weights. Repairs an output directory without paying "
+                         "for the quantization again")
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
+
+    if args.assets_only:
+        if not os.path.isdir(args.dst):
+            raise SystemExit(f"--assets-only: {args.dst} does not exist. Check the path -- "
+                             f"a missing directory is what TokenizerFactory reports as "
+                             f"'neither tokenizer.json nor tokenizer.model found'.")
+        write_config(args.src, args.dst)
+        copied = copy_aux_files(args.src, args.dst)
+        print(f"wrote config.json and {len(copied)} assets into {args.dst}")
+        return 0
 
     rep = convert(args.src, args.dst, args.device, args.grid, args.lambda_grid,
                   args.layers, args.shard_mib, not args.no_verify, args.dry_run)
