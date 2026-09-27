@@ -7,6 +7,12 @@
 
 namespace blackwell {
 
+// The validator clamps the tier-2 knob against its own copy of the kernel's split
+// ceiling; this is the one TU that sees both headers, so it is where they are held
+// to agree. If this fires, change BOTH constants.
+static_assert(KernelLimits::kAttentionSplitKMax == attn::kSplitKMaxSplits,
+              "KernelLimits::kAttentionSplitKMax must mirror attn::kSplitKMaxSplits");
+
 void ContinuousKVManager::prepare_decode_step(SeqId seq, int /*pos*/) {
     // The legacy path is single-sequence; per-token staging is folded into
     // attention_decode (it is per-layer). Guard against branch misuse.
@@ -50,8 +56,15 @@ void ContinuousKVManager::attention_decode(int layer_idx, int pos,
             m_arena.get_max_seq_len(), m_config.rope_theta, rope_scaling_from(m_config));
     }
 
-    launch_attention_decoding_kernel(
-        d_Q, d_layer_k_cache, d_layer_v_cache, d_O, pos,
+    // Split-K decode attention. The context length decides the split factor
+    // (short contexts resolve to 1 and the launcher falls straight through to the
+    // single-block kernel), the plan's ceiling caps it, and a null scratchpad --
+    // a head_dim the kernel cannot serve -- disables it outright. The launcher
+    // handles all three degenerate cases, so there is one call site, not a branch.
+    const int splits = attn::select_split_k(pos + 1, m_split_k_max);
+    launch_attention_decoding_split_k(
+        d_Q, d_layer_k_cache, d_layer_v_cache, d_O,
+        m_arena.get_attention_split_k_scratch(), splits, pos,
         m_config.num_attention_heads, m_config.num_key_value_heads, m_config.head_dim,
         m_arena.get_max_seq_len());
 

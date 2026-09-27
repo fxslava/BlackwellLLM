@@ -171,7 +171,8 @@ BlackwellEngine::Impl::Impl(const std::string& index_path, const blackwell::Infe
                                                              m_runtime.paged_branch_factor,
                                                              m_runtime.kv_vram_cache_pages);
     } else {
-        kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(arena, m_config);
+        kv_mgr = std::make_unique<blackwell::ContinuousKVManager>(
+            arena, m_config, m_runtime.attention_split_k_max);
     }
 
     // Finalize the one capability the topology alone could not decide: CoW

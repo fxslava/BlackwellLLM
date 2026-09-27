@@ -1,6 +1,7 @@
 #include "memory_pool.h"
 #include "blackwell/weight_loader.h"
 #include "common.h"
+#include "kernels/attention.cuh"   // attn::split_k_scratch_floats / kSplitKBlockSize
 #include <algorithm>
 // Hybrid error doctrine (Roadmap #2): every CUDA check here is CUDA_CHECK_THROW
 // -- no exit() from this library. Construction/allocation failures unwind via
@@ -371,9 +372,25 @@ void VRAMArena::allocate_dynamic_pool(size_t max_seq_len) {
         }
     }
 
+    // Split-K decode-attention scratchpad (see the accessor in memory_pool.h).
+    // Gated on the decode kernel's hard head_dim contract: a model whose heads are
+    // wider than the block cannot use that kernel at all, so it gets no scratchpad
+    // and its KV manager keeps the dedicated path. Sized for the MAXIMUM split
+    // factor once -- the per-step dispatch never allocates.
+    size_t split_k_scratch_bytes = 0;
+    if (head_dim <= static_cast<size_t>(blackwell::attn::kSplitKBlockSize)) {
+        const size_t floats = blackwell::attn::split_k_scratch_floats(
+            m_config.num_attention_heads, head_dim);
+        d_attn_split_k_scratch.allocate(floats);   // INIT tier: throws on OOM
+        split_k_scratch_bytes = floats * sizeof(float);
+        std::cout << "[VRAM Arena] Split-K attention scratchpad: "
+                  << (split_k_scratch_bytes / 1024.0) << " KB (max "
+                  << blackwell::attn::kSplitKMaxSplits << " splits)\n";
+    }
+
     std::cout << "[VRAM Arena] Dynamic pool allocated. Context capacity: " << max_seq_len << " tokens.\n";
     std::cout << "[VRAM Arena] Total dynamic memory consumption: "
-              << ((ping_pong_bytes * 2 + total_cache_bytes * 2 +
+              << ((ping_pong_bytes * 2 + total_cache_bytes * 2 + split_k_scratch_bytes +
                    (offloaded_count ? 4 * single_layer_kv_bytes : 0)) / (1024 * 1024.0)) << " MB\n";
 }
 

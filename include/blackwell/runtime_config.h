@@ -53,6 +53,17 @@ inline constexpr int kAudioSoftTokenMs = 160;
 //                 if speech resumes.
 enum class AudioStreamingMode { Reconcile, CenterSlice };
 
+// Hard kernel/hardware limits the validator asserts against. These mirror
+// compile-time kernel constants; they are NOT tunable, only checkable. Declared
+// ahead of the config tiers because RuntimeConfig defaults itself from them.
+struct KernelLimits {
+    static constexpr int kPagedFlashHeadDimMax = 128; // paged_flash_attention HEAD_DIM_MAX
+    // Mirrors blackwell::attn::kSplitKMaxSplits (src/kernels/attention.cuh) --
+    // phase 2 of the split-K decode kernel reduces the slices inside one warp.
+    // A static_assert in kv_cache/continuous_kv_manager.cpp keeps the two equal.
+    static constexpr int kAttentionSplitKMax = 16;
+};
+
 // ── Tier 2: high-level streaming request (audio sliding-window + reconciliation) ─
 // All fields are USER INTENT in ms / ratios; build_and_validate_runtime resolves
 // them into a validated AudioStreamingPlan (tier 3). Nothing here is consumed
@@ -95,6 +106,17 @@ struct InferenceConfig {
     // tokens of live typing) is faster looping the GEMV. num_tokens < threshold
     // uses the GEMV sweep; >= threshold uses the batched GEMM. Must be >= 1.
     int batched_gemm_threshold = 16;
+
+    // Cap on the Split-K (Flash-Decoding) split factor for decode attention.
+    // Decode attention launches one block per query head, which leaves most of a
+    // 56-SM part idle at batch = 1; splitting the CONTEXT dimension into S slices
+    // widens the grid to [q_heads, S]. The engine picks S per step from the context
+    // length (attn::select_split_k) and clamps it to this ceiling.
+    //   0 = auto (the kernel's own maximum, KernelLimits::kAttentionSplitKMax)
+    //   1 = split-K OFF -- the single-block kernel, which is the FP32 parity
+    //       reference; set this when bisecting a numerical regression
+    //   2..kAttentionSplitKMax = a hard ceiling on the split factor
+    int attention_split_k_max = 0;
 
     // Default sampling knobs. Per-call forward() arguments still override these.
     float temperature = 0.6f;
@@ -162,6 +184,14 @@ struct RuntimeConfig {
     // the fast batch=1 GEMV, at/above it launches the Tensor-Core batched GEMM.
     int batched_gemm_threshold = 16;
 
+    // --- decode-attention Split-K (Flash-Decoding) ----------------------------
+    // Resolved ceiling on the split factor, in [1, KernelLimits::kAttentionSplitKMax]
+    // (the tier-2 "0 = auto" sentinel does not survive here). 1 means split-K is
+    // off and decode attention runs the single-block kernel. The KV manager
+    // consults it once at construction; the per-step split factor itself comes
+    // from the context length (attn::select_split_k), not from the plan.
+    int attention_split_k_max = KernelLimits::kAttentionSplitKMax;
+
     // --- tiered KV prefix-cache substrate (Paged mode only; docs/TIERED_KV_AND_AOT.md §5.1) ---
     // One page = paging::PAGE_SIZE (16) tokens of KV across all layers.
     //
@@ -199,6 +229,9 @@ struct RuntimeOverrides {
     std::optional<size_t> num_gpu_layers;     // kAllLayersResident forces all-resident
     std::optional<int>    paged_branch_factor;
     std::optional<int>    batched_gemm_threshold;  // GEMV<->batched-GEMM crossover (>= 1)
+    // Decode-attention split-K ceiling; 1 disables split-K (see the
+    // InferenceConfig field for the full semantics). 0 = auto, like tier 2.
+    std::optional<int>    attention_split_k_max;
 
     // Tiered KV prefix-cache sizing (see the RuntimeConfig fields for semantics).
     std::optional<int>         kv_vram_cache_pages;
@@ -223,12 +256,6 @@ struct RuntimeOverrides {
     // drive a load-progress UI from it. Called per tensor; keep it O(1) and
     // never let it throw. Empty = no reporting.
     std::function<void(size_t bytes_done, size_t bytes_total)> load_progress;
-};
-
-// Hard kernel/hardware limits the validator asserts against. These mirror
-// compile-time kernel constants; they are NOT tunable, only checkable.
-struct KernelLimits {
-    static constexpr int kPagedFlashHeadDimMax = 128; // paged_flash_attention HEAD_DIM_MAX
 };
 
 // Derive the static model capabilities from the parsed topology alone

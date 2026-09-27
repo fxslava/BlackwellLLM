@@ -112,6 +112,20 @@ RuntimeConfig build_and_validate_runtime(const ModelConfig& model,
     if (rt.batched_gemm_threshold < 1)
         throw std::invalid_argument("RuntimeConfig: batched_gemm_threshold must be >= 1");
 
+    // Decode-attention split-K ceiling. Tier 2 spells "let the kernel decide" as 0;
+    // tier 3 carries a decided number, so the sentinel is expanded here. An
+    // out-of-range request is REJECTED rather than clamped: silently capping a
+    // deliberate 64 would make a latency experiment report the wrong split factor.
+    const int split_k_request =
+        overrides.attention_split_k_max.value_or(request.attention_split_k_max);
+    if (split_k_request < 0 || split_k_request > KernelLimits::kAttentionSplitKMax)
+        throw std::invalid_argument(
+            "RuntimeConfig: attention_split_k_max must be in [0, " +
+            std::to_string(KernelLimits::kAttentionSplitKMax) +
+            "] (0 = auto, 1 = split-K off), got " + std::to_string(split_k_request));
+    rt.attention_split_k_max =
+        (split_k_request == 0) ? KernelLimits::kAttentionSplitKMax : split_k_request;
+
     // --- attention dispatch / head_dim validation -----------------------------
     // Qwen3.5 hybrid gated attention (head_dim 256) uses a dedicated naive path,
     // so the paged-flash 128-cap does not apply to it. For every other model the

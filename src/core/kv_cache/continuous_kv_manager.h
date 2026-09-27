@@ -1,7 +1,8 @@
 #pragma once
 #include "ikv_cache_manager.h"
-#include "memory_pool.h"        // VRAMArena
-#include "blackwell/config.h"   // ModelConfig
+#include "memory_pool.h"                // VRAMArena
+#include "blackwell/config.h"           // ModelConfig
+#include "blackwell/runtime_config.h"   // KernelLimits::kAttentionSplitKMax
 
 namespace blackwell {
 
@@ -13,10 +14,18 @@ namespace blackwell {
 // contiguous cache and throw std::runtime_error; rewind() IS supported as a
 // single-sequence linear rollback (delegates to VRAMArena::truncate_kv to
 // reconcile the offload high-water marks with the rewound position).
+// attention_decode dispatches decode attention through the two-phase Split-K
+// (Flash-Decoding) kernel when the context is long enough to pay for it and the
+// arena carries a scratchpad; split_k_max == 1 pins it to the single-block kernel,
+// which is the FP32 parity reference. Everything else about the sequence is
+// unchanged either way.
 class ContinuousKVManager : public IKVCacheManager {
 public:
-    ContinuousKVManager(VRAMArena& arena, const ModelConfig& config)
-        : m_arena(arena), m_config(config) {}
+    // split_k_max: the resolved RuntimeConfig::attention_split_k_max ceiling. The
+    // default keeps direct (test / tool) constructions on the shipping behavior.
+    ContinuousKVManager(VRAMArena& arena, const ModelConfig& config,
+                        int split_k_max = KernelLimits::kAttentionSplitKMax)
+        : m_arena(arena), m_config(config), m_split_k_max(split_k_max) {}
 
     void prepare_decode_step(SeqId seq, int pos) override;
     void prepare_prefill_step(SeqId seq, int start_pos, int num_tokens) override;
@@ -38,6 +47,7 @@ public:
 private:
     VRAMArena&         m_arena;
     const ModelConfig& m_config;
+    int                m_split_k_max;   // 1 == split-K off (parity reference)
 };
 
 } // namespace blackwell

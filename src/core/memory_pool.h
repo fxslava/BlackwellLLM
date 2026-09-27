@@ -8,6 +8,7 @@
 #include <vector>
 #include <stdexcept>
 #include "safetensors.h"
+#include "device_buffer.h"   // DeviceBuffer<T> (Roadmap #3: new pools are RAII)
 #include "blackwell/config.h"
 
 struct QuantizedTensorPtrs {
@@ -107,6 +108,29 @@ public:
     // Global KV-Cache buffers (VRAM-resident layers only)
     float* get_k_cache() const { return d_k_cache; }
     float* get_v_cache() const { return d_v_cache; }
+
+    // Split-K (Flash-Decoding) attention scratchpad: the per-(query head, context
+    // slice) partial context vectors and softmax statistics the two-phase decode
+    // kernel hands from phase 1 to phase 2 (layout: attn::split_k_scratch_floats).
+    //
+    // Sized ONCE for the largest split factor the kernel supports, so the decode
+    // loop may pick any split factor per step with zero allocation -- the whole
+    // point of putting it here rather than in the dispatch path. ~266 KB at
+    // Llama/GLM geometry (q=32, head_dim=128, S=16): small enough to stay
+    // L2-resident across the phase boundary, and it is NOT evacuated by
+    // hibernate() (transient scratch, nothing to preserve).
+    //
+    // ONE buffer serves every layer of every step. That is safe, not lucky: phase
+    // 1 writes each slice before phase 2 reads it, both phases are enqueued on the
+    // compute stream, and every layer's pair is enqueued after the previous
+    // layer's -- so the reuse is stream-ordered. It relies on the single-threaded
+    // engine doctrine (see the class comment on hibernate): a second thread
+    // driving attention against the same arena would race here.
+    //
+    // NULL when the model's head_dim exceeds the 128-wide decode kernel's hard
+    // contract (Qwen3.5's gated head_dim-256 layers use their own path) -- callers
+    // treat null as "split-K unavailable" and fall back to the single-block kernel.
+    float* get_attention_split_k_scratch() const { return d_attn_split_k_scratch.get(); }
 
     // 🎯 НОВЫЕ МЕТОДЫ: Получение сохраненных размеров и емкостей
     size_t get_max_seq_len() const { return m_max_seq_len; }
@@ -218,6 +242,13 @@ private:
     // KV Cache pool
     float* d_k_cache = nullptr;
     float* d_v_cache = nullptr;
+
+    // Split-K decode-attention scratchpad. RAII (Roadmap #3) rather than another
+    // entry in release_pools()' hand-maintained free list: it is allocated in the
+    // ctor AFTER the raw pools, so a throw on a later allocation must not leak it,
+    // and a DeviceBuffer member unwinds on its own. Declared last among the pools
+    // for that reason -- it depends on nothing and nothing depends on it.
+    blackwell::DeviceBuffer<float> d_attn_split_k_scratch;
 
     ModelConfig m_config;
     LoadProgressFn m_load_progress;  // optional weight-load progress observer
